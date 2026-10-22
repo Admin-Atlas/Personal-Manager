@@ -18,9 +18,11 @@
 // Every time carries its own zone; when this computer's zone can't be read, times can't be changed
 // at all rather than guessing UTC (plan rule R6). A typed date only counts once its field commits
 // it (on blur), so Save and Close blur the focused field first, and a date the field couldn't read
-// stops the save rather than vanishing.
+// stops the save rather than vanishing, until that field is given a date: its line names it, and a
+// save it stops puts focus there. The fields themselves live in `EventFields`, shared with creating
+// an event (`NewEventEditor`).
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type {
   Calendar,
@@ -28,18 +30,18 @@ import type {
   EditLoad,
   EventForEdit,
   EventPatchDraft,
-  EventVisibility,
   FieldPermissions,
   Milestone,
   SeenSummary,
   SeriesChoices,
   SeriesInfo,
-  ShowAs,
   SplitAction,
   TimeDraft,
 } from "../../../lib/types";
 import {
   DEFAULT_LENGTH_MS,
+  NO_BAD_DATES,
+  allDayOf,
   canEdit,
   changedFields,
   checkDraft,
@@ -49,11 +51,13 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   halfInstant,
+  hasBadDate,
   rebaseDraft,
+  refusedDateId,
   seedDraft,
   toChanges,
+  type BadDates,
   type EditorFields,
-  type EndChoice,
 } from "../../../lib/calendarEdit/eventDraft";
 import {
   ambiguousText,
@@ -69,22 +73,16 @@ import {
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
+import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import {
-  Button,
-  Callout,
-  ConfirmDialog,
-  Dialog,
-  Input,
-  SegmentedControl,
-  Select,
-  Skeleton,
-  Textarea,
-  Toggle,
-  useFieldA11y,
-} from "../../ui";
-import { DateField } from "../../DateField";
-import { TimeField } from "../../TimeField";
-import { ZoneSearchList } from "../ZoneSearchList";
+  NO_ZONE,
+  ShowAsControl,
+  TextRow,
+  VisibilitySelect,
+  WhenFields,
+  ZonePanel,
+  type Timed,
+} from "./EventFields";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
 import {
   choicesForEdit,
@@ -131,48 +129,13 @@ interface Asking {
   view: ChoicesView;
 }
 
-type Timed = Extract<TimeDraft, { kind: "timed" }>;
-
-const SHOW_AS: { value: ShowAs; label: string }[] = [
-  { value: "busy", label: "Busy" },
-  { value: "free", label: "Free" },
-];
-
-const VISIBILITY: { value: EventVisibility; label: string }[] = [
-  { value: "default", label: "Calendar default" },
-  { value: "public", label: "Public" },
-  { value: "private", label: "Private" },
-];
-
-const NO_ZONE =
-  "PM couldn't tell which time zone this computer is in, so it can't change times. Set the time zone in your system settings.";
-
-/** `date` (`YYYY-MM-DD`) moved by `days`. */
-function addDays(date: string, days: number): string {
-  const [y, m, d] = date.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
-}
-
-/** Whole days from `a` to `b` (`YYYY-MM-DD`). */
-function daysBetween(a: string, b: string): number {
-  return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86_400_000);
-}
-
 /** All day ↔ timed. Back to the kind Google holds restores Google's time exactly; otherwise an
  *  all-day span becomes 09:00 on its first day to 10:00 on its last, in `zone`, and a timed event
- *  keeps its days (an end at midnight closes the day before). */
+ *  keeps its days (an end at midnight closes the day before: `allDayOf`). */
 function switchKind(t: TimeDraft, base: TimeDraft, zone: string): TimeDraft {
   const to = t.kind === "timed" ? "all_day" : "timed";
   if (base.kind === to) return { ...base };
-  if (t.kind === "timed") {
-    const last =
-      t.end_time === "00:00" && t.end_date > t.start_date ? addDays(t.end_date, -1) : t.end_date;
-    return {
-      kind: "all_day",
-      first_day: t.start_date,
-      last_day: last < t.start_date ? t.start_date : last,
-    };
-  }
+  if (t.kind === "timed") return allDayOf(t);
   return {
     kind: "timed",
     start_date: t.first_day,
@@ -202,13 +165,15 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   // The latest draft, readable synchronously: Save and Close blur the focused field first, and a
   // date typed but not yet committed commits in that blur, before React re-renders.
   const draftRef = useRef<EditorFields | null>(null);
-  // Text a date field couldn't read; a save is refused while it stands.
-  const badDateRef = useRef<string | null>(null);
-  const [badDate, setBadDateState] = useState<string | null>(null);
-  const setBadDate = (text: string | null) => {
-    badDateRef.current = text;
-    setBadDateState(text);
+  // Text a date field couldn't read, by the half it sets: no save until that field is given a date.
+  const badDatesRef = useRef<BadDates>(NO_BAD_DATES);
+  const [badDates, setBadDatesState] = useState<BadDates>(NO_BAD_DATES);
+  const setBadDates = (next: BadDates) => {
+    badDatesRef.current = next;
+    setBadDatesState(next);
   };
+  // The When fields' own, so a save a refusal stops can find the date field it names.
+  const whenId = useId();
   // The event's length, kept while its start moves (and across a start that can't be read).
   const lengthRef = useRef<number | null>(null);
   const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(null);
@@ -276,13 +241,20 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
     }
   }
 
+  /** Focus on `el` (what `commitFocused` blurred, or the field a refusal names) when the save it
+   *  began went no further: never left on the page behind the dialog. */
+  function refocus(el: Element | null) {
+    if (!(el instanceof HTMLElement) || !el.closest('[role="dialog"]')) return;
+    if (el.isConnected && !el.matches(":disabled")) el.focus();
+  }
+
   const isDirty = () =>
     !!loaded && !!draftRef.current && changedFields(loaded.base, draftRef.current).length > 0;
 
   const requestClose = () => {
     if (saving) return;
     commitFocused();
-    if (isDirty() || badDateRef.current) setAskDiscard("close");
+    if (isDirty() || hasBadDate(badDatesRef.current)) setAskDiscard("close");
     else onClose();
   };
 
@@ -371,16 +343,27 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
   }
 
   async function save() {
+    // Refused before anything is blurred, so focus stays put.
+    if (!loaded || saving || asking) return;
+    const focused = document.activeElement;
     commitFocused();
     const current = draftRef.current;
-    if (!loaded || !current || saving || asking) return;
+    if (!current) return;
     // A new Save: no earlier ask's count or words carry into it (C9b-1 critique 1 L8).
     againRef.current = 0;
     heldNotice.current = null;
     // What stops this save is already said under When, as it happened; a banner repeating it would
-    // outlive the fix.
-    if (badDateRef.current || checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
+    // outlive the fix. A date a field couldn't read puts focus on that field, which the line names
+    // and only a date typed or picked there clears (a blur gives it nothing, so the refusal stands);
+    // anything else puts focus back where it was.
+    if (hasBadDate(badDatesRef.current)) {
       setBanner(null);
+      refocus(document.getElementById(refusedDateId(whenId, badDatesRef.current)));
+      return;
+    }
+    if (checkDraft(loaded.base, current, loaded.event).problems.length > 0) {
+      setBanner(null);
+      refocus(focused);
       return;
     }
     const changes = toChanges(loaded.base, current);
@@ -621,6 +604,7 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           calendar ? `Saving to ${calendar.name}${account ? ` · ${account}` : ""}` : undefined
         }
         closeLabel="Close"
+        closeDisabled={saving}
         widthClassName="max-w-lg"
         heightClassName="max-h-[85vh]"
         footer={
@@ -672,17 +656,16 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             />
 
             <WhenFields
+              id={whenId}
               draft={draft}
+              badDates={badDates}
               held={heldTimed}
               endChoices={endChoices}
               endMin={endMin}
               disabled={!timeEditable}
-              onChange={(time) => {
-                setBadDate(null);
-                setDraft({ ...draft, time });
-              }}
-              onRejectDate={setBadDate}
-              onAcceptDate={() => setBadDate(null)}
+              onChange={(time) => setDraft({ ...draft, time })}
+              onRejectDate={(half, text) => setBadDates({ ...badDatesRef.current, [half]: text })}
+              onAcceptDate={(half) => setBadDates({ ...badDatesRef.current, [half]: null })}
               moveStart={moveStart}
               moveEndDate={moveEndDate}
               onSwitchKind={() =>
@@ -693,54 +676,32 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
               onPickZone={setZonePick}
             />
             {zonePick && timeEditable && draft.time.kind === "timed" && (
-              <div
-                className="rounded-[var(--radius-sm)] border border-border2 p-2"
-                onKeyDown={(e) => {
-                  // Escape closes this panel, not the whole editor.
-                  if (e.key === "Escape") {
-                    e.stopPropagation();
-                    setZonePick(null);
-                  }
+              <ZonePanel
+                onPick={(zone) => {
+                  if (draft.time.kind !== "timed") return;
+                  const t = draft.time;
+                  setDraft({
+                    ...draft,
+                    time: changeZones(
+                      t,
+                      zonePick === "end" ? t.start_zone : zone,
+                      zonePick === "start" ? t.end_zone : zone,
+                    ),
+                  });
+                  setZonePick(null);
                 }}
-              >
-                <ZoneSearchList
-                  autoFocus
-                  onPick={(zone) => {
-                    if (draft.time.kind !== "timed") return;
-                    const t = draft.time;
-                    setDraft({
-                      ...draft,
-                      time: changeZones(
-                        t,
-                        zonePick === "end" ? t.start_zone : zone,
-                        zonePick === "start" ? t.end_zone : zone,
-                      ),
-                    });
-                    setZonePick(null);
-                  }}
-                />
-                <Button variant="tertiary" size="xs" onClick={() => setZonePick(null)}>
-                  Keep the zone
-                </Button>
-              </div>
+                onKeep={() => setZonePick(null)}
+              />
             )}
             {check?.ambiguous.map((half) => (
               <p key={half} className="text-xs text-ink4">
                 {ambiguousText(half)}
               </p>
             ))}
-            {/* What would stop the save, shown as it happens rather than only on Save (each sentence
-                once: a start and an end in the same skipped hour say the same thing). */}
-            {[
-              ...new Set([
-                ...(badDate
-                  ? [
-                      `“${badDate}” isn't a date PM can read. Type it as dd-mm-yyyy, or pick it from the calendar.`,
-                    ]
-                  : []),
-                ...(check?.problems.map(problemText) ?? []),
-              ]),
-            ].map((text) => (
+            {/* What else would stop the save (a date a field couldn't read is said under When),
+                shown as it happens rather than only on Save (each sentence once: a start and an end
+                in the same skipped hour say the same thing). */}
+            {[...new Set(check?.problems.map(problemText) ?? [])].map((text) => (
               <p key={text} className="text-xs text-st-due">
                 {text}
               </p>
@@ -771,34 +732,19 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
             )}
 
             <div className="flex flex-wrap items-center gap-4">
-              <SegmentedControl
-                ariaLabel="Shows as"
-                options={SHOW_AS}
+              <ShowAsControl
                 value={draft.show_as}
                 disabled={!may("show_as")}
                 onChange={(show_as) => setDraft({ ...draft, show_as })}
               />
-              <label className="flex items-center gap-2 text-sm text-ink2">
-                Visibility
-                <Select
-                  compact
-                  value={draft.visibility}
-                  disabled={!may("visibility")}
-                  onChange={(e) =>
-                    setDraft({ ...draft, visibility: e.target.value as EventVisibility })
-                  }
-                >
-                  {VISIBILITY.map((v) => (
-                    <option key={v.value} value={v.value}>
-                      {v.label}
-                    </option>
-                  ))}
-                  {(loaded.base.visibility === "confidential" ||
-                    draft.visibility === "confidential") && (
-                    <option value="confidential">Confidential</option>
-                  )}
-                </Select>
-              </label>
+              <VisibilitySelect
+                value={draft.visibility}
+                disabled={!may("visibility")}
+                onChange={(visibility) => setDraft({ ...draft, visibility })}
+                confidential={
+                  loaded.base.visibility === "confidential" || draft.visibility === "confidential"
+                }
+              />
             </div>
 
             {loaded.event.attachments.length > 0 && (
@@ -873,192 +819,5 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
           : "Nothing has been saved to Google yet."}
       </ConfirmDialog>
     </>
-  );
-}
-
-/** A labelled text field (one line, or several). */
-function TextRow({
-  label,
-  value,
-  onChange,
-  disabled,
-  multiline,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  disabled: boolean;
-  multiline?: boolean;
-}) {
-  const a11y = useFieldA11y();
-  return (
-    <div className="flex flex-col gap-1">
-      <label {...a11y.labelProps} className="text-sm text-ink2">
-        {label}
-      </label>
-      {multiline ? (
-        <Textarea
-          {...a11y.controlProps}
-          rows={4}
-          value={value}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      ) : (
-        <Input
-          {...a11y.controlProps}
-          value={value}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      )}
-    </div>
-  );
-}
-
-/** When: all day or timed, the dates and times, and the zone(s). */
-function WhenFields({
-  draft,
-  held,
-  endChoices,
-  endMin,
-  disabled,
-  onChange,
-  onRejectDate,
-  onAcceptDate,
-  moveStart,
-  moveEndDate,
-  onSwitchKind,
-  canSwitchKind,
-  onPickZone,
-}: {
-  draft: EditorFields;
-  /** Google's timed start and end, kept on offer in the time lists. */
-  held: Timed | null;
-  /** The End time list: times after the start, with the event's length. */
-  endChoices: readonly EndChoice[];
-  /** The first day the End date can be. */
-  endMin: string | undefined;
-  disabled: boolean;
-  onChange: (t: TimeDraft) => void;
-  /** A date field gave up on typed text it couldn't read, and showed its date again. */
-  onRejectDate: (text: string) => void;
-  /** A date field holds a date it read (typed, picked, or left as it was). */
-  onAcceptDate: () => void;
-  moveStart: (t: Timed, date: string, time: string) => Timed;
-  moveEndDate: (t: Timed, date: string) => Timed;
-  onSwitchKind: () => void;
-  canSwitchKind: boolean;
-  onPickZone: (which: "both" | "start" | "end") => void;
-}) {
-  const t = draft.time;
-  // What every date field here shares.
-  const dateProps = {
-    clearable: false,
-    disabled,
-    onReject: onRejectDate,
-    onAccept: onAcceptDate,
-  };
-  return (
-    <fieldset className="flex flex-col gap-2" disabled={disabled}>
-      <legend className="text-sm text-ink2">When</legend>
-      <label className="flex items-center gap-2 text-xs text-ink3">
-        <Toggle
-          ariaLabel="All day"
-          checked={t.kind === "all_day"}
-          disabled={disabled || !canSwitchKind}
-          onChange={onSwitchKind}
-        />
-        All day
-      </label>
-      {t.kind === "all_day" ? (
-        <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
-          <DateField
-            {...dateProps}
-            ariaLabel="First day"
-            value={t.first_day}
-            // Moving the first day moves the whole event; the last day alone changes its length.
-            onCommit={(first_day) =>
-              onChange({
-                ...t,
-                first_day,
-                last_day: addDays(t.last_day, daysBetween(t.first_day, first_day)),
-              })
-            }
-          />
-          <span>to</span>
-          <DateField
-            {...dateProps}
-            ariaLabel="Last day"
-            value={t.last_day}
-            min={t.first_day}
-            onCommit={(last_day) => onChange({ ...t, last_day })}
-          />
-        </div>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
-            <span className="w-10">Starts</span>
-            <DateField
-              {...dateProps}
-              ariaLabel="Start date"
-              value={t.start_date}
-              onCommit={(d) => onChange(moveStart(t, d, t.start_time))}
-            />
-            <TimeField
-              ariaLabel="Start time"
-              compact
-              value={t.start_time}
-              held={held?.start_time}
-              disabled={disabled}
-              onChange={(hm) => onChange(moveStart(t, t.start_date, hm))}
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
-            <span className="w-10">Ends</span>
-            <DateField
-              {...dateProps}
-              ariaLabel="End date"
-              value={t.end_date}
-              min={endMin}
-              onCommit={(end_date) => onChange(moveEndDate(t, end_date))}
-            />
-            <TimeField
-              ariaLabel="End time"
-              compact
-              value={t.end_time}
-              choices={endChoices}
-              disabled={disabled}
-              onChange={(end_time) => onChange({ ...t, end_time })}
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-2 text-xs text-ink4">
-            {t.start_zone === t.end_zone ? (
-              <>
-                <span>Times in {t.start_zone}</span>
-                <Button variant="tertiary" size="xs" onClick={() => onPickZone("both")}>
-                  Change time zone
-                </Button>
-                <Button variant="tertiary" size="xs" onClick={() => onPickZone("end")}>
-                  End in another zone
-                </Button>
-              </>
-            ) : (
-              <>
-                <span>
-                  Starts in {t.start_zone}, ends in {t.end_zone}
-                </span>
-                <Button variant="tertiary" size="xs" onClick={() => onPickZone("start")}>
-                  Start zone
-                </Button>
-                <Button variant="tertiary" size="xs" onClick={() => onPickZone("end")}>
-                  End zone
-                </Button>
-              </>
-            )}
-          </div>
-        </>
-      )}
-    </fieldset>
   );
 }

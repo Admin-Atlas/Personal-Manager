@@ -9,8 +9,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReadOnlyReason, SplitAction, WriteOutcome, WriteWarning } from "../types";
 import {
   CALLOUT_TONE,
+  CREATE_CHANGED,
+  CREATE_LOST,
   conflictFields,
+  createdText,
+  createReasonText,
+  createText,
   deleteText,
+  endsRetry,
+  heldCreateText,
+  retryAfter,
   earlierChangeText,
   leftBehindText,
   listFields,
@@ -403,6 +411,121 @@ describe("settling a change PM couldn't finish", () => {
       ).text,
     ).toBe(
       "“Gym” wasn't deleted. PM is still finishing an earlier change to it from 02-11. Finish it first.",
+    );
+  });
+});
+
+// --- creating an event (#884, C10) ---
+
+const made = (warnings: WriteWarning[] = []): Extract<WriteOutcome, { outcome: "saved" }> => ({
+  outcome: "saved",
+  warnings,
+  left_behind: [],
+});
+const lost: WriteOutcome = { outcome: "failed", message: CREATE_LOST };
+const changed: WriteOutcome = { outcome: "failed", message: CREATE_CHANGED };
+
+describe("creating an event", () => {
+  // The webview ends a retry token only on these: anything else may leave the first copy in Google.
+  it("drops a retry token only on saved, gone, CREATE_LOST or CREATE_CHANGED", () => {
+    const ends: WriteOutcome[] = [made(), { outcome: "gone" }, lost, changed];
+    const keeps: WriteOutcome[] = [
+      { outcome: "ambiguous", retry_token: "ref-1" },
+      { outcome: "reauth" },
+      { outcome: "busy" },
+      { outcome: "read_only", reason: "editing_off" },
+      { outcome: "failed", message: "PM couldn't reach Google." },
+      { outcome: "unconfirmed" },
+    ];
+    for (const o of ends) {
+      expect(endsRetry(o)).toBe(true);
+      expect(retryAfter("ref-1", o)).toBeNull();
+    }
+    for (const o of keeps) {
+      expect(endsRetry(o)).toBe(false);
+      expect(retryAfter("ref-1", o)).toBe("ref-1");
+    }
+    // A first create holds a token only when its answer never arrived.
+    expect(retryAfter(null, { outcome: "ambiguous", retry_token: "ref-2" })).toBe("ref-2");
+    expect(retryAfter(null, { outcome: "busy" })).toBeNull();
+    expect(retryAfter(null, { outcome: "failed", message: "Offline." })).toBeNull();
+  });
+
+  it("says Created, and where PM's calendar won't show it", () => {
+    const here = { name: "Work", hidden: false };
+    expect(createdText("Dentist", made(), here)).toEqual({
+      tone: "ok",
+      text: "Created “Dentist”.",
+    });
+    expect(createdText("  ", made(), here).text).toBe("Created “(no title)”.");
+    expect(createdText("Dentist", made(), { name: "Work", hidden: true })).toEqual({
+      tone: "warn",
+      text: "Created “Dentist” in Work, which is hidden here.",
+    });
+    expect(createdText("Dentist", made(["outside_mirror"]), here)).toEqual({
+      tone: "warn",
+      text: "Created “Dentist” in Google. It starts outside the months PM syncs, so it won't show here.",
+    });
+    expect(createdText("Dentist", made(["mirror_refresh_pending"]), here)).toEqual({
+      tone: "ok",
+      text: "Created “Dentist” in Google. PM's calendar will show it after the next refresh.",
+    });
+  });
+
+  it("never says a create PM may have made wasn't made", () => {
+    const ambiguous = createText({ outcome: "ambiguous", retry_token: "ref-1" }, "Dentist", true);
+    expect(ambiguous.tone).toBe("warn");
+    expect(ambiguous.text).toBe(
+      "PM lost touch with Google while creating “Dentist”, so it may already be in your calendar. Check again: PM looks for it first and sends it again only if Google still doesn't show it.",
+    );
+    expect(ambiguous.text).not.toContain("ref-1");
+    // Held, the calendar can't be changed, so the refusal never asks for another one, and it says
+    // the first send may have landed.
+    const refused = createText(
+      { outcome: "read_only", reason: "calendar_read_only" },
+      "Dentist",
+      true,
+    ).text;
+    expect(refused).not.toMatch(/Choose another/);
+    expect(refused).toMatch(/^“Dentist” wasn't sent again: .* PM may already have made it: /);
+    for (const o of [
+      { outcome: "reauth" },
+      { outcome: "busy" },
+      { outcome: "read_only", reason: "editing_off" },
+      { outcome: "failed", message: "Not now." },
+    ] as WriteOutcome[]) {
+      const said = createText(o, "Dentist", true);
+      expect(said.tone).toBe("warn");
+      expect(said.text).not.toMatch(/wasn't created/);
+    }
+    expect(heldCreateText("Dentist")).toEqual({
+      tone: "warn",
+      text: "PM may already have made “Dentist”. Check again: PM looks for it in Google first and sends it again only if it isn't there.",
+    });
+  });
+
+  it("names what wasn't created, and why", () => {
+    expect(
+      createText({ outcome: "failed", message: "PM couldn't reach Google." }, "Dentist", false),
+    ).toEqual({ tone: "error", text: "“Dentist” wasn't created: PM couldn't reach Google." });
+    expect(
+      createText({ outcome: "read_only", reason: "calendar_read_only" }, "Dentist", false).text,
+    ).toBe("“Dentist” wasn't created: This calendar doesn't let you add events. Choose another.");
+    expect(createReasonText("private_event")).toBe(
+      "This calendar's sharing doesn't let you make private events on it.",
+    );
+    expect(createReasonText("editing_off")).toBe(reasonText("editing_off"));
+    expect(createText({ outcome: "gone" }, "Dentist", false)).toEqual({
+      tone: "warn",
+      text: "PM made “Dentist”, but it has since been deleted in Google.",
+    });
+    // The token PM no longer holds: never "create it again" without looking first.
+    expect(createText(lost, "Dentist", false)).toEqual({
+      tone: "warn",
+      text: "PM lost touch with Google and can't tell whether “Dentist” was made. Look for it in Google Calendar before creating it again, so it isn't made twice.",
+    });
+    expect(createText(changed, "Dentist", false).text).toMatch(
+      /^“Dentist” wasn't sent again: .* so it isn't made twice\.$/,
     );
   });
 });

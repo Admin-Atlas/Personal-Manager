@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.150.0-alpha",
+    date: "2026-10-20",
+    highlights: [
+      "You can now create events in your Google calendars right from PM: press + New event at the top of the calendar, or just press c. Pick the calendar, and next time PM starts on the one you used last; a new event lasts as long as your Google Calendar's default, so a 30-minute default gives a 30-minute event. Ctrl+S (⌘S on a Mac) saves, as in Google Calendar.",
+      "It works on Google accounts with editing turned on in Settings › Connectors, and goes straight to Google with your calendar's usual notifications. If PM loses touch with Google while saving, it says so and offers Check again, which looks for the event in Google before sending it again, so a dropped connection is very unlikely to make a second copy. Repeating events and inviting guests come later.",
+    ],
+  },
+  {
     version: "3.149.1-alpha",
     date: "2026-10-20",
     highlights: [

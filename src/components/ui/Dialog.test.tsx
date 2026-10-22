@@ -154,6 +154,22 @@ describe("Dialog", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("disables the bar chrome's Close button with closeDisabled", () => {
+    const { getByRole, rerender } = render(
+      <Dialog open onClose={noop} chrome="bar" title="New event" closeDisabled>
+        <p>body</p>
+      </Dialog>,
+    );
+    const close = () => getByRole("button", { name: "Close" }) as HTMLButtonElement;
+    expect(close().disabled).toBe(true);
+    rerender(
+      <Dialog open onClose={noop} chrome="bar" title="New event">
+        <p>body</p>
+      </Dialog>,
+    );
+    expect(close().disabled).toBe(false);
+  });
+
   it("renders eyebrow, subtitle and footer where each chrome puts them", () => {
     const { getByText } = render(
       <Dialog

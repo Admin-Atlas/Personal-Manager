@@ -11,10 +11,22 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
+// The floating briefing, with something to show; its body isn't what these read.
+vi.mock("../../../lib/briefing", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useBriefing: () => ({ briefing: { briefing: "Stand-up at ten." }, busy: false }),
+}));
+vi.mock("../../Briefing", () => ({ Briefing: () => null }));
+
+import { Modal } from "../../ui";
+import { BriefingPanel } from "../../BriefingPanel";
 import { WriteNotices } from "./WriteNotices";
 import type { WriteNotice } from "./useEventWrites";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 const deleting = (id: number, summary: string): WriteNotice => ({
   id,
@@ -24,7 +36,39 @@ const deleting = (id: number, summary: string): WriteNotice => ({
   undoLabel: `Undo deleting “${summary}”`,
 });
 
+/** An element's one z-index utility, as a number (`z-50`, `z-[45]`). jsdom paints nothing, so the
+ *  stacking is read from the classes. */
+function zOf(el: Element | null): number {
+  const z = Array.from(el?.classList ?? [])
+    .map((c) => /^z-\[?(\d+)\]?$/.exec(c))
+    .filter((m) => m !== null);
+  expect(z).toHaveLength(1);
+  return Number(z[0]![1]);
+}
+
 describe("WriteNotices", () => {
+  // A notice that never goes (Check again) covered a new event's Cancel and Save on a short window,
+  // and sat outside the dialog's focus trap: notices stack under any open dialog's scrim. Tied with
+  // the floating briefing, which comes after them in the page as here, they went under it instead:
+  // they sit strictly between the two.
+  it("sits under an open dialog's scrim and over the floating briefing", () => {
+    localStorage.setItem("pm.briefing.float", "inApp");
+    render(
+      <>
+        <Modal open onClose={vi.fn()} label="New event">
+          <button type="button">Save</button>
+        </Modal>
+        <WriteNotices notices={[deleting(1, "Gym")]} onUndo={vi.fn()} onDismiss={vi.fn()} />
+        <BriefingPanel />
+      </>,
+    );
+    const scrim = screen.getByRole("dialog").parentElement;
+    const briefing = screen.getByRole("complementary", { name: "Today's briefing" });
+    const stack = screen.getByText("Deleting “Gym”.").closest(".fixed");
+    expect(zOf(stack)).toBeLessThan(zOf(scrim));
+    expect(zOf(stack)).toBeGreaterThan(zOf(briefing));
+  });
+
   it("names the shortcut on the newest Undo only", () => {
     render(
       <WriteNotices
@@ -102,5 +146,42 @@ describe("WriteNotices", () => {
     const standup = screen.getByRole("button", { name: "Finish (“Standup”)" }) as HTMLButtonElement;
     expect(gym.disabled).toBe(true);
     expect(standup.disabled).toBe(false);
+  });
+
+  // A new event PM may already have made keeps Check again until Google shows how it ended (C10).
+  it("offers Check again on a new event PM may have made, off while it checks", () => {
+    const held = (id: number, summary: string, checking = false): WriteNotice => ({
+      id,
+      tone: "warn",
+      text: `PM may already have made “${summary}”.`,
+      create: {
+        token: `ref-${id}`,
+        sent: {
+          calendarId: "gcal:me@x.com:me@x.com",
+          draft: {
+            summary,
+            time: { kind: "all_day", first_day: "2026-10-12", last_day: "2026-10-12" },
+            location: "",
+            description: "",
+            show_as: "free",
+            visibility: "default",
+          },
+        },
+      },
+      checking,
+    });
+    const onCheckCreate = vi.fn();
+    const props = { onUndo: vi.fn(), onDismiss: vi.fn(), onCheckCreate };
+    const view = render(<WriteNotices notices={[held(1, "Gym")]} {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    expect(onCheckCreate).toHaveBeenCalledWith(1);
+    // Checking: its button off. Two up: each names its event.
+    view.rerender(<WriteNotices notices={[held(1, "Gym", true), held(2, " ")]} {...props} />);
+    const gym = screen.getByRole("button", { name: "Check again (“Gym”)" }) as HTMLButtonElement;
+    const untitled = screen.getByRole("button", {
+      name: "Check again (“(no title)”)",
+    }) as HTMLButtonElement;
+    expect(gym.disabled).toBe(true);
+    expect(untitled.disabled).toBe(false);
   });
 });

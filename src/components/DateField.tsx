@@ -28,9 +28,16 @@ interface Props {
   onCommit: (iso: string) => void;
   /** Fired with typed text that couldn't be read as a date, when the field gives up on it. */
   onReject?: (text: string) => void;
-  /** Fired whenever the field ends up holding a date it read, typed or picked, even one equal to
-   *  `value` (when `onCommit` stays quiet): a caller holding an `onReject` can let it go. */
+  /** Fired when the field is given a date, typed or picked, even one equal to `value` (when
+   *  `onCommit` stays quiet): a caller holding an `onReject` can let it go. Leaving the field on
+   *  text nobody typed (its own date, or the one it put back after a rejection) gives it nothing,
+   *  so a refusal the caller holds can't end by a blur alone. */
   onAccept?: () => void;
+  /** The caller still holds an `onReject` of this field's: marked wrong (a red edge and
+   *  `aria-invalid`) as nonsense being typed is, until the caller lets it go. */
+  refused?: boolean;
+  /** The id of the words that say what's wrong with it (`aria-describedby`). */
+  describedBy?: string;
   disabled?: boolean;
   /** Applied to the text input (height, padding, font). */
   className?: string;
@@ -54,6 +61,8 @@ export function DateField({
   onCommit,
   onReject,
   onAccept,
+  refused = false,
+  describedBy,
   disabled,
   className,
   wrapperClassName,
@@ -67,6 +76,9 @@ export function DateField({
   const [draft, setDraft] = useState(() => isoToDisplay(value));
   const [invalid, setInvalid] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Whether the text shown was typed since the field last showed a date of its own: only then does
+  // reading it on blur count as being given a date (`onAccept`).
+  const typed = useRef(false);
 
   // Adjust the draft when the stored value changes underneath us (a refetch, or the popover writing
   // a pick). Render-phase sync rather than an effect: an effect would paint one frame of the stale
@@ -76,6 +88,7 @@ export function DateField({
     lastValue.current = value;
     setDraft(isoToDisplay(value));
     setInvalid(false);
+    typed.current = false;
   }
 
   const selected = isoToDate(value);
@@ -86,6 +99,8 @@ export function DateField({
    *  committing junk — but only on blur, never mid-typing. */
   function commitDraft() {
     const read = parseDisplay(draft);
+    const given = typed.current;
+    typed.current = false;
     if (read === null) {
       // Typed text that isn't a date: say so to a caller that wants to know (a form that must not
       // carry on as if it had been entered), then show the stored value again.
@@ -98,7 +113,9 @@ export function DateField({
     setInvalid(false);
     // Normalise what's shown ("4/8" → "04-08-2026") so the field always reads back in one format.
     setDraft(isoToDisplay(parsed));
-    onAccept?.();
+    // Text nobody typed (the date put back after a rejection, read again as focus leaves) gives
+    // nothing: a form's save that blurs the field first must still find the refusal standing.
+    if (given) onAccept?.();
     if (parsed !== value) onCommit(parsed);
   }
 
@@ -136,10 +153,12 @@ export function DateField({
           disabled={disabled}
           placeholder={placeholder}
           aria-label={ariaLabel}
-          aria-invalid={invalid || undefined}
+          aria-invalid={invalid || refused || undefined}
+          aria-describedby={describedBy}
           title={title ?? "Type a date as dd-mm-yyyy, or click to pick one"}
           onChange={(e) => {
             setDraft(e.currentTarget.value);
+            typed.current = true;
             // Live-flag nonsense so the border reacts as you type, but never rewrite the text — the
             // whole point is that a half-typed date survives.
             setInvalid(parseDisplay(e.currentTarget.value) === null);
@@ -167,7 +186,7 @@ export function DateField({
           }}
           className={cn(
             "min-w-0 flex-1 rounded-[var(--radius-sm)] border bg-surface outline-none transition placeholder:text-ink4 focus:border-accent",
-            invalid ? "border-st-due" : "border-border2",
+            invalid || refused ? "border-st-due" : "border-border2",
             className,
           )}
         />

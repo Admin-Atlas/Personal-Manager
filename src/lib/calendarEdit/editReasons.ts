@@ -452,6 +452,161 @@ export function savedNotice(
   return { tone: left ? "warn" : "ok", text: parts.join(" ") };
 }
 
+// --- creating an event (C10) ---
+
+/** The backend's words for a new event's retry token it no longer holds (PM restarted, or eight
+ *  hours passed), and for a retry naming a draft other than the one it was creating. Copies of the
+ *  backend's own, which a test there pins to these: the webview tells these two from every other
+ *  failure only by their words, and both end the token. */
+export const CREATE_LOST =
+  "PM lost touch with Google and can't tell whether this new event was made. Look for it in Google Calendar before creating it again, so it isn't made twice.";
+export const CREATE_CHANGED =
+  "This differs from the new event PM was creating when it lost touch with Google, so PM didn't send it. PM may already have made the earlier one: look for it in Google Calendar before creating it again, so it isn't made twice.";
+
+/** Whether a create's answer ends its retry token: only Google showing the event made (`saved`),
+ *  made and then deleted (`gone`), or the backend no longer holding it or refusing a changed draft.
+ *  Anything else may still leave the first copy in Google, so Check again stays (C10 critiques). */
+export function endsRetry(outcome: WriteOutcome): boolean {
+  if (outcome.outcome === "saved" || outcome.outcome === "gone") return true;
+  return (
+    outcome.outcome === "failed" &&
+    (outcome.message === CREATE_LOST || outcome.message === CREATE_CHANGED)
+  );
+}
+
+/** The retry token a create's answer leaves: the one an `ambiguous` answer gives, else the one that
+ *  was sent while nothing ended it, else none. */
+export function retryAfter(sent: string | null, outcome: WriteOutcome): string | null {
+  if (outcome.outcome === "ambiguous") return outcome.retry_token;
+  return sent !== null && !endsRetry(outcome) ? sent : null;
+}
+
+/** Where a new event went: its calendar's name, and whether PM's calendar keeps it out of sight
+ *  there (`createdWhere`). */
+export interface CreatedWhere {
+  name: string;
+  hidden: boolean;
+}
+
+/** Why a calendar can't take a new event, in a create's terms (the rest read as for a change). */
+export function createReasonText(reason: ReadOnlyReason): string {
+  switch (reason) {
+    case "private_event":
+      return "This calendar's sharing doesn't let you make private events on it.";
+    case "calendar_read_only":
+      return "This calendar doesn't let you add events. Choose another.";
+    default:
+      return reasonText(reason);
+  }
+}
+
+/** A new event Google holds, once the editor has closed (C10 §15): created, and whether PM's
+ *  calendar will show it. Ok when it will, a warning (which stays) when it won't. */
+export function createdText(
+  title: string,
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  where: CreatedWhere,
+): { tone: Tone; text: string } {
+  const t = quote(title);
+  if (outcome.warnings.includes("outside_mirror")) {
+    return {
+      tone: "warn",
+      text: `Created ${t} in Google. It starts outside the months PM syncs, so it won't show here.`,
+    };
+  }
+  if (where.hidden) {
+    return { tone: "warn", text: `Created ${t} in ${where.name}, which is hidden here.` };
+  }
+  if (outcome.warnings.includes("mirror_refresh_pending")) {
+    return {
+      tone: "ok",
+      text: `Created ${t} in Google. ${writeWarningText("mirror_refresh_pending", "save")}`,
+    };
+  }
+  return { tone: "ok", text: `Created ${t}.` };
+}
+
+/** What creating `title` came to when it wasn't saved, in the editor's banner or a notice that
+ *  outlives it. `held`: a retry token is still held after it (`retryAfter`), so the first copy may
+ *  be in Google: it never says the event wasn't made, and Check again stays. */
+export function createText(
+  outcome: WriteOutcome,
+  title: string,
+  held: boolean,
+): { tone: Tone; text: string } {
+  const t = quote(title);
+  const notMade = (why: string, tone: Tone = "error") =>
+    held
+      ? { tone: "warn" as const, text: `${t}: ${why}` }
+      : { tone, text: `${t} wasn't created: ${why}` };
+  switch (outcome.outcome) {
+    case "saved":
+      return { tone: "ok", text: `Created ${t}.` };
+    case "ambiguous":
+      return {
+        tone: "warn",
+        text: `PM lost touch with Google while creating ${t}, so it may already be in your calendar. Check again: PM looks for it first and sends it again only if Google still doesn't show it.`,
+      };
+    case "gone":
+      return { tone: "warn", text: `PM made ${t}, but it has since been deleted in Google.` };
+    case "failed":
+      if (outcome.message === CREATE_LOST) {
+        return {
+          tone: "warn",
+          text: `PM lost touch with Google and can't tell whether ${t} was made. Look for it in Google Calendar before creating it again, so it isn't made twice.`,
+        };
+      }
+      if (outcome.message === CREATE_CHANGED) {
+        return {
+          tone: "warn",
+          text: `${t} wasn't sent again: it differs from the event PM was creating when it lost touch with Google. Look for it in Google Calendar before creating it again, so it isn't made twice.`,
+        };
+      }
+      return notMade(outcome.message);
+    // Held, the draft is locked to what was sent, so there's no other calendar to choose: the
+    // change's own words say why, and that the first send may have landed.
+    case "read_only":
+      return held
+        ? {
+            tone: "warn",
+            text: `${t} wasn't sent again: ${reasonText(outcome.reason)} PM may already have made it: look for it in Google Calendar before creating it again, so it isn't made twice.`,
+          }
+        : notMade(createReasonText(outcome.reason));
+    case "reauth":
+      return held
+        ? {
+            tone: "warn",
+            text: `${t}: Google needs you to sign in again. Reconnect the account in Settings › Connectors, then check again.`,
+          }
+        : notMade(REAUTH);
+    case "busy":
+      return held
+        ? { tone: "warn", text: `${t}: Google is busy right now. Check again in a moment.` }
+        : notMade("Google is busy right now. Try again in a moment.", "warn");
+    // Never a create's answer; said as a change's would be.
+    case "no_change":
+    case "needs_choice":
+    case "ignored_by_google":
+    case "partial_split":
+    case "split_removed":
+    case "conflict":
+    case "unconfirmed": {
+      const said = outcomeText(outcome);
+      return notMade(said.text, said.tone);
+    }
+    default:
+      return unreachable(outcome);
+  }
+}
+
+/** A surface closed while PM may already have made its new event: what the notice it leaves says. */
+export function heldCreateText(title: string): { tone: Tone; text: string } {
+  return {
+    tone: "warn",
+    text: `PM may already have made ${quote(title)}. Check again: PM looks for it in Google first and sends it again only if it isn't there.`,
+  };
+}
+
 /** Why the editor couldn't open. */
 export function loadText(load: Exclude<EditLoad, { outcome: "ready" }>): string {
   switch (load.outcome) {
@@ -487,4 +642,11 @@ export function problemText(problem: DraftProblem): string {
 /** The note for a time the clocks pass twice: which of the two the save means. */
 export function ambiguousText(half: "start" | "end"): string {
   return `The ${half} time happens twice that night, as the clocks go back. PM saves the first.`;
+}
+
+/** The line for typed `text` the date field named `field` ("End date", "Last day") couldn't read.
+ *  It names the field, since only a date typed or picked there ends the refusal (`BadDates`), even
+ *  the one it shows already. */
+export function badDateText(field: string, text: string): string {
+  return `${field}: “${text}” isn't a date PM can read. Type the ${field.toLowerCase()} again as dd-mm-yyyy, or pick it from the calendar.`;
 }

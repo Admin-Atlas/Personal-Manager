@@ -1103,8 +1103,7 @@ export const updateCalendarEvent = (
 /** Create an event on one of PM's Google calendars (`calendarId`, PM's own id). Outcomes come back as
  *  data. `retryToken` (from an `ambiguous` outcome) looks for the earlier attempt and sends it again,
  *  under the same id, only if Google still doesn't show it, so a retry is very unlikely to make a
- *  second copy. Nobody is emailed: new events have no guests.
- *  Release builds refuse it until the editor's create mode ships. */
+ *  second copy. Nobody is emailed: new events have no guests. */
 export const createCalendarEvent = (
   calendarId: string,
   draft: NewEventDraft,

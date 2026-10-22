@@ -47,6 +47,29 @@ describe("calendarNavKey", () => {
   it("leaves Ctrl+Z to the Undo decision", () => {
     expect(calendarNavKey(key("z", { ctrlKey: true }), false)).toBeNull();
   });
+
+  // Google's keys (#884, C10): c is the full editor, Shift+C the quick one.
+  it("c creates, Shift+C quick-creates; not with Ctrl, in a field, or behind a dialog", () => {
+    expect(calendarNavKey(key("c"), false)).toBe("create");
+    expect(calendarNavKey(key("C", { shiftKey: true }), false)).toBe("quick-create");
+    // Ctrl+C stays copy, and Cmd/Alt+C are the app's.
+    expect(calendarNavKey(key("c", { ctrlKey: true }), false)).toBeNull();
+    expect(calendarNavKey(key("c", { metaKey: true }), false)).toBeNull();
+    expect(calendarNavKey(key("c", { altKey: true }), false)).toBeNull();
+    for (const tag of ["INPUT", "TEXTAREA", "SELECT"]) {
+      expect(calendarNavKey(key("c", { target: el(tag) }), false)).toBeNull();
+    }
+    expect(calendarNavKey(key("c", { target: el("DIV", true) }), false)).toBeNull();
+    expect(calendarNavKey(key("c", { target: el("BUTTON") }), true)).toBeNull();
+    expect(calendarNavKey(key("C", { shiftKey: true }), true)).toBeNull();
+  });
+
+  it("reads Shift, not the letter's case, so Caps Lock doesn't change the surface", () => {
+    // Caps Lock on: the key reads "C" with no Shift held.
+    expect(calendarNavKey(key("C"), false)).toBe("create");
+    // Caps Lock on and Shift held: the key reads "c".
+    expect(calendarNavKey(key("c", { shiftKey: true }), false)).toBe("quick-create");
+  });
 });
 
 function undoKey(over: Partial<UndoKeyEvent> = {}): UndoKeyEvent {

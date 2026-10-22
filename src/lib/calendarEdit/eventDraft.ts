@@ -10,12 +10,16 @@
 // clocks skip), mirroring the backend's `calendar_write::time`, which has the final say. `rebaseDraft`
 // carries a draft onto a newer copy after a conflict: the user's edits stay, except where Google
 // changed the same field, where Google's value wins and the editor says so.
+//
+// Creating an event uses the same fields: `newEventSeed` starts one, it's judged against
+// `NEW_EVENT_BASE` (nothing to keep, so every half is checked), and `toNewEvent` sends all of it.
 
 import type {
   EventForEdit,
   EventPatchDraft,
   EventVisibility,
   FieldPermissions,
+  NewEventDraft,
   ShowAs,
   TimeDraft,
 } from "../types";
@@ -139,6 +143,25 @@ export interface DraftCheck {
   /** Halves the user changed to a time the clocks pass twice that night: the save takes the first. */
   ambiguous: ("start" | "end")[];
 }
+
+/** Text a date field couldn't read, by the half of the event it sets (Start date or First day, End
+ *  date or Last day). Each stands until that half's field is given a date, typed or picked, and a
+ *  save is refused while either does: another date, a time or a blur never ends it, or the save
+ *  would go on the very date the user was changing. */
+export type BadDates = Readonly<Record<"start" | "end", string | null>>;
+
+export const NO_BAD_DATES: BadDates = { start: null, end: null };
+
+export const hasBadDate = (bad: BadDates) => bad.start !== null || bad.end !== null;
+
+/** The id of the date field setting `half`, in the When fields given `when` as their id. */
+export const dateFieldId = (when: string, half: "start" | "end") => `${when}-${half}-date`;
+
+/** Where a save refused for `bad` puts focus: the date field whose refusal stands, the start's
+ *  first (each half has one, whatever the event's kind). A blur there gives it nothing, so only a
+ *  date typed or picked in it ends the refusal. */
+export const refusedDateId = (when: string, bad: BadDates) =>
+  dateFieldId(when, bad.start !== null ? "start" : "end");
 
 /** Google's exact instants for the copy the base was seeded from (`EventForEdit` carries them). */
 export interface HeldTimes {
@@ -392,6 +415,147 @@ export function rebaseDraft(
     }
   }
   return { base: newBase, draft: next, overwritten };
+}
+
+/** `date` (`YYYY-MM-DD`) moved by `days`. */
+function shiftDay(date: string, days: number): string {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
+
+/** A timed span as all day: the days it covers, an end at midnight closing the day before (so a
+ *  23:00 to 00:00 event is one day), and never a last day before the first. */
+export function allDayOf(t: Timed): Extract<TimeDraft, { kind: "all_day" }> {
+  const last =
+    t.end_time === "00:00" && t.end_date > t.start_date ? shiftDay(t.end_date, -1) : t.end_date;
+  return {
+    kind: "all_day",
+    first_day: t.start_date,
+    last_day: last < t.start_date ? t.start_date : last,
+  };
+}
+
+// --- creating an event ---
+
+/** What creating checks against: there's no time to keep, so every half counts as changed and is
+ *  judged (`checkDraft` skips a time equal to its base's, and `halfInstant` keeps a base's untouched
+ *  half). */
+export const NEW_EVENT_BASE: EditorFields = {
+  summary: "",
+  location: "",
+  description: "",
+  time: { kind: "all_day", first_day: "", last_day: "" },
+  show_as: "busy",
+  visibility: "default",
+};
+
+const hhmm = (minutes: number) =>
+  `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+
+/** The first time from `time` on `date`, a half hour at a time, that the clocks show in `zone`: a
+ *  start the clocks skip that night (they go forward) moves on to when the hour is over. `null` when
+ *  the rest of the day is skipped. */
+function firstShown(date: string, time: string, zone: string): string | null {
+  const [h, m] = time.split(":").map(Number);
+  for (let at = h * 60 + m; at < 24 * 60; at += 30) {
+    if (resolveWallTime(date, hhmm(at), zone).kind !== "gap") return hhmm(at);
+  }
+  return null;
+}
+
+/** A new event's starting fields, on `day` (`YYYY-MM-DD`, in `zone`): on today the next half hour
+ *  strictly after `now` (14:10 → 14:30, 14:30 → 15:00, 23:40 → 00:00 the next day), on any other day
+ *  09:00, stepping past a time the clocks skip; `lengthMs` long (`endAfterStart`, so a repeated hour
+ *  never gives an end before the start). Busy, the calendar's default visibility. With no zone at all
+ *  there's no time to show, so it starts as an all-day event on `day`, free as Google's are. */
+export function newEventSeed(
+  day: string,
+  now: Date,
+  zone: string | null,
+  lengthMs: number,
+): EditorFields {
+  const fields = { summary: "", location: "", description: "", visibility: "default" as const };
+  if (zone === null) {
+    return { ...fields, time: { kind: "all_day", first_day: day, last_day: day }, show_as: "free" };
+  }
+  let date = day;
+  let time = "09:00";
+  let today: { date: string; time: string } | null = null;
+  try {
+    today = wallTimeOf(now, zone);
+  } catch {
+    // A zone this webview doesn't know: the live lines say so, and nothing can be saved.
+  }
+  if (today && today.date === day) {
+    const [h, m] = today.time.split(":").map(Number);
+    const next = (Math.floor((h * 60 + m) / 30) + 1) * 30;
+    if (next >= 24 * 60) {
+      date = shiftDay(day, 1);
+      time = "00:00";
+    } else {
+      time = hhmm(next);
+    }
+  }
+  let start = firstShown(date, time, zone);
+  if (start === null) {
+    date = shiftDay(date, 1);
+    start = firstShown(date, "00:00", zone) ?? "00:00";
+  }
+  const timed: Timed = {
+    kind: "timed",
+    start_date: date,
+    start_time: start,
+    start_zone: zone,
+    end_date: date,
+    end_time: start,
+    end_zone: zone,
+  };
+  return { ...fields, time: endAfterStart(NEW_EVENT_BASE, timed, lengthMs), show_as: "busy" };
+}
+
+/** All day ↔ timed for a new event: all day keeps the days the time covers (`allDayOf`, as editing
+ *  does); timed goes back to the seed's start time on the first day, in `zone`, `lengthMs` long.
+ *  Show as follows Google's default for the kind (all day free, timed busy) until the user picks
+ *  it (`showAsTouched`). */
+export function switchNewKind(
+  draft: EditorFields,
+  seed: EditorFields,
+  zone: string,
+  lengthMs: number,
+  showAsTouched: boolean,
+): EditorFields {
+  const t = draft.time;
+  if (t.kind === "timed") {
+    return { ...draft, time: allDayOf(t), show_as: showAsTouched ? draft.show_as : "free" };
+  }
+  const from = seed.time.kind === "timed" ? seed.time.start_time : "09:00";
+  const start = firstShown(t.first_day, from, zone) ?? from;
+  const timed: Timed = {
+    kind: "timed",
+    start_date: t.first_day,
+    start_time: start,
+    start_zone: zone,
+    end_date: t.first_day,
+    end_time: start,
+    end_zone: zone,
+  };
+  return {
+    ...draft,
+    time: endAfterStart(NEW_EVENT_BASE, timed, lengthMs),
+    show_as: showAsTouched ? draft.show_as : "busy",
+  };
+}
+
+/** What creating an event sends: every field, as the editor holds it. */
+export function toNewEvent(draft: EditorFields): NewEventDraft {
+  return {
+    summary: draft.summary,
+    time: { ...draft.time },
+    location: draft.location,
+    description: draft.description,
+    show_as: draft.show_as,
+    visibility: draft.visibility,
+  };
 }
 
 function setField(target: EditorFields, field: EditorField, from: EditorFields) {

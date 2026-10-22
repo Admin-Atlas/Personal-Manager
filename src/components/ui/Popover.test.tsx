@@ -135,6 +135,36 @@ describe("Popover stacking", () => {
     expect(screen.queryByRole("group", { name: "Panels" })).not.toBeNull();
   });
 
+  // A list the keyboard has to reach inside a dialog (the new event's calendars): portalled to the
+  // body it sat outside the dialog's focus trap and its aria-modal, so neither Tab nor a screen
+  // reader could get to it. `withinDialog` puts it inside; without it, the body as before.
+  it("portals into the dialog around it with withinDialog, and to the body without", () => {
+    for (const withinDialog of [true, false]) {
+      render(
+        <Modal open onClose={vi.fn()} label="New event">
+          <Popover
+            escapeClipping
+            withinDialog={withinDialog}
+            ariaLabel="Calendars"
+            trigger={({ toggle }) => (
+              <button type="button" onClick={toggle}>
+                Open
+              </button>
+            )}
+          >
+            <span>panel body</span>
+          </Popover>
+        </Modal>,
+      );
+      fireEvent.click(screen.getByText("Open"));
+      const panel = screen.getByRole("group", { name: "Calendars" });
+      expect(screen.getByRole("dialog").contains(panel)).toBe(withinDialog);
+      // Placed in the viewport either way, so the dialog's scrolling body can't clip it.
+      expect(panel.className).toContain("fixed");
+      cleanup();
+    }
+  });
+
   it("never emits two z-index utilities", () => {
     // `cn` does not de-conflict. Two z-classes on one element is a silent, stylesheet-ordering-
     // dependent bug, so pin the count directly for both modes.

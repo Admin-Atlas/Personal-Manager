@@ -7,6 +7,8 @@ import { describe, expect, it } from "vitest";
 
 import type { EventForEdit, FieldPermissions, TimeDraft } from "../types";
 import {
+  NEW_EVENT_BASE,
+  allDayOf,
   canEdit,
   changedFields,
   checkDraft,
@@ -16,9 +18,12 @@ import {
   endsAfterStart,
   firstEndOnItsDate,
   halfInstant,
+  newEventSeed,
   rebaseDraft,
   seedDraft,
+  switchNewKind,
   toChanges,
+  toNewEvent,
   type EditorFields,
 } from "./eventDraft";
 import { QUARTER_HOURS } from "./timeSlots";
@@ -361,5 +366,161 @@ describe("carrying a draft onto Google's newer copy", () => {
     const r = rebaseDraft(base(), { ...base(), time: later }, { ...base(), time: { ...later } });
     expect(r.overwritten).toEqual([]);
     expect(toChanges(r.base, r.draft)).toEqual({});
+  });
+});
+
+// --- creating an event (#884, C10) ---
+
+const HOUR = 60 * 60_000;
+const HALF = 30 * 60_000;
+
+describe("a new event's starting fields", () => {
+  it("newEventSeed: next half hour on today, 09:00 elsewhere, the account's length", () => {
+    // 14:10 in London (BST): 14:30, for the account's 30 minutes.
+    const now = new Date("2026-10-12T13:10:00Z");
+    const seed = newEventSeed("2026-10-12", now, "Europe/London", HALF);
+    expect(seed.time).toEqual(timed("2026-10-12", "14:30", "2026-10-12", "15:00"));
+    expect(seed).toMatchObject({
+      summary: "",
+      location: "",
+      description: "",
+      show_as: "busy",
+      visibility: "default",
+    });
+    // Strictly after: on the half hour itself, the next one.
+    expect(
+      newEventSeed("2026-10-12", new Date("2026-10-12T13:30:00Z"), "Europe/London", HOUR).time,
+    ).toEqual(timed("2026-10-12", "15:00", "2026-10-12", "16:00"));
+    // Another day: 09:00.
+    expect(newEventSeed("2026-10-14", now, "Europe/London", HOUR).time).toEqual(
+      timed("2026-10-14", "09:00", "2026-10-14", "10:00"),
+    );
+    // "Today" is the zone's: 00:30 in Tokyo is still the day before in London.
+    expect(
+      newEventSeed("2026-10-13", new Date("2026-10-12T15:30:00Z"), "Asia/Tokyo", HOUR).time,
+    ).toEqual(timed("2026-10-13", "01:00", "2026-10-13", "02:00", "Asia/Tokyo"));
+  });
+
+  it("newEventSeed past 23:30 starts tomorrow at 00:00", () => {
+    const now = new Date("2026-10-12T22:40:00Z"); // 23:40 BST
+    expect(newEventSeed("2026-10-12", now, "Europe/London", HOUR).time).toEqual(
+      timed("2026-10-13", "00:00", "2026-10-13", "01:00"),
+    );
+  });
+
+  it("steps past a start the clocks skip", () => {
+    // London's clocks go from 01:00 to 02:00 on 28-03-2027: at 00:35 the next half hour, 01:00,
+    // never happens, nor does 01:30.
+    const now = new Date("2027-03-28T00:35:00Z");
+    const seed = newEventSeed("2027-03-28", now, "Europe/London", HOUR);
+    expect(seed.time).toEqual(timed("2027-03-28", "02:00", "2027-03-28", "03:00"));
+    expect(checkDraft(NEW_EVENT_BASE, seed).problems).toEqual([]);
+  });
+
+  it("starts all day, free, when there's no zone to show times in", () => {
+    expect(newEventSeed("2026-10-14", new Date(), null, HOUR)).toMatchObject({
+      time: { kind: "all_day", first_day: "2026-10-14", last_day: "2026-10-14" },
+      show_as: "free",
+    });
+  });
+
+  it("checkDraft against NEW_EVENT_BASE judges a seeded gap", () => {
+    const fields = (time: TimeDraft): EditorFields => ({ ...NEW_EVENT_BASE, time });
+    // Every half is judged: there's nothing Google holds to keep.
+    expect(
+      checkDraft(NEW_EVENT_BASE, fields(timed("2027-03-28", "01:30", "2027-03-28", "02:30")))
+        .problems,
+    ).toEqual([{ kind: "gap", half: "start", zone: "Europe/London", time: "01:30" }]);
+    expect(
+      checkDraft(NEW_EVENT_BASE, fields(timed("2026-10-12", "10:00", "2026-10-12", "10:00")))
+        .problems,
+    ).toEqual([{ kind: "end_before_start" }]);
+    expect(
+      checkDraft(
+        NEW_EVENT_BASE,
+        fields({ kind: "all_day", first_day: "2026-10-14", last_day: "2026-10-13" }),
+      ).problems,
+    ).toEqual([{ kind: "end_before_start" }]);
+    // The night the clocks go back: the first 01:30, said.
+    expect(
+      checkDraft(NEW_EVENT_BASE, fields(timed("2026-10-25", "01:30", "2026-10-25", "03:00")))
+        .ambiguous,
+    ).toEqual(["start"]);
+    expect(
+      checkDraft(NEW_EVENT_BASE, fields(timed("2026-10-12", "10:00", "2026-10-12", "11:00"))),
+    ).toEqual({ problems: [], ambiguous: [] });
+  });
+
+  it("toNewEvent sends every field", () => {
+    const draft: EditorFields = {
+      summary: "Dentist",
+      location: "",
+      description: "Bring the form",
+      time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
+      show_as: "free",
+      visibility: "private",
+    };
+    const sent = toNewEvent(draft);
+    expect(sent).toEqual({
+      summary: "Dentist",
+      time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
+      location: "",
+      description: "Bring the form",
+      show_as: "free",
+      visibility: "private",
+    });
+    // A copy: a later edit to the draft can't change what was sent.
+    expect(sent.time).not.toBe(draft.time);
+  });
+
+  it("switchNewKind keeps the day and length and follows Google's free/busy until touched", () => {
+    const seed = newEventSeed(
+      "2026-10-12",
+      new Date("2026-10-12T13:10:00Z"),
+      "Europe/London",
+      HALF,
+    );
+    const allDay = switchNewKind(seed, seed, "Europe/London", HALF, false);
+    expect(allDay.time).toEqual({
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-12",
+    });
+    expect(allDay.show_as).toBe("free");
+    const back = switchNewKind(
+      { ...allDay, time: { kind: "all_day", first_day: "2026-10-20", last_day: "2026-10-22" } },
+      seed,
+      "Europe/London",
+      HALF,
+      false,
+    );
+    expect(back.time).toEqual(timed("2026-10-20", "14:30", "2026-10-20", "15:00"));
+    expect(back.show_as).toBe("busy");
+    // Picked by the user: kept, both ways.
+    expect(
+      switchNewKind({ ...seed, show_as: "busy" }, seed, "Europe/London", HALF, true).show_as,
+    ).toBe("busy");
+    expect(
+      switchNewKind({ ...allDay, show_as: "free" }, seed, "Europe/London", HALF, true).show_as,
+    ).toBe("free");
+  });
+
+  it("switchNewKind reads an end at midnight as the day before, as editing does", () => {
+    const late: EditorFields = {
+      ...NEW_EVENT_BASE,
+      time: timed("2026-10-12", "23:00", "2026-10-13", "00:00"),
+    };
+    expect(switchNewKind(late, late, "Europe/London", HOUR, false).time).toEqual({
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-12",
+    });
+    const twoNights = timed("2026-10-12", "23:00", "2026-10-14", "00:00");
+    if (twoNights.kind !== "timed") throw new Error("timed");
+    expect(allDayOf(twoNights)).toEqual({
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-13",
+    });
   });
 });

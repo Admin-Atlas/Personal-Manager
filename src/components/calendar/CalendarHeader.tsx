@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The calendar's shared chrome — one header, no second sidebar. View switcher (active = accent),
-// ‹ Today › nav, the date-range label, the Calendars dropdown, and Refresh-now.
+// The calendar's shared chrome — one header, no second sidebar. "+ New event", ‹ Today › nav, the
+// date-range label, the view switcher (active = accent), and Refresh-now.
+//
+// "+ New event" (#884, C10) is the one control here that changes a calendar: it opens the editor for
+// a new Google event, as `c` does, and sits first, where Google's Create does. It shows once a Google
+// account is connected; when no calendar can take an event it stays focusable and says why (its
+// tooltip, and a click), rather than going grey and silent. It's secondary, so the editor's Save stays
+// the one primary button on screen. Everything else here only changes what you see.
 //
 // The last-synced time rides ON the Refresh button rather than beside it: it is the one fact that
-// tells you whether pressing Refresh is worth it. The old separate "Read-only" badge is gone — it was
-// a static, prop-free span nothing derived from, and the calendar has no edit affordances to
-// disambiguate; the fact is still stated in the help card, the empty state and the Connectors copy.
+// tells you whether pressing Refresh is worth it.
 
+import { useEffect, useId, useState } from "react";
 import {
   DAY_COUNT_MAX,
   DAY_COUNT_MIN,
@@ -18,7 +23,7 @@ import {
 } from "../../lib/calendarPrefs";
 import { formatSyncedShort, formatWhen } from "../../lib/format";
 import { useDepth, useTheme, type Coords } from "../../theme";
-import { Button, SegmentedControl, Select, type SegOption } from "../ui";
+import { Button, SegmentedControl, Select, Tooltip, VisuallyHidden, type SegOption } from "../ui";
 import { MiniCalendarPopover } from "./MiniCalendarPopover";
 import { RangeControl } from "./RangeControl";
 
@@ -48,7 +53,14 @@ interface Props {
   onRefresh: () => void;
   syncing: boolean;
   lastSync: string | null;
+  /** Start a new event. Absent: no Google account is connected, and there's no button. */
+  onCreate?: () => void;
+  /** Why no new event can be made now, or null when one can. */
+  createReason?: string | null;
 }
+
+/** How long a click's "why not" stays beside the button. */
+const SAID_MS = 6000;
 
 const VIEW_LABEL: Record<CalendarViewMode, string> = {
   month: "Month",
@@ -78,9 +90,24 @@ export function CalendarHeader({
   onRefresh,
   syncing,
   lastSync,
+  onCreate,
+  createReason = null,
 }: Props) {
   const { showMeta } = useDepth();
   const { system } = useTheme();
+  const reasonId = useId();
+  // A click on New event while none can be made: the reason, said beside it for a moment (a
+  // tooltip shows only on hover or focus, and a click doesn't focus a button in WebKit). Counted
+  // (0 = not said), so another click starts the moment over and says it again as new text.
+  const [said, setSaid] = useState(0);
+  useEffect(() => {
+    if (said === 0) return;
+    const t = setTimeout(() => setSaid(0), SAID_MS);
+    return () => clearTimeout(t);
+  }, [said]);
+  useEffect(() => {
+    if (createReason === null) setSaid(0);
+  }, [createReason]);
   // The last successful sync: clock time if it was today, else the date. Null when unset/unparseable.
   const synced = lastSync ? formatSyncedShort(lastSync) || null : null;
   // The Work/Day/24h scale only drives the pixel time-grid (Slate/Editorial). Terminal renders
@@ -97,6 +124,36 @@ export function CalendarHeader({
       className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-rule px-4 py-2"
       data-help="calendar-header"
     >
+      {onCreate && (
+        <div className="flex items-center gap-2">
+          <Tooltip label={createReason ?? "New event · c"}>
+            <Button
+              variant="secondary"
+              size="sm"
+              aria-disabled={createReason !== null || undefined}
+              aria-describedby={createReason !== null ? reasonId : undefined}
+              aria-keyshortcuts="c"
+              className="aria-disabled:cursor-not-allowed aria-disabled:text-ink4"
+              onClick={() => {
+                if (createReason !== null) setSaid((n) => n + 1);
+                else onCreate();
+              }}
+            >
+              + New event
+            </Button>
+          </Tooltip>
+          {createReason !== null && (
+            <>
+              <VisuallyHidden id={reasonId}>{createReason}</VisuallyHidden>
+              <span role="status" className="max-w-xs text-xs text-ink3">
+                {/* A new node each click: a screen reader says text added, not text unchanged. */}
+                {said > 0 && <span key={said}>{createReason}</span>}
+              </span>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="flex items-center gap-1">
         <Button variant="tertiary" onClick={onPrev} title="Previous" aria-label="Previous">
           ‹

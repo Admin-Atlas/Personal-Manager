@@ -4,13 +4,34 @@
 
 // How far a sideways swipe moves the day grids (Settings > General). Pinned: the one-day default
 // nobody's swipe changes from, what a stored value from a newer or broken build falls back to, and
-// "All the days on screen" following whichever grid is swiped.
+// "All the days on screen" following whichever grid is swiped. Also the calendar a new event starts
+// on (#884, C10), kept beside the hidden set in the encrypted store.
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { readSwipeDays, swipeDays, writeSwipeDays } from "./calendarPrefs";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { getPref, setPref } from "./ipc";
+import {
+  readHidden,
+  readLastCreate,
+  readSwipeDays,
+  swipeDays,
+  writeHidden,
+  writeLastCreate,
+  writeSwipeDays,
+} from "./calendarPrefs";
+import { __resetStoredPrefs, hydrateStoredPrefs } from "./storedPrefs";
+
+vi.mock("./ipc", () => ({
+  getPref: vi.fn(async () => null),
+  setPref: vi.fn(async () => undefined),
+}));
 
 beforeEach(() => {
   localStorage.clear();
+  __resetStoredPrefs();
+  vi.mocked(getPref).mockReset();
+  vi.mocked(setPref).mockReset();
+  vi.mocked(getPref).mockImplementation(async () => null);
+  vi.mocked(setPref).mockImplementation(async () => undefined);
 });
 
 describe("how far a swipe moves", () => {
@@ -39,6 +60,40 @@ describe("how far a swipe moves", () => {
     for (const bad of ["0", "8", "2.5", "-1", "week", ""]) {
       localStorage.setItem("pm.calendar.swipeDays", bad);
       expect(readSwipeDays()).toBe(1);
+    }
+  });
+});
+
+describe("the calendar a new event starts on", () => {
+  it("last create round-trips beside hidden in calendar_ui", async () => {
+    vi.mocked(getPref).mockImplementation(async (key: string) =>
+      key === "calendar_ui" ? JSON.stringify({ hidden: ["gcal:me@x.com:work"] }) : null,
+    );
+    await hydrateStoredPrefs();
+    expect(readLastCreate()).toBeNull();
+
+    writeLastCreate("gcal:me@x.com:me@x.com");
+    expect(readLastCreate()).toBe("gcal:me@x.com:me@x.com");
+    // The hidden set is still there, in the same row: one blob, merged, never replaced.
+    expect([...readHidden()]).toEqual(["gcal:me@x.com:work"]);
+    expect(setPref).toHaveBeenLastCalledWith(
+      "calendar_ui",
+      JSON.stringify({ hidden: ["gcal:me@x.com:work"], last_create: "gcal:me@x.com:me@x.com" }),
+    );
+
+    // And the other way round: hiding a calendar keeps the last create.
+    writeHidden(new Set(["gcal:me@x.com:work", "gcal:me@x.com:home"]));
+    expect(readLastCreate()).toBe("gcal:me@x.com:me@x.com");
+  });
+
+  it("reads nothing it can't use as none", async () => {
+    for (const bad of [42, "", null, ["gcal:me@x.com:me@x.com"]]) {
+      __resetStoredPrefs();
+      vi.mocked(getPref).mockImplementation(async (key: string) =>
+        key === "calendar_ui" ? JSON.stringify({ last_create: bad }) : null,
+      );
+      await hydrateStoredPrefs();
+      expect(readLastCreate()).toBeNull();
     }
   });
 });
