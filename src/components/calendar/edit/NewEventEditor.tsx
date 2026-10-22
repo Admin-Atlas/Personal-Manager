@@ -460,7 +460,9 @@ export function NewEventEditor({
   function changeKind(zone: string) {
     const was = draftRef.current;
     const switched = switchNewKind(was, seed, zone, lengthRef.current, showAsTouched.current);
-    const r = remindersAfterKindSwitch(seed, switched, true);
+    // The seed is on the calendar's defaults (`newEventSeed`), so defaults on the draft stay the
+    // defaults whoever put them there: no switch's reset to remember.
+    const r = remindersAfterKindSwitch(seed, switched, true, false);
     changeTime(r.draft);
     setRemindersNote(r.note);
   }

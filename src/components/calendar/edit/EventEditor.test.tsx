@@ -2489,6 +2489,82 @@ describe("EventEditor, notifications and colour", () => {
     expect(saveEdit.mock.calls[1][1]).toEqual({ summary: "Gym" });
   });
 
+  // C13 review round 2: the defaults pressed for are the user's, on either kind; a switch there and
+  // back put nothing there, so it takes nothing away.
+  it("switching to all day and back keeps the defaults I picked", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Use Work's defaults" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { reminders: { use_default: true, overrides: [] } },
+      ...UNSCOPED,
+    );
+  });
+
+  // C13 review round 2: once the list has changed, the defaults on it are the user's, even if the
+  // switch had put them there first.
+  it("defaults picked again after the switch stay when switching back", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use Work's defaults" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { reminders: { use_default: true, overrides: [] } },
+      ...UNSCOPED,
+    );
+  });
+
+  // C13 review round 2: a conflict that puts Google's timed time back over the switch keeps the
+  // defaults pressed for before it, since the switch never put them there.
+  it("a conflict that undoes the switch to all day keeps the defaults I picked", async () => {
+    const moved = event({
+      reminders: own(["popup", 10]),
+      time: {
+        kind: "timed",
+        start_date: "2026-10-12",
+        start_time: "15:00",
+        start_zone: "Europe/London",
+        end_date: "2026-10-12",
+        end_time: "16:00",
+        end_zone: "Europe/London",
+      },
+      start_at: "2026-10-12T14:00:00Z",
+      end_at: "2026-10-12T15:00:00Z",
+    });
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ reminders: own(["popup", 10]) })))
+      .mockResolvedValueOnce(ready(moved, ALL, "s2"));
+    saveEdit
+      .mockResolvedValueOnce({ outcome: "conflict", fields: ["start", "end"] })
+      .mockResolvedValueOnce(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Use Work's defaults" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/changed in Google while you were editing/);
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit.mock.calls[1][1]).toEqual({ reminders: { use_default: true, overrides: [] } });
+  });
+
   // C13 review round 1: Google's list put in by a conflict is no longer the defaults the switch's
   // line names, so the line goes.
   it("a conflict that replaces the notifications drops the switch's line", async () => {

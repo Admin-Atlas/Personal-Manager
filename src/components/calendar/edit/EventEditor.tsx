@@ -290,6 +290,9 @@ export function EventEditor({
   const badRemindersRef = useRef(false);
   // The kind switch put the defaults back: said under the list until it next changes.
   const [remindersNote, setRemindersNote] = useState<string | null>(null);
+  // The draft's defaults are the ones a kind switch put there, untouched since: switching back
+  // puts the event's list back (`remindersAfterKindSwitch`). Defaults the user picked stay.
+  const kindResetRef = useRef(false);
   // The Custom dialog, while open: no save goes from behind it.
   const customRef = useRef(false);
   const [customOpen, setCustomOpenState] = useState(false);
@@ -472,15 +475,23 @@ export function EventEditor({
     let next = r.draft;
     // Google's time won over a switch of the user's between all-day and timed: the notifications
     // that switch replaced come back with it, as switching back would (C13 review round 1), so a
-    // save never sends a reset whose reason is gone. A list the rebase changed otherwise leaves the
-    // switch's line saying nothing true.
+    // save never sends a reset whose reason is gone. Defaults the user picked are no reset, and
+    // stay (review round 2). A list the rebase changed otherwise leaves the switch's line saying
+    // nothing true, and is no longer the switch's.
     let note: string | null | undefined;
     if (was.time.kind !== loaded.base.time.kind && next.time.kind !== was.time.kind) {
-      const k = remindersAfterKindSwitch(r.base, next, canEdit(fresh.permissions, "reminders"));
+      const k = remindersAfterKindSwitch(
+        r.base,
+        next,
+        canEdit(fresh.permissions, "reminders"),
+        kindResetRef.current,
+      );
       next = k.draft;
+      kindResetRef.current = k.reset;
       const allDay = next.time.kind === "all_day";
       note = k.note && kindNoteText(k.note, calendar?.name ?? null, allDay);
     } else if (!sameReminders(next.reminders, was.reminders)) {
+      kindResetRef.current = false;
       note = null;
     }
     setLoaded({
@@ -510,7 +521,13 @@ export function EventEditor({
     const was = draftRef.current;
     if (!loaded || !was) return;
     const switched = { ...was, time: switchKind(was.time, loaded.base.time, zone) };
-    const r = remindersAfterKindSwitch(loaded.base, switched, may("reminders"));
+    const r = remindersAfterKindSwitch(
+      loaded.base,
+      switched,
+      may("reminders"),
+      kindResetRef.current,
+    );
+    kindResetRef.current = r.reset;
     changeTime(r.draft);
     setRemindersNote(
       r.note && kindNoteText(r.note, calendar?.name ?? null, switched.time.kind === "all_day"),
@@ -1018,6 +1035,7 @@ export function EventEditor({
               note={remindersNote}
               onChange={(reminders) => {
                 setRemindersNote(null);
+                kindResetRef.current = false;
                 if (draftRef.current) setDraft({ ...draftRef.current, reminders });
               }}
               onInvalid={(bad) => {
