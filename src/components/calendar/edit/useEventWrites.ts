@@ -27,6 +27,9 @@
 // (only a read), and, after a "this and following" change lands, a question per milestone linked to
 // it from that day on, whether to move it to the new part (DECISIONS 17-10 #2). Moving one changes
 // PM's own milestone, never Google; Move back is offered for a few seconds after.
+//
+// Replying to an invitation (C14) comes through here too: Yes, No or Maybe, with a note, for one
+// occurrence or all of a repeating one. Google tells the organiser, so nothing is asked first.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
@@ -37,6 +40,7 @@ import {
   getSeriesSummary,
   listHeldDeletes,
   onCalendarDeleteSettled,
+  respondToCalendarEvent,
   seriesChoices,
   setMilestoneEvent,
   settleSeriesSplit,
@@ -51,6 +55,8 @@ import type {
   MilestoneMove,
   NewEventDraft,
   Notify,
+  Rsvp,
+  RsvpScope,
   SeenSummary,
   SeriesChoices,
   SeriesScope,
@@ -497,6 +503,18 @@ export function choicesForDelete(event: CalendarEvent): Promise<SeriesChoices> {
   });
   asking.set(key, answer);
   return answer;
+}
+
+/** Send a reply to an invitation (by its row id): Yes, No or Maybe, with `note` (null keeps the one
+ *  Google holds, "" removes it), and for an occurrence of a repeating event which ones. The outcome
+ *  comes back as data; the reply control says what it came to. */
+export function respond(
+  eventId: string,
+  reply: Rsvp,
+  note: string | null = null,
+  scope: RsvpScope | null = null,
+): Promise<WriteOutcome> {
+  return respondToCalendarEvent(eventId, reply, note, scope);
 }
 
 /** A save's outcome. `newPartial`, on a `partial_split` only: whether its notice is new. False
@@ -1086,6 +1104,7 @@ export function useEventWrites() {
     hiddenIds,
     settles: snap.settles,
     startDelete,
+    respond,
     undoDelete,
     undoLatest,
     settleSplit,

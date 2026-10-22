@@ -150,6 +150,10 @@ const row = (over: Partial<CalendarEvent>): CalendarEvent => ({
   all_day: false,
   html_link: null,
   uid: "u1",
+  // What the list says PM may offer on it (C14): yours, so Edit and Delete, and nobody invited.
+  edit_block: null,
+  can_delete: true,
+  can_respond: false,
   ...over,
 });
 const standup = row({});
@@ -436,6 +440,8 @@ describe("CalendarView: guests", () => {
       reminders: { use_default: true, overrides: [] },
       color_id: null,
       label_id: null,
+      reply: null,
+      organizer_self: true,
     };
     const load: EditLoad = {
       outcome: "ready",
@@ -452,6 +458,7 @@ describe("CalendarView: guests", () => {
         reminders: true,
         colour: true,
         delete: true,
+        respond: false,
         reasons: [],
       },
       seen: null,
@@ -468,6 +475,16 @@ describe("CalendarView: guests", () => {
     );
     expect(option.textContent).toContain("Ann");
     expect(option.textContent).toContain("ann@x.org");
+  });
+
+  // The list decides Delete, as the backend's gate does (C14): a row it marks undeletable (a locked
+  // copy, an invitation) offers Edit and no Delete, whatever the webview could guess from the row.
+  it("offers Delete only where the list says it can be deleted", async () => {
+    rows = [row({ can_delete: false })];
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: /Standup/ }));
+    expect(await screen.findByRole("button", { name: "Edit" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
   it("reopens a delete the backend asks about guests with its numbers and the sending account", async () => {

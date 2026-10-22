@@ -1537,6 +1537,12 @@ export interface CalendarEvent {
    *  can — assuming editing is on for its account (merge `CalendarOverview.editing` for that). The
    *  editor asks Google again when it opens. */
   edit_block?: ReadOnlyReason | null;
+  /** From the unified-view list only, assuming editing is on as `edit_block` does: whether it may be
+   *  deleted (the backend's own rule, so the view never offers a delete the send would refuse), and
+   *  whether the user may reply to it (Yes, No, Maybe), which follows the guest list, not who
+   *  organises it (C14). */
+  can_delete?: boolean;
+  can_respond?: boolean;
 }
 
 // --- Calendar editing (#884; mirrors `calendar_write::dto`) ---
@@ -1548,6 +1554,8 @@ export type ReadOnlyReason =
   | "calendar_read_only"
   | "private_event"
   | "not_organizer"
+  /** The calendar this copy is on isn't on the event's guest list: there's no reply to send (C14). */
+  | "not_invited"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
   | "special_type"
@@ -1613,6 +1621,18 @@ export interface EventPatchDraft {
 /** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
  *  "external_only" is never offered. */
 export type Notify = "all" | "none" | "external_only";
+
+/** A reply to an invitation (C14). */
+export type Rsvp = "yes" | "no" | "maybe";
+/** Which occurrences of a repeating event a reply is for (never "this and following"). */
+export type RsvpScope = "this" | "all";
+/** The user's own reply as the editor opened it. */
+export interface ReplyForEdit {
+  /** Google's word: accepted | declined | tentative | needsAction. */
+  response: string | null;
+  /** "" for none. Everyone invited can see it. */
+  note: string;
+}
 
 /** What the user wants for one guest after the save: on it, required or optional, or off it. */
 export type GuestState = "absent" | "required" | "optional";
@@ -1761,6 +1781,9 @@ export interface FieldPermissions {
   reminders: boolean;
   colour: boolean;
   delete: boolean;
+  /** The user may reply (Yes, No, Maybe). No field of the editor's: a reply alone leaves the
+   *  editor read-only (C14). */
+  respond: boolean;
   reasons: ReadOnlyReason[];
 }
 
@@ -1796,6 +1819,11 @@ export interface EventForEdit {
   /** Google's colour id and label id, null when unset. A label sets the colour Google draws. */
   color_id: string | null;
   label_id: string | null;
+  /** The user's own reply, from the guest-list entry marked as the calendar this copy is on; null
+   *  without one (C14). */
+  reply: ReplyForEdit | null;
+  /** The calendar this copy is on organises the event (Google's `organizer.self`). */
+  organizer_self: boolean;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
@@ -1889,13 +1917,16 @@ export type SeriesScope = "this" | "following" | "all";
  *  following" change landed, but PM couldn't tell which repeating event Google made of the new
  *  part, so the milestones `milestone_moves` lists stay on the earlier part. `partly_applied`: Google
  *  applied a one-event save without keeping all of it (a colour it wouldn't clear beside a new
- *  title, say), so the event is as Google holds it (C13 review round 1). */
+ *  title, say), so the event is as Google holds it (C13 review round 1). `kept_own_reply`: a reply
+ *  to every occurrence landed, and the occurrences `left_behind` names, answered on their own
+ *  before, kept their own answer (C14). */
 export type WriteWarning =
   | "mirror_refresh_pending"
   | "left_on_old_series"
   | "outside_mirror"
   | "milestone_not_offered"
-  | "partly_applied";
+  | "partly_applied"
+  | "kept_own_reply";
 
 /** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
  *  change. */
@@ -1950,7 +1981,8 @@ export interface MilestoneMove {
 /** What a save came to. `saved` and `no_change` are the successes. */
 export type WriteOutcome =
   /** `left_behind`: the days (YYYY-MM-DD) of occurrences changed on their own that a series delete
-   *  couldn't cancel, so they may still show. `milestone_moves`: a "this and following" change that
+   *  couldn't cancel, so they may still show (`left_on_old_series`), or that kept their own answer
+   *  to a reply for every occurrence (`kept_own_reply`). `milestone_moves`: a "this and following" change that
    *  landed, with milestones linked to the earlier part dated from its first day on, but not one on
    *  an occurrence it left there (C9b-2). */
   | {

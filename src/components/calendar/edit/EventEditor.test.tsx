@@ -122,6 +122,7 @@ const ALL: FieldPermissions = {
   reminders: true,
   colour: true,
   delete: true,
+  respond: false,
   reasons: [],
 };
 
@@ -155,6 +156,8 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     reminders: { use_default: true, overrides: [] },
     color_id: null,
     label_id: null,
+    reply: null,
+    organizer_self: true,
     ...over,
   };
 }

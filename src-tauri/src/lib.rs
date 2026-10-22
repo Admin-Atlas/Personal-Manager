@@ -1786,6 +1786,7 @@ pub fn run() {
             commands::set_calendar_editing_paused,
             commands::get_calendar_event_for_edit,
             commands::update_calendar_event,
+            commands::respond_to_calendar_event,
             commands::create_calendar_event,
             commands::delete_calendar_event,
             commands::cancel_calendar_delete,

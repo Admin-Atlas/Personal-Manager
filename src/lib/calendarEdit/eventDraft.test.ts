@@ -71,6 +71,8 @@ const event: EventForEdit = {
   reminders: { use_default: true, overrides: [] },
   color_id: null,
   label_id: null,
+  reply: null,
+  organizer_self: true,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -119,6 +121,7 @@ describe("the event draft", () => {
       reminders: true,
       colour: true,
       delete: false,
+      respond: false,
       reasons: ["locked"],
     };
     expect(canEdit(perms, "summary")).toBe(false);
@@ -609,6 +612,7 @@ describe("guests in the draft", () => {
       reminders: true,
       colour: true,
       delete: true,
+      respond: false,
       reasons: [],
     };
     expect(canEdit(perms, "guests")).toBe(false);
@@ -1117,6 +1121,7 @@ describe("notifications and colour in the draft", () => {
       reminders: true,
       colour: false,
       delete: false,
+      respond: false,
       reasons: ["label_read_only"],
     };
     expect(canEdit(perms, "reminders")).toBe(true);
