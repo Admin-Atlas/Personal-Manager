@@ -141,6 +141,8 @@ const seed: EditorFields = {
   recurrence: { kind: "once" },
   guests: [],
   guest_perms: { modify: false, invite_others: true, see_others: true },
+  reminders: { use_default: true, overrides: [] },
+  colour: { kind: "calendar" },
   show_as: "busy",
   visibility: "default",
 };
@@ -149,7 +151,8 @@ const seed: EditorFields = {
 const sentFor = (summary: string) => ({
   calendarId: PERSONAL,
   // Every field the seed has: no guests (quick create has no guest box), and Google's own guest
-  // permissions, unsaid (C12d).
+  // permissions, unsaid (C12d); the calendar's notifications and colour, as null (quick create has
+  // neither row, C13).
   draft: {
     summary,
     time: seed.time,
@@ -159,6 +162,8 @@ const sentFor = (summary: string) => ({
     visibility: seed.visibility,
     recurrence: null,
     guests: [],
+    reminders: null,
+    colour: null,
   } as NewEventDraft,
 });
 
@@ -329,13 +334,16 @@ describe("QuickCreatePopover", () => {
     fireEvent.keyDown(title(), { key: "Enter" });
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
     // The calendar, every field of the draft, and no token or answer: no repeat, and no guests, so
-    // no one to notify (C12d: the guest list goes, empty).
+    // no one to notify (C12d: the guest list goes, empty); the calendar's notifications and colour,
+    // as null (C13: quick create has neither row).
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
+      "colour",
       "description",
       "guests",
       "location",
       "recurrence",
+      "reminders",
       "show_as",
       "summary",
       "time",

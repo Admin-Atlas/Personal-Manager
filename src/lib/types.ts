@@ -1678,10 +1678,10 @@ export interface NewEventDraft {
   guests_can_modify?: boolean;
   guests_can_invite_others?: boolean;
   guests_can_see_other_guests?: boolean;
-  /** Its own notifications (C13): left out, null or the defaults, Google gives the calendar's. */
-  reminders?: RemindersDraft | null;
-  /** One of Google's eleven colours (C13): left out, null or the calendar's, it has none. */
-  colour?: ColourChoice | null;
+  /** Its own notifications (C13): null on the defaults, and Google gives it the calendar's. */
+  reminders: RemindersDraft | null;
+  /** One of Google's eleven colours (C13): null on the calendar's, and it has none of its own. */
+  colour: ColourChoice | null;
 }
 
 // --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---

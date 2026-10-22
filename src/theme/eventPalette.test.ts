@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
-import { eventColour, eventFill, eventHover, inkOn } from "./eventPalette";
+import { eventColour, eventFill, eventHover, inkOn, PICKER_ORDER } from "./eventPalette";
 import { oklabLCH, oklchLuminance, contrastRatio } from "./oklab";
 import { ACCENTS, CONTRASTS, MODES, SYSTEMS } from "./profiles";
 import { themeVars } from "./tokens";
@@ -31,6 +31,23 @@ describe("Google's event colours", () => {
     const hexes = OWN.map((c) => c.hex);
     expect(new Set(hexes).size).toBe(11);
     for (const h of hexes) expect(h).toMatch(/^#[0-9a-f]{6}$/);
+  });
+
+  it("lists all eleven once for the picker, in the order Google's menu does (C13, INFERRED)", () => {
+    expect(PICKER_ORDER.map((id) => eventColour(id)?.name)).toEqual([
+      "Tomato",
+      "Flamingo",
+      "Tangerine",
+      "Banana",
+      "Sage",
+      "Basil",
+      "Peacock",
+      "Blueberry",
+      "Lavender",
+      "Grape",
+      "Graphite",
+    ]);
+    expect(new Set(PICKER_ORDER).size).toBe(11);
   });
 
   it("gives no colour for none, or an id it doesn't know", () => {

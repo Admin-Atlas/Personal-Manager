@@ -1266,6 +1266,8 @@ const draft: NewEventDraft = {
   visibility: "default",
   recurrence: null,
   guests: [],
+  reminders: null,
+  colour: null,
 };
 const sent = { calendarId: CAL, draft };
 const shown = { name: "Me", hidden: false };

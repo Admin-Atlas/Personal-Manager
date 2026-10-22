@@ -1169,6 +1169,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               ? (milestones.find((m) => m.event_uid && m.event_uid === editing.uid) ?? null)
               : null
           }
+          colorOf={colorOf}
           onDelete={(row) => {
             // Close the editor first so its focus goes back to the event's chip, and the delete
             // dialog that opens next returns it there too.

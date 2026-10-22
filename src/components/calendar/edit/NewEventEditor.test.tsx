@@ -121,7 +121,12 @@ const overview: CalendarOverview = {
   accounts: [account(ME), account(WORK)],
   calendars: [
     calendar(ME, "me@x.com", { name: "Personal", is_primary: true }),
-    calendar(ME, "family", { name: "Family", access_role: "writerWithoutPrivateAccess" }),
+    calendar(ME, "family", {
+      name: "Family",
+      access_role: "writerWithoutPrivateAccess",
+      // Its default notifications, which a new event on it shows (C13).
+      default_reminders: [{ method: "popup", minutes: 10 }],
+    }),
     calendar(WORK, "work@x.com", { name: "Work", is_primary: true }),
   ],
   last_sync: null,
@@ -149,6 +154,8 @@ const seed: EditorFields = {
   recurrence: { kind: "once" },
   guests: [],
   guest_perms: { modify: false, invite_others: true, see_others: true },
+  reminders: { use_default: true, overrides: [] },
+  colour: { kind: "calendar" },
   show_as: "busy",
   visibility: "default",
 };
@@ -156,7 +163,8 @@ const seed: EditorFields = {
 /** What the editor sends for the seed titled `summary`, on `calendarId`. */
 const sentFor = (summary: string, calendarId = PERSONAL) => ({
   calendarId,
-  // Every field the seed has: no guests, and Google's own guest permissions, unsaid (C12d).
+  // Every field the seed has: no guests, and Google's own guest permissions, unsaid (C12d); the
+  // calendar's notifications and colour, as null (C13).
   draft: {
     summary,
     time: seed.time,
@@ -166,6 +174,8 @@ const sentFor = (summary: string, calendarId = PERSONAL) => ({
     visibility: seed.visibility,
     recurrence: null,
     guests: [],
+    reminders: null,
+    colour: null,
   } as NewEventDraft,
 });
 
@@ -342,13 +352,16 @@ describe("NewEventEditor", () => {
     fireEvent.change(title(), { target: { value: "Dentist" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    // The calendar, every field of the draft, and no token: nobody to notify, no repeat, no guests.
+    // The calendar, every field of the draft, and no token: nobody to notify, no repeat, no guests,
+    // the calendar's notifications and colour (C13).
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
+      "colour",
       "description",
       "guests",
       "location",
       "recurrence",
+      "reminders",
       "show_as",
       "summary",
       "time",
@@ -1928,5 +1941,112 @@ describe("NewEventEditor guests (C12d)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(await screen.findByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+// Notifications and colour (#884, C13): left as the calendar's they go as null; a list or a colour
+// goes as chosen; Ctrl+S sends a number typed but not committed, and a row it can't commit holds
+// every way to save; another calendar keeps a list the user made; the kind switch says so.
+describe("NewEventEditor, notifications and colour", () => {
+  const count = (words: string) =>
+    screen.getByRole<HTMLInputElement>("textbox", { name: `How many: ${words}` });
+
+  it("sends the list and colour chosen", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    expect(screen.getByText("Personal has no default notifications.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    // Focus goes to the new row's number (C13 critique C2-M6).
+    await waitFor(() => expect(document.activeElement).toBe(count("30 minutes before")));
+    fireEvent.click(screen.getByRole("button", { name: "Colour: Calendar colour" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Tomato" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [
+        PERSONAL,
+        {
+          ...sentFor("Dentist").draft,
+          reminders: { use_default: false, overrides: [{ method: "popup", minutes: 30 }] },
+          colour: { kind: "colour", id: "11" },
+        },
+        null,
+        null,
+      ],
+    ]);
+  });
+
+  it("Ctrl+S with an uncommitted row saves the typed value (C13 critique C2-M5)", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    const row = count("30 minutes before");
+    row.focus();
+    fireEvent.change(row, { target: { value: "45" } });
+    await ctrlS();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].reminders).toEqual({
+      use_default: false,
+      overrides: [{ method: "popup", minutes: 45 }],
+    });
+  });
+
+  it("a row it can't commit holds Save, Ctrl+S and Enter, and closing asks first", async () => {
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    const unit = screen.getByRole("combobox", { name: "Unit: 30 minutes before" });
+    // 30 weeks: past Google's four.
+    fireEvent.change(unit, { target: { value: "weeks" } });
+    expect(screen.getByText("Google allows notifications up to 4 weeks before.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await ctrlS();
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await act(async () => {});
+    expect(createEvent).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("text a default row can't take asks before closing, though the draft never changed", async () => {
+    const { onClose } = open({ calendarId: FAMILY });
+    const row = count("10 minutes before");
+    row.focus();
+    fireEvent.change(row, { target: { value: "ten" } });
+    fireEvent.blur(row);
+    expect(screen.getByText("Use a whole number.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("dialog", { name: "Discard this new event?" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("another calendar keeps the list made, and shows its own defaults otherwise", async () => {
+    open();
+    pickCalendar("Personal", "Family");
+    expect(screen.getByText("Family's default notifications:")).toBeTruthy();
+    expect(count("10 minutes before")).toBeTruthy();
+    pickCalendar("Family", "Personal");
+    expect(screen.getByText("Personal has no default notifications.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    pickCalendar("Personal", "Family");
+    expect(screen.queryByText("Family's default notifications:")).toBeNull();
+    expect(count("30 minutes before")).toBeTruthy();
+  });
+
+  it("switching to all day puts a list made back to the calendar's defaults, and says so", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Personal's defaults for all-day events."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].reminders).toBeNull();
   });
 });

@@ -52,15 +52,6 @@ export function reasonText(reason: ReadOnlyReason): string {
   }
 }
 
-/** Reasons for rows the editor doesn't have yet (the notifications and colour rows): a line about
- *  a control that isn't there would only puzzle (C13 critique C1-M10). */
-const ROWLESS: readonly ReadOnlyReason[] = ["label_read_only", "reminders_unreadable"];
-
-/** The reasons the editor says: those for the rows it shows. */
-export function shownReasons(reasons: readonly ReadOnlyReason[]): ReadOnlyReason[] {
-  return reasons.filter((r) => !ROWLESS.includes(r));
-}
-
 /** A field's name in a sentence. */
 export function fieldLabel(field: EditorField): string {
   switch (field) {
@@ -77,6 +68,11 @@ export function fieldLabel(field: EditorField): string {
       return "guest permissions";
     case "location":
       return "location";
+    // Google's word for them, never "reminders".
+    case "reminders":
+      return "notifications";
+    case "colour":
+      return "colour";
     case "description":
       return "description";
     case "show_as":
@@ -100,6 +96,10 @@ export function conflictFields(keys: readonly string[]): EditorField[] {
     guestsCanInviteOthers: "guest_perms",
     guestsCanSeeOtherGuests: "guest_perms",
     location: "location",
+    reminders: "reminders",
+    // A colour's conflict check watches the label too: to the user, both are the colour.
+    colorId: "colour",
+    eventLabelId: "colour",
     description: "description",
     transparency: "show_as",
     visibility: "visibility",

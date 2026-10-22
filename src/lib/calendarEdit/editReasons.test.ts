@@ -47,7 +47,6 @@ import {
   rebasedText,
   savedNotice,
   settleText,
-  shownReasons,
   SPLIT_ORDER,
   splitActionLabel,
   writeWarningText,
@@ -105,20 +104,22 @@ describe("edit reasons", () => {
     for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/reminder/i);
   });
 
-  it("says no reason for a row the editor doesn't have yet (C13 critique C1-M10)", () => {
-    expect(
-      shownReasons(["locked", "label_read_only", "reminders_unreadable", "html_description"]),
-    ).toEqual(["locked", "html_description"]);
-    expect(shownReasons(REASONS)).toHaveLength(REASONS.length - 2);
-  });
-
   it("names conflicting fields in the editor's words", () => {
-    // A key the editor has no field for (the colour, say) names nothing.
-    expect(conflictFields(["start", "end", "summary", "transparency", "colorId"])).toEqual([
+    // A key the editor has no field for names nothing.
+    expect(conflictFields(["start", "end", "summary", "transparency", "conferenceData"])).toEqual([
       "time",
       "summary",
       "show_as",
     ]);
+    // Notifications and colour (C13): a colour's check watches the label too, and both are the
+    // colour, said once.
+    expect(conflictFields(["eventLabelId"])).toEqual(["colour"]);
+    expect(conflictFields(["colorId"])).toEqual(["colour"]);
+    expect(conflictFields(["colorId", "eventLabelId", "reminders"])).toEqual([
+      "colour",
+      "reminders",
+    ]);
+    expect(listFields(["reminders", "colour"])).toBe("notifications and colour");
     // The guest list and its three permissions (C12), each said once.
     expect(
       conflictFields([

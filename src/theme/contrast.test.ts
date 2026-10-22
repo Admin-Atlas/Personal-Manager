@@ -91,6 +91,21 @@ describe("contrast axis — WCAG targets across every system × mode", () => {
         }
       });
 
+      // The event colour picker (EventColorPicker, #884 C13). A swatch's fill is anyone's colour, so
+      // its edge is `--ink4`, which the switch case above already measures on both backgrounds. What
+      // is new is the chosen swatch's ring: 2px of `--ink` with a 2px gap in `--panel` between it
+      // and the fill, so it is read against the popover's own `--panel` and never against the
+      // colour. Swept over every accent and BOTH levels (the AA case above takes only the default
+      // accent), since the accent tints the panel.
+      it(`${system}/${mode}: the colour picker's chosen ring clears 3:1 on its panel, at every level`, () => {
+        for (const contrast of ["aa", "high"] as const) {
+          for (const anyAccent of ACCENTS[system]) {
+            const v = themeVars(system, mode, anyAccent, false, contrast);
+            expect(ratioOf(v, "ink", "panel")).toBeGreaterThanOrEqual(3);
+          }
+        }
+      });
+
       // The chat Thinking toggle (ThinkingToggle.tsx) is a bordered text button that fills with the
       // accent when on. Same choice as the switch above, for the same reason: its edge is `--ink4` in
       // BOTH states, because an accent edge is drawn in the colour of a pale-accent light theme's
