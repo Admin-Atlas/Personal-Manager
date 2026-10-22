@@ -208,6 +208,8 @@ jobs:
       # (#956). A PR that touches the sidecar runs the suite again against the locked dependency
       # set, with a missing fastembed a failure rather than a skip. About 550 MB and a minute, and
       # the embedding test downloads the 67 MB English model, so only when sidecar/ changed.
+      # Installed exactly as the app installs it, `--no-deps` included (sidecar.rs `provision`
+      # says why: the lock overrides fastembed's pillow cap).
       - name: Sidecar unit tests (the locked dependencies, sidecar changes only)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -219,7 +221,7 @@ jobs:
           fi
           python -m venv "$RUNNER_TEMP/sidecar-venv"
           "$RUNNER_TEMP/sidecar-venv/bin/python" -m pip install --disable-pip-version-check \
-            --no-cache-dir --require-hashes -r sidecar/requirements.lock
+            --no-cache-dir --require-hashes --no-deps -r sidecar/requirements.lock
           "$RUNNER_TEMP/sidecar-venv/bin/python" sidecar/test_pm_sidecar.py
 
   # --- secrets: gitleaks over the working tree AND git history ------------

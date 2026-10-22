@@ -1054,8 +1054,9 @@ impl SidecarManager {
 
         // Tear down a venv we can't trust — a previous attempt that died before
         // stamping the marker, or one whose interpreter is now too old (e.g. it
-        // was first built against macOS's system 3.9, then the user installed
-        // 3.10+). This is what removes the manual "delete the venv and retry".
+        // was first built against macOS's system 3.9, or on a 3.10 from before
+        // the floor rose to 3.11). This is what removes the manual "delete the
+        // venv and retry".
         let venv_python_exists = self.paths.venv_python().exists();
         let detected = venv_python_exists
             .then(|| detect_python_version(&self.paths.venv_python()))
@@ -1135,16 +1136,18 @@ impl SidecarManager {
         // whatever PyPI served that day — in the one process that opens untrusted PDFs, Office
         // documents and images. The flag is also fail-closed in a second, useful way: it makes pip
         // reject a lock that is not FULLY pinned, so a partially-regenerated file cannot install.
-        pip.args([
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-cache-dir",
-            "--require-hashes",
-            "-r",
-        ])
-        .arg(&lock);
+        // `--no-deps`: the lock is resolved past one dependency's declared bound. fastembed 0.9.0
+        // says `pillow<13`, but only pillow 13 carries the decoder fixes published from 2026-10-17
+        // (see sidecar/requirements-override.txt), so pip's own resolver would refuse the lock. The
+        // lock needs no resolving here anyway: uv resolved every dependency into it, and
+        // `just requirements-lock` fails one that has drifted from its inputs. Every line is still
+        // pinned and hash-checked; what pip no longer does is notice a dependency MISSING from the
+        // lock, which only a hand-edited lock could produce. The optional installs and CI's
+        // installs of the lock (pr.yml, release.yml) take the same flag.
+        pip.args(["-m", "pip", "install"])
+            .args(LOCK_INSTALL_FLAGS)
+            .arg("-r")
+            .arg(&lock);
         clean_python_env(&mut pip);
         no_window(&mut pip);
         run_command(&mut pip, "pip install requirements").map_err(|e| ProvisionError {
@@ -1246,9 +1249,11 @@ impl SidecarManager {
                         kind: SidecarErrorKind::PythonDownloadFailed,
                         source: Error::Other(format!(
                             "PM downloaded a Python interpreter to {} but it did not report a \
-                             usable version (3.10+). This is a problem with PM's build, not your \
+                             usable version ({}.{}+). This is a problem with PM's build, not your \
                              computer.",
-                            p.display()
+                            p.display(),
+                            MIN_PYTHON.0,
+                            MIN_PYTHON.1
                         )),
                     });
                 }
@@ -1303,7 +1308,7 @@ impl SidecarManager {
             return Ok(false);
         }
         // The lock can be unchanged yet the venv's interpreter be too old
-        // (built against macOS system 3.9, then the user installed 3.10+). Don't
+        // (built against macOS system 3.9, then the user installed 3.11+). Don't
         // report Ready in that case — let provision() rebuild it. This probe runs
         // only here, in the otherwise-ready branch, not on every status() poll.
         Ok(detect_python_version(&self.paths.venv_python()).is_some_and(meets_min))
@@ -1739,7 +1744,9 @@ impl SidecarManager {
         // arrive with its whole transitive tree (opencv, shapely, pyclipper) free-resolved at install
         // time. The lock is also resolved against the BASE lock, so an on-demand install can no
         // longer move a package the running venv depends on — pip was previously free to satisfy
-        // rapidocr by swapping the numpy that fastembed and onnxruntime are using.
+        // rapidocr by swapping the numpy that fastembed and onnxruntime are using. `--no-deps` as
+        // in the base install (see `provision`): the component's lock is just as complete, so
+        // every lock installs by one rule — pip resolves nothing on the user's machine.
         let lock = self.paths.optional_lock(component);
         if !lock.exists() {
             return Err(Error::Other(format!(
@@ -1769,16 +1776,9 @@ impl SidecarManager {
             )?;
         }
         let lock_arg = lock.to_string_lossy().into_owned();
-        let args: Vec<&str> = vec![
-            "install",
-            "--disable-pip-version-check",
-            "--no-cache-dir",
-            "--progress-bar",
-            "off",
-            "--require-hashes",
-            "-r",
-            &lock_arg,
-        ];
+        let mut args: Vec<&str> = vec!["install"];
+        args.extend(LOCK_INSTALL_FLAGS);
+        args.extend(["--progress-bar", "off", "-r", &lock_arg]);
         run_pip_streaming(&py, &args, |line| {
             if let Some(f) = pip_phase_fraction(line, &mut downloads) {
                 if f > last {
@@ -2699,9 +2699,23 @@ fn request_timeout(method: &str) -> std::time::Duration {
     }
 }
 
-/// markitdown (pinned in requirements.txt) needs Python >= 3.10, so the venv's
-/// base interpreter must too.
-const MIN_PYTHON: (u32, u32) = (3, 10);
+/// The flags every pip install of a lock passes, the base venv's and each optional component's.
+/// `--require-hashes` and `--no-deps` are the two that carry weight; `provision` says why each.
+const LOCK_INSTALL_FLAGS: [&str; 4] = [
+    "--disable-pip-version-check",
+    "--no-cache-dir",
+    "--require-hashes",
+    "--no-deps",
+];
+
+/// pillow 13 (pinned in requirements.txt: the first release with the decoder fixes
+/// published from 2026-10-17) needs Python >= 3.11, so the venv's base interpreter
+/// must too. It was 3.10, markitdown's floor, until then; 3.10 reaches end of life
+/// in October 2026. Every installer already provides 3.12 (bundled on Windows and
+/// Linux, downloaded on macOS when the machine has nothing new enough), so a venv
+/// left on 3.10 is rebuilt once on the next launch. `just lock-regen` reads this
+/// value as the floor the locks resolve from.
+const MIN_PYTHON: (u32, u32) = (3, 11);
 
 /// Highest `python3.N` minor we probe by versioned name. Gives headroom past
 /// today's releases; anything newer is still found via the bare `python3` name.
@@ -2716,7 +2730,7 @@ fn meets_min(v: (u32, u32)) -> bool {
 /// - no venv yet → false (the normal create path handles it)
 /// - venv but no marker → true (a previous attempt died before stamping)
 /// - venv + marker but the interpreter is too old / unprobeable → true (e.g.
-///   built against macOS system 3.9, then the user installed 3.10+)
+///   built against macOS system 3.9, or on a 3.10 from before the floor rose)
 fn should_rebuild_venv(
     venv_python_exists: bool,
     marker_present: bool,
@@ -2895,9 +2909,9 @@ fn unknown(e: impl Into<Error>) -> ProvisionError {
     }
 }
 
-/// Map a pip / `run_command` failure message to a cause. The common one is
-/// markitdown needing Python >= 3.10, which pip reports as "No matching
-/// distribution found" / "requires-python".
+/// Map a pip / `run_command` failure message to a cause. The common one is a
+/// pinned package needing a newer Python than the venv's (pillow 13 needs 3.11),
+/// which pip reports as "No matching distribution found" / "requires-python".
 fn classify_pip_failure(msg: &str) -> SidecarErrorKind {
     let m = msg.to_ascii_lowercase();
     if m.contains("no matching distribution")
@@ -2910,16 +2924,21 @@ fn classify_pip_failure(msg: &str) -> SidecarErrorKind {
     }
 }
 
+// Both messages name the floor from MIN_PYTHON itself, so raising it cannot leave them asking for
+// a version PM then refuses.
 fn missing_message() -> String {
-    "No Python interpreter was found. PM's document engine needs Python 3.10 or newer — \
-     install it and make sure it's on your PATH, or set PM_PYTHON to its full path."
-        .to_string()
+    let (major, minor) = MIN_PYTHON;
+    format!(
+        "No Python interpreter was found. PM's document engine needs Python {major}.{minor} or \
+         newer — install it and make sure it's on your PATH, or set PM_PYTHON to its full path."
+    )
 }
 
 fn too_old_message() -> String {
-    let mut m = String::from(
-        "The Python that was found is older than 3.10, which PM's document engine requires. \
-         Install Python 3.10 or newer, then retry.",
+    let (major, minor) = MIN_PYTHON;
+    let mut m = format!(
+        "The Python that was found is older than {major}.{minor}, which PM's document engine \
+         requires. Install Python {major}.{minor} or newer, then retry."
     );
     if std::env::var_os("PM_PYTHON").is_some() {
         m.push_str(" (PM_PYTHON points to an interpreter that is too old.)");
@@ -4164,11 +4183,32 @@ mod tests {
 
     #[test]
     fn enforces_minimum_python() {
-        assert!(meets_min((3, 10)));
+        assert!(meets_min((3, 11)));
         assert!(meets_min((3, 14)));
         assert!(meets_min((4, 0)));
+        // pillow 13 has no 3.10 wheels and no 3.10 in its Requires-Python.
+        assert!(!meets_min((3, 10)));
         assert!(!meets_min((3, 9)));
         assert!(!meets_min((2, 7)));
+    }
+
+    #[test]
+    fn every_lock_install_is_hash_checked_and_resolves_nothing() {
+        // `--require-hashes`: an artifact whose digest is not in the lock is refused. `--no-deps`:
+        // pip must not re-resolve, because the base lock overrides fastembed 0.9.0's `pillow<13`
+        // and pip's resolver refuses it (ResolutionImpossible) — every install would fail.
+        assert!(LOCK_INSTALL_FLAGS.contains(&"--require-hashes"));
+        assert!(LOCK_INSTALL_FLAGS.contains(&"--no-deps"));
+    }
+
+    #[test]
+    fn python_guidance_names_the_floor_pm_enforces() {
+        // The messages used to spell the version out, so raising MIN_PYTHON would have left them
+        // asking for a Python that PM then turns down.
+        assert!(missing_message().contains("needs Python 3.11 or newer"));
+        let too_old = too_old_message();
+        assert!(too_old.contains("older than 3.11"));
+        assert!(too_old.contains("Install Python 3.11 or newer"));
     }
 
     #[test]
@@ -4182,8 +4222,10 @@ mod tests {
         // Venv + marker but the interpreter is too old / unprobeable.
         assert!(should_rebuild_venv(true, true, Some((3, 9))));
         assert!(should_rebuild_venv(true, true, None));
+        // A venv an older PM built on 3.10, which the floor accepted until pillow 13: rebuilt once.
+        assert!(should_rebuild_venv(true, true, Some((3, 10))));
         // Venv + marker + new enough → keep it.
-        assert!(!should_rebuild_venv(true, true, Some((3, 10))));
+        assert!(!should_rebuild_venv(true, true, Some((3, 11))));
         assert!(!should_rebuild_venv(true, true, Some((3, 12))));
     }
 
@@ -4202,6 +4244,11 @@ mod tests {
         );
         assert_eq!(
             classify_pip_failure("x requires a different Python: 3.9.6 not in '>=3.10'"),
+            SidecarErrorKind::PythonTooOld
+        );
+        // What a 3.10 interpreter meets now: pillow 13 publishes no wheel it can install.
+        assert_eq!(
+            classify_pip_failure("ERROR: No matching distribution found for pillow==13.0.0"),
             SidecarErrorKind::PythonTooOld
         );
         assert_eq!(
@@ -4337,10 +4384,8 @@ mod tests {
             "Current".to_string(),
             "3.10".to_string(),
         ];
-        assert_eq!(
-            pick_framework_versions(&names),
-            vec![(3, 12), (3, 11), (3, 10)]
-        );
+        // 3.10 is listed and dropped: it is below the floor now, like 3.9.
+        assert_eq!(pick_framework_versions(&names), vec![(3, 12), (3, 11)]);
 
         let empty: Vec<String> = Vec::new();
         assert!(pick_framework_versions(&empty).is_empty());

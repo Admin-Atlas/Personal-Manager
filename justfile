@@ -136,8 +136,15 @@ deny:
 # transitive ones included, on the base venv AND both optional components (L-6). It used to scan
 # requirements.txt, i.e. the six top-level pins only, so a CVE in (say) pdfminer.six or lxml — both
 # of which parse untrusted input — was never looked at.
+#
+# `--disable-pip`: audit the pinned versions as written instead of pip-installing the locks into a
+# throwaway venv first. pip-audit allows it only for hashed requirements, which every lock line is,
+# and it does not resolve anything, so it audits exactly the lock. Installing them was also how the
+# audit broke: the base lock overrides fastembed's `pillow<13` (sidecar/requirements-override.txt),
+# which pip's resolver refuses. Like the install it replaces, it reads the lines whose markers
+# match the auditing interpreter (3.12 in CI).
 pip-audit:
-    pip-audit -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock
+    pip-audit --disable-pip -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock
 
 # JS dependency CVE audit against the npm lockfile. `moderate` (not `high`) so a moderate-rated
 # sanitizer / proto-pollution advisory in the render path can't pass green (L-7).

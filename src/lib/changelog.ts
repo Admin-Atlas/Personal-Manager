@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.148.7-alpha",
+    date: "2026-10-21",
+    highlights: [
+      "Security fixes for photos. This week the image library PM uses to read your photos fixed a long list of flaws in how it decodes pictures, some serious enough that a booby-trapped image could have done real harm, and PM now runs the fixed version. PM also reads a photo only as one of the kinds of photo it expects (JPEG, PNG, WebP or HEIC), so a file of some other kind wearing a photo's name is turned away, while a real photo with the wrong ending, like a PNG saved as .jpg, still reads as before. When PM can't read a photo, because it's damaged, cut off partway through a download, or not a photo at all, the file's row now says so instead of blaming text recognition. The fixed library needs Python 3.11 or newer. PM's Windows and Linux installers bring their own, and on a Mac PM uses yours if it's new enough or fetches one by itself, so most people won't notice a thing: PM updates its document engine by itself the next time it starts, and if it had been running on an older Python of yours, it moves to a newer one once.",
+      "Security fixes for connections. This week a certificate authority lost control of some of its signing keys, which would let whoever holds them pass for almost any website on a network they control. PM no longer trusts anything signed with those keys, both when the app talks to services such as Google and when its document engine downloads what it needs.",
+    ],
+  },
+  {
     version: "3.148.6-alpha",
     date: "2026-10-18",
     highlights: [

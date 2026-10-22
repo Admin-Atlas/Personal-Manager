@@ -9,7 +9,7 @@
 //! and bundling unsigned dylibs inside the signed `.app` needs the Apple-signing
 //! pipeline (see `docs/MACOS-SIGNING.md`). So the fallback here is the other half
 //! of the same idea: when [`crate::sidecar::SidecarManager::resolve_base_python`]
-//! probes the machine and finds **no** interpreter ≥ 3.10, it downloads one at
+//! probes the machine and finds **no** interpreter ≥ 3.11, it downloads one at
 //! runtime into PM's data-home (a subprocess download into a user directory, not
 //! a build-time bundle into the signed app — so it isn't gated on signing, and a
 //! `reqwest` download carries no `com.apple.quarantine` flag).
@@ -19,7 +19,7 @@
 //! before it is unpacked (no trust-on-first-use); a stamp file makes a second run
 //! skip the work. The pinned interpreter version is deliberately exact — it's the
 //! one validated in CI against markitdown/fastembed/faster-whisper — unlike the
-//! *probe*, which accepts any ≥ 3.10 already on the machine.
+//! *probe*, which accepts any ≥ 3.11 already on the machine.
 //!
 //! macOS-only in practice: [`fetch_macos_python`] is only ever called from the
 //! `cfg!(target_os = "macos")` arm of `resolve_base_python`. The pure helpers are

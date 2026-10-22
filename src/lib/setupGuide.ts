@@ -63,14 +63,14 @@ export function guideFor(mode: SetupGuideMode, platform: SetupPlatform): SetupGu
     case "python_missing": {
       const summary =
         mode === "python_too_old"
-          ? "PM's document engine needs Python 3.10 or newer, and the Python on this computer is older. (macOS ships an old Python, so this is common on a fresh Mac.)"
-          : "PM's document engine needs Python 3.10 or newer, and PM couldn't find a suitable one on this computer.";
+          ? "PM's document engine needs Python 3.11 or newer, and the Python on this computer is older. (macOS ships an old Python, so this is common on a fresh Mac.)"
+          : "PM's document engine needs Python 3.11 or newer, and PM couldn't find a suitable one on this computer.";
       if (platform === "mac") {
         return {
           title: "PM needs a newer Python",
           summary,
           steps: [
-            "Install Python 3.10 or newer — run `brew install python@3.12`, or download it from python.org and run the installer.",
+            "Install Python 3.11 or newer — run `brew install python@3.12`, or download it from python.org and run the installer.",
             "Click Retry below. PM checks the usual install locations automatically — you don't need the Terminal or any environment variables.",
             "Still stuck? Open Technical details below to see exactly what PM found.",
           ],
@@ -83,7 +83,7 @@ export function guideFor(mode: SetupGuideMode, platform: SetupPlatform): SetupGu
           title: "PM needs a newer Python",
           summary,
           steps: [
-            "Install Python 3.10 or newer with your package manager — Fedora: `sudo dnf install python3`; Debian/Ubuntu: `sudo apt install python3`.",
+            "Install Python 3.11 or newer with your package manager — Fedora: `sudo dnf install python3`; Debian/Ubuntu: `sudo apt install python3` (Ubuntu 22.04's is 3.10, so there: `sudo apt install python3.11 python3.11-venv`).",
             "Click Retry below.",
             "Unusual setup? You can point PM at a specific interpreter with the PM_PYTHON environment variable.",
           ],
@@ -93,7 +93,7 @@ export function guideFor(mode: SetupGuideMode, platform: SetupPlatform): SetupGu
         title: "PM needs a newer Python",
         summary,
         steps: [
-          "Install Python 3.10 or newer from python.org — tick “Add python.exe to PATH” in the installer.",
+          "Install Python 3.11 or newer from python.org — tick “Add python.exe to PATH” in the installer.",
           "Click Retry below.",
           "Unusual setup? You can point PM at a specific interpreter with the PM_PYTHON environment variable.",
         ],

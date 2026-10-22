@@ -9,7 +9,7 @@
 // Needs `uv` on PATH. uv rather than pip-tools for one reason that decided the whole shape of
 // this: `--universal` resolves across every platform AND every Python version at once, emitting
 // environment markers where the resolution forks. One file therefore covers Windows, macOS and
-// Linux and every CPython from MIN_PYTHON upwards — which matters because MIN_PYTHON is 3.10 and
+// Linux and every CPython from MIN_PYTHON upwards — which matters because MIN_PYTHON is 3.11 and
 // macOS prefers a system interpreter over PM's downloaded 3.12, so the real deployed range is
 // much wider than "the version we ship".
 //
@@ -27,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SIDECAR_RS = "src-tauri/src/sidecar.rs";
 const BASE_INPUT = "sidecar/requirements.txt";
+const BASE_OVERRIDE = "sidecar/requirements-override.txt";
 const BASE_LOCK = "sidecar/requirements.lock";
 
 const read = (rel) => readFileSync(join(ROOT, rel), "utf8");
@@ -73,7 +74,11 @@ function header(lines) {
     "#",
     "# Universal resolution: ONE file covers Windows, macOS and Linux and every CPython from the",
     "# MIN_PYTHON floor upwards, with environment markers where the resolution forks by interpreter",
-    "# (numpy, onnxruntime, pandas, av) or by platform (colorama, magika, pyreadline3, hf-xet).",
+    "# (numpy, and scipy for t-SNE) or by platform (colorama, magika, tzdata, hf-xet).",
+    "#",
+    "# The base lock is also resolved with sidecar/requirements-override.txt, which lifts a declared",
+    "# bound in one dependency's metadata (that file says which, and why), so every install of these",
+    "# locks passes `--no-deps`: pip would otherwise re-apply the bound and refuse the lock.",
     "#",
     ...lines,
     "",
@@ -101,14 +106,19 @@ function main() {
   const floor = pythonFloor(rust);
   const pins = optionalPins(rust);
   const baseInputHash = sha256(read(BASE_INPUT));
+  const overrideHash = sha256(read(BASE_OVERRIDE));
 
+  // `--override` on the base compile only: it lifts a dependency's declared bound (fastembed's
+  // `pillow<13`, see that file's header). The optional locks inherit the result through the
+  // base-lock constraint below rather than taking the override themselves.
   const base = compile({
     label: BASE_LOCK,
-    args: [...UV, BASE_INPUT, "--python-version", floor],
+    args: [...UV, BASE_INPUT, "--override", BASE_OVERRIDE, "--python-version", floor],
     stamps: [
       "# pm-lock: 1",
       `# pm-python-floor: ${floor}`,
       `# pm-input: ${BASE_INPUT}@sha256:${baseInputHash}`,
+      `# pm-override: ${BASE_OVERRIDE}@sha256:${overrideHash}`,
     ],
   });
   writeFileSync(join(ROOT, BASE_LOCK), base);

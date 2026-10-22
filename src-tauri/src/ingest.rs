@@ -719,17 +719,9 @@ fn ingest_photo(
     // come back either way. No DB lock held across this call.
     let run_ocr = state.sidecar.optional_ocr_ready();
     let analysis = state.sidecar.analyze_image(path, run_ocr)?;
-    // `ocr_ran` is the only thing that tells "OCR was asked for and broke" from "this image holds
-    // no text" — the two produce a byte-identical document otherwise, so a receipt indexed with no
-    // searchable text looked entirely normal. A cold model cache no longer lands here (the sidecar
-    // reports that as a miss and the fetcher fills it), so what is left is a genuinely broken
-    // component, and the user is the only one who can act on it.
-    let ocr_warning = (run_ocr && !analysis.ocr_ran).then(|| {
-        eprintln!(
-            "ingest: photo indexed without OCR (the text-recognition component did not run): {}",
-            path.display()
-        );
-        "text recognition did not run, so any text in this image is not searchable".to_string()
+    let ocr_warning = photo_read_warning(ext, run_ocr, &analysis).map(|note| {
+        eprintln!("ingest: a photo was indexed with a note: {note}");
+        note.to_string()
     });
 
     let capture_date =
@@ -872,6 +864,40 @@ fn ingest_photo(
         // copy failed must not have the first note silently overwritten by the second.
         warning: join_warnings([ocr_warning, copy_warning]),
     })
+}
+
+/// The note a photo's row carries when something in it was not read, or `None`. Pure, so every case
+/// is pinned by a test rather than by a real broken component.
+///
+/// Two causes, kept apart because what the user can do about them differs:
+/// - The image did not open (the sidecar reports no size). It opens a photo only as a photo format
+///   (JPEG, PNG, WebP, HEIC), and with OCR on it decodes the pixels before the engine runs, so this
+///   is a damaged or cut-off file, or another kind of image renamed — the FILE, which no reinstall
+///   fixes. Blaming the text-recognition component would send the user to repair something that
+///   works. The one silent case is a HEIC with OCR off: decoding HEIC needs pi-heif, which ships
+///   with the OCR component the UI already offers on a photo drop.
+/// - It opened, OCR was asked for, and did not run. `ocr_ran` is the only thing that tells that
+///   apart from "this image holds no text": the two produce a byte-identical document otherwise, so
+///   a receipt indexed with no searchable text looked entirely normal. A cold model cache no longer
+///   lands here (the sidecar reports that as a miss and the fetcher fills it), so what is left is a
+///   genuinely broken component, and the user is the only one who can act on it.
+fn photo_read_warning(
+    ext: Option<&str>,
+    run_ocr: bool,
+    analysis: &photos::ImageAnalysis,
+) -> Option<&'static str> {
+    let opened = analysis.width.is_some() || analysis.height.is_some();
+    if !opened {
+        if ext == Some("heic") && !run_ocr {
+            return None;
+        }
+        return Some(
+            "PM could not read this image (it may be damaged or cut off, or not the kind of image \
+             its name says), so its picture and any text in it were not read",
+        );
+    }
+    (run_ocr && !analysis.ocr_ran)
+        .then_some("text recognition did not run, so any text in this image is not searchable")
 }
 
 /// Fold several optional notes into the one `warning` slot [`Outcome::Indexed`] carries, dropping the
@@ -4902,6 +4928,49 @@ mod tests {
             done_detail(2, Some("text recognition did not run")),
             "2 chunks — text recognition did not run"
         );
+    }
+
+    #[test]
+    fn a_photo_that_did_not_open_blames_the_file_not_the_ocr_component() {
+        let opened = photos::ImageAnalysis {
+            width: Some(1200),
+            height: Some(800),
+            ..Default::default()
+        };
+        let read = photos::ImageAnalysis {
+            ocr_ran: true,
+            ..opened.clone()
+        };
+        let unopened = photos::ImageAnalysis::default();
+        let file_note = Some(
+            "PM could not read this image (it may be damaged or cut off, or not the kind of image \
+             its name says), so its picture and any text in it were not read",
+        );
+        let ocr_note =
+            Some("text recognition did not run, so any text in this image is not searchable");
+
+        // Nothing went wrong, OCR on or off.
+        assert_eq!(photo_read_warning(Some("jpg"), true, &read), None);
+        assert_eq!(photo_read_warning(Some("jpg"), false, &opened), None);
+        // It opened and the component did not run: the component's note, as before.
+        assert_eq!(photo_read_warning(Some("jpg"), true, &opened), ocr_note);
+        // It did not open — a TIFF renamed .jpg, say, which the sidecar now refuses. OCR was never
+        // attempted, so `ocr_ran` is false here too, and the old note blamed the component.
+        assert_eq!(photo_read_warning(Some("jpg"), true, &unopened), file_note);
+        // …and the user hears about it with OCR off as well.
+        assert_eq!(photo_read_warning(Some("png"), false, &unopened), file_note);
+        // A JPEG cut off halfway, with OCR on: its pixels would not decode, so the sidecar sends no
+        // size but keeps the EXIF from the header. The size decides it, and the file is blamed.
+        let cut_off = photos::ImageAnalysis {
+            capture_date: Some("2023-01-02".to_string()),
+            lat: Some(55.95),
+            lon: Some(-3.19),
+            ..Default::default()
+        };
+        assert_eq!(photo_read_warning(Some("jpg"), true, &cut_off), file_note);
+        // The one silent case: HEIC needs pi-heif, which comes with the OCR component.
+        assert_eq!(photo_read_warning(Some("heic"), false, &unopened), None);
+        assert_eq!(photo_read_warning(Some("heic"), true, &unopened), file_note);
     }
 
     #[test]

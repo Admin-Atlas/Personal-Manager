@@ -48,6 +48,15 @@
 #   pillow — pinned explicitly (it arrives transitively via markitdown's image/PDF path and the
 #     sidecar's own EXIF/dimension reader) so a security-patched version is enforced rather than
 #     whatever the resolver happens to pick.
+#
+#     13.0.0 is the only release carrying the fixes for the decoder advisories published from
+#     2026-10-17 (there is no 12.x after 12.3.0), and it needs Python 3.11 or newer, which is why
+#     MIN_PYTHON in sidecar.rs is (3, 11). fastembed 0.9.0 still declares `pillow<13` on every
+#     Python although its code runs on 13 (and PM calls only its text models), so the same pin
+#     also sits in requirements-override.txt: `just lock-regen` passes that file to uv as an
+#     override, which lifts fastembed's cap, and the sidecar installs the lock with `--no-deps` so
+#     pip does not put the cap back on the user's machine. Remove the override line once a
+#     fastembed release allows pillow 13 — qdrant/fastembed#830 (open, unmerged at 0.9.0).
 #   defusedxml — hardens the stdlib XML parser (openpyxl's fallback) against entity-expansion / XXE
 #     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.8
@@ -55,5 +64,5 @@ fastembed==0.9.0
 faster-whisper==1.2.1
 av<19
 openpyxl==3.1.5
-pillow==12.3.0
+pillow==13.0.0
 defusedxml==0.7.1
