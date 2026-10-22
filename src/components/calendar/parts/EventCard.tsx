@@ -15,6 +15,7 @@
 import type { CSSProperties } from "react";
 import { cn } from "../../ui";
 import { DRAFT_EVENT_CLASS, PAST_EVENT_CLASS, spokenName } from "../../../lib/calendar-layout";
+import { declinedName } from "../../../lib/calendarEdit/rsvp";
 import { eventFill, eventHover, inkOn, type EventColour } from "../../../theme/eventPalette";
 
 interface Props {
@@ -40,6 +41,8 @@ interface Props {
   /** The new event being made (its ghost): the words its name starts with, saying so (`draftNote`).
    *  Drawn dashed, never greyed as past. Null for any other event. */
   ghost?: string | null;
+  /** The user declined it: its title is struck through and its name says so, as Google draws it. */
+  declined?: boolean;
   /** A piece of an event across days: it started on an earlier day (square top) or runs on into
    *  a later one (square bottom). */
   continuesBefore?: boolean;
@@ -70,6 +73,7 @@ export function EventCard({
   showLocation,
   isPast,
   ghost = null,
+  declined = false,
   continuesBefore,
   continuesAfter,
   tabStop = true,
@@ -95,8 +99,11 @@ export function EventCard({
   const withLoc = showLocation && !!location && heightPx >= LOC_MIN_H;
 
   // A full accessible name (summary + time + place) even when the card is too short to show the meta,
-  // the ghost's saying first that it's the new event.
-  const ariaLabel = spokenName(ghost, [summary, timeLabel, location].filter(Boolean).join(", "));
+  // the ghost's saying first that it's the new event, and a declined one's saying so last.
+  const ariaLabel = declinedName(
+    spokenName(ghost, [summary, timeLabel, location].filter(Boolean).join(", ")),
+    declined,
+  );
 
   return (
     <div
@@ -124,7 +131,10 @@ export function EventCard({
       }
     >
       <div
-        className="truncate font-head text-[0.6875rem] font-medium leading-tight text-ink"
+        className={cn(
+          "truncate font-head text-[0.6875rem] font-medium leading-tight text-ink",
+          declined && "line-through",
+        )}
         style={inkOn(own)}
       >
         {summary}

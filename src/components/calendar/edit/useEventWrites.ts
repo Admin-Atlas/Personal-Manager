@@ -29,7 +29,9 @@
 // PM's own milestone, never Google; Move back is offered for a few seconds after.
 //
 // Replying to an invitation (C14) comes through here too: Yes, No or Maybe, with a note, for one
-// occurrence or all of a repeating one. Google tells the organiser, so nothing is asked first.
+// occurrence or all of a repeating one. Google tells the organiser, so nothing is asked first. The
+// reply control says what it came to; an answer that comes after the control has gone, or that
+// isn't a success, is a notice here too.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
@@ -75,6 +77,7 @@ import {
   moveBackFailedText,
   moveFailedText,
   moveOfferText,
+  replyNoticeText,
   retryAfter,
   savedNotice,
   settleText,
@@ -515,6 +518,18 @@ export function respond(
   scope: RsvpScope | null = null,
 ): Promise<WriteOutcome> {
   return respondToCalendarEvent(eventId, reply, note, scope);
+}
+
+/** What a reply came to, as a notice naming the event `title`: said here when the reply control
+ *  went before the answer came (the popover closed), and for any answer that isn't a success, so
+ *  it outlives the popover and the tab (C14 critique C2-M1). A success goes by itself. */
+export function noteReply(
+  title: string,
+  outcome: WriteOutcome,
+  reply: Rsvp,
+  scope: RsvpScope | null,
+) {
+  put({ id: nextNotice++, ...replyNoticeText(outcome, reply, scope, title) });
 }
 
 /** A save's outcome. `newPartial`, on a `partial_split` only: whether its notice is new. False

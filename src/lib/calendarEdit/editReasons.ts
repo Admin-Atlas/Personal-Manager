@@ -25,6 +25,8 @@ function unreachable(value: never): never {
   throw new Error(`unhandled calendar edit value: ${JSON.stringify(value)}`);
 }
 
+const NOT_ORGANISER = "Someone else organises this event.";
+
 /** Why PM won't change an event, or a part of it. */
 export function reasonText(reason: ReadOnlyReason): string {
   switch (reason) {
@@ -36,8 +38,9 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This calendar is shared with you to view only, so its events can't be changed here.";
     case "private_event":
       return "This is a private event on a calendar shared with you, and you can't change private events there.";
+    // A reply follows the guest list, not who organises the event (C14 critiques C1-L10, C2-L1).
     case "not_organizer":
-      return "Someone else organises this event, so only they can change it.";
+      return `${NOT_ORGANISER} You can reply, and change only your own settings.`;
     case "not_invited":
       return "This calendar isn't on the event's guest list, so there's no reply to send from it.";
     case "became_repeating":
@@ -55,6 +58,18 @@ export function reasonText(reason: ReadOnlyReason): string {
     default:
       return unreachable(reason);
   }
+}
+
+/** The popover's line under an event someone else organises (C14 critiques C1-L10, C2-L1, C2-L10):
+ *  what the user may still do from this copy. `canReply`: its calendar is on the guest list;
+ *  `editingOn`: its account has editing on, without which nothing is sent, a reply included. */
+export function notOrganizerText(canReply: boolean, editingOn: boolean): string {
+  if (!editingOn) {
+    const what = canReply ? "reply" : "change your own settings";
+    return `${NOT_ORGANISER} Turn on editing for this account to ${what} from PM.`;
+  }
+  if (canReply) return reasonText("not_organizer");
+  return `${NOT_ORGANISER} You can change only your own settings.`;
 }
 
 /** A field's name in a sentence. */
@@ -492,13 +507,7 @@ export function replyText(
   switch (outcome.outcome) {
     case "saved": {
       const all = scope === "all" ? " for all events" : "";
-      const words = [`You replied ${rsvpLabel(reply)}${all}.`];
-      if (outcome.warnings.includes("mirror_refresh_pending")) {
-        words.push(writeWarningText("mirror_refresh_pending", "save"));
-      }
-      const kept = outcome.warnings.includes("kept_own_reply");
-      if (kept) words.push(writeWarningText("kept_own_reply", "save", outcome.left_behind));
-      return { tone: kept ? "warn" : "ok", text: words.join(" ") };
+      return savedReplyText(outcome, `You replied ${rsvpLabel(reply)}${all}.`);
     }
     case "no_change":
       return { tone: "ok", text: "That's already your reply." };
@@ -539,6 +548,41 @@ export function replyText(
     default:
       return unreachable(outcome);
   }
+}
+
+/** A saved reply's words: `head`, then what PM's calendar still owes and the occurrences that kept
+ *  their own answer. */
+function savedReplyText(
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  head: string,
+): { tone: Tone; text: string } {
+  const words = [head];
+  if (outcome.warnings.includes("mirror_refresh_pending")) {
+    words.push(writeWarningText("mirror_refresh_pending", "save"));
+  }
+  const kept = outcome.warnings.includes("kept_own_reply");
+  if (kept) words.push(writeWarningText("kept_own_reply", "save", outcome.left_behind));
+  return { tone: kept ? "warn" : "ok", text: words.join(" ") };
+}
+
+/** What a reply came to, as one of the calendar's notices, naming the event (C14 critique C2-M1):
+ *  for a reply whose control went before its answer came (the popover closed), and for any answer
+ *  that isn't a success, which mustn't go with the popover. */
+export function replyNoticeText(
+  outcome: WriteOutcome,
+  reply: Rsvp,
+  scope: RsvpScope | null,
+  title: string,
+): { tone: Tone; text: string } {
+  if (outcome.outcome === "saved") {
+    const all = scope === "all" ? "all events of " : "";
+    return savedReplyText(outcome, `You replied ${rsvpLabel(reply)} to ${all}${quote(title)}.`);
+  }
+  if (outcome.outcome === "no_change") {
+    return { tone: "ok", text: `That's already your reply to ${quote(title)}.` };
+  }
+  const said = replyText(outcome, reply, scope);
+  return { tone: said.tone, text: `Your reply to ${quote(title)}: ${said.text}` };
 }
 
 /** A delete of chosen occurrences that the plan changed under again, after the dialog reopened

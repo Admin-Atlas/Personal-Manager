@@ -1322,6 +1322,26 @@ describe("replying to an invitation (C14)", () => {
     expect(hook.result.current.notices).toEqual([]);
     expect(hook.result.current.hiddenIds.size).toBe(0);
   });
+
+  // C14 critique C2-M1 (C14b): the reply control hands its answer here when it has gone, or when
+  // the answer isn't a success; a success goes by itself, anything else stays until dismissed.
+  it("says what a reply came to as a notice naming the event", async () => {
+    const { mod, hook, act } = await load();
+    act(() => mod.noteReply("Dentist", { outcome: "busy" }, "no", null));
+    act(() =>
+      mod.noteReply("Gym", { outcome: "saved", warnings: [], left_behind: [] }, "yes", "all"),
+    );
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "warn",
+        text: "Your reply to “Dentist”: Google is busy right now. Reply again in a moment.",
+      },
+      { id: 2, tone: "ok", text: "You replied Yes to all events of “Gym”." },
+    ]);
+    await act(async () => vi.advanceTimersByTime(5000));
+    expect(hook.result.current.notices.map((n) => n.id)).toEqual([1]);
+  });
 });
 
 describe("creating an event", () => {

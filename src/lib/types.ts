@@ -2073,6 +2073,9 @@ export interface CalendarCheck {
  *  until the user's local midnight. Every other consumer keeps the strict gate and never sees them. */
 export interface AgendaEvent extends CalendarEvent {
   ended: boolean;
+  /** The user declined it on every copy that has their own guest entry: struck through, as Google
+   *  draws it (#884, C14b). Said here because the agenda's rows carry no guest list. */
+  declined: boolean;
 }
 
 /** The upcoming event that named a project (shown on its focus card). */

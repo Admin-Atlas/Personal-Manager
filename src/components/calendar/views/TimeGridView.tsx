@@ -39,6 +39,7 @@ import { NowLine } from "../parts/NowLine";
 import { AllDayBand } from "../parts/AllDayBand";
 import { whenText } from "../parts/whenText";
 import { eventColour } from "../../../theme/eventPalette";
+import { isDeclined } from "../../../lib/calendarEdit/rsvp";
 
 interface Props {
   /** The visible day columns (local midnights), left → right. Day = 1, Week = 7. */
@@ -454,6 +455,7 @@ export function TimeGridView({
                   showLocation={showPower}
                   isPast={isEventPast(card.ev, nowDate)}
                   ghost={draftNote(card.ev)}
+                  declined={isDeclined(card.ev)}
                   continuesBefore={card.continuesBefore}
                   continuesAfter={card.continuesAfter}
                   tabStop={card.tabStop}

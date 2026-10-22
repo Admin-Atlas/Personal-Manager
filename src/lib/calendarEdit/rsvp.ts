@@ -7,8 +7,15 @@
 //
 // The user's reply is their own entry on the guest list, the one Google marks `self`: the calendar
 // the copy is on, chosen as the backend chooses it (`calendar_write::rsvp::self_entry`).
+//
+// The calendar shows one row per occurrence, and the same invitation can be mirrored on two of the
+// user's calendars (both their accounts connected): the popover offers a reply from each copy that
+// can send one (`replyCopies`), and the grid strikes a row through only when every copy that has
+// the user's own entry says they declined (`markDeclined`), the nearest PM can come to Google
+// drawing each calendar's copy apart.
 
-import type { CalendarEvent, Rsvp } from "../types";
+import { occurrenceKey } from "../calendar-layout";
+import type { Attendee, Calendar, CalendarEvent, Rsvp } from "../types";
 import { addressKey, replyOf, trimmed, type Reply } from "./guests";
 
 /** The three replies, in Google's order. */
@@ -30,14 +37,25 @@ export function myReply(
   ev: Pick<CalendarEvent, "attendees">,
   ownAddress: string | null = null,
 ): Reply | null {
+  const own = ownEntry(ev, ownAddress);
+  return own ? replyOf(own.response) : null;
+}
+
+/** The user's own entry on a row's guest list (see `myReply`), or null without one. */
+function ownEntry(
+  ev: Pick<CalendarEvent, "attendees">,
+  ownAddress: string | null,
+): Attendee | null {
   const marked = (ev.attendees ?? []).filter(
     (a) => a.self && a.email !== null && trimmed(a.email) !== "",
   );
-  const own =
+  return (
     (ownAddress !== null
       ? marked.find((a) => a.email !== null && addressKey(a.email) === addressKey(ownAddress))
-      : undefined) ?? marked[0];
-  return own ? replyOf(own.response) : null;
+      : undefined) ??
+    marked[0] ??
+    null
+  );
 }
 
 /** The user declined it (Google strikes such an event through). */
@@ -67,3 +85,88 @@ export function tidyNote(text: string): string {
 
 /** How long a note is, as the backend counts it. */
 export const noteLength = (text: string): number => [...tidyNote(text)].length;
+
+// --- declined events, and the copies a reply can come from (C14b) ---
+
+/** A row as a view shows it: `declined` when the user declined it, set by `markDeclined` on the
+ *  Calendar tab and by the backend on the Focus tab's agenda (whose rows carry no guest list). */
+export type ShownEvent = CalendarEvent & { declined?: boolean };
+
+/** Whether a shown row is struck through: the user declined it, and Google Calendar draws a declined
+ *  event's title struck through. */
+export const isDeclined = (ev: CalendarEvent): boolean => (ev as ShownEvent).declined === true;
+
+/** An event's accessible name, ending ", declined" when it is struck through (`isDeclined`). */
+export const declinedName = (name: string, declined: boolean): string =>
+  declined ? `${name}, declined` : name;
+
+/** `kept`, the rows a view shows (one per occurrence, deduped from `visible`, every copy it could
+ *  show), each marked `declined` when at least one copy of its occurrence has the user's own guest
+ *  entry and every such copy says they declined (C14 critiques C1-M4, C2-H3). Google draws each
+ *  calendar's copy apart; PM shows one for them all, so a copy still going keeps the row plain.
+ *  `ownAddress` gives a calendar's own address (its `remote_id`), which picks the entry as the
+ *  backend does. A row left plain is the same object; a declined one is a copy. */
+export function markDeclined<T extends CalendarEvent>(
+  kept: readonly T[],
+  visible: readonly CalendarEvent[],
+  ownAddress: (calendarId: string) => string | null,
+): T[] {
+  const copies = new Map<string, CalendarEvent[]>();
+  for (const e of visible) {
+    const key = occurrenceKey(e);
+    if (key === null) continue;
+    copies.set(key, [...(copies.get(key) ?? []), e]);
+  }
+  return kept.map((ev) => {
+    const key = occurrenceKey(ev);
+    const all = (key !== null ? copies.get(key) : undefined) ?? [ev];
+    const answers = all.flatMap((copy) => {
+      const own = ownEntry(copy, ownAddress(copy.calendar_id));
+      return own ? [replyOf(own.response)] : [];
+    });
+    const declined = answers.length > 0 && answers.every((r) => r === "no");
+    return declined ? { ...ev, declined: true } : ev;
+  });
+}
+
+/** One copy of an occurrence the user may reply from, and whose reply it is. */
+export interface ReplyCopy {
+  event: CalendarEvent;
+  calendar: Calendar;
+  /** The calendar's name when the popover must say whose reply it is, else null. */
+  forWhom: string | null;
+}
+
+/** The copies of `ev`'s occurrence the user can reply from: every row of `events` (the rows before
+ *  the view's dedup, so the invitation's copy shows even when the organiser's was kept) with the
+ *  same occurrence, or `ev` alone when it has none, that the list marked answerable, on a Google
+ *  calendar `canWrite` allows (shown, and its account's editing on). `ev`'s own copy first, then
+ *  by calendar name. Each is named when there's more than one, or when its calendar isn't its
+ *  account's main one: replying there answers for that calendar (C14 spec §0.5 row 6). */
+export function replyCopies(
+  events: readonly CalendarEvent[],
+  ev: CalendarEvent,
+  calendars: readonly Calendar[],
+  canWrite: (calendar: Calendar) => boolean,
+): ReplyCopy[] {
+  const key = occurrenceKey(ev);
+  const rows = key === null ? [ev] : events.filter((e) => occurrenceKey(e) === key);
+  const copies = rows.flatMap((event) => {
+    const calendar = calendars.find((c) => c.id === event.calendar_id);
+    return event.can_respond === true &&
+      calendar !== undefined &&
+      calendar.provider === "google" &&
+      canWrite(calendar)
+      ? [{ event, calendar }]
+      : [];
+  });
+  copies.sort(
+    (a, b) =>
+      Number(b.event.id === ev.id) - Number(a.event.id === ev.id) ||
+      a.calendar.name.localeCompare(b.calendar.name),
+  );
+  return copies.map((c) => ({
+    ...c,
+    forWhom: copies.length > 1 || !c.calendar.is_primary ? c.calendar.name : null,
+  }));
+}

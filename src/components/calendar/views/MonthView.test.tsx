@@ -8,7 +8,7 @@
 // events drawn as ever; never folded into "+N more" on a busy day; and at Minimal depth, a dashed
 // ring among the dots.
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 import { DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
@@ -174,5 +174,24 @@ describe("MonthView", () => {
     } finally {
       depth = "standard";
     }
+  });
+
+  // #884 C14b: an event the user declined (the calendar marks it, `markDeclined`) is struck
+  // through, as Google draws it, and its name says so; any other is drawn as ever.
+  it("strikes through an event the user declined, as a chip or a band, and says so", () => {
+    const declined = (e: CalendarEvent) => ({ ...e, declined: true }) as CalendarEvent;
+    month([
+      declined(ev({ id: "c", summary: "Review", start: "2026-10-13T09:00:00" })),
+      ev({ id: "p", summary: "Plain", start: "2026-10-14T09:00:00" }),
+      declined(
+        ev({ id: "b", summary: "Away", start: "2026-10-20", end: "2026-10-23", all_day: true }),
+      ),
+    ]);
+    const chip = screen.getByRole("button", { name: `${clock(9)}, Review, declined` });
+    expect(within(chip).getByText("Review").className).toContain("line-through");
+    const plain = screen.getByRole("button", { name: `${clock(9)}, Plain` });
+    expect(within(plain).getByText("Plain").className).not.toContain("line-through");
+    const band = screen.getByRole("button", { name: "Away, declined" });
+    expect(within(band).getByText("Away").className).toContain("line-through");
   });
 });
