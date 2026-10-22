@@ -852,35 +852,49 @@ pub async fn update_calendar_event(
     .await)
 }
 
-/// What Google's copy shows of a one-event save whose answer can't be trusted.
+/// What Google's copy shows of a one-event save: its reply, or a GET after an answer that can't be
+/// trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shown {
     /// It holds the save.
     Landed,
+    /// It holds some of the save and not the rest: Google applied it without keeping all of it (a
+    /// colour it wouldn't clear beside a new title, say). Landed as Google holds it, and said so:
+    /// never "nothing was saved" (C13 review round 1).
+    Partly,
     /// It doesn't: nothing of the save is there.
     NotThere,
     /// It repeats, but not as sent: PM can't tell.
     Unsure,
 }
 
-/// Read Google's copy `now` for the save `body`. A one-off given a repeat (`repeats`: where its rule
-/// starts) is read by meaning: its times as sent and a rule that means the same from that start,
-/// since Google may write a rule its own way. One that repeats otherwise is unsure, never "nothing
-/// was saved" (C11 critique 1 M3); one that doesn't repeat at all never got the save.
+/// Read Google's copy `now` for the save `body`, sent on `before`. A one-off given a repeat
+/// (`repeats`: where its rule starts) is read by meaning: its times as sent and a rule that means the
+/// same from that start, since Google may write a rule its own way. One that repeats otherwise is
+/// unsure, never "nothing was saved" (C11 critique 1 M3); one that doesn't repeat at all never got
+/// the rule, and holds the rest of the save in part or not at all.
 fn shown_by(
+    before: &Value,
     now: &Value,
     body: &serde_json::Map<String, Value>,
     repeats: Option<&SeriesStart>,
 ) -> Shown {
+    let held_in_part = || {
+        if patch::any_applied(before, now, body) {
+            Shown::Partly
+        } else {
+            Shown::NotThere
+        }
+    };
     let Some(start) = repeats else {
         return if patch::already_applied(now, body) {
             Shown::Landed
         } else {
-            Shown::NotThere
+            held_in_part()
         };
     };
     if !calendar::is_master(now) {
-        return Shown::NotThere;
+        return held_in_part();
     }
     let rest: serde_json::Map<String, Value> = body
         .iter()
@@ -922,6 +936,41 @@ async fn landed_save<W: Wire, H: Host>(
         return land_repeating_save(wire, host, target, session, &saved).await;
     }
     land_saved(host, target, session, saved, sent)
+}
+
+/// A one-event save Google applied without keeping all of it ([`Shown::Partly`], or a reply that
+/// holds it otherwise than sent): landed as Google holds it, a copy that repeats now as the repeating
+/// event it is and one that doesn't as the one-off it still is, with
+/// [`WriteWarning::PartlyApplied`] so the words say to look (C13 review round 1).
+async fn landed_in_part<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    session: &str,
+    saved: Value,
+    sent: &serde_json::Map<String, Value>,
+    repeats: &Option<SeriesStart>,
+) -> WriteOutcome {
+    let outcome = if repeats.is_some() && calendar::is_master(&saved) {
+        land_repeating_save(wire, host, target, session, &saved).await
+    } else {
+        land_saved(host, target, session, saved, sent)
+    };
+    match outcome {
+        WriteOutcome::Saved {
+            mut warnings,
+            left_behind,
+            milestone_moves,
+        } => {
+            warnings.push(WriteWarning::PartlyApplied);
+            WriteOutcome::Saved {
+                warnings,
+                left_behind,
+                milestone_moves,
+            }
+        }
+        other => other,
+    }
 }
 
 /// A one-off made to repeat, landed (C11 §10): Google's copy is the repeating event's own now, which
@@ -1148,17 +1197,29 @@ async fn save_event<W: Wire, H: Host>(
             // No answer, or a sign-in refused after a server error: it may or may not have landed.
             // Look before saying either (review H1).
             Err(google_io::NoAnswer::Lost { .. }) => {
-                return after_lost_answer(wire, host, target, session, &body, repeats.as_ref())
-                    .await
+                return after_lost_answer(
+                    wire,
+                    host,
+                    target,
+                    session,
+                    &fresh,
+                    &body,
+                    repeats.as_ref(),
+                )
+                .await
             }
         };
         // A server error on the way may have been applied, whatever the last answer says (a retry
         // of a copy that landed is answered 412): look before reporting anything but success.
         if reply.maybe_applied && reply.verdict != Verdict::Ok {
             match get(wire, &target.remote_calendar, &target.remote_event).await {
-                Fetched::Event(now) => match shown_by(&now, &body, repeats.as_ref()) {
+                Fetched::Event(now) => match shown_by(&fresh, &now, &body, repeats.as_ref()) {
                     Shown::Landed => {
                         return landed_save(wire, host, target, session, now, &body, &repeats).await
+                    }
+                    Shown::Partly => {
+                        return landed_in_part(wire, host, target, session, now, &body, &repeats)
+                            .await
                     }
                     Shown::Unsure => return WriteOutcome::Unconfirmed,
                     Shown::NotThere => {}
@@ -1170,16 +1231,26 @@ async fn save_event<W: Wire, H: Host>(
         match reply.verdict {
             Verdict::Ok => {
                 return match serde_json::from_str::<Value>(&reply.body) {
-                    // Google answered as if it had saved, and its copy doesn't hold what was sent
-                    // (a colour it wouldn't clear, say): never "Saved" (C13 critique C2-H1), as a
-                    // repeating event's write already says. A one-off made to repeat is read by
-                    // meaning when it lands.
-                    Ok(saved) if repeats.is_none() && !patch::already_applied(&saved, &body) => {
-                        WriteOutcome::IgnoredByGoogle { split: false }
-                    }
-                    Ok(saved) => {
-                        landed_save(wire, host, target, session, saved, &body, &repeats).await
-                    }
+                    // Google's copy is read for what it holds of the save, a one-off made to repeat
+                    // by meaning (C13 critique C2-H1, review round 1). All of it: saved.
+                    Ok(saved) => match shown_by(&fresh, &saved, &body, repeats.as_ref()) {
+                        Shown::Landed => {
+                            landed_save(wire, host, target, session, saved, &body, &repeats).await
+                        }
+                        // Every field it sent as it was (a colour Google wouldn't clear, say):
+                        // never "Saved", as a repeating event's write already says.
+                        Shown::NotThere if patch::none_applied(&fresh, &saved, &body) => {
+                            WriteOutcome::IgnoredByGoogle { split: false }
+                        }
+                        // Applied, but not all of it as sent: a title that landed beside a colour
+                        // Google kept, or a rule it wrote to mean something else. Google's copy is
+                        // landed as it is and the words say to look: never "nothing changed", and
+                        // never a plain "Saved".
+                        _ => {
+                            landed_in_part(wire, host, target, session, saved, &body, &repeats)
+                                .await
+                        }
+                    },
                     // Saved, but the reply wasn't JSON: the next sync will show it. A one-off made
                     // to repeat is a repeating event now, which this editor's copy no longer is.
                     Err(_) => {
@@ -6468,20 +6539,25 @@ const QUOTA: &str = "This Google account has reached one of Google Calendar's us
                      Google isn't taking changes for now. Try again later; the limit usually lifts \
                      within a day.";
 
-/// A save whose answer never arrived: GET the event and see whether it landed. `repeats`: the save
-/// gave a one-off a repeat, which starts there ([`shown_by`]).
+/// A save whose answer never arrived: GET the event and see whether it landed. `before`: the copy it
+/// was sent on. `repeats`: the save gave a one-off a repeat, which starts there ([`shown_by`]). Part
+/// of it there is a save that happened, never "nothing was saved" (C13 review round 1).
 async fn after_lost_answer<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
     session: &str,
+    before: &Value,
     body: &serde_json::Map<String, Value>,
     repeats: Option<&SeriesStart>,
 ) -> WriteOutcome {
     match get(wire, &target.remote_calendar, &target.remote_event).await {
-        Fetched::Event(now) => match shown_by(&now, body, repeats) {
+        Fetched::Event(now) => match shown_by(before, &now, body, repeats) {
             Shown::Landed => {
                 landed_save(wire, host, target, session, now, body, &repeats.copied()).await
+            }
+            Shown::Partly => {
+                landed_in_part(wire, host, target, session, now, body, &repeats.copied()).await
             }
             Shown::NotThere => WriteOutcome::Failed {
                 message: "PM lost touch with Google, and your change isn't there. Nothing was \
@@ -17232,6 +17308,180 @@ mod tests {
         assert_eq!(row.color_id.as_deref(), Some("5"));
     }
 
+    /// C13 review round 1: Google keeping part of a save (the colour it wouldn't clear) beside a part
+    /// it took (the new title), on a 200, after an answer that never came, or after a server error
+    /// that may have been applied, is a save that happened: Google's copy lands in the mirror and the
+    /// session, and the outcome says Google didn't keep all of it, never "nothing changed". The next
+    /// title save is then no conflict over PM's own change.
+    #[tokio::test]
+    async fn a_save_google_kept_part_of_lands_what_it_holds_and_says_so() {
+        let coloured = with(dentist(), "colorId", json!("5"));
+        let part = written(&coloured, &[("summary", json!("Team lunch"))], "\"s2\"");
+        let draft = EventPatchDraft {
+            summary: Some("Team lunch".into()),
+            colour: Some(crate::calendar_write::dto::ColourDraft::Calendar),
+            ..Default::default()
+        };
+        let in_part = WriteOutcome::Saved {
+            warnings: vec![WriteWarning::PartlyApplied],
+            left_behind: Vec::new(),
+            milestone_moves: None,
+        };
+        let patch = |answer: Scripted| Step::write(Method::Patch, "/events/solo", "\"s1\"", answer);
+        let maybe = Scripted::Reply {
+            status: 500,
+            body: None,
+            date: None,
+            maybe_applied: true,
+        };
+        for answers in [
+            vec![patch(Scripted::Json(part.clone()))],
+            vec![
+                patch(Scripted::Lost { retried: false }),
+                Step::get("/events/solo", "", part.clone()),
+            ],
+            vec![patch(maybe), Step::get("/events/solo", "", part.clone())],
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&coloured));
+            let (outcome, script, session) =
+                save_one_off(&host, &coloured, target(&coloured), &draft, answers).await;
+            script.asked_all();
+            assert!(outcome == in_part, "saved in part, and said so");
+            let row = host
+                .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+                .unwrap()
+                .unwrap();
+            assert!(row.summary == "Team lunch", "the title Google took");
+            assert!(
+                row.color_id.as_deref() == Some("5"),
+                "the colour Google kept"
+            );
+            // The session moved onto Google's copy: a new title goes on it.
+            let open = open_session(&host.edit, &session).unwrap().unwrap();
+            let brunch = written(&part, &[("summary", json!("Team brunch"))], "\"s3\"");
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", part.clone()),
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s2\"",
+                    Scripted::Json(brunch),
+                ),
+            ]);
+            let next = EventPatchDraft {
+                summary: Some("Team brunch".into()),
+                ..Default::default()
+            };
+            let outcome = save_event(
+                &script,
+                &*host,
+                &session,
+                &open,
+                &next,
+                EditingStatus::On,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "the next title saves, no conflict");
+        }
+    }
+
+    /// C13 review round 1: "ignored" is only a 200 whose copy holds every field sent as it was. One
+    /// that holds a field otherwise (a title Google wrote its own way, beside the colour it kept) was
+    /// applied: it lands as Google holds it and says Google didn't keep all of it.
+    #[tokio::test]
+    async fn a_save_google_answered_otherwise_is_never_ignored() {
+        let coloured = with(dentist(), "colorId", json!("5"));
+        let host = TestHost::holding(std::slice::from_ref(&coloured));
+        let otherwise = written(&coloured, &[("summary", json!("Team lunch (1)"))], "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &coloured,
+            target(&coloured),
+            &EventPatchDraft {
+                summary: Some("Team lunch".into()),
+                colour: Some(crate::calendar_write::dto::ColourDraft::Calendar),
+                ..Default::default()
+            },
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(otherwise),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::PartlyApplied],
+                    left_behind: Vec::new(),
+                    milestone_moves: None,
+                },
+            "applied, never ignored"
+        );
+        let row = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.summary == "Team lunch (1)",
+            "Google's title, as it holds it"
+        );
+    }
+
+    /// C13 review round 1: a one-off made to repeat is read for what Google holds of it on a 200
+    /// too. The rule landed in Google's own spelling beside a colour it kept is saved, saying Google
+    /// didn't keep all of it, never a plain "Saved".
+    #[tokio::test]
+    async fn a_one_off_made_to_repeat_whose_colour_google_kept_says_so() {
+        let coloured = with(dentist(), "colorId", json!("5"));
+        let host = TestHost::holding(std::slice::from_ref(&coloured));
+        let draft = EventPatchDraft {
+            colour: Some(crate::calendar_write::dto::ColourDraft::Calendar),
+            ..weekly_on(&[DayCode::Mon])
+        };
+        let kept = with(
+            dentist_weekly("RRULE:BYDAY=MO;FREQ=WEEKLY;INTERVAL=1"),
+            "colorId",
+            json!("5"),
+        );
+        let (outcome, script, session) = save_one_off(
+            &host,
+            &coloured,
+            target(&coloured),
+            &draft,
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(kept),
+                ),
+                dentist_listing(dentist_mondays()),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            first_write(&script).body.unwrap()["colorId"] == Value::Null,
+            "the calendar's colour as null"
+        );
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::PartlyApplied],
+                    left_behind: Vec::new(),
+                    milestone_moves: None,
+                },
+            "saved, said to be in part"
+        );
+        // It repeats now, as Google holds it: the one-off's session ends.
+        assert!(open_session(&host.edit, &session).unwrap().is_none());
+    }
+
     /// Google may hand a list back in another order than sent: after a lost answer that reads as
     /// landed, as it does on a 200.
     #[tokio::test]
@@ -17334,8 +17584,24 @@ mod tests {
                     message: patch::InsertError::NoEventZone.to_string()
                 }
         );
-        // Shown in New York's time on this computer, it repeats there.
+        // Shown in New York's time on this computer, it repeats there. Google's answer holds the
+        // nodes as sent: one holding London's would be a save Google kept otherwise (C13 review
+        // round 1).
         let shown = TestHost::holding(std::slice::from_ref(&event));
+        let in_new_york = written(
+            &dentist_weekly("RRULE:FREQ=WEEKLY;BYDAY=MO"),
+            &[
+                (
+                    "start",
+                    json!({ "dateTime": "2026-10-12T04:00:00-04:00", "timeZone": "America/New_York" }),
+                ),
+                (
+                    "end",
+                    json!({ "dateTime": "2026-10-12T05:00:00-04:00", "timeZone": "America/New_York" }),
+                ),
+            ],
+            "\"s2\"",
+        );
         let (outcome, script, _) = save_one_off_in(
             &shown,
             &event,
@@ -17346,7 +17612,7 @@ mod tests {
                     Method::Patch,
                     "/events/solo",
                     "\"s1\"",
-                    Scripted::Json(dentist_weekly("RRULE:FREQ=WEEKLY;BYDAY=MO")),
+                    Scripted::Json(in_new_york),
                 ),
                 dentist_listing(dentist_mondays()),
             ],

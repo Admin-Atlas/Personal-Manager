@@ -161,6 +161,19 @@ describe("ReminderList", () => {
     expect(invalid).toEqual([true]);
   });
 
+  // C13 review round 1: 0 days at 09:00 is a whole number on the day itself, which an all-day
+  // event's count from the midnight before it can't hold: said as that, at any time of day.
+  it("an all-day row of 0 days says to pick at least 1 day, whatever its time", () => {
+    const { changes, invalid } = harness(own(["popup", 900]), { allDay: true });
+    const row = count("1 day before at 09:00");
+    retype(row, "0");
+    expect(screen.getByText("Pick at least 1 day before.")).toBeTruthy();
+    expect(screen.queryByText("Use a whole number.")).toBeNull();
+    expect(row.getAttribute("aria-invalid")).toBe("true");
+    expect(changes).toEqual([]);
+    expect(invalid).toEqual([true]);
+  });
+
   it("a removed row that couldn't be committed no longer holds the save", () => {
     const { invalid } = harness(own(["popup", 10], ["popup", 30]));
     retype(count("10 minutes before"), "ten");

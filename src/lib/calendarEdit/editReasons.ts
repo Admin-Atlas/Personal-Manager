@@ -200,6 +200,10 @@ export function writeWarningText(
     // A notice per milestone names each one (`milestoneStayedText`); this is the short form.
     case "milestone_not_offered":
       return "PM couldn't find the new part in Google, so a linked milestone stays on the earlier part.";
+    // Google applied a one-event save without keeping all of it (C13 review round 1): never
+    // "nothing changed", and never a plain "Saved".
+    case "partly_applied":
+      return "Google didn't keep all of your changes, so check the event.";
     default:
       return unreachable(warning);
   }
@@ -293,6 +297,16 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
         return {
           tone: "warn",
           text: `Saved from that day on. ${writeWarningText("left_on_old_series", "save", outcome.left_behind)}`,
+        };
+      }
+      // Google didn't keep all of it (C13 review round 1): saved, and worth a look.
+      if (outcome.warnings.includes("partly_applied")) {
+        const pending = outcome.warnings.includes("mirror_refresh_pending")
+          ? ` ${writeWarningText("mirror_refresh_pending", "save")}`
+          : "";
+        return {
+          tone: "warn",
+          text: `Saved to Google. ${writeWarningText("partly_applied", "save")}${pending}`,
         };
       }
       return {
@@ -609,20 +623,23 @@ export function savedNotice(
  *  (`savedNotice`, and `settleText` for a Finish): outside the months PM syncs; then PM's calendar
  *  catching up, which beside an event outside is in a delete's words, since the saved event won't
  *  show after a refresh but what it replaced still does until then (C11c review); then occurrences
- *  left on the earlier part. A milestone that stayed has a notice of its own, naming it. `warn`: the
- *  user should look, and nothing says to edit it again here. */
+ *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1). A
+ *  milestone that stayed has a notice of its own, naming it. `warn`: the user should look, and
+ *  nothing says to edit it again here. */
 function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
   words: string[];
   warn: boolean;
 } {
+  const partly = outcome.warnings.includes("partly_applied");
   const outside = outcome.warnings.includes("outside_mirror");
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const left = outcome.warnings.includes("left_on_old_series");
   const words: string[] = [];
+  if (partly) words.push(writeWarningText("partly_applied", "save"));
   if (outside) words.push(writeWarningText("outside_mirror", "save"));
   if (pending) words.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
   if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
-  return { words, warn: outside || left };
+  return { words, warn: partly || outside || left };
 }
 
 // --- creating an event (C10) ---

@@ -738,6 +738,25 @@ pub fn already_applied(fresh: &Value, body: &Map<String, Value>) -> bool {
             .all(|(key, value)| field_eq(key, Some(value), fresh.get(key.as_str())))
 }
 
+/// Whether `now` holds any field `body` changed from `before` (the copy it went out on), as sent: a
+/// field sent as `before` already had it says nothing either way. Beside [`already_applied`] false,
+/// Google applied the save without keeping all of it (a colour it wouldn't clear beside a new
+/// title, say), which is never "nothing changed" (C13 review round 1).
+pub fn any_applied(before: &Value, now: &Value, body: &Map<String, Value>) -> bool {
+    !is_gone(now)
+        && body.iter().any(|(key, value)| {
+            !field_eq(key, before.get(key.as_str()), Some(value))
+                && field_eq(key, Some(value), now.get(key.as_str()))
+        })
+}
+
+/// Whether `now` still holds what `before` held for every field `body` sends: Google kept the event
+/// as it was. Only then is a save Google answered with success one it ignored (C13 critique C2-H1).
+pub fn none_applied(before: &Value, now: &Value, body: &Map<String, Value>) -> bool {
+    body.keys()
+        .all(|key| field_eq(key, before.get(key.as_str()), now.get(key.as_str())))
+}
+
 /// The answer to "may this delete still go ahead?" after Google's copy turned out to be newer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteCheck {
@@ -1255,6 +1274,52 @@ mod tests {
         landed["summary"] = "Dentist (moved)".into();
         landed["transparency"] = "transparent".into();
         assert!(already_applied(&landed, &body));
+    }
+
+    /// C13 review round 1: a copy holding part of a save is told apart from one holding none of it,
+    /// so a save Google applied without keeping all of it never reads "nothing changed". A field sent
+    /// as it already was proves nothing either way, and a deleted copy holds nothing.
+    #[test]
+    fn a_save_held_in_part_is_told_from_one_held_not_at_all() {
+        // The dentist with a colour and no label, so "Calendar colour" may go.
+        let before = with_key(&fresh(), "eventLabelId", json!(""));
+        let mut body = build_patch(
+            &before,
+            &EventPatchDraft {
+                summary: Some("Team lunch".into()),
+                colour: Some(ColourDraft::Calendar),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            body.get("colorId") == Some(&Value::Null),
+            "the calendar's colour as null"
+        );
+        // The title landed; the colour Google kept.
+        let part = with_key(&before, "summary", json!("Team lunch"));
+        assert!(!already_applied(&part, &body));
+        assert!(any_applied(&before, &part, &body));
+        assert!(!none_applied(&before, &part, &body));
+        // Nothing landed: Google kept every field as it was.
+        assert!(!any_applied(&before, &before, &body));
+        assert!(none_applied(&before, &before, &body));
+        // A field Google holds neither as sent nor as it was: not kept, and not landed either.
+        let other = with_key(&before, "summary", json!("Lunch (Google)"));
+        assert!(!any_applied(&before, &other, &body));
+        assert!(!none_applied(&before, &other, &body));
+        // Sent as it already was, a field proves nothing landed.
+        body.insert("location".into(), json!("High St"));
+        assert!(!any_applied(&before, &before, &body));
+        // Deleted, a copy holds none of it, whatever its details say.
+        let gone = with_key(&part, "status", json!("cancelled"));
+        assert!(!any_applied(&before, &gone, &body));
+    }
+
+    fn with_key(event: &Value, key: &str, value: Value) -> Value {
+        let mut v = event.clone();
+        v[key] = value;
+        v
     }
 
     fn seen() -> SeenSummary {

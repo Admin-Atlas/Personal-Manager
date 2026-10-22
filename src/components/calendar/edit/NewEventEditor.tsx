@@ -74,7 +74,7 @@ import {
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
-import { kindSwitchText } from "../../../lib/calendarEdit/reminders";
+import { kindNoteText, type KindSwitchNote } from "../../../lib/calendarEdit/reminders";
 import {
   ambiguousText,
   CALLOUT_TONE,
@@ -91,7 +91,7 @@ import {
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
-import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
+import { sameAddress, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { repeatStartOf, startDateOf } from "../../../lib/calendarEdit/recurrenceDraft";
 import { isLetterKey } from "../../../lib/letterKey";
 import { deviceTimeZoneOrNull } from "../../../theme";
@@ -189,6 +189,11 @@ interface Prompt {
 
 const PRIVATE_OFF = "This calendar's sharing doesn't let you make private events on it.";
 
+/** Said under the guest box when the calendar picked was on the list as a guest: it organises the
+ *  event now, as Google lists it (C13 review round 1). */
+const organiserLeftText = (address: string) =>
+  `${address} organises this event now, so it came off the guest list.`;
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 export function NewEventEditor({
@@ -267,8 +272,12 @@ export function NewEventEditor({
   const [badGuest, setBadGuestState] = useState<string | null>(null);
   // A notification row holding something it can't commit (said under it): no save meanwhile.
   const badRemindersRef = useRef(false);
-  // The kind switch put the defaults back: said under the list until it next changes.
-  const [remindersNote, setRemindersNote] = useState<string | null>(null);
+  // The kind switch put the defaults back: said under the list until it next changes, naming the
+  // calendar picked when it's said (the defaults are that calendar's).
+  const [remindersNote, setRemindersNote] = useState<KindSwitchNote | null>(null);
+  // A guest another calendar's address took off the list when that calendar was picked, since it
+  // organises the event now: said under the guest box until the list next changes.
+  const [guestNote, setGuestNote] = useState<string | null>(null);
   const saveButton = useRef<HTMLButtonElement>(null);
   const titleBox = useRef<HTMLDivElement>(null);
   // The latest overview and hidden set, for the words an answer gets after the props moved on.
@@ -453,21 +462,32 @@ export function NewEventEditor({
     const switched = switchNewKind(was, seed, zone, lengthRef.current, showAsTouched.current);
     const r = remindersAfterKindSwitch(seed, switched, true);
     changeTime(r.draft);
-    const name = targetById(targets, calendarRef.current)?.calendar.name ?? null;
-    setRemindersNote(r.reset ? kindSwitchText(name, switched.time.kind === "all_day") : null);
+    setRemindersNote(r.note);
   }
 
   /** Another calendar. While the time is still the seed's, the end follows that account's length
-   *  (and back again), as Google's own length would. */
+   *  (and back again), as Google's own length would. The calendar organises the event, so its own
+   *  address typed as a guest on another one comes off the list, said under the box: GuestField
+   *  refuses adding it, and the backend counts it as the event's own, never one Google invites (C13
+   *  review round 1). */
   function pickCalendar(id: string) {
     setCalendarId(id);
-    if (timeTouched.current) return;
-    const length = lengthFor(overviewRef.current, targetById(targets, id));
-    lengthRef.current = length;
-    const t = draftRef.current.time;
-    if (t.kind === "timed") {
-      setDraft({ ...draftRef.current, time: endAfterStart(NEW_EVENT_BASE, t, length) });
+    const target = targetById(targets, id);
+    const organiser = target?.calendar.remote_id ?? null;
+    const was = draftRef.current;
+    const left = organiser
+      ? was.guests.filter((g) => !sameAddress(g.email, organiser))
+      : was.guests;
+    const dropped = left.length !== was.guests.length;
+    let next = dropped ? { ...was, guests: left } : was;
+    setGuestNote(dropped && organiser ? organiserLeftText(organiser) : null);
+    if (!timeTouched.current) {
+      const length = lengthFor(overviewRef.current, target);
+      lengthRef.current = length;
+      const t = next.time;
+      if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
     }
+    if (next !== was) setDraft(next);
   }
 
   /** Whether the backend has said `fields`' repeat can be saved, for exactly its rule and start (a
@@ -809,7 +829,11 @@ export function NewEventEditor({
             organizer={target?.calendar.remote_id ?? null}
             disabled={locked}
             omitted={false}
-            onChange={(guests) => setDraft({ ...draftRef.current, guests })}
+            notice={guestNote}
+            onChange={(guests) => {
+              setGuestNote(null);
+              setDraft({ ...draftRef.current, guests });
+            }}
             onPerms={(guest_perms) => setDraft({ ...draftRef.current, guest_perms })}
             onReject={setBadGuest}
           />
@@ -826,7 +850,14 @@ export function NewEventEditor({
             allDay={draft.time.kind === "all_day"}
             calendar={target?.calendar ?? null}
             disabled={locked}
-            note={remindersNote}
+            note={
+              remindersNote &&
+              kindNoteText(
+                remindersNote,
+                target?.calendar.name ?? null,
+                draft.time.kind === "all_day",
+              )
+            }
             onChange={(reminders) => {
               setRemindersNote(null);
               setDraft({ ...draftRef.current, reminders });

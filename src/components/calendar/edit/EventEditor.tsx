@@ -88,7 +88,7 @@ import {
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
-import { kindSwitchText } from "../../../lib/calendarEdit/reminders";
+import { kindNoteText, sameReminders } from "../../../lib/calendarEdit/reminders";
 import {
   ONCE,
   repeatingStartOf,
@@ -467,7 +467,22 @@ export function EventEditor({
       return;
     }
     const seed = repeatSeed(fresh.series, rowRepeats || !!fresh.series);
-    const r = rebaseDraft(loaded.base, seedDraft(fresh.event, seed), draftRef.current);
+    const was = draftRef.current;
+    const r = rebaseDraft(loaded.base, seedDraft(fresh.event, seed), was);
+    let next = r.draft;
+    // Google's time won over a switch of the user's between all-day and timed: the notifications
+    // that switch replaced come back with it, as switching back would (C13 review round 1), so a
+    // save never sends a reset whose reason is gone. A list the rebase changed otherwise leaves the
+    // switch's line saying nothing true.
+    let note: string | null | undefined;
+    if (was.time.kind !== loaded.base.time.kind && next.time.kind !== was.time.kind) {
+      const k = remindersAfterKindSwitch(r.base, next, canEdit(fresh.permissions, "reminders"));
+      next = k.draft;
+      const allDay = next.time.kind === "all_day";
+      note = k.note && kindNoteText(k.note, calendar?.name ?? null, allDay);
+    } else if (!sameReminders(next.reminders, was.reminders)) {
+      note = null;
+    }
     setLoaded({
       session: fresh.session,
       event: fresh.event,
@@ -476,7 +491,8 @@ export function EventEditor({
       seen: fresh.seen,
       series: fresh.series,
     });
-    setDraft(r.draft);
+    setDraft(next);
+    if (note !== undefined) setRemindersNote(note);
     setBanner({ tone: "warn", text: rebasedText(head, r.overwritten, r.lost_guests) });
   }
 
@@ -497,7 +513,7 @@ export function EventEditor({
     const r = remindersAfterKindSwitch(loaded.base, switched, may("reminders"));
     changeTime(r.draft);
     setRemindersNote(
-      r.reset ? kindSwitchText(calendar?.name ?? null, switched.time.kind === "all_day") : null,
+      r.note && kindNoteText(r.note, calendar?.name ?? null, switched.time.kind === "all_day"),
     );
   }
 
