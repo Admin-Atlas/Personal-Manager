@@ -739,6 +739,34 @@ describe("CalendarView: invitations", () => {
     expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "yes", null, "all");
   });
 
+  // PR B review round 1: the occurrence clicked kept its own No when Yes went to all events, and
+  // its row lands still declined: "Going?" says No, as the guest list and the struck-through chip do.
+  it("an occurrence that kept its own answer for all events keeps it in the popover", async () => {
+    const declined = () => row({ ...invite("declined"), series_id: "s1", recurring: true });
+    rows = [declined()];
+    ipc.respondToCalendarEvent.mockResolvedValue({
+      outcome: "saved",
+      warnings: ["kept_own_reply"],
+      left_behind: [today],
+    });
+    ipc.getSeriesSummary.mockResolvedValue(null);
+    await mount();
+    fireEvent.click(chip());
+    const going = () =>
+      ["Yes", "No", "Maybe"].filter(
+        (name) => screen.getByRole("button", { name }).getAttribute("aria-pressed") === "true",
+      );
+    expect(going()).toEqual(["No"]);
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "All events" })));
+    expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "yes", null, "all");
+    expect(going()).toEqual(["No"]);
+    rows = [declined()];
+    await act(async () => writeLanded());
+    expect(screen.getByRole("dialog", { name: "Standup" }).textContent).toContain("declined");
+    expect(going()).toEqual(["No"]);
+  });
+
   // C14 critiques C1-L7, C2-L7: the Terminal look's agenda (also its Day and Week) and month table.
   it("the Terminal look strikes it through too, and says so", async () => {
     env.system = "terminal";
