@@ -483,6 +483,8 @@ mod tests {
             }),
             show_as: Some(ShowAs::Free),
             visibility: Some(Visibility::Private),
+            // A repeat is never a one-event body's: the series planners write it (C11).
+            recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
         };
         let body = build_patch(&fresh(), &draft).unwrap();
         for key in body.keys() {

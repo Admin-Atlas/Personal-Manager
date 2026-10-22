@@ -203,6 +203,8 @@ describe("EventEditor", () => {
       { outcome: "saved", warnings: [] },
       null,
       "2026-10-12",
+      false,
+      false,
     );
     expect(choicesForEdit).not.toHaveBeenCalled();
   });
@@ -783,7 +785,7 @@ describe("EventEditor, a repeating event", () => {
     expect(saveEdit).toHaveBeenCalledWith(
       "s1",
       { summary: "Gym" },
-      { scope: "all", token: "t-all" },
+      { scope: "all", token: "t-all", asAll: false },
       "Gym",
     );
     // The very object the choices were asked for: the token binds it.
@@ -794,13 +796,50 @@ describe("EventEditor, a repeating event", () => {
       { outcome: "saved", warnings: [] },
       "all",
       "2026-10-12",
+      false,
+      false,
+    );
+  });
+
+  // C11c review round 2: "This and following" from the first occurrence goes as that row, with its
+  // token, but saves every occurrence, so the notice is told to say so.
+  it("tells the notice a 'this and following' pick from the first occurrence saved every one", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    choicesForEdit.mockResolvedValue(
+      choices({ following: { row: "as_all", warnings: [], token: "t-first" } }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const { onClose, dialog } = await retitle();
+    const d = inDialog(dialog);
+    fireEvent.click(await d.findByRole("radio", { name: /^This and following events/ }));
+    fireEvent.click(d.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    const picked = saveEdit.mock.calls[0][2];
+    expect([picked?.scope, picked?.token]).toEqual(["following", "t-first"]);
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Gym",
+      { outcome: "saved", warnings: [] },
+      "following",
+      "2026-10-12",
+      false,
+      true,
     );
   });
 
   it("asks when the editor knows its repeating event, whatever the row says", async () => {
     openForEdit.mockResolvedValue({
       ...ready(event()),
-      series: { first: false, repeats: "Weekly on Monday" },
+      series: {
+        first: false,
+        repeats: "Weekly on Monday",
+        rule: {
+          pattern: { kind: "weekly", days: ["mon"] },
+          interval: 1,
+          ends: { kind: "never" },
+        },
+        starts: "2026-10-05",
+        zone: "Europe/London",
+      },
     } as EditLoad);
     choicesForEdit.mockResolvedValue(choices());
     await open();
@@ -901,7 +940,7 @@ describe("EventEditor, a repeating event", () => {
     expect(saveEdit).toHaveBeenCalledTimes(1);
     expect(saveEdit.mock.calls[0][1]).toBe(choicesForEdit.mock.calls[1][1]);
     expect(saveEdit.mock.calls[0][1]).toEqual({ summary: "Gym (moved)" });
-    expect(saveEdit.mock.calls[0][2]).toEqual({ scope: "this", token: "t-this" });
+    expect(saveEdit.mock.calls[0][2]).toEqual({ scope: "this", token: "t-this", asAll: false });
   });
 
   it("opens the choices when a save without one is answered that it repeats (R9)", async () => {

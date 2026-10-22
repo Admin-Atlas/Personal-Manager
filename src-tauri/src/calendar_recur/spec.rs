@@ -397,12 +397,12 @@ pub fn describe(spec: &RecurrenceSpec, start: &SeriesStart) -> String {
 /// described, or [`CUSTOM_RULE`] for anything outside the editor's set. EXDATEs and RDATEs don't
 /// change the words.
 pub fn describe_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> String {
-    spec_of_lines(lines, start)
-        .map_or_else(|| CUSTOM_RULE.to_string(), |spec| describe(&spec, start))
+    spec_of(lines, start).map_or_else(|| CUSTOM_RULE.to_string(), |spec| describe(&spec, start))
 }
 
-/// `recurrence` lines' one RRULE as a rule from the editor's set, or `None` for anything else.
-fn spec_of_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<RecurrenceSpec> {
+/// `recurrence` lines' one RRULE as a rule from the editor's set, or `None` for anything else: what
+/// the editor's Repeat row starts from, and what a change of rule is told from (C11).
+pub fn spec_of<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<RecurrenceSpec> {
     let lines = lines::parse(lines);
     let mut rules = lines.iter().filter_map(|l| match &l.kind {
         Kind::Rule(rule) => Some(rule),
@@ -423,7 +423,7 @@ fn spec_of_lines<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<Recu
 /// 13 October". `None` for a daily series, which names no day, and for a rule outside the editor's
 /// set; the question then says how far every occurrence moves instead.
 pub fn day_phrase<S: AsRef<str>>(lines: &[S], start: &SeriesStart) -> Option<String> {
-    let spec = spec_of_lines(lines, start)?;
+    let spec = spec_of(lines, start)?;
     let n = spec.interval;
     let months = |text: String| match n {
         1 => format!("{text} of each month"),

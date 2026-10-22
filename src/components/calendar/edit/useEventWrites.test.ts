@@ -1029,6 +1029,20 @@ describe("a repeating event", () => {
     // A one-off's words are as they were.
     act(() => mod.noteSaved("Dentist", { outcome: "saved", warnings: [] }));
     expect(hook.result.current.notices[1].text).toBe("Saved “Dentist”.");
+    // "This and following" from the first occurrence saved every one, and says so (C11c review).
+    act(() =>
+      mod.noteSaved(
+        "Gym",
+        { outcome: "saved", warnings: [] },
+        "following",
+        "2026-10-05",
+        true,
+        true,
+      ),
+    );
+    expect(hook.result.current.notices[2].text).toBe(
+      "Saved “Gym” as one event that doesn't repeat, on 05-10. To change it back, edit it again.",
+    );
   });
 });
 

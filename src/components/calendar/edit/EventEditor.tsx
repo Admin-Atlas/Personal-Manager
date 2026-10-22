@@ -499,7 +499,14 @@ export function EventEditor({ row, calendar, account, milestone, onDelete, onClo
       if (outcome.outcome !== "needs_choice") heldNotice.current = null;
       switch (outcome.outcome) {
         case "saved":
-          noteSaved(what.title, outcome, picked?.scope ?? null, what.from);
+          noteSaved(
+            what.title,
+            outcome,
+            picked?.scope ?? null,
+            what.from,
+            what.changes.recurrence?.kind === "once",
+            picked?.asAll ?? false,
+          );
           stayOpen = false;
           onClose();
           return;

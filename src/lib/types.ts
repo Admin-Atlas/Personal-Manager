@@ -1580,7 +1580,13 @@ export interface EventPatchDraft {
   time?: TimeDraft | null;
   show_as?: ShowAs | null;
   visibility?: EventVisibility | null;
+  /** How it repeats from now on; omitted or null leaves it as it is (C11). The editor sends none
+   *  yet: changing how an event repeats is the next step. */
+  recurrence?: RepeatDraft | null;
 }
+
+/** A change to how an event repeats: a rule from the editor's set, or "Does not repeat". */
+export type RepeatDraft = { kind: "rule"; rule: RepeatRule } | { kind: "once" };
 
 /** A new event, for creating an event: every field as the editor holds it (empty text is left out
  *  of what goes to Google). No guests, reminders or colour yet. */
@@ -1710,6 +1716,13 @@ export interface SeriesInfo {
   first: boolean;
   /** How it repeats, as Google Calendar says it ("Weekly on Monday"). */
   repeats: string;
+  /** The rule as one from the repeat menu's set, or null for one PM can only show (`repeats` says
+   *  it), which can only be replaced. */
+  rule: RepeatRule | null;
+  /** Its first occurrence's day (YYYY-MM-DD), in the zone it repeats in. */
+  starts: string;
+  /** The zone it repeats in; null for an all-day one, which repeats by days. */
+  zone: string | null;
 }
 
 /** What the choices for a change to a repeating occurrence are asked for: an open editor's draft, or
@@ -1735,7 +1748,11 @@ export type SeriesWarning =
     }
   | { warning: "length_changes" }
   | { warning: "not_carried"; attachments: boolean; conference: boolean; label: boolean }
-  | { warning: "new_identity" };
+  | { warning: "new_identity" }
+  /** It stops repeating: only the occurrence on `day` stays, as an event of its own. */
+  | { warning: "becomes_one_event"; day: string }
+  /** This many occurrences changed on their own fall on days a new repeat skips: their changes go. */
+  | { warning: "changes_lost"; count: number };
 
 /** One of "This event", "This and following" and "All events". `token` names the plan in the save. */
 export type ScopeRow =

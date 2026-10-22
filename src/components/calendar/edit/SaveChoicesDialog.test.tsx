@@ -106,7 +106,7 @@ describe("SaveChoicesDialog", () => {
     fireEvent.click(save);
     fireEvent.click(save);
     expect(onChoose).toHaveBeenCalledTimes(1);
-    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "f" });
+    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "f", asAll: false });
   });
 
   it("shows rows that can't be chosen disabled, with their reasons", () => {
@@ -138,17 +138,24 @@ describe("SaveChoicesDialog", () => {
     fireEvent.click(radio(/^All events/));
     expect(button("Save").disabled).toBe(false);
     fireEvent.click(button("Save"));
-    expect(onChoose).toHaveBeenCalledWith({ scope: "all", token: "a" });
+    expect(onChoose).toHaveBeenCalledWith({ scope: "all", token: "a", asAll: false });
   });
 
   it("says what 'this and following' means from the first occurrence", () => {
-    open({ view: view(ready(offered("t"), { row: "as_all", warnings: [], token: "x" })) });
+    const { onChoose } = open({
+      view: view(ready(offered("t"), { row: "as_all", warnings: [], token: "x" })),
+    });
     expect(radio(/^This and following events/)).toBeTruthy();
     expect(
       screen.getByText(
         "This is the first occurrence, so this changes every occurrence, like All events.",
       ),
     ).toBeTruthy();
+    // Picked, it goes as the row it is, with its token, and says it saves every occurrence, so the
+    // notice after it can (C11c review round 2).
+    fireEvent.click(radio(/^This and following events/));
+    fireEvent.click(button("Save"));
+    expect(onChoose).toHaveBeenCalledWith({ scope: "following", token: "x", asAll: true });
   });
 
   it("says the picked row's question in the live region, naming both days", () => {

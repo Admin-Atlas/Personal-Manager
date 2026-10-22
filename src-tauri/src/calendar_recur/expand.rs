@@ -287,6 +287,46 @@ pub fn last_before(
     Ok(last)
 }
 
+/// The last occurrence a rule that ends (a COUNT or an UNTIL) makes, deleted or not; `None` when it
+/// makes none. Only for a rule that ends: one that never does walks to its limit and is
+/// [`RecurError::CannotCount`].
+pub fn last_occurrence(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+) -> Result<Option<Point>, RecurError> {
+    let mut last = None;
+    walk(facts, start, |p| {
+        last = Some(p);
+        true
+    })?;
+    Ok(last)
+}
+
+/// The rule's first occurrence that `kept` keeps (one not deleted, say), no later than `until`: the
+/// one a series that stops repeating still shows (C11 critique 1 H1). `None` when there's none by
+/// then.
+pub fn first_kept(
+    facts: &RuleFacts,
+    start: &SeriesStart,
+    until: Point,
+    kept: impl Fn(&Point) -> bool,
+) -> Result<Option<Point>, RecurError> {
+    same_kind(start, &until)?;
+    let zone = start.zone();
+    let mut first = None;
+    walk(facts, start, |p| {
+        if p.cmp_in(&until, zone) == Ordering::Greater {
+            return false;
+        }
+        if kept(&p) {
+            first = Some(p);
+            return false;
+        }
+        true
+    })?;
+    Ok(first)
+}
+
 /// The series' first occurrence on or after `start` under `spec`: "Weekly on Monday and Wednesday"
 /// chosen on a Tuesday starts on the Wednesday, at the time chosen. RFC 5545 counts a series' start as
 /// an occurrence whether or not its rule makes it, and the crate doesn't, so PM never writes a start
@@ -751,6 +791,32 @@ mod tests {
             &all_day,
         );
         format!("{results:?} {moved:?}")
+    }
+
+    /// C11 critique 1 H1: the first occurrence a series that stops repeating keeps is the first not
+    /// deleted, never past the one asked about.
+    #[test]
+    fn the_first_kept_occurrence_skips_deleted_ones_up_to_a_bound() {
+        let weekly = facts("RRULE:FREQ=WEEKLY;BYDAY=MO");
+        let start = london(2026, 10, 5, 9);
+        let gone = [at("2026-10-05T08:00:00Z"), at("2026-10-12T08:00:00Z")];
+        let kept = |p: &Point| !gone.contains(p);
+        assert_eq!(
+            first_kept(&weekly, &start, at("2026-10-26T09:00:00Z"), kept),
+            Ok(Some(at("2026-10-19T08:00:00Z")))
+        );
+        assert_eq!(
+            first_kept(&weekly, &start, at("2026-10-12T08:00:00Z"), kept),
+            Ok(None)
+        );
+        assert_eq!(
+            first_kept(&weekly, &start, at("2026-10-26T09:00:00Z"), |_| true),
+            Ok(Some(at("2026-10-05T08:00:00Z")))
+        );
+        assert_eq!(
+            first_kept(&weekly, &start, Point::Day(day(2026, 10, 26)), kept),
+            Err(RecurError::Mismatch)
+        );
     }
 
     /// The child half of the next test: in a process started with [`PROBE`] set, prints [`probe`]

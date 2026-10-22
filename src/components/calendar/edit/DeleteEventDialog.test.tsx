@@ -118,7 +118,11 @@ describe("DeleteEventDialog", () => {
     fireEvent.click(radio(/^This and following events/));
     expect(screen.getByText(/can't restore these from its Trash/)).toBeTruthy();
     fireEvent.click(del);
-    expect(onConfirm).toHaveBeenCalledWith(occurrence, { scope: "following", token: "f" });
+    expect(onConfirm).toHaveBeenCalledWith(occurrence, {
+      scope: "following",
+      token: "f",
+      asAll: false,
+    });
     // The held Undo still applies.
     expect(screen.getByText(/You can undo it for a few seconds/)).toBeTruthy();
   });

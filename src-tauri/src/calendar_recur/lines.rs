@@ -118,6 +118,12 @@ impl Rule {
         rule
     }
 
+    /// Whether it says where it ends (a COUNT or an UNTIL), read from its parts as written, so a rule
+    /// PM can only show as text says it too.
+    pub fn ends(&self) -> bool {
+        self.get("COUNT").is_some() || self.get("UNTIL").is_some()
+    }
+
     /// The rule as an RRULE line, canonical: upper-case, parts in their order.
     pub fn line(&self) -> String {
         let parts: Vec<String> = self.parts.iter().map(|(k, v)| format!("{k}={v}")).collect();

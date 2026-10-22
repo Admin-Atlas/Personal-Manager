@@ -23,6 +23,10 @@ export type ReadyChoices = Extract<SeriesChoices, { outcome: "ready" }>;
 export interface Picked {
   scope: SeriesScope;
   token: string;
+  /** The row was "this and following" from the first occurrence (`RowView.asAll`): what saves is
+   *  every occurrence's plan, so the notice after it speaks as All. Never sent: the write names
+   *  `scope` and `token` only. */
+  asAll?: boolean;
 }
 
 function unreachable(value: never): never {
@@ -45,6 +49,9 @@ export interface RowView {
   detail: string;
   /** Offered, or "this and following" from the first occurrence (every occurrence). */
   selectable: boolean;
+  /** "This and following" from the first occurrence: its warnings are every occurrence's plan's,
+   *  and are worded as All's. */
+  asAll: boolean;
   /** The row's token when selectable. */
   token: string | null;
   warnings: SeriesWarning[];
@@ -82,7 +89,7 @@ function offeredDetail(scope: SeriesScope, asAll: boolean, kind: ChoiceKind, day
 }
 
 function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: string): RowView {
-  const base = { scope, label: LABEL[scope] };
+  const base = { scope, label: LABEL[scope], asAll: false };
   switch (row.row) {
     case "offered":
     case "as_all":
@@ -90,6 +97,7 @@ function rowView(scope: SeriesScope, row: ScopeRow, kind: ChoiceKind, day?: stri
         ...base,
         detail: offeredDetail(scope, row.row === "as_all", kind, day),
         selectable: true,
+        asAll: row.row === "as_all",
         token: row.token,
         warnings: row.warnings,
       };
@@ -183,7 +191,9 @@ export function againText(kind: ChoiceKind): string {
 
 const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
   "repeat_day_changes",
+  "becomes_one_event",
   "start_moved",
+  "changes_lost",
   "length_changes",
   "exceptions_may_reset",
   "not_carried",
@@ -192,13 +202,15 @@ const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
 ];
 
 /** The selected row's lines, the question first; equal kinds keep the backend's order. A warning
- *  with nothing to say (a "not carried" naming nothing) has no line. */
+ *  with nothing to say (a "not carried" naming nothing) has no line. Each is worded by the plan the
+ *  row was made from: a "this and following" row that changes every occurrence speaks as All. */
 export function warningLines(row: RowView, kind: ChoiceKind, title: string): string[] {
   const rank = (w: SeriesWarning) => WARNING_ORDER.indexOf(w.warning);
+  const scope: SeriesScope = row.asAll ? "all" : row.scope;
   return [...row.warnings]
     .map((w, i) => ({ w, i }))
     .sort((a, b) => rank(a.w) - rank(b.w) || a.i - b.i)
-    .map(({ w }) => seriesWarningText(w, kind, row.scope, title))
+    .map(({ w }) => seriesWarningText(w, kind, scope, title))
     .filter((line) => line !== "");
 }
 
@@ -221,7 +233,19 @@ export function seriesWarningText(
     case "repeat_day_changes":
       return repeatDayQuestion(title, w, scope);
     case "start_moved":
-      return `The first occurrence of ${t} moves from ${formatDateOnly(w.from)} to ${formatDateOnly(w.to)}.`;
+      // From one occurrence on, only a new repeat moves where the new part starts (C11).
+      return scope === "following"
+        ? `From this occurrence on, the new part of ${t} starts on ${formatDateOnly(w.to)}, the first day the new repeat allows.`
+        : `The first occurrence of ${t} moves from ${formatDateOnly(w.from)} to ${formatDateOnly(w.to)}.`;
+    case "becomes_one_event":
+      // "Does not repeat" (C11): never "a new repeating event" (C11 critique 2 M2).
+      return scope === "following"
+        ? `From this occurrence on, ${t} becomes a separate event that doesn't repeat: this occurrence stays, and every one after it goes.`
+        : `Only the occurrence on ${formatDateOnly(w.day)} stays, as an event that doesn't repeat. Every other occurrence of ${t} goes.`;
+    case "changes_lost":
+      return w.count === 1
+        ? `One occurrence of ${t} you changed on its own falls on a day the new repeat skips, so that change goes.`
+        : `${w.count} occurrences of ${t} you changed on their own fall on days the new repeat skips, so those changes go.`;
     case "length_changes":
       return scope === "following"
         ? "Every occurrence from this one on will last as long as this one."

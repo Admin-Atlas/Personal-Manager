@@ -332,6 +332,59 @@ describe("a repeating event's save, said once the editor has closed", () => {
       text: "Saved “Gym” from 21-10 on, as a repeating event of its own. Some occurrences you changed on their own may still be on the earlier part, or hidden by Google (02-11); check them in Google Calendar.",
     });
   });
+
+  // C11c review: "Does not repeat" from one occurrence on makes one event, never a repeating one.
+  it("words a 'this and following' save that stops it repeating as one event", () => {
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-21", true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” from 21-10 on, as one event that doesn't repeat. There's no Undo: editing it again changes that event, but won't join it back to the earlier ones.",
+    });
+  });
+
+  // C11c review: a save that leaves its one event outside the months PM syncs says so, warns, and
+  // never says to edit it again here, where it no longer shows.
+  it("says a save left outside the months PM syncs won't show, and nothing of editing it again", () => {
+    expect(savedNotice("Standup", saved(["outside_mirror"]), "all")).toEqual({
+      tone: "warn",
+      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it.",
+    });
+  });
+
+  // C11c review round 2: the old occurrences still show until the next refresh, so the calendar
+  // catching up is still said. The pair "Does not repeat" for every occurrence answers when Google's
+  // list of what's left stops short, and from one occurrence on when PM's calendar couldn't be
+  // written.
+  it("says the calendar catches up when the old occurrences still show beside an event outside", () => {
+    const both = saved(["outside_mirror", "mirror_refresh_pending"]);
+    expect(savedNotice("Standup", both, "all", "2026-10-19", true)).toEqual({
+      tone: "warn",
+      text: "Saved “Standup” for every occurrence. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+    });
+    expect(savedNotice("Standup", both, "following", "2026-12-06", true)).toEqual({
+      tone: "warn",
+      text: "Saved “Standup” from 06-12 on, as one event that doesn't repeat. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+    });
+  });
+
+  // C11c review round 2: "This and following" on the first occurrence saves every occurrence, so its
+  // notice is All's: no part made, no earlier one, and a stop names the one event left.
+  it("words a 'this and following' save from the first occurrence as every occurrence", () => {
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-05", false, true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    });
+    expect(savedNotice("Gym", saved([]), "following", "2026-10-06", true, true)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym” as one event that doesn't repeat, on 06-10. To change it back, edit it again.",
+    });
+    // Only that row: All's own stop keeps its words, and so does any other row picked.
+    expect(savedNotice("Gym", saved([]), "all", "2026-10-19", true, false).text).toBe(
+      "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    );
+    expect(savedNotice("Gym", saved([]), "this", "2026-10-19", false, true).text).toBe(
+      "Saved “Gym” for this occurrence. To change it back, edit it again.",
+    );
+  });
 });
 
 describe("settling a change PM couldn't finish", () => {
@@ -412,6 +465,21 @@ describe("settling a change PM couldn't finish", () => {
     expect(settleText({ outcome: "failed", message: "x" }, "Gym")).toEqual({
       tone: "error",
       text: "“Gym”: x",
+    });
+  });
+
+  // C11c review round 3: a Finish words what landed as a save does. Outside the months PM syncs,
+  // PM's calendar won't show it, so it catches up rather than shows it, and that's a warning.
+  it("words a Finish that lands outside the months PM syncs as a save says it", () => {
+    const both = saved(["outside_mirror", "mirror_refresh_pending"]);
+    expect(settleText(both, "Standup")).toEqual({
+      tone: "warn",
+      text: "Finished the change to “Standup”. It starts outside the months PM syncs, so PM's calendar won't show it. PM's calendar will catch up after the next refresh.",
+    });
+    expect(settleText(saved(["outside_mirror"]), "Standup").tone).toBe("warn");
+    expect(settleText(saved(["mirror_refresh_pending"]), "Standup")).toEqual({
+      tone: "ok",
+      text: "Finished the change to “Standup”. PM's calendar will show it after the next refresh.",
     });
   });
 

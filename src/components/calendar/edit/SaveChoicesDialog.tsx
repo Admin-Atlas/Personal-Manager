@@ -102,7 +102,7 @@ export function SaveChoicesDialog({
     // Once: a second click before the parent unmounts the dialog sends nothing.
     if (!canSend || sent.current || !selected?.token) return;
     sent.current = true;
-    onChoose({ scope: selected.scope, token: selected.token });
+    onChoose({ scope: selected.scope, token: selected.token, asAll: selected.asAll });
   }
 
   const lead =
