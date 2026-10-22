@@ -2797,9 +2797,11 @@ describe("EventEditor, an invitation", () => {
         guests: [boss, { ...mine, response: "declined" }, ann],
         reply: { response: "declined", note: "" },
       });
-    for (const [left, shown] of [
-      [["2026-10-12"], "declined"],
-      [["2026-10-19"], "accepted"],
+    // "Going?" too (PR B review round 1): the occurrence that kept No has No pressed, never the
+    // reply sent.
+    for (const [left, shown, going] of [
+      [["2026-10-12"], "declined", "No"],
+      [["2026-10-19"], "accepted", "Yes"],
     ] as const) {
       openForEdit.mockResolvedValue(ready(declined(), THEIRS));
       respond.mockResolvedValue({
@@ -2813,6 +2815,11 @@ describe("EventEditor, an invitation", () => {
       await screen.findByText(/You replied Yes for all events\./);
       expect(respond).toHaveBeenLastCalledWith(occurrence.id, "yes", null, "all");
       expect(within(myEntry()).getByText(shown)).toBeTruthy();
+      expect(
+        ["Yes", "No", "Maybe"].filter(
+          (name) => screen.getByRole("button", { name }).getAttribute("aria-pressed") === "true",
+        ),
+      ).toEqual([going]);
       cleanup();
     }
   });

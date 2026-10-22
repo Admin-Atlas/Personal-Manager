@@ -289,6 +289,47 @@ describe("RsvpControl", () => {
     expect(pressed()).toEqual(["No"]);
   });
 
+  // PR B review round 1: once the row has moved on, a change in Google back to the answer the reply
+  // was sent over shows, never the reply sent.
+  it("the reply shown gives way for good once the row moves on", async () => {
+    const { view, props } = control({ current: "yes" });
+    await act(async () => fireEvent.click(button("No")));
+    expect(pressed()).toEqual(["No"]);
+    view.rerender(<RsvpControl {...props} current="no" />);
+    expect(pressed()).toEqual(["No"]);
+    // Answered Yes again in Google Calendar, say.
+    view.rerender(<RsvpControl {...props} current="yes" />);
+    expect(pressed()).toEqual(["Yes"]);
+  });
+
+  // PR B review round 1: Google kept this occurrence's own answer when the reply went to all events
+  // (its day among those the outcome names), so the reply sent isn't shown as its own.
+  it("an all-events reply some occurrence kept its own answer against leaves it to the row", async () => {
+    const kept: WriteOutcome = {
+      outcome: "saved",
+      warnings: ["kept_own_reply"],
+      left_behind: ["2026-10-19"],
+    };
+    const { view, props } = control({
+      current: "no",
+      repeating: true,
+      onReply: vi.fn<OnReply>(() => Promise.resolve(kept)),
+    });
+    fireEvent.click(button("Yes"));
+    await act(async () => fireEvent.click(button("All events")));
+    expect(status().textContent).toBe(
+      "You replied Yes for all events. 1 occurrence you answered on its own kept its answer.",
+    );
+    expect(pressed()).toEqual(["No"]);
+    // So Yes can still go to this occurrence alone.
+    fireEvent.click(button("Yes"));
+    expect(screen.getByRole("group", { name: "Reply Yes to which occurrences?" })).toBeTruthy();
+    fireEvent.click(button("Back"));
+    // Where this one took it, its row (or the editor's copy) says so.
+    view.rerender(<RsvpControl {...props} current="yes" />);
+    expect(pressed()).toEqual(["Yes"]);
+  });
+
   it("replying for a shared calendar names it", () => {
     control({ forWhom: "Team" });
     expect(screen.getByRole("group", { name: "Going? Replying for Team." })).toBeTruthy();
@@ -350,6 +391,41 @@ describe("RsvpControl", () => {
       view.rerender(<RsvpControl {...props} note="from Google" />);
       type("");
       expect(screen.getByRole("button", { name: "Remove note" })).toBeTruthy();
+    });
+
+    // PR B review round 1: as the reply sent, the note sent gives way for good once `note` moves on.
+    it("the note sent gives way for good once the note held moves on", async () => {
+      const { view, props } = control({ current: "yes", note: "" });
+      fireEvent.click(button("Add a note"));
+      type("late");
+      await act(async () => fireEvent.click(button("Send note")));
+      type("");
+      expect(screen.getByRole("button", { name: "Remove note" })).toBeTruthy();
+      view.rerender(<RsvpControl {...props} note="late" />);
+      expect(screen.getByRole("button", { name: "Remove note" })).toBeTruthy();
+      // Removed again in Google: no note held, so nothing to remove.
+      view.rerender(<RsvpControl {...props} note="" />);
+      expect(screen.getByRole("button", { name: "Send note" })).toBeTruthy();
+    });
+
+    // PR B review round 1: Send note is only unavailable while a reply from the occurrence question
+    // is on its way, so it must send nothing and leave that question as it is.
+    it("Send note while an occurrence's reply is on its way sends nothing", async () => {
+      const { onReply, answers } = later();
+      control({ current: "yes", repeating: true, note: "", onReply });
+      fireEvent.click(button("Add a note"));
+      type("late");
+      fireEvent.click(button("No"));
+      fireEvent.click(button("This event"));
+      expect(button("Send note").getAttribute("aria-disabled")).toBe("true");
+      fireEvent.click(button("Send note"));
+      expect(screen.getByRole("group", { name: "Reply No to which occurrences?" })).toBeTruthy();
+      await act(async () => answers[0](SAVED));
+      expect(onReply).toHaveBeenCalledTimes(1);
+      expect(onReply).toHaveBeenCalledWith("no", null, "this");
+      expect(screen.queryByRole("group", { name: /which occurrences/ })).toBeNull();
+      // The note is still there to send.
+      expect(box().value).toBe("late");
     });
 
     it("a note over 1,000 characters can't be sent", () => {

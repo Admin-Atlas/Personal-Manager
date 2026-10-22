@@ -96,6 +96,15 @@ export function RsvpControl({
     };
   }, []);
 
+  // The reply sent gives way for good once `current` moves on, whatever to, so a later change in
+  // Google back to the answer it was sent over shows too (C1-L5); the note sent the same with `note`.
+  useEffect(() => {
+    if (shown !== null && shown.over !== current) setShown(null);
+  }, [shown, current]);
+  useEffect(() => {
+    if (sentNote !== null && sentNote.over !== note) setSentNote(null);
+  }, [sentNote, note]);
+
   useLayoutEffect(() => {
     const want = focusNext.current;
     if (want === null) return;
@@ -142,10 +151,14 @@ export function RsvpControl({
       setStep({ reply: choice, note: text });
       return;
     }
-    if (success) {
+    // A reply for all events that some occurrence kept its own answer against: this one may be among
+    // them, so what it holds is left to `current` (the editor sets it from the days named, the
+    // popover reads Google's rows as they land), never shown as the reply sent.
+    const keptSome = outcome.outcome === "saved" && outcome.warnings.includes("kept_own_reply");
+    if (success && !keptSome) {
       setShown({ reply: choice, over: against });
       if (text !== null) setSentNote({ text: tidyNote(text), over: noteAgainst });
-    } else {
+    } else if (!success) {
       noteReply(title, outcome, choice, scope);
     }
     // Sent from the occurrence question (nothing closes it while the reply is on its way): back to
@@ -183,6 +196,9 @@ export function RsvpControl({
   }
 
   function sendNote() {
+    // While a reply is on its way Send note is only unavailable (it keeps focus), so it sends
+    // nothing, and never swaps the occurrence question that reply was sent from.
+    if (sendingRef.current) return;
     // Never so: Send note is disabled without a reply (or with too long a note).
     if (reply === null) return;
     if (repeating) {

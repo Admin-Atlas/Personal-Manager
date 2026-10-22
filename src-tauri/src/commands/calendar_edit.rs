@@ -2743,21 +2743,27 @@ async fn land_reply<W: Wire, H: Host>(
             _ => saved_pending(host, target),
         };
     };
-    land_every_reply(wire, host, target, sent, occurrence).await
+    land_every_reply(wire, host, target, sent, occurrence, &now).await
 }
 
 /// A reply to every occurrence, landed from a re-fetch of the occurrences over the mirror's window,
-/// read again (`REFETCH_AGAIN`) while it's short or the occurrence clicked, answered with the
-/// repeating event before, doesn't show the reply yet. Still so, nothing is recorded and the next
-/// sync shows it (C14 critique C1-M2: never half landed). Every occurrence listed is upserted and
-/// none deleted: a reply removes nothing. Occurrences answered on their own that kept their answer
-/// are said, by day (`KeptOwnReply`), never hidden behind "all events" (C1-M3, C2-H1).
+/// read again (`REFETCH_AGAIN`) while it's short, lacks the occurrence clicked, or doesn't show the
+/// reply yet. The occurrence clicked shows it when it had the repeating event's reply before; one
+/// answered on its own may keep its answer, so then some occurrence updated no earlier than the
+/// repeating event's copy read after the reply (`now`) must be listed, as `land_series` floors a
+/// change to every occurrence (L-R14, INFERRED): a lagging listing would land the others with their
+/// old reply and say they kept an answer of their own (PR B review round 1). Still so, nothing is
+/// recorded and the next sync shows it (C14 critique C1-M2: never half landed). Every occurrence
+/// listed is upserted and none deleted: a reply removes nothing. Occurrences answered on their own
+/// that kept their answer are said, by day (`KeptOwnReply`), never hidden behind "all events"
+/// (C1-M3, C2-H1).
 async fn land_every_reply<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
     sent: &ReplySent<'_>,
     occurrence: &Value,
+    now: &Value,
 ) -> WriteOutcome {
     let cal = target.remote_calendar.as_str();
     let Ok(mirror) = host.mirror(&target.calendar_id) else {
@@ -2766,6 +2772,20 @@ async fn land_every_reply<W: Wire, H: Host>(
     let clicked = occurrence.get("id").and_then(Value::as_str);
     // It had the repeating event's reply before, so it takes the new one with it.
     let follows = rsvp::own_response(occurrence, cal) == rsvp::own_response(sent.before, cal);
+    let moment = |copy: &Value| {
+        copy.get("updated")
+            .and_then(Value::as_str)
+            .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+    };
+    // Without an `updated` on the repeating event, a lagging listing can't be told from a current one.
+    let floor = moment(now);
+    let caught_up = |items: &[Value]| {
+        floor.is_some_and(|floor| {
+            items
+                .iter()
+                .any(|item| moment(item).is_some_and(|at| at >= floor))
+        })
+    };
     let mut listing = Listing::default();
     let mut stale = true;
     for pause in [None, Some(REFETCH_AGAIN[0]), Some(REFETCH_AGAIN[1])] {
@@ -2778,7 +2798,13 @@ async fn land_every_reply<W: Wire, H: Host>(
             .iter()
             .find(|item| item.get("id").and_then(Value::as_str) == clicked);
         stale = !listing.complete
-            || shown.is_none_or(|s| follows && !rsvp::rsvp_applied(s, cal, sent.response, None));
+            || shown.is_none_or(|s| {
+                if follows {
+                    !rsvp::rsvp_applied(s, cal, sent.response, None)
+                } else {
+                    !caught_up(&listing.items)
+                }
+            });
         if !stale {
             break;
         }
@@ -23279,6 +23305,94 @@ mod tests {
             row_reply(&host, occurrence["id"].as_str().unwrap()).as_deref(),
             Some("declined")
         );
+    }
+
+    /// PR B review round 1: from an occurrence answered on its own, "all events" can't wait for the
+    /// occurrence clicked, so it waits for a listing no older than the repeating event's copy after
+    /// the reply. A lagging one, whose other occurrences still have the old reply, is read again,
+    /// never landed with them said to have kept an answer of their own; one that never catches up
+    /// records nothing.
+    #[tokio::test]
+    async fn all_events_from_an_occurrence_answered_on_its_own_waits_out_a_lagging_listing() {
+        // Answered No on its own before the reply, so its version is older than the reply's.
+        let occurrence = with(
+            replied(&monday_invite(), "declined", None, "\"i1\""),
+            "updated",
+            json!("2026-10-10T08:00:00.000Z"),
+        );
+        let series = weekly_invite();
+        let series_now = replied(&series, "accepted", None, "\"m2\"");
+        let later = invitation_of(plain("2026-10-26T09:00:00Z"));
+        let lagging = || {
+            refetch_read(Scripted::Json(page(
+                vec![occurrence.clone(), later.clone()],
+                None,
+            )))
+        };
+        let caught_up = refetch_read(Scripted::Json(page(
+            vec![
+                occurrence.clone(),
+                replied(&later, "accepted", None, "\"i2\""),
+            ],
+            None,
+        )));
+        let steps = |listings: Vec<Step>| {
+            let mut steps = all_events_steps(
+                &occurrence,
+                &series,
+                "\"m1\"",
+                Scripted::Json(only_me(&series_now)),
+            );
+            steps.push(Step::get("/events/abc", "", series_now.clone()));
+            steps.extend(listings);
+            steps
+        };
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        let script = Script::new(steps(vec![lagging(), caught_up]));
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::KeptOwnReply],
+                    left_behind: vec!["2026-10-19".into()],
+                    milestone_moves: None,
+                },
+            "landed from the second listing, only the occurrence answered on its own said"
+        );
+        assert_eq!(script.waits(), vec![REFETCH_AGAIN[0]]);
+        assert_eq!(
+            row_reply(&host, later["id"].as_str().unwrap()).as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            row_reply(&host, occurrence["id"].as_str().unwrap()).as_deref(),
+            Some("declined")
+        );
+
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        let script = Script::new(steps(vec![lagging(), lagging(), lagging()]));
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == pending(), "taken, shown after the next refresh");
+        assert!(host.nothing_recorded(), "never half landed");
+        assert_eq!(script.waits(), REFETCH_AGAIN.to_vec());
     }
 
     /// C14 §4.6: the editor opens with the user's own reply and whether they organise it; on an
