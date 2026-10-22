@@ -1151,22 +1151,50 @@ describe("notifications and colour in the draft", () => {
 
   it("a kind switch puts my own notifications back to the defaults and says so, and back again restores them", () => {
     const allDay = { kind: "all_day" as const, first_day: "2026-10-12", last_day: "2026-10-12" };
-    const switched = remindersAfterKindSwitch(listed, { ...listed, time: allDay }, true);
+    const switched = remindersAfterKindSwitch(listed, { ...listed, time: allDay }, true, false);
     expect(switched.note).toBe("defaults");
     expect(switched.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(switched.reset).toBe(true);
     // Back on the kind Google holds: Google's list again, nothing to say (C13 critique C2-L5).
-    const back = remindersAfterKindSwitch(listed, { ...switched.draft, time: listed.time }, true);
+    const back = remindersAfterKindSwitch(
+      listed,
+      { ...switched.draft, time: listed.time },
+      true,
+      switched.reset,
+    );
     expect(back.note).toBeNull();
     expect(back.draft.reminders).toEqual(own(["popup", 10], ["email", 60]));
+    expect(back.reset).toBe(false);
     expect(changedFields(listed, back.draft)).toEqual([]);
     // Already on the defaults: nothing to put back, nothing said.
-    const onDefaults = remindersAfterKindSwitch(base(), { ...base(), time: allDay }, true);
+    const onDefaults = remindersAfterKindSwitch(base(), { ...base(), time: allDay }, true, false);
     expect(onDefaults.note).toBeNull();
     expect(onDefaults.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(onDefaults.reset).toBe(false);
     // Notifications the user can't change are never touched (C1-L14).
-    const locked = remindersAfterKindSwitch(listed, { ...listed, time: allDay }, false);
+    const locked = remindersAfterKindSwitch(listed, { ...listed, time: allDay }, false, false);
     expect(locked.note).toBeNull();
     expect(locked.draft.reminders).toEqual(listed.reminders);
+    expect(locked.reset).toBe(false);
+  });
+
+  // C13 review round 2: defaults the user picked over the event's own list are their choice on
+  // either kind. The switch put nothing there, so there's nothing for a switch back to undo.
+  it("a switch there and back keeps the defaults I picked", () => {
+    const allDay = { kind: "all_day" as const, first_day: "2026-10-12", last_day: "2026-10-12" };
+    const picked = { ...listed, reminders: { use_default: true, overrides: [] } };
+    const away = remindersAfterKindSwitch(listed, { ...picked, time: allDay }, true, false);
+    expect(away.note).toBeNull();
+    expect(away.reset).toBe(false);
+    const back = remindersAfterKindSwitch(
+      listed,
+      { ...away.draft, time: listed.time },
+      true,
+      away.reset,
+    );
+    expect(back.note).toBeNull();
+    expect(back.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(changedFields(listed, back.draft)).toEqual(["reminders"]);
   });
 
   // C13 review round 1: back on the kind Google holds, a list the user made on the other kind is
@@ -1175,16 +1203,28 @@ describe("notifications and colour in the draft", () => {
     const allDay = { kind: "all_day" as const, first_day: "2026-10-12", last_day: "2026-10-12" };
     // On the defaults in Google: a list made on the other kind goes back to the defaults.
     const made = { ...base(), time: allDay, reminders: own(["popup", 900], ["popup", 2340]) };
-    const toDefaults = remindersAfterKindSwitch(base(), { ...made, time: base().time }, true);
+    const toDefaults = remindersAfterKindSwitch(
+      base(),
+      { ...made, time: base().time },
+      true,
+      false,
+    );
     expect(toDefaults.note).toBe("defaults");
     expect(toDefaults.draft.reminders).toEqual({ use_default: true, overrides: [] });
     // A list of its own in Google: that list comes back over the one made.
     const madeOver = { ...listed, time: allDay, reminders: own(["email", 900]) };
-    const toEvent = remindersAfterKindSwitch(listed, { ...madeOver, time: listed.time }, true);
+    const toEvent = remindersAfterKindSwitch(
+      listed,
+      { ...madeOver, time: listed.time },
+      true,
+      false,
+    );
     expect(toEvent.note).toBe("event");
     expect(toEvent.draft.reminders).toEqual(listed.reminders);
     // The same list as Google's replaces nothing, and says nothing.
     const same = { ...listed, time: allDay, reminders: own(["email", 60], ["popup", 10]) };
-    expect(remindersAfterKindSwitch(listed, { ...same, time: listed.time }, true).note).toBeNull();
+    expect(
+      remindersAfterKindSwitch(listed, { ...same, time: listed.time }, true, false).note,
+    ).toBeNull();
   });
 });
