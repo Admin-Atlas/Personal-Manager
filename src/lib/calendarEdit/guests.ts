@@ -215,11 +215,16 @@ const fromAnAccount = (c: Calendar) =>
 /** The account a calendar is read with: the address after `gcal:` or `outlook:`. */
 const accountOf = (c: Calendar) => c.source_id.slice(c.source_id.indexOf(":") + 1);
 
+/** The domain Google gives a calendar that isn't a person's (one the user made, "Work" say). */
+const GROUP_DOMAIN = "@group.calendar.google.com";
+
 /** Every address in PM's mirrored Google and Outlook calendars, once each, its name the most common
  *  non-empty one, most-seen first then by name. Never the user, a room, `me`, or anything that
  *  isn't an address. The user is every account's own address (Outlook never marks one as the
- *  user's), and the entry Google marks as the calendar's own on the user's primary calendar only: on
- *  a calendar shared into the account, that's the colleague whose calendar it is. */
+ *  user's), and the entry Google marks as the calendar's own on the user's primary calendar and on
+ *  a calendar that isn't a person's: there it's the calendar itself, never a guest to invite. On a
+ *  person's calendar shared into the account, it's the colleague whose calendar it is, who stays
+ *  suggested. */
 export function guestSuggestions(
   events: readonly CalendarEvent[],
   calendars: readonly Calendar[],
@@ -227,7 +232,12 @@ export function guestSuggestions(
 ): GuestSuggestion[] {
   const accounts = calendars.filter(fromAnAccount);
   const fromAccounts = new Set(accounts.map((c) => c.id));
-  const primary = new Set(accounts.filter((c) => c.is_primary).map((c) => c.id));
+  // The calendars whose own entry is the user's, not a colleague's.
+  const ownEntryIsMine = new Set(
+    accounts
+      .filter((c) => c.is_primary || addressKey(c.remote_id ?? "").endsWith(GROUP_DOMAIN))
+      .map((c) => c.id),
+  );
   const seen = new Map<string, { email: string; names: Map<string, number>; count: number }>();
   const mine = new Set<string>(me ? [addressKey(me)] : []);
   for (const c of accounts) mine.add(addressKey(accountOf(c)));
@@ -236,7 +246,7 @@ export function guestSuggestions(
     for (const a of event.attendees ?? []) {
       if (!a.email) continue;
       const key = addressKey(a.email);
-      if (a.self && primary.has(event.calendar_id)) {
+      if (a.self && ownEntryIsMine.has(event.calendar_id)) {
         mine.add(key);
         continue;
       }

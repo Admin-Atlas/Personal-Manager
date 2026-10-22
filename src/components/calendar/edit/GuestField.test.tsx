@@ -356,6 +356,15 @@ describe("GuestField, the list", () => {
     expect(within(a).getAllByRole("button")).toHaveLength(2);
   });
 
+  it("knows the organiser by address too, on a list Google sent without its marks", () => {
+    // The save never sends a change to the organiser's entry, so the row offers none.
+    setUp({ guests: [guest("O@x.org", { name: "Olga" }), ANN], organizer: "o@x.org" });
+    const [o, a] = rows();
+    expect(within(o).queryAllByRole("button")).toHaveLength(0);
+    expect(o.textContent).toContain("Organiser");
+    expect(within(a).getAllByRole("button")).toHaveLength(2);
+  });
+
   it("marks a guest optional and back, under one name", () => {
     const { latest } = setUp();
     const toggle = screen.getByRole("button", { name: "Optional, Ann" });
@@ -480,6 +489,17 @@ describe("GuestField, the list", () => {
       true,
     );
     expect((screen.getByLabelText("Modify event") as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("dims the Optional toggle when it can't be pressed, on or off", () => {
+    setUp({ omitted: true, guests: [ME, ANN, guest("bo@x.org", { optional: true })] });
+    const off = screen.getByRole("button", { name: "Optional, Ann" }) as HTMLButtonElement;
+    const on = screen.getByRole("button", { name: "Optional, bo@x.org" }) as HTMLButtonElement;
+    expect([off.disabled, on.disabled]).toEqual([true, true]);
+    // Its words dim as the × beside it does, and the fill gives way to the surface.
+    expect(off.classList).toContain("disabled:text-ink4");
+    expect(on.classList).toContain("disabled:text-ink4");
+    expect(on.classList).toContain("disabled:bg-surface");
   });
 
   it("when off, still shows the list, and every control is off", () => {

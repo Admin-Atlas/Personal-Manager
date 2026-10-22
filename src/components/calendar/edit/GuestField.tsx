@@ -67,9 +67,6 @@ const ALREADY = "Already on the list.";
 const ORGANISER = "That's the organiser, who is on it already.";
 const CUT_SHORT = "Google didn't send this event's whole guest list, so PM can't change it.";
 
-/** The organiser's and the user's own entries: shown, never changed. */
-const fixed = (g: GuestDraft) => g.organizer || g.self;
-
 export function GuestField({
   guests,
   base,
@@ -127,6 +124,9 @@ export function GuestField({
 
   const locked = disabled || omitted;
   const isOrganiser = (email: string) => organizer !== null && sameAddress(email, organizer);
+  /** The organiser's and the user's own entries: shown, never changed. The organiser by address
+   *  too, flagged by Google or not: the save never sends a change to them (`guestOps`). */
+  const fixed = (g: GuestDraft) => g.organizer || g.self || isOrganiser(g.email);
   const offered = useMemo(
     () =>
       suggestions.filter(
@@ -387,7 +387,9 @@ export function GuestField({
                     {who}
                   </span>
                   {g.name?.trim() && <span className="truncate text-xs text-ink4">{g.email}</span>}
-                  {g.organizer && <span className="shrink-0 text-xs text-ink4">Organiser</span>}
+                  {(g.organizer || isOrganiser(g.email)) && (
+                    <span className="shrink-0 text-xs text-ink4">Organiser</span>
+                  )}
                   {g.optional && fixed(g) && (
                     <span className="shrink-0 text-xs text-ink4">Optional</span>
                   )}
@@ -400,7 +402,9 @@ export function GuestField({
                     {/* One name whatever its state, which aria-pressed carries (C12 critique
                         C2-L2). On screen it's filled when on, as the recurrence dialog's weekday
                         toggles are, and has an `--ink4` edge when off: the contrast floor a
-                        control's edge needs. */}
+                        control's edge needs. Off limits (Google cut the list short, or the field
+                        is off), its words dim to `--ink4` and the fill gives way to the surface,
+                        as the × beside it dims. */}
                     <button
                       type="button"
                       aria-pressed={g.optional}
@@ -411,8 +415,8 @@ export function GuestField({
                       }
                       className={
                         g.optional
-                          ? "inline-flex min-h-[var(--tap-min,24px)] shrink-0 items-center rounded-[var(--radius-sm)] bg-accent px-1.5 text-xs font-medium text-accent-ink transition disabled:cursor-not-allowed"
-                          : "inline-flex min-h-[var(--tap-min,24px)] shrink-0 items-center rounded-[var(--radius-sm)] px-1.5 text-xs text-ink2 shadow-[inset_0_0_0_1px_var(--ink4)] transition enabled:hover:text-ink disabled:cursor-not-allowed"
+                          ? "inline-flex min-h-[var(--tap-min,24px)] shrink-0 items-center rounded-[var(--radius-sm)] bg-accent px-1.5 text-xs font-medium text-accent-ink transition disabled:cursor-not-allowed disabled:bg-surface disabled:text-ink4"
+                          : "inline-flex min-h-[var(--tap-min,24px)] shrink-0 items-center rounded-[var(--radius-sm)] px-1.5 text-xs text-ink2 shadow-[inset_0_0_0_1px_var(--ink4)] transition enabled:hover:text-ink disabled:cursor-not-allowed disabled:text-ink4"
                       }
                     >
                       Optional

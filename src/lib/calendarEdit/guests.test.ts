@@ -250,6 +250,27 @@ describe("suggestions", () => {
     expect(all[0]).toEqual({ email: "boss@x.org", name: "Boss", count: 2 });
   });
 
+  it("never offer the user's own other calendars, while a colleague's shared one stays offered", () => {
+    // "Work", a calendar the user made: on events they organise there, its own entry is marked as
+    // the calendar's, under its group address.
+    const WORK = "abc123@group.calendar.google.com";
+    const work = {
+      ...calendar(`gcal:me@x.org:${WORK}`, "gcal:me@x.org", "google"),
+      remote_id: WORK,
+    };
+    const shared = {
+      ...calendar("gcal:me@x.org:boss@x.org", "gcal:me@x.org", "google"),
+      remote_id: "boss@x.org",
+    };
+    const theirs = [
+      event(work.id, [{ ...who(WORK, "Work", true), organizer: true }, who("eve@x.org", "Eve")]),
+      event(work.id, [{ ...who(WORK, "Work", true), organizer: true }, who("fay@x.org", "Fay")]),
+      event(shared.id, [who("boss@x.org", "Boss", true), who("eve@x.org", "Eve")]),
+    ];
+    const all = guestSuggestions(theirs, [...calendars, work, shared], null);
+    expect(all.map((s) => s.email)).toEqual(["eve@x.org", "boss@x.org", "fay@x.org"]);
+  });
+
   it("match by name or address, leaving out who is on the list, up to the limit", () => {
     const all = guestSuggestions(events, calendars, null);
     expect(matchSuggestions(all, "an", []).map((s) => s.email)).toEqual([
