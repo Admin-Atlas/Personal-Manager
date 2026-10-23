@@ -257,6 +257,17 @@ function quickCreate(summary: string) {
   fireEvent.change(title(), { target: { value: summary } });
 }
 
+// C16a: the box the drag gesture will hold the pointer in (C16b), which the LD1 probe finds by its
+// attribute: the swipe's own box, holding the event the view draws.
+describe("CalendarView: the grid's box", () => {
+  it("marks the swipe's box, around the events, for the drag and its probe", async () => {
+    await mount();
+    const grids = document.querySelectorAll("[data-calendar-grid]");
+    expect(grids).toHaveLength(1);
+    expect(grids[0].contains(screen.getByRole("button", { name: /Standup/ }))).toBe(true);
+  });
+});
+
 describe("CalendarView: a new event", () => {
   it("Shift+C opens quick create, non-modal, under + New event; c the full editor", async () => {
     await mount();

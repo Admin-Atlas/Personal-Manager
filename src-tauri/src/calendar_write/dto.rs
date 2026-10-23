@@ -295,6 +295,54 @@ pub struct SeenSummary {
     pub location: Option<String>,
 }
 
+/// What the user saw of an event's time when they dragged it: the mirror row's start, end and kind,
+/// in the mirror's own terms. A drag sends only times, so only times decide whether a version Google
+/// changed since may still be moved ([`super::patch::timing_still_matches`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenTimes {
+    /// As the mirror stores it: a date for an all-day event, else a UTC `…Z` instant.
+    pub start: String,
+    pub end: Option<String>,
+    pub all_day: bool,
+}
+
+/// Where a drag put an event, in this computer's wall time (the request's `device_zone`). The
+/// backend says it again in the event's own zone, so a drag never changes which zone an event is in
+/// ([`super::time::retime_draft`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MoveTo {
+    Timed {
+        start_date: String,
+        start_time: String,
+        end_date: String,
+        end_time: String,
+    },
+    /// `last_day` is the last day covered, as [`TimeDraft::AllDay`] holds it.
+    AllDay { first_day: String, last_day: String },
+}
+
+/// A drag of one event, as the webview hands it over: the mirror row, the time the user saw on it,
+/// where it was dropped, and this computer's zone (`None` when the webview can't tell; never a
+/// guessed UTC, R6). The choices and the move send the same values, which the choice token binds
+/// (C16 critique C1-M4).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MoveRequest {
+    pub event_id: String,
+    pub seen: SeenTimes,
+    pub to: MoveTo,
+    pub device_zone: Option<String>,
+}
+
+/// An Undo PM can offer for a write that just landed: the token that names it, and for how long.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UndoOffer {
+    /// PM's own (a random id); never an event's id or an etag (R5).
+    pub undo_token: String,
+    /// How long the Undo is offered, in seconds: 8, as a delete's (A15).
+    pub undo_seconds: u64,
+}
+
 /// Which occurrences of a repeating event a save or a delete is for: the dialog's three rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -353,6 +401,9 @@ pub struct ListRights {
     pub can_delete: bool,
     /// Yes, No or Maybe.
     pub can_respond: bool,
+    /// Its start and end: the gate's own answer, so the calendar never offers a drag the move would
+    /// refuse (C16 critique C2-M4).
+    pub can_retime: bool,
 }
 
 /// Why PM won't change an event, or one part of it. Each has a reason line in the editor.
@@ -462,6 +513,11 @@ pub enum WriteOutcome {
         /// so every outcome (and every `Result` that carries one as its error) stays small.
         #[serde(skip_serializing_if = "Option::is_none")]
         milestone_moves: Option<Box<MilestoneMoves>>,
+        /// Undo for a few seconds: a move of a one-off, or of "This event" of a repeating one, that
+        /// Google answered and that changed only the core fields ([`super::patch::UNDOABLE`]).
+        /// `None`, and left out, for every other write.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        undo: Option<UndoOffer>,
     },
     /// Google already holds exactly this; nothing was sent.
     NoChange,
@@ -755,8 +811,8 @@ pub struct SeriesInfo {
     pub zone: Option<String>,
 }
 
-/// What the choices for a change to a repeating occurrence are asked for: an open editor's draft, or
-/// a delete of a mirror row (`seen` is what the user saw of it).
+/// What the choices for a change to a repeating occurrence are asked for: an open editor's draft, a
+/// delete of a mirror row (`seen` is what the user saw of it), or a drag of one (C16).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChoiceRequest {
@@ -769,6 +825,8 @@ pub enum ChoiceRequest {
         event_id: String,
         seen: SeenSummary,
     },
+    /// A drag of an occurrence: the row dragged, what the user saw of its time, and where it went.
+    Move(MoveRequest),
 }
 
 /// "This event", "This and following" and "All events" for one change, each planned against Google's
@@ -921,6 +979,7 @@ mod tests {
                 warnings: vec![WriteWarning::MirrorRefreshPending],
                 left_behind: Vec::new(),
                 milestone_moves: None,
+                undo: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["mirror_refresh_pending"]}"#
@@ -935,6 +994,7 @@ mod tests {
                 warnings: vec![WriteWarning::LeftOnOldSeries],
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
+                undo: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["left_on_old_series"],"left_behind":["2026-11-02"]}"#
@@ -945,6 +1005,7 @@ mod tests {
                 warnings: vec![WriteWarning::KeptOwnReply],
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
+                undo: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["kept_own_reply"],"left_behind":["2026-11-02"]}"#
@@ -1029,6 +1090,7 @@ mod tests {
                     warnings: vec![WriteWarning::OutsideMirror],
                     left_behind: Vec::new(),
                     milestone_moves: None,
+                    undo: None,
                 },
                 r#"{"outcome":"saved","warnings":["outside_mirror"]}"#,
             ),
@@ -1114,6 +1176,7 @@ mod tests {
                 warnings: Vec::new(),
                 left_behind: Vec::new(),
                 milestone_moves: Some(Box::new(moves.clone())),
+                undo: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":[],"milestone_moves":{"new_series_ical":"tail@google.com","earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":"2026-10-19","earlier_last_day":"2026-10-12","today":"2026-10-13","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
@@ -1128,9 +1191,86 @@ mod tests {
                     earlier_last_day: None,
                     ..moves
                 })),
+                undo: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["milestone_not_offered"],"milestone_moves":{"new_series_ical":null,"earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":null,"earlier_last_day":null,"today":"2026-10-13","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
+        );
+    }
+
+    /// C16a: a drop as the webview sends it (both kinds of time, a zone or none), a move's choices
+    /// asked with the same fields, and `saved` with and without its Undo (left out when none).
+    #[test]
+    fn move_to_and_offers_read_and_serialise_as_the_view_names_them() {
+        let timed: MoveRequest = serde_json::from_str(
+            r#"{"event_id":"cal:e","seen":{"start":"2026-10-12T08:00:00Z",
+                "end":"2026-10-12T09:00:00Z","all_day":false},"to":{"kind":"timed",
+                "start_date":"2026-10-13","start_time":"09:30","end_date":"2026-10-13",
+                "end_time":"10:30"},"device_zone":"Europe/London"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            timed,
+            MoveRequest {
+                event_id: "cal:e".into(),
+                seen: SeenTimes {
+                    start: "2026-10-12T08:00:00Z".into(),
+                    end: Some("2026-10-12T09:00:00Z".into()),
+                    all_day: false,
+                },
+                to: MoveTo::Timed {
+                    start_date: "2026-10-13".into(),
+                    start_time: "09:30".into(),
+                    end_date: "2026-10-13".into(),
+                    end_time: "10:30".into(),
+                },
+                device_zone: Some("Europe/London".into()),
+            }
+        );
+        let all_day: MoveTo = serde_json::from_str(
+            r#"{"kind":"all_day","first_day":"2026-10-13","last_day":"2026-10-14"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            all_day,
+            MoveTo::AllDay {
+                first_day: "2026-10-13".into(),
+                last_day: "2026-10-14".into(),
+            }
+        );
+        let request: ChoiceRequest = serde_json::from_str(
+            r#"{"kind":"move","event_id":"cal:e","seen":{"start":"2026-10-12","end":"2026-10-13",
+                "all_day":true},"to":{"kind":"all_day","first_day":"2026-10-14",
+                "last_day":"2026-10-14"},"device_zone":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &request,
+            ChoiceRequest::Move(m) if m.event_id == "cal:e" && m.device_zone.is_none()
+                && m.seen.all_day && m.seen.end.as_deref() == Some("2026-10-13")
+        ));
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: Vec::new(),
+                left_behind: Vec::new(),
+                milestone_moves: None,
+                undo: Some(UndoOffer {
+                    undo_token: "u1".into(),
+                    undo_seconds: 8,
+                }),
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":[],"undo":{"undo_token":"u1","undo_seconds":8}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: Vec::new(),
+                left_behind: Vec::new(),
+                milestone_moves: None,
+                undo: None,
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":[]}"#
         );
     }
 
@@ -1480,18 +1620,20 @@ mod tests {
                 edit_block: None,
                 can_delete: true,
                 can_respond: false,
+                can_retime: true,
             })
             .unwrap(),
-            r#"{"edit_block":null,"can_delete":true,"can_respond":false}"#
+            r#"{"edit_block":null,"can_delete":true,"can_respond":false,"can_retime":true}"#
         );
         assert_eq!(
             serde_json::to_string(&ListRights {
                 edit_block: Some(ReadOnlyReason::NotOrganizer),
                 can_delete: false,
                 can_respond: true,
+                can_retime: false,
             })
             .unwrap(),
-            r#"{"edit_block":"not_organizer","can_delete":false,"can_respond":true}"#
+            r#"{"edit_block":"not_organizer","can_delete":false,"can_respond":true,"can_retime":false}"#
         );
         assert_eq!(
             serde_json::to_string(&ReplyForEdit {

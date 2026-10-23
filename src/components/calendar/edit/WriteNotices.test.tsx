@@ -70,6 +70,32 @@ describe("WriteNotices", () => {
     expect(zOf(stack)).toBeGreaterThan(zOf(briefing));
   });
 
+  // C16a: a move's Undo hands back its kind, so the calendar sends the right one; a delete's, which
+  // carries none, is a delete's. The newest of either kind is the shortcut's.
+  it("Undo hands its kind back", () => {
+    const onUndo = vi.fn();
+    const moved: WriteNotice = {
+      id: 2,
+      tone: "ok",
+      text: "“Dentist” is now 12-10 · 10:00–11:00.",
+      undoToken: "u2",
+      undoLabel: "Undo moving “Dentist”",
+      undoKind: "change",
+      undoRow: "cal:e",
+    };
+    render(
+      <WriteNotices notices={[deleting(1, "Gym"), moved]} onUndo={onUndo} onDismiss={vi.fn()} />,
+    );
+    const move = screen.getByRole("button", { name: "Undo moving “Dentist”" });
+    expect(move.getAttribute("aria-keyshortcuts")).toBe("Control+Z Meta+Z");
+    fireEvent.click(move);
+    fireEvent.click(screen.getByRole("button", { name: "Undo deleting “Gym”" }));
+    expect(onUndo.mock.calls).toEqual([
+      ["u2", "change"],
+      ["t1", "delete"],
+    ]);
+  });
+
   it("names the shortcut on the newest Undo only", () => {
     render(
       <WriteNotices

@@ -36,6 +36,8 @@ const CALENDAR_WRITES = {
   importNames: [
     "getCalendarEventForEdit",
     "updateCalendarEvent",
+    "rescheduleCalendarEvent",
+    "undoCalendarChange",
     "respondToCalendarEvent",
     "createCalendarEvent",
     "deleteCalendarEvent",

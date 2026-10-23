@@ -8,6 +8,8 @@
 // (it outlives the Calendar tab unmounting), so each test loads a fresh copy.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { occurrenceKey } from "../../../lib/calendar-layout";
+import { ghostEvent, type Timing } from "../../../lib/calendarDrag";
 import type {
   CalendarEvent,
   ChoiceRequest,
@@ -17,6 +19,7 @@ import type {
   GuestNotice,
   HeldDeleteInfo,
   MilestoneMoves,
+  MoveRequest,
   NewEventDraft,
   Notify,
   Rsvp,
@@ -67,6 +70,11 @@ const setMilestoneEvent =
   vi.fn<
     (id: number, uid: string | null, date: string | null, only: string | null) => Promise<void>
   >();
+const rescheduleCalendarEvent =
+  vi.fn<
+    (request: MoveRequest, scope: Scope, choice: Scope, ...told: Told) => Promise<WriteOutcome>
+  >();
+const undoCalendarChange = vi.fn<(token: string) => Promise<WriteOutcome>>();
 let settledHandler: ((s: DeleteSettled) => void) | null = null;
 
 vi.mock("../../../lib/calendarPrefs", async (importOriginal) => ({
@@ -96,6 +104,9 @@ vi.mock("../../../lib/ipc", () => ({
   respondToCalendarEvent: (...a: [string, Rsvp, string | null, RsvpScope | null]) =>
     respondToCalendarEvent(...a),
   settleSeriesSplit: (token: string, action: SplitAction) => settleSeriesSplit(token, action),
+  rescheduleCalendarEvent: (request: MoveRequest, scope: Scope, choice: Scope, ...told: Told) =>
+    rescheduleCalendarEvent(request, scope, choice, ...told),
+  undoCalendarChange: (token: string) => undoCalendarChange(token),
   onCalendarDeleteSettled: (h: (s: DeleteSettled) => void) => {
     settledHandler = h;
     return Promise.resolve(() => {});
@@ -424,7 +435,7 @@ describe("undoing the newest delete", () => {
     expect(cancelCalendarDelete).toHaveBeenCalledTimes(1);
   });
 
-  it("reads the newest from the notices", async () => {
+  it("reads the newest from the notices, and what it undoes", async () => {
     const { mod } = await load();
     expect(mod.latestUndo([])).toBeNull();
     expect(
@@ -433,7 +444,14 @@ describe("undoing the newest delete", () => {
         { id: 2, tone: "ok", text: "b", undoToken: "new" },
         { id: 3, tone: "ok", text: "Saved." },
       ]),
-    ).toBe("new");
+    ).toEqual({ token: "new", kind: "delete" });
+    // C16a: a move's Undo says so; a delete's, from before moves, says nothing and is a delete's.
+    expect(
+      mod.latestUndo([
+        { id: 1, tone: "ok", text: "a", undoToken: "old" },
+        { id: 2, tone: "ok", text: "b", undoToken: "u1", undoKind: "change", undoRow: event.id },
+      ]),
+    ).toEqual({ token: "u1", kind: "change" });
   });
 });
 
@@ -1858,5 +1876,399 @@ describe("how a repeating event repeats, and moving its milestones", () => {
     await act(() => mod.moveMilestone(id));
     expect(mod.undoLatest()).toBe(false);
     expect(setMilestoneEvent).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Moving an event (#884, C16a): the drop drawn where it went while it's asked about and saved, the
+// move sent once, its notice with an Undo for its seconds, and the Undo itself.
+describe("moving an event", () => {
+  const withUid = { ...event, uid: "abc@google.com" };
+  const from: Timing = {
+    kind: "timed",
+    start: { day: "2026-10-12", min: 540 },
+    end: { day: "2026-10-12", min: 600 },
+  };
+  const to: Timing = {
+    kind: "timed",
+    start: { day: "2026-10-12", min: 600 },
+    end: { day: "2026-10-12", min: 660 },
+  };
+  const later: Timing = {
+    kind: "timed",
+    start: { day: "2026-10-12", min: 720 },
+    end: { day: "2026-10-12", min: 780 },
+  };
+  const offer = (token: string) => ({ undo_token: token, undo_seconds: 8 });
+  const saved = (token: string | null): WriteOutcome => ({
+    outcome: "saved",
+    warnings: [],
+    ...(token ? { undo: offer(token) } : {}),
+  });
+
+  /** A fresh store, the calendar's reads of the mirror through it (under StrictMode), and a drop of
+   *  the dentist from nine to ten. */
+  async function loadMove() {
+    vi.resetModules();
+    const mod = await import("./useEventWrites");
+    const { StrictMode } = await import("react");
+    const { renderHook, act } = await import("@testing-library/react");
+    const reads: ((events: CalendarEvent[]) => void)[] = [];
+    const read = () => new Promise<CalendarEvent[]>((resolve) => reads.push(resolve));
+    const hook = renderHook(
+      () => ({
+        writes: mod.useEventWrites(),
+        load: mod.useMirrorReads(read, () => {}, vi.fn()),
+      }),
+      { wrapper: StrictMode },
+    );
+    await act(async () => {});
+    const drop = mod.dropOf(withUid, from, to, false);
+    return { mod, hook, act, reads, drop };
+  }
+
+  it("sends what the user saw and where it went, and offers Undo for its seconds", async () => {
+    rescheduleCalendarEvent.mockResolvedValue(saved("u1"));
+    const { mod, hook, act, drop } = await loadMove();
+    act(() => void mod.beginMove(drop));
+    await act(() => mod.moveEvent(drop, null, null, null));
+    expect(rescheduleCalendarEvent).toHaveBeenCalledWith(
+      {
+        event_id: withUid.id,
+        seen: { start: withUid.start, end: withUid.end, all_day: false },
+        to: {
+          kind: "timed",
+          start_date: "2026-10-12",
+          start_time: "10:00",
+          end_date: "2026-10-12",
+          end_time: "11:00",
+        },
+        device_zone: drop.zone,
+      },
+      null,
+      null,
+      null,
+      null,
+    );
+    const [notice] = hook.result.current.writes.notices;
+    expect(notice).toMatchObject({
+      tone: "ok",
+      undoToken: "u1",
+      undoLabel: "Undo moving “Dentist”",
+      undoKind: "change",
+      undoRow: withUid.id,
+    });
+    expect(notice.text).toMatch(/^“Dentist” is now .+\.$/);
+    expect(notice.text).not.toContain("second email");
+    // Its window closes: the Undo goes, then the notice, like any done one.
+    act(() => {
+      vi.advanceTimersByTime(8000);
+    });
+    expect(hook.result.current.writes.notices[0].undoToken).toBeUndefined();
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(hook.result.current.writes.notices).toEqual([]);
+  });
+
+  it("says guests get a second email if a move that emailed them is undone", async () => {
+    rescheduleCalendarEvent.mockResolvedValue(saved("u1"));
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, null, "external_only", GUESTS));
+    expect(rescheduleCalendarEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      null,
+      null,
+      "external_only",
+      GUESTS,
+    );
+    const [notice] = hook.result.current.writes.notices;
+    expect(notice.text).toMatch(/ Guests will get a second email if you undo\.$/);
+    expect(notice.undoLabel).toBe("Undo moving “Dentist” (guests get a second email)");
+    // Once the Undo has gone, so have the words about it.
+    act(() => {
+      vi.advanceTimersByTime(8000);
+    });
+    expect(hook.result.current.writes.notices[0].text).not.toContain("second email");
+  });
+
+  it("Ctrl+Z presses a move's Undo, and the event goes back", async () => {
+    rescheduleCalendarEvent.mockResolvedValue(saved("u1"));
+    undoCalendarChange.mockResolvedValue(saved(null));
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, null, null, null));
+    let pressed = false;
+    await act(async () => {
+      pressed = mod.undoLatest();
+    });
+    expect(pressed).toBe(true);
+    expect(undoCalendarChange).toHaveBeenCalledWith("u1");
+    expect(deleteCalendarEvent).not.toHaveBeenCalled();
+    expect(cancelCalendarDelete).not.toHaveBeenCalled();
+    expect(hook.result.current.writes.notices[0]).toEqual({
+      id: 1,
+      tone: "ok",
+      text: "Moved “Dentist” back.",
+    });
+    // Drawn where it was until a read has it there; another account's copy, which may have caught
+    // up with the move, is hidden where the move had put it.
+    expect(hook.result.current.writes.moves.get(withUid.id)).toMatchObject({
+      timing: from,
+      phase: "landed",
+    });
+    expect(hook.result.current.writes.twins.get(occurrenceKey(ghostEvent(withUid, to))!)).toEqual({
+      except: withUid.id,
+      until: expect.any(Number),
+    });
+    expect(mod.undoLatest()).toBe(false);
+  });
+
+  it("a new move of the same event takes the earlier Undo away when it's sent, not before", async () => {
+    rescheduleCalendarEvent.mockResolvedValueOnce(saved("u1")).mockResolvedValueOnce(saved("u2"));
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, null, null, null));
+    const again = mod.dropOf(withUid, to, later, false);
+    act(() => void mod.beginMove(again));
+    // Back from the dialog would keep it: the backend still holds it.
+    expect(hook.result.current.writes.notices[0].undoToken).toBe("u1");
+    await act(() => mod.moveEvent(again, null, null, null));
+    const [first, second] = hook.result.current.writes.notices;
+    expect(first.undoToken).toBeUndefined();
+    expect(second.undoToken).toBe("u2");
+    expect(mod.latestUndo(hook.result.current.writes.notices)).toEqual({
+      token: "u2",
+      kind: "change",
+    });
+  });
+
+  it("a delete or a reply of the event takes its move's Undo away", async () => {
+    rescheduleCalendarEvent.mockResolvedValue(saved("u1"));
+    respondToCalendarEvent.mockResolvedValue({ outcome: "saved", warnings: [] });
+    deleteCalendarEvent.mockResolvedValue(held);
+    for (const write of ["reply", "delete"] as const) {
+      const { mod, hook, act, drop } = await loadMove();
+      await act(() => mod.moveEvent(drop, null, null, null));
+      expect(hook.result.current.writes.notices[0].undoToken).toBe("u1");
+      if (write === "reply") await act(() => mod.respond(withUid.id, "yes"));
+      else await act(async () => void (await mod.startDelete(withUid)));
+      expect(hook.result.current.writes.notices[0].undoToken).toBeUndefined();
+    }
+  });
+
+  it("a pending move settles on the read its landing starts, not an earlier one", async () => {
+    let answer: (o: WriteOutcome) => void = () => {};
+    rescheduleCalendarEvent.mockReturnValue(new Promise((r) => (answer = r)));
+    const { mod, hook, act, reads, drop } = await loadMove();
+    act(() => void mod.beginMove(drop));
+    let sent: Promise<WriteOutcome> = Promise.resolve({ outcome: "no_change" });
+    act(() => {
+      sent = mod.moveEvent(drop, null, null, null);
+    });
+    expect(hook.result.current.writes.moves.get(withUid.id)?.phase).toBe("saving");
+    // The read `calendar://write-outcome` starts, begun before the webview hears the answer.
+    const early = hook.result.current.load();
+    await act(async () => {
+      answer(saved("u1"));
+      await sent;
+    });
+    expect(hook.result.current.writes.moves.get(withUid.id)?.phase).toBe("landed");
+    // The landing started a read of its own.
+    expect(reads).toHaveLength(2);
+    await act(async () => {
+      reads[0]([withUid]);
+      await early;
+    });
+    expect(hook.result.current.writes.moves.has(withUid.id)).toBe(true);
+    // Another account's copy of it, still at the old time there.
+    const other = {
+      ...withUid,
+      id: "gcal:you@x.com:you@x.com:abc",
+      calendar_id: "gcal:you@x.com:you@x.com",
+    };
+    const moved = (ev: CalendarEvent) => ({ ...ev, start: "2026-10-12T10:00:00Z" });
+    await act(async () => reads[1]([moved(withUid), other]));
+    expect(hook.result.current.writes.moves.has(withUid.id)).toBe(false);
+    // It stays hidden until a read shows it moved too.
+    expect(hook.result.current.writes.twins.size).toBe(1);
+    const read = hook.result.current.load();
+    await act(async () => {
+      reads[2]([moved(withUid), moved(other)]);
+      await read;
+    });
+    expect(hook.result.current.writes.twins.size).toBe(0);
+  });
+
+  it("hides another account's copy for ten minutes at most", async () => {
+    const { mod, hook, act, reads, drop } = await loadMove();
+    act(() => void mod.beginMove(drop));
+    act(() => {
+      vi.advanceTimersByTime(10 * 60 * 1000 - 1);
+    });
+    let read = hook.result.current.load();
+    await act(async () => {
+      reads[0]([withUid]);
+      await read;
+    });
+    expect(hook.result.current.writes.twins.size).toBe(1);
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    read = hook.result.current.load();
+    await act(async () => {
+      reads[1]([withUid]);
+      await read;
+    });
+    expect(hook.result.current.writes.twins.size).toBe(0);
+  });
+
+  it("a move PM's calendar isn't refreshed with yet stays drawn, with no mark, for a while", async () => {
+    rescheduleCalendarEvent.mockResolvedValue({
+      outcome: "saved",
+      warnings: ["mirror_refresh_pending"],
+    });
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, null, null, null));
+    const entry = hook.result.current.writes.moves.get(withUid.id);
+    expect(entry).toMatchObject({ phase: "landed", mark: null });
+    expect(entry?.until).toBe(Date.now() + 10 * 60 * 1000);
+    expect(hook.result.current.writes.notices[0]).toMatchObject({
+      tone: "ok",
+      text: "Moved “Dentist” in Google. PM's calendar will show it after the next refresh.",
+    });
+    expect(hook.result.current.writes.notices[0].undoToken).toBeUndefined();
+  });
+
+  it("a refused move goes back at once, its other copies shown again, with its words", async () => {
+    rescheduleCalendarEvent.mockResolvedValue({ outcome: "conflict", fields: ["start"] });
+    const { mod, hook, act, drop } = await loadMove();
+    act(() => void mod.beginMove(drop));
+    expect(hook.result.current.writes.moves.get(withUid.id)?.phase).toBe("asking");
+    // Another account's copy of it is hidden from the start, whatever is chosen (C1-L10).
+    expect([...hook.result.current.writes.twins.values()]).toEqual([
+      { except: withUid.id, until: expect.any(Number) },
+    ]);
+    await act(() => mod.moveEvent(drop, null, null, null));
+    expect(hook.result.current.writes.moves.size).toBe(0);
+    expect(hook.result.current.writes.twins.size).toBe(0);
+    expect(hook.result.current.writes.notices[0]).toMatchObject({
+      tone: "warn",
+      text: "“Dentist” changed in Google since PM last showed it, so it wasn't moved. PM now shows Google's version.",
+    });
+  });
+
+  it("Back puts it back and shows its other copies again", async () => {
+    const { mod, hook, act, drop } = await loadMove();
+    act(() => void mod.beginMove(drop));
+    act(() => mod.cancelMove(withUid.id));
+    expect(hook.result.current.writes.moves.size).toBe(0);
+    expect(hook.result.current.writes.twins.size).toBe(0);
+    expect(rescheduleCalendarEvent).not.toHaveBeenCalled();
+  });
+
+  it("needs_choice puts no notice, and the drop waits for its flow again", async () => {
+    rescheduleCalendarEvent.mockResolvedValue({ outcome: "needs_choice", scope: true });
+    const { mod, hook, act, reads, drop } = await loadMove();
+    let flow = "";
+    act(() => {
+      flow = mod.beginMove(drop);
+    });
+    await act(() => mod.moveEvent(drop, null, null, null));
+    expect(hook.result.current.writes.notices).toEqual([]);
+    expect(hook.result.current.writes.moves.get(withUid.id)).toMatchObject({
+      phase: "asking",
+      flow,
+    });
+    // Its flow still open, a read keeps it.
+    const read = hook.result.current.load();
+    await act(async () => {
+      reads[0]([withUid]);
+      await read;
+    });
+    expect(hook.result.current.writes.moves.has(withUid.id)).toBe(true);
+  });
+
+  it("a partial move keeps its settle buttons", async () => {
+    rescheduleCalendarEvent.mockResolvedValue({
+      outcome: "partial_split",
+      token: "s1",
+      offers: ["remove", "check"],
+      from: "2026-10-12",
+    });
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, { scope: "following", token: "f" }, null, null));
+    expect(hook.result.current.writes.notices[0].split).toEqual({
+      token: "s1",
+      offers: ["remove", "check"],
+      title: "Dentist",
+    });
+    expect(hook.result.current.writes.moves.size).toBe(0);
+  });
+
+  it("a move of every occurrence says so, with no Undo", async () => {
+    rescheduleCalendarEvent.mockResolvedValue(saved(null));
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, { scope: "all", token: "a" }, null, null));
+    expect(rescheduleCalendarEvent).toHaveBeenCalledWith(expect.anything(), "all", "a", null, null);
+    expect(hook.result.current.writes.notices[0]).toMatchObject({
+      text: "Saved “Dentist” for every occurrence. To change it back, edit it again.",
+    });
+    expect(hook.result.current.writes.notices[0].undoToken).toBeUndefined();
+  });
+
+  it("sends a drop once, however often it's committed", async () => {
+    let answer: (o: WriteOutcome) => void = () => {};
+    rescheduleCalendarEvent.mockReturnValue(new Promise((r) => (answer = r)));
+    const { mod, act, drop } = await loadMove();
+    const first = mod.moveEvent(drop, null, null, null);
+    const second = mod.moveEvent(drop, null, null, null);
+    await act(async () => {
+      answer(saved("u1"));
+      await first;
+    });
+    expect(await second).toEqual(await first);
+    expect(rescheduleCalendarEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks a move's choices once while one is on its way, with what the move sends", async () => {
+    let answer: (c: SeriesChoices) => void = () => {};
+    seriesChoices.mockReturnValue(new Promise((r) => (answer = r)));
+    const { mod, act, drop } = await loadMove();
+    const first = mod.choicesForMove(drop);
+    const second = mod.choicesForMove(drop);
+    expect(first).toBe(second);
+    expect(seriesChoices).toHaveBeenCalledTimes(1);
+    expect(seriesChoices).toHaveBeenCalledWith({
+      kind: "move",
+      event_id: withUid.id,
+      seen: drop.seen,
+      to: drop.moveTo,
+      device_zone: drop.zone,
+    });
+    await act(async () => {
+      answer({ outcome: "not_repeating" });
+      await first;
+    });
+    void mod.choicesForMove(drop);
+    expect(seriesChoices).toHaveBeenCalledTimes(2);
+  });
+
+  it("an Undo answered busy keeps its button; one PM no longer holds says so", async () => {
+    rescheduleCalendarEvent.mockResolvedValue(saved("u1"));
+    undoCalendarChange
+      .mockResolvedValueOnce({ outcome: "busy" })
+      .mockResolvedValueOnce({ outcome: "failed", message: "That can't be undone any more." });
+    const { mod, hook, act, drop } = await loadMove();
+    await act(() => mod.moveEvent(drop, null, null, null));
+    await act(() => mod.undoChange("u1"));
+    expect(hook.result.current.writes.notices[0].undoToken).toBe("u1");
+    expect(hook.result.current.writes.moves.size).toBe(0);
+    await act(async () => {
+      mod.undo("u1", "change");
+    });
+    expect(hook.result.current.writes.notices[0]).toEqual({
+      id: 1,
+      tone: "error",
+      text: "Couldn't move “Dentist” back. That can't be undone any more.",
+    });
+    expect(hook.result.current.writes.moves.size).toBe(0);
   });
 });

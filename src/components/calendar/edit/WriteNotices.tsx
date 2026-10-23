@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The calendar's notices about its own writes (#884): "Deleting “Dentist”. Undo", then how it ended.
+// The calendar's notices about its own writes (#884): "Deleting “Dentist”. Undo", then how it ended;
+// after a move (C16), where it is now, with an Undo.
 // They float over the grid, bottom centre, like the reader's notice, so each mixes its tone into
 // `--bg` (see Callout) rather than letting the events behind show through. The newest Undo is also
 // Ctrl+Z (⌘Z on a Mac), which its tooltip says. A "this and following" change PM couldn't finish
@@ -28,7 +29,7 @@ import {
   SPLIT_ORDER,
   splitActionLabel,
 } from "../../../lib/calendarEdit/editReasons";
-import { latestUndo, type WriteNotice } from "./useEventWrites";
+import { latestUndo, type UndoKind, type WriteNotice } from "./useEventWrites";
 
 const UNDO_KEY = IS_MAC ? "⌘Z" : "Ctrl+Z";
 
@@ -38,7 +39,8 @@ const WAITING = "aria-disabled:cursor-not-allowed";
 
 interface Props {
   notices: readonly WriteNotice[];
-  onUndo: (token: string) => void;
+  /** Press an Undo: a delete's (`kind` "delete") or a move's (C16a). */
+  onUndo: (token: string, kind: UndoKind) => void;
   onDismiss: (id: number) => void;
   /** Settle a change PM couldn't finish (`token`, from its notice), naming its event `title`. */
   onSettle?: (token: string, action: SplitAction, title: string) => void;
@@ -62,7 +64,7 @@ export function WriteNotices({
   onHold,
 }: Props) {
   if (notices.length === 0) return null;
-  const newest = latestUndo(notices);
+  const newest = latestUndo(notices)?.token;
   // With two such notices up, each button names its event, so "Finish" isn't said twice alike.
   const partials = notices.filter((n) => n.split).length;
   const creates = notices.filter((n) => n.create).length;
@@ -190,7 +192,7 @@ export function WriteNotices({
                     size="xs"
                     aria-label={n.undoLabel}
                     aria-keyshortcuts={n.undoToken === newest ? "Control+Z Meta+Z" : undefined}
-                    onClick={() => onUndo(n.undoToken!)}
+                    onClick={() => onUndo(n.undoToken!, n.undoKind ?? "delete")}
                   >
                     Undo
                   </Button>

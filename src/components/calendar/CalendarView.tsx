@@ -29,7 +29,7 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { A11_NOTE, notOrganizerText, reasonText } from "../../lib/calendarEdit/editReasons";
+import { copyRank, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
 import { isRepeating } from "../../lib/calendarEdit/saveChoices";
@@ -723,41 +723,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
   const writes = useEventWrites();
 
-  // What PM may do to a synced event (#884): the row's own block, then its account's editing status.
-  // The list computes `edit_block` assuming editing is on; the overview says whether it is.
-  const editingFor = useCallback(
-    (ev: CalendarEvent): { canEdit: boolean; canDelete: boolean; reason: string | null } => {
-      const none = (reason: string | null) => ({ canEdit: false, canDelete: false, reason });
-      const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
-      const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
-      // Someone else's event says what the user may still do from this copy: reply when it's on
-      // the guest list, which the strip above the line offers, their own settings, and how when
-      // editing is off (C14b, C14c).
-      const theirs = ev.organizer_self === false;
-      if (ev.edit_block === "not_organizer") {
-        return none(notOrganizerText(ev.can_respond === true, on));
-      }
-      if (ev.edit_block) return none(reasonText(ev.edit_block));
-      if (cal?.provider !== "google") return none(null);
-      if (!on) {
-        return none(
-          theirs ? notOrganizerText(ev.can_respond === true, false) : reasonText("editing_off"),
-        );
-      }
-      // The gate decides Delete (C14): a locked copy, whose delete Google doesn't document, and an
-      // invitation can't be deleted. A row the list didn't mark gets none. On an invitation the line
-      // says what stays the organiser's, or Google's warning where they let guests change it.
-      const reason = ev.locked
-        ? reasonText("locked")
-        : theirs
-          ? ev.guests_can_modify
-            ? A11_NOTE
-            : notOrganizerText(ev.can_respond === true, true)
-          : null;
-      return { canEdit: true, canDelete: ev.can_delete === true, reason };
-    },
-    [overview],
-  );
+  // What PM may do to a synced event (#884): the row's own rights, then its account's editing
+  // status (`eventRights`, the one predicate the popover, the dedup and a drag read, C16a).
+  const rights = useCallback((ev: CalendarEvent) => eventRights(ev, overview), [overview]);
 
   const visibleEvents = useMemo(() => {
     // Filter to visible calendars, THEN dedup the same physical OCCURRENCE mirrored on two of them
@@ -765,7 +733,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // grid/agenda. Done after the hide filter so hiding one calendar still shows the copy on the
     // calendar left visible. Keyed on the UID alone this also collapsed every recurring series to one
     // occurrence across the whole mirror — see `occurrenceKey`, which FocusUpcoming shares. The copy
-    // kept is the first, unless a later one ranks higher (`keepRank`): the copy you organise and can
+    // kept is the first, unless a later one ranks higher (`copyRank`): the copy you organise and can
     // change, then any you can change. An invitation can be changed too (your own settings, C14c), so
     // being editable no longer means "yours"; the organiser's copy still wins over it.
     //
@@ -782,8 +750,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         .map(occurrenceKey)
         .filter((k): k is string => k !== null),
     );
-    const keepRank = (e: CalendarEvent) =>
-      editingFor(e).canEdit ? (e.organizer_self === true ? 2 : 1) : 0;
+    const keepRank = (e: CalendarEvent) => copyRank(rights(e), e);
     const at = new Map<string, number>();
     const out: CalendarEvent[] = [];
     const copies: CalendarEvent[] = [];
@@ -810,7 +777,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     if (!hidden.has(MILESTONE_CALENDAR_ID)) marked.push(...milestoneEvents);
     if (!hidden.has(PINBOARD_CALENDAR_ID)) marked.push(...pinboardEvents);
     return marked;
-  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor, overview]);
+  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, rights, overview]);
 
   // The new event's ghost (C10c): quick create's draft in its calendar's colour, saying how far it
   // has got, or a saved one's waiting for its row. It joins after the hide filter, so it shows on a
@@ -850,7 +817,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return overview?.accounts.find((a) => a.id === cal?.source_id)?.email ?? null;
   };
   const popoverEditing = (ev: CalendarEvent): PopoverEditing => ({
-    ...editingFor(ev),
+    ...rights(ev),
     onEdit: () => {
       setEventPopup(null);
       setEditing(ev);
@@ -1162,8 +1129,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         // resolved, and the day columns inside it are keyed by date, so a step unmounts the one
         // leaving the window. `useHorizontalWheelShift` owns neither problem from here — it listens on the
         // window and hit-tests this element's box, so it needs only to be told which box (its
-        // header has the two failure modes that shape came from).
-        <div ref={gridRef} className="flex min-h-0 flex-1 flex-col">
+        // header has the two failure modes that shape came from). `data-calendar-grid` is where the
+        // drag gesture will hold the pointer (C16b); until then the pointer-capture probe (LD1, a
+        // devtools snippet) finds it by that.
+        <div ref={gridRef} className="flex min-h-0 flex-1 flex-col" data-calendar-grid="">
           {/* key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the
               keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not
               JS). The day component of the key (from the minute tick) remounts the body when the
@@ -1284,7 +1253,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       />
       <WriteNotices
         notices={writes.notices}
-        onUndo={(token) => void writes.undoDelete(token)}
+        onUndo={(token, kind) => writes.undo(token, kind)}
         onDismiss={writes.dismissNotice}
         onSettle={(token, action, title) => void writes.settleSplit(token, action, title)}
         onCheckCreate={(id) =>

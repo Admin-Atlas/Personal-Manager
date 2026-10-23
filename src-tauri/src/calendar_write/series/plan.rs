@@ -1151,8 +1151,9 @@ fn lines_of(v: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// The values `fresh` holds for `keys`, absent ones as `null`.
-pub(super) fn snapshot(fresh: &Value, keys: &[&str]) -> Map<String, Value> {
+/// The values `fresh` holds for `keys`, absent ones as `null`. A one-event move's Undo keeps the same
+/// (C16a), so `pub(crate)`.
+pub(crate) fn snapshot(fresh: &Value, keys: &[&str]) -> Map<String, Value> {
     keys.iter()
         .map(|k| {
             (

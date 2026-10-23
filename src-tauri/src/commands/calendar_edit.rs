@@ -48,9 +48,10 @@ use crate::calendar_write::classify::{Method, Verdict};
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
     FieldPermissions, GuestForEdit, GuestNotice, HeldDeleteInfo, ListRights, MilestoneMoves,
-    MilestoneOffer, NewEventDraft, Notify, ReadOnlyReason, RemindersDraft, RepeatDraft, Rsvp,
-    RsvpScope, ScopeRow, SeenSummary, SeriesChoices, SeriesInfo, SeriesScope, SeriesWarningDto,
-    ShowAs, SplitAction, TimeDraft, Visibility, WriteOutcome, WriteWarning,
+    MilestoneOffer, MoveRequest, MoveTo, NewEventDraft, Notify, ReadOnlyReason, RemindersDraft,
+    RepeatDraft, Rsvp, RsvpScope, ScopeRow, SeenSummary, SeenTimes, SeriesChoices, SeriesInfo,
+    SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft, UndoOffer, Visibility,
+    WriteOutcome, WriteWarning,
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
@@ -60,8 +61,8 @@ use crate::calendar_write::rsvp;
 use crate::calendar_write::series::diff::{self, Expect, GoneRow, Refetch, Removes, SeriesDiff};
 use crate::calendar_write::series::journal::{self, Entry, Look, Orphan};
 use crate::calendar_write::series::plan::{
-    marks_from, plan_series_delete, plan_series_edit, Fresh, NotPlanned, Op, Opened, SeriesInput,
-    SeriesPlan, SeriesWarning, Shows, Step, Undo,
+    marks_from, plan_series_delete, plan_series_edit, snapshot, Fresh, NotPlanned, Op, Opened,
+    SeriesInput, SeriesPlan, SeriesWarning, Shows, Step, Undo,
 };
 use crate::calendar_write::series::run::{
     Answer, End, Machine, Next, Ran, Rollback, Run, Settle, SettleAction, Settled, Unfit, Unsent,
@@ -82,8 +83,8 @@ use super::shared::require_main_window;
 use super::vaults::require_vault_owner;
 
 /// What editing keeps in memory, in [`AppState`]. Lock order everywhere: the DB, then `recent`;
-/// `partials`, `splitting`, `creates`, `in_flight` and `summaries` are each taken alone, never with
-/// the DB or another of these held.
+/// `partials`, `splitting`, `creates`, `in_flight`, `summaries` and `undos` are each taken alone,
+/// never with the DB or another of these held, and never across an await.
 #[derive(Default)]
 pub struct CalendarEditState {
     /// Saves of the last ten minutes, laid over each sync's fetch (rule R4).
@@ -115,6 +116,10 @@ pub struct CalendarEditState {
     /// Each repeating event's words for the popover, by [`series_key`] (C9b-2). Forgotten by any
     /// write to the series ([`InFlight`]'s and [`HeldClaim`]'s drop).
     summaries: Mutex<Summaries>,
+    /// Moves that can still be undone, by the token the webview names them with (C16a). One per
+    /// row: any later landing on the row lets its Undo go ([`retire_landed`]). Lost on a reload of
+    /// the webview's notice or a restart, which only loses the offer (A15: one Undo duration).
+    undos: Mutex<HashMap<String, ChangeUndo>>,
 }
 
 /// An open editor: which event, and the copy of it the user saw.
@@ -930,13 +935,14 @@ fn rule_lines(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// A one-event save that landed, with Google's copy of it `saved`: into the mirror, the session moved
-/// onto it. A one-off made to repeat (`repeats`) lands as the repeating event it now is.
+/// A one-event save that landed, with Google's copy of it `saved`: into the mirror, an editor's
+/// session (`None` for a move or an Undo) moved onto it. A one-off made to repeat (`repeats`) lands as
+/// the repeating event it now is.
 async fn landed_save<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
-    session: &str,
+    session: Option<&str>,
     saved: Value,
     sent: &serde_json::Map<String, Value>,
     repeats: &Option<SeriesStart>,
@@ -955,7 +961,7 @@ async fn landed_in_part<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
-    session: &str,
+    session: Option<&str>,
     saved: Value,
     sent: &serde_json::Map<String, Value>,
     repeats: &Option<SeriesStart>,
@@ -970,12 +976,14 @@ async fn landed_in_part<W: Wire, H: Host>(
             mut warnings,
             left_behind,
             milestone_moves,
+            undo,
         } => {
             warnings.push(WriteWarning::PartlyApplied);
             WriteOutcome::Saved {
                 warnings,
                 left_behind,
                 milestone_moves,
+                undo,
             }
         }
         other => other,
@@ -990,10 +998,12 @@ async fn land_repeating_save<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
-    session: &str,
+    session: Option<&str>,
     copy: &Value,
 ) -> WriteOutcome {
-    end_session(host.edit(), session);
+    if let Some(session) = session {
+        end_session(host.edit(), session);
+    }
     let cal = CalIds {
         calendar_id: &target.calendar_id,
         remote_calendar: &target.remote_calendar,
@@ -1090,151 +1100,169 @@ async fn save_event<W: Wire, H: Host>(
     let Some(_flight) = InFlight::claim(host.edit(), &open.target.row_id) else {
         return WriteOutcome::Busy;
     };
-    let target = &open.target;
+    let one = OneWrite {
+        wire,
+        host,
+        target: &open.target,
+        editing,
+    };
+    let basis = Basis::Session {
+        session,
+        open,
+        draft,
+    };
+    // An editor's save offers no Undo yet: that comes with the editor's own (C16d).
+    send_one(&one, &basis, answer).await.0
+}
 
-    // At most two rounds: a 412 means the event changed between our GET and our PATCH, and gets one
-    // fresh look (R2); a second 412 is a conflict.
+// --- one write to one event: an editor's save, a drop, an Undo (C16a) ---
+
+/// What a one-event write works with (C16 critique C1-M4): Google through `wire`, the mirror and the
+/// claims through `host`, the event, and the account's editing status.
+struct OneWrite<'a, W, H> {
+    wire: &'a W,
+    host: &'a H,
+    target: &'a Target,
+    editing: EditingStatus,
+}
+
+/// What a one-event write is, and so what it is checked against on Google's fresh copy before
+/// anything is sent (R2).
+enum Basis<'a> {
+    /// An editor's save: its draft, against the copy the editor opened; the session moves onto
+    /// what lands.
+    Session {
+        session: &'a str,
+        open: &'a EditSession,
+        draft: &'a EventPatchDraft,
+    },
+    /// A drop: the times the user dragged (`seen`), where to (`to`, this computer's wall time), and
+    /// this computer's zone.
+    Seen {
+        seen: &'a SeenTimes,
+        to: &'a MoveTo,
+        device: Option<chrono_tz::Tz>,
+    },
+    /// An Undo: Google must still hold what the write left.
+    Undo(&'a ChangeUndo),
+}
+
+impl Basis<'_> {
+    /// The editor's session, which a landing moves onto Google's copy; none for a drop or an Undo.
+    fn session(&self) -> Option<&str> {
+        match self {
+            Basis::Session { session, .. } => Some(session),
+            Basis::Seen { .. } | Basis::Undo(_) => None,
+        }
+    }
+}
+
+/// One round's body, ready to go: what it sends, the Send / Don't send it goes with and who that
+/// would reach (`None`: nobody), and, for a one-off given a repeat, where the rule starts.
+struct Ready {
+    body: serde_json::Map<String, Value>,
+    notify: Notify,
+    guests: Option<GuestNotice>,
+    repeats: Option<SeriesStart>,
+}
+
+/// A one-event write Google holds as sent, read from its answer (or the look after one that never
+/// came): what an Undo needs (C16a). Google's values of the keys sent, from the copy the write went
+/// out on (`before`) and from its answer (`after`), the Send / Don't send it went with, and who that
+/// would reach.
+struct Landed {
+    before: serde_json::Map<String, Value>,
+    after: serde_json::Map<String, Value>,
+    notify: Notify,
+    guests: Option<GuestNotice>,
+}
+
+/// Send one write to one event: a fresh copy, the checks `basis` names on it, one PATCH guarded by
+/// its etag, and Google's answer into the mirror. At most two rounds: a 412 means the event changed
+/// between the GET and the PATCH, and gets one fresh look (R2); a second is a conflict. `Landed`
+/// comes back beside a save that landed with nothing to say about it, for an Undo.
+async fn send_one<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    basis: &Basis<'_>,
+    answer: &GuestAnswer,
+) -> (WriteOutcome, Option<Landed>) {
+    let (wire, host, target) = (one.wire, one.host, one.target);
+    let session = basis.session();
     for round in 1..=2 {
         let fresh = match get(wire, &target.remote_calendar, &target.remote_event).await {
             Fetched::Event(fresh) => fresh,
-            Fetched::Gone => return land_gone(host, target, None),
-            Fetched::Reauth => return WriteOutcome::Reauth,
-            Fetched::Busy => return WriteOutcome::Busy,
-            Fetched::Failed(message) => return WriteOutcome::Failed { message },
+            Fetched::Gone => return (land_gone(host, target, None), None),
+            Fetched::Reauth => return (WriteOutcome::Reauth, None),
+            Fetched::Busy => return (WriteOutcome::Busy, None),
+            Fetched::Failed(message) => return (WriteOutcome::Failed { message }, None),
         };
         if patch::is_gone(&fresh) {
-            return land_gone(host, target, Some(&fresh));
+            return (land_gone(host, target, Some(&fresh)), None);
         }
-        let facts = facts_from_fresh(&fresh, &target.facts, editing);
-        let perms = gate::edit_rights(&facts);
-        if let Some(reason) = refused_field(&perms, draft) {
-            return WriteOutcome::ReadOnly { reason };
-        }
-        // An occurrence of a repeating event: which occurrences is the user's choice, never a
-        // default (rule R9). Only a GET has gone out.
-        if fresh.get("recurringEventId").is_some() {
-            return WriteOutcome::needs_scope();
-        }
-        // Guest changes need real addresses, each once, the organiser and the user left as they
-        // are, and Google's whole list to go onto (C12).
-        if let Err(e) = attendees::check(&fresh, draft.guest_ops()) {
-            return WriteOutcome::Failed {
-                message: e.to_string(),
-            };
-        }
-        // The one-off new part of a change PM couldn't finish waits until that change is settled.
-        // Only reads have gone out.
-        if let Some(held) = held_new_part(wire, host, target, &fresh).await {
-            return held;
-        }
-        let mut body = match patch::build_patch(&fresh, draft) {
-            Ok(body) => body,
-            Err(e) => {
-                return WriteOutcome::Failed {
-                    message: e.to_string(),
-                }
+        let ready = match basis {
+            Basis::Session { open, draft, .. } => {
+                ready_save(one, open, draft, &fresh, answer).await
             }
+            Basis::Seen { seen, to, device } => {
+                ready_move(one, seen, to, *device, &fresh, answer).await
+            }
+            Basis::Undo(record) => ready_undo(one, record, &fresh),
         };
-        // A one-off given a repeat (C11 §10): its times and its rule go with the rest, started on the
-        // first day the rule makes, read in the zone the editor showed them in; where it repeats from
-        // is kept to read Google's copy by. "Does not repeat" is what a one-off already does.
-        let repeats = match &draft.recurrence {
-            Some(RepeatDraft::Rule { rule }) => match patch::add_repeat(
-                &mut body,
-                &fresh,
-                draft.time.as_ref(),
-                rule,
-                shown_zone(&target.facts, open.device_zone).as_deref(),
-            ) {
-                Ok(start) => Some(start),
-                Err(e) => {
-                    return WriteOutcome::Failed {
-                        message: e.to_string(),
-                    }
-                }
-            },
-            Some(RepeatDraft::Once) | None => None,
-        };
-        if body.is_empty() {
-            return WriteOutcome::NoChange;
-        }
-        // Fail closed: a single-event save sends nothing beyond the fields it may change, and its
-        // repeat only when it was given one.
-        let allowed = if repeats.is_some() {
-            patch::REPEAT_PATCHABLE
-        } else {
-            patch::PATCHABLE
-        };
-        if body.keys().any(|k| !allowed.contains(&k.as_str())) {
-            return WriteOutcome::Failed {
-                message: "PM built a change it isn't allowed to send, so nothing was saved.".into(),
-            };
-        }
-        match patch::update_check(&open.base, &fresh, &body) {
-            UpdateCheck::Proceed => {}
-            UpdateCheck::Gone => return land_gone(host, target, Some(&fresh)),
-            UpdateCheck::Conflict(fields) => return WriteOutcome::Conflict { fields },
-        }
-        // R9: who this would email is the user's to say, every time, for the numbers they saw;
-        // nobody, and it's `none` (R7). Asked before anything is sent, a second round included.
-        let notify = match answer.for_write(attendees::notify_required(
-            &fresh,
-            &body,
-            &own_of(target, &[&fresh]),
-        )) {
-            Ok(notify) => notify,
-            Err(ask) => return ask,
+        let ready = match ready {
+            Ok(ready) => ready,
+            Err(outcome) => return (outcome, None),
         };
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
-            return WriteOutcome::Failed {
-                message: "Google sent this event without a version stamp, so PM won't change it."
-                    .into(),
-            };
+            let message =
+                "Google sent this event without a version stamp, so PM won't change it.".into();
+            return (WriteOutcome::Failed { message }, None);
         };
         // R7/R9: the user's answer, or none where nobody would be emailed.
         let request = plan::patch_event(
             &target.remote_calendar,
             &target.remote_event,
             etag,
-            Value::Object(body.clone()),
-            notify,
+            Value::Object(ready.body.clone()),
+            ready.notify,
             plan::VersionFlags::default(),
         );
         let reply = match wire.send(&request).await {
             Ok(reply) => reply,
-            Err(google_io::NoAnswer::Unsent { why, .. }) => return unsent_outcome(why),
+            Err(google_io::NoAnswer::Unsent { why, .. }) => return (unsent_outcome(why), None),
             // No answer, or a sign-in refused after a server error: it may or may not have landed.
             // Look before saying either (review H1).
             Err(google_io::NoAnswer::Lost { .. }) => {
-                return after_lost_answer(
-                    wire,
-                    host,
-                    target,
-                    session,
-                    &fresh,
-                    &body,
-                    repeats.as_ref(),
-                )
-                .await
+                return after_lost_answer(one, session, &fresh, &ready).await
             }
         };
         // A server error on the way may have been applied, whatever the last answer says (a retry
         // of a copy that landed is answered 412): look before reporting anything but success.
         if reply.maybe_applied && reply.verdict != Verdict::Ok {
             match get(wire, &target.remote_calendar, &target.remote_event).await {
-                Fetched::Event(now) => match shown_by(&fresh, &now, &body, repeats.as_ref()) {
-                    Shown::Landed => {
-                        return landed_save(wire, host, target, session, now, &body, &repeats).await
+                Fetched::Event(now) => {
+                    match shown_by(&fresh, &now, &ready.body, ready.repeats.as_ref()) {
+                        Shown::Landed => {
+                            return landed_one(one, session, &fresh, now, &ready).await
+                        }
+                        Shown::Partly => {
+                            let outcome = landed_in_part(
+                                wire,
+                                host,
+                                target,
+                                session,
+                                now,
+                                &ready.body,
+                                &ready.repeats,
+                            )
+                            .await;
+                            return (outcome, None);
+                        }
+                        Shown::Unsure => return (WriteOutcome::Unconfirmed, None),
+                        Shown::NotThere => {}
                     }
-                    Shown::Partly => {
-                        return landed_in_part(wire, host, target, session, now, &body, &repeats)
-                            .await
-                    }
-                    Shown::Unsure => return WriteOutcome::Unconfirmed,
-                    Shown::NotThere => {}
-                },
-                Fetched::Gone => return land_gone(host, target, None),
-                _ => return WriteOutcome::Unconfirmed,
+                }
+                Fetched::Gone => return (land_gone(host, target, None), None),
+                _ => return (WriteOutcome::Unconfirmed, None),
             }
         }
         match reply.verdict {
@@ -1242,40 +1270,299 @@ async fn save_event<W: Wire, H: Host>(
                 return match serde_json::from_str::<Value>(&reply.body) {
                     // Google's copy is read for what it holds of the save, a one-off made to repeat
                     // by meaning (C13 critique C2-H1, review round 1). All of it: saved.
-                    Ok(saved) => match shown_by(&fresh, &saved, &body, repeats.as_ref()) {
-                        Shown::Landed => {
-                            landed_save(wire, host, target, session, saved, &body, &repeats).await
+                    Ok(saved) => {
+                        match shown_by(&fresh, &saved, &ready.body, ready.repeats.as_ref()) {
+                            Shown::Landed => landed_one(one, session, &fresh, saved, &ready).await,
+                            // Every field it sent as it was (a colour Google wouldn't clear, say):
+                            // never "Saved", as a repeating event's write already says.
+                            Shown::NotThere if patch::none_applied(&fresh, &saved, &ready.body) => {
+                                (WriteOutcome::IgnoredByGoogle { split: false }, None)
+                            }
+                            // Applied, but not all of it as sent: a title that landed beside a colour
+                            // Google kept, or a rule it wrote to mean something else. Google's copy is
+                            // landed as it is and the words say to look: never "nothing changed", and
+                            // never a plain "Saved".
+                            _ => {
+                                let outcome = landed_in_part(
+                                    wire,
+                                    host,
+                                    target,
+                                    session,
+                                    saved,
+                                    &ready.body,
+                                    &ready.repeats,
+                                )
+                                .await;
+                                (outcome, None)
+                            }
                         }
-                        // Every field it sent as it was (a colour Google wouldn't clear, say):
-                        // never "Saved", as a repeating event's write already says.
-                        Shown::NotThere if patch::none_applied(&fresh, &saved, &body) => {
-                            WriteOutcome::IgnoredByGoogle { split: false }
-                        }
-                        // Applied, but not all of it as sent: a title that landed beside a colour
-                        // Google kept, or a rule it wrote to mean something else. Google's copy is
-                        // landed as it is and the words say to look: never "nothing changed", and
-                        // never a plain "Saved".
-                        _ => {
-                            landed_in_part(wire, host, target, session, saved, &body, &repeats)
-                                .await
-                        }
-                    },
+                    }
                     // Saved, but the reply wasn't JSON: the next sync will show it. A one-off made
                     // to repeat is a repeating event now, which this editor's copy no longer is.
                     Err(_) => {
-                        if repeats.is_some() {
+                        if let (Some(session), Some(_)) = (session, &ready.repeats) {
                             end_session(host.edit(), session);
                         }
-                        saved_pending(host, target)
+                        (saved_pending(host, target), None)
                     }
                 };
             }
             Verdict::Conflict if round == 1 => continue,
-            Verdict::Gone => return land_gone(host, target, None),
-            verdict => return outcome_for(verdict, editing),
+            Verdict::Conflict => return (conflicted(one, basis).await, None),
+            Verdict::Gone => return (land_gone(host, target, None), None),
+            verdict => return (outcome_for(verdict, one.editing), None),
         }
     }
-    WriteOutcome::Conflict { fields: Vec::new() }
+    (conflicted(one, basis).await, None)
+}
+
+/// A second 412: a conflict. An editor keeps its draft and says so; a drop or an Undo shows Google's
+/// copy now, so the words that say PM shows Google's version are true (C16 critique C2-M10).
+async fn conflicted<W: Wire, H: Host>(one: &OneWrite<'_, W, H>, basis: &Basis<'_>) -> WriteOutcome {
+    let conflict = WriteOutcome::Conflict { fields: Vec::new() };
+    if matches!(basis, Basis::Session { .. }) {
+        return conflict;
+    }
+    let (host, target) = (one.host, one.target);
+    match get(one.wire, &target.remote_calendar, &target.remote_event).await {
+        Fetched::Event(now) if patch::is_gone(&now) => land_gone(host, target, Some(&now)),
+        Fetched::Event(now) => land_fresh(host, target, &now, conflict),
+        Fetched::Gone => land_gone(host, target, None),
+        _ => conflict,
+    }
+}
+
+/// A one-event write Google holds as sent (`saved`: its answer, or the look after one that never
+/// came), landed, `before` being the copy it went out on; with what an Undo of it needs. Whether one
+/// is offered is [`with_undo`]'s to say (a save with something to say beside it, or that sent more
+/// than the core fields, a repeat among them, has none).
+async fn landed_one<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    session: Option<&str>,
+    before: &Value,
+    saved: Value,
+    ready: &Ready,
+) -> (WriteOutcome, Option<Landed>) {
+    let keys: Vec<&str> = ready.body.keys().map(String::as_str).collect();
+    let landed = Landed {
+        before: snapshot(before, &keys),
+        after: snapshot(&saved, &keys),
+        notify: ready.notify,
+        guests: ready.guests.clone(),
+    };
+    let outcome = landed_save(
+        one.wire,
+        one.host,
+        one.target,
+        session,
+        saved,
+        &ready.body,
+        &ready.repeats,
+    )
+    .await;
+    (outcome, Some(landed))
+}
+
+/// An editor's save, checked on Google's copy `fresh`: the gate, which occurrences (R9), its guest
+/// changes, a change PM couldn't finish, the body, R2 against the copy the editor opened, and Send /
+/// Don't send. Only reads have gone out when it refuses.
+async fn ready_save<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    open: &EditSession,
+    draft: &EventPatchDraft,
+    fresh: &Value,
+    answer: &GuestAnswer,
+) -> std::result::Result<Ready, WriteOutcome> {
+    let target = one.target;
+    let failed = |message: String| WriteOutcome::Failed { message };
+    let facts = facts_from_fresh(fresh, &target.facts, one.editing);
+    let perms = gate::edit_rights(&facts);
+    if let Some(reason) = refused_field(&perms, draft) {
+        return Err(WriteOutcome::ReadOnly { reason });
+    }
+    // An occurrence of a repeating event: which occurrences is the user's choice, never a default
+    // (rule R9). Only a GET has gone out.
+    if fresh.get("recurringEventId").is_some() {
+        return Err(WriteOutcome::needs_scope());
+    }
+    // Guest changes need real addresses, each once, the organiser and the user left as they are,
+    // and Google's whole list to go onto (C12).
+    attendees::check(fresh, draft.guest_ops()).map_err(|e| failed(e.to_string()))?;
+    // The one-off new part of a change PM couldn't finish waits until that change is settled. Only
+    // reads have gone out.
+    if let Some(held) = held_new_part(one.wire, one.host, target, fresh).await {
+        return Err(held);
+    }
+    let mut body = patch::build_patch(fresh, draft).map_err(|e| failed(e.to_string()))?;
+    // A one-off given a repeat (C11 §10): its times and its rule go with the rest, started on the
+    // first day the rule makes, read in the zone the editor showed them in; where it repeats from is
+    // kept to read Google's copy by. "Does not repeat" is what a one-off already does.
+    let repeats = match &draft.recurrence {
+        Some(RepeatDraft::Rule { rule }) => Some(
+            patch::add_repeat(
+                &mut body,
+                fresh,
+                draft.time.as_ref(),
+                rule,
+                shown_zone(&target.facts, open.device_zone).as_deref(),
+            )
+            .map_err(|e| failed(e.to_string()))?,
+        ),
+        Some(RepeatDraft::Once) | None => None,
+    };
+    if body.is_empty() {
+        return Err(WriteOutcome::NoChange);
+    }
+    // Fail closed: a single-event save sends nothing beyond the fields it may change, and its repeat
+    // only when it was given one.
+    let allowed = if repeats.is_some() {
+        patch::REPEAT_PATCHABLE
+    } else {
+        patch::PATCHABLE
+    };
+    if body.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return Err(failed(UNFIT.into()));
+    }
+    match patch::update_check(&open.base, fresh, &body) {
+        UpdateCheck::Proceed => {}
+        UpdateCheck::Gone => return Err(land_gone(one.host, target, Some(fresh))),
+        UpdateCheck::Conflict(fields) => return Err(WriteOutcome::Conflict { fields }),
+    }
+    // R9: who this would email is the user's to say, every time, for the numbers they saw; nobody,
+    // and it's `none` (R7). Asked before anything is sent, a second round included.
+    let guests = attendees::notify_required(fresh, &body, &own_of(target, &[fresh]));
+    let notify = answer.for_write(guests.clone())?;
+    Ok(Ready {
+        body,
+        notify,
+        guests,
+        repeats,
+    })
+}
+
+/// A drop, checked on Google's copy `fresh` (C16a): the time's own gate (the reason first, as for a
+/// save, C16 critique C1-L3), which occurrences (R9), whether the time is still the one the user
+/// dragged (when it isn't, Google's copy lands, so the next drag starts from it), and a change PM
+/// couldn't finish; then the body, which is the start and end only, and Send / Don't send.
+async fn ready_move<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    seen: &SeenTimes,
+    to: &MoveTo,
+    device: Option<chrono_tz::Tz>,
+    fresh: &Value,
+    answer: &GuestAnswer,
+) -> std::result::Result<Ready, WriteOutcome> {
+    let (host, target) = (one.host, one.target);
+    let failed = |message: String| WriteOutcome::Failed { message };
+    let perms = gate::edit_rights(&facts_from_fresh(fresh, &target.facts, one.editing));
+    if !perms.time {
+        return Err(WriteOutcome::ReadOnly {
+            reason: gate::reason_for(&perms, gate::Field::Time),
+        });
+    }
+    if fresh.get("recurringEventId").is_some() {
+        return Err(WriteOutcome::needs_scope());
+    }
+    match patch::timing_still_matches(seen, fresh) {
+        DeleteCheck::Matches => {}
+        DeleteCheck::Gone => return Err(land_gone(host, target, Some(fresh))),
+        DeleteCheck::Changed(fields) => return Err(land_changed(host, target, fresh, fields)),
+    }
+    if let Some(held) = held_new_part(one.wire, host, target, fresh).await {
+        return Err(held);
+    }
+    let time = time::retime_draft(to, device, fresh).map_err(|e| failed(e.to_string()))?;
+    let draft = EventPatchDraft {
+        time: Some(time),
+        ..Default::default()
+    };
+    let body = patch::build_patch(fresh, &draft).map_err(|e| failed(e.to_string()))?;
+    if body.is_empty() {
+        return Err(WriteOutcome::NoChange);
+    }
+    // Fail closed: a drop sends its start and end, and nothing else.
+    if body
+        .keys()
+        .any(|k| !patch::TIMING_KEYS.contains(&k.as_str()))
+    {
+        return Err(failed(UNFIT.into()));
+    }
+    let guests = attendees::notify_required(fresh, &body, &own_of(target, &[fresh]));
+    let notify = answer.for_write(guests.clone())?;
+    Ok(Ready {
+        body,
+        notify,
+        guests,
+        repeats: None,
+    })
+}
+
+/// An Undo, checked on Google's copy `fresh` (C16a): each field's own gate, then that Google still
+/// holds what the write left (when it doesn't, Google's copy lands and nothing is sent); then the
+/// body that puts Google's own values back, emailing whom the write did, and only while that is
+/// still who it would reach (C16 critique C1-L7). No R9: the record names the very event PM wrote.
+fn ready_undo<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    record: &ChangeUndo,
+    fresh: &Value,
+) -> std::result::Result<Ready, WriteOutcome> {
+    let (host, target) = (one.host, one.target);
+    let unfit = || WriteOutcome::Failed {
+        message: UNFIT.into(),
+    };
+    let perms = gate::edit_rights(&facts_from_fresh(fresh, &target.facts, one.editing));
+    if let Some(reason) = undo_refused(&perms, &record.before) {
+        return Err(WriteOutcome::ReadOnly { reason });
+    }
+    let changed = patch::still_holds(fresh, &record.after);
+    if !changed.is_empty() {
+        return Err(land_changed(host, target, fresh, changed));
+    }
+    let body = patch::undo_body(fresh, &record.before).ok_or_else(unfit)?;
+    // Fail closed: an Undo puts back the core fields, and nothing else.
+    if body.is_empty() || body.keys().any(|k| !patch::UNDOABLE.contains(&k.as_str())) {
+        return Err(unfit());
+    }
+    let guests = attendees::notify_required(fresh, &body, &own_of(target, &[fresh]));
+    let same = match (&guests, &record.guests) {
+        (None, None) => true,
+        (Some(now), Some(then)) => now.answered_by(then),
+        _ => false,
+    };
+    if !same {
+        return Err(WriteOutcome::Failed {
+            message: UNDO_GUESTS.into(),
+        });
+    }
+    // R7a: the write's own answer, given for these very guests (`none` where there were none, R7).
+    Ok(Ready {
+        body,
+        notify: record.notify,
+        guests,
+        repeats: None,
+    })
+}
+
+/// Why an Undo of `before`'s fields is refused on Google's copy now, by the gate's `perms`: the
+/// first closed field's own reason, as a save's ([`refused_field`]).
+fn undo_refused(
+    perms: &FieldPermissions,
+    before: &serde_json::Map<String, Value>,
+) -> Option<ReadOnlyReason> {
+    use gate::Field;
+    before.keys().find_map(|key| {
+        let (open, field) = match key.as_str() {
+            "summary" => (perms.summary, Field::Summary),
+            "start" | "end" => (perms.time, Field::Time),
+            "location" => (perms.location, Field::Location),
+            "description" => (perms.description, Field::Description),
+            "transparency" => (perms.show_as, Field::ShowAs),
+            "visibility" => (perms.visibility, Field::Visibility),
+            // Never in an Undo: its body fails closed on it.
+            _ => return None,
+        };
+        (!open).then(|| gate::reason_for(perms, field))
+    })
 }
 
 // --- creating an event (C10) ---
@@ -1838,6 +2125,7 @@ async fn land_new_series<W: Wire, H: Host>(
             warnings: vec![WriteWarning::OutsideMirror],
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         };
     }
     let mut listing = Listing::default();
@@ -1868,6 +2156,7 @@ async fn land_new_series<W: Wire, H: Host>(
             warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         },
         Err(_) => series_pending(host, cal.calendar_id, gone),
     }
@@ -1884,6 +2173,7 @@ fn series_pending(host: &impl Host, calendar_id: &str, gone: Vec<GoneRow>) -> Wr
         warnings: vec![WriteWarning::MirrorRefreshPending],
         left_behind: Vec::new(),
         milestone_moves: None,
+        undo: None,
     }
 }
 
@@ -1927,6 +2217,7 @@ fn land_created(host: &impl Host, target: &CalendarTarget, copy: &Value) -> Writ
             warnings: vec![WriteWarning::OutsideMirror],
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         };
     }
     let id = row.id.clone();
@@ -1935,6 +2226,7 @@ fn land_created(host: &impl Host, target: &CalendarTarget, copy: &Value) -> Writ
             warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         },
         Err(_) => created_pending(host, target),
     }
@@ -1947,6 +2239,7 @@ fn created_pending(host: &impl Host, target: &CalendarTarget) -> WriteOutcome {
         warnings: vec![WriteWarning::MirrorRefreshPending],
         left_behind: Vec::new(),
         milestone_moves: None,
+        undo: None,
     }
 }
 
@@ -2365,6 +2658,378 @@ async fn send_delete<W: Wire, H: Host>(
     WriteOutcome::Conflict { fields: Vec::new() }
 }
 
+// --- moving an event, and putting a move back (C16a) ---
+
+/// Moving by dragging, held back from release builds until the views that drag land (C16b), as
+/// creating was (C10). Dev builds move, for the probes.
+const MOVE_NOT_YET: &str = "Moving events by dragging isn't available yet.";
+
+/// A drop on an occurrence of a repeating event that doesn't repeat any more: the drag's own words.
+const NOT_REPEATING_MOVE: &str = "That event doesn't repeat any more. Drag it again.";
+
+/// Move or resize an event to where it was dropped. A fresh copy is read first, and the move goes
+/// ahead only if its time is still the one the user dragged (`request.seen`); it sends only its start
+/// and end, on Google's latest version. `request.to` is this computer's wall time, in its zone
+/// (`request.device_zone`); the event keeps its own zone. `scope` and `choice` name the occurrences
+/// of a repeating event and the plan chosen, as for a save (its choices are asked with this same
+/// request, which the token binds); `notify` and `asked` are the answer to whether guests are emailed
+/// and the numbers the question showed. A one-off or "This event" that lands comes back with an Undo
+/// for a few seconds.
+#[tauri::command]
+pub async fn reschedule_calendar_event(
+    app: AppHandle,
+    window: tauri::Window,
+    request: MoveRequest,
+    scope: Option<SeriesScope>,
+    choice: Option<String>,
+    notify: Option<Notify>,
+    asked: Option<GuestNotice>,
+) -> Result<WriteOutcome> {
+    require_main_window(&window)?;
+    require_owner(&app)?;
+    if !cfg!(debug_assertions) {
+        return Ok(WriteOutcome::Failed {
+            message: MOVE_NOT_YET.into(),
+        });
+    }
+    let state = app.state::<AppState>();
+    let (target, editing_choice) = {
+        let conn = state.conn()?;
+        match resolve_target(&conn, &request.event_id)? {
+            Ok(target) => {
+                let choice = calendar_editing::choice(&conn, &target.email)?;
+                (target, choice)
+            }
+            Err(reason) => return Ok(WriteOutcome::ReadOnly { reason }),
+        }
+    };
+    #[cfg(debug_assertions)]
+    {
+        let series_wide = matches!(scope, Some(SeriesScope::Following | SeriesScope::All));
+        let allowed = dev_allow::check(&*state.conn()?, &target.remote_calendar, series_wide)?;
+        if let Err(message) = allowed {
+            return Ok(WriteOutcome::Failed {
+                message: message.into(),
+            });
+        }
+    }
+    let editing = editing_status(editing_choice, &target.token_key);
+    let token_key = target.token_key.clone();
+    let wire = GoogleWire(&token_key);
+    if let Some(scope) = scope {
+        let ctx = SeriesWrite {
+            wire: &wire,
+            host: &app,
+            target: &target,
+            editing,
+            missing_ok: MISSING_CHOICE_OK,
+            new_series_id: plan::client_event_id,
+        };
+        return Ok(move_series(&ctx, &request, scope.into(), choice.as_deref(), notify).await);
+    }
+    let answer = GuestAnswer { notify, asked };
+    Ok(move_event(&wire, &app, &target, &request, editing, &answer).await)
+}
+
+/// This computer's zone for a drop: a timed one is refused without it (R6, never a guessed UTC); an
+/// all-day one needs none.
+fn move_zone(request: &MoveRequest) -> std::result::Result<Option<chrono_tz::Tz>, time::TimeError> {
+    match request.to {
+        MoveTo::AllDay { .. } => Ok(None),
+        MoveTo::Timed { .. } => time::parse_device_zone(request.device_zone.as_deref()).map(Some),
+    }
+}
+
+/// [`reschedule_calendar_event`] for one event, past its shell: this computer's zone (refused before
+/// anything is read), the row's claim, then [`send_one`] against what the user saw. A move that lands
+/// with nothing to say beside it keeps an Undo.
+async fn move_event<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    request: &MoveRequest,
+    editing: EditingStatus,
+    answer: &GuestAnswer,
+) -> WriteOutcome {
+    let device = match move_zone(request) {
+        Ok(device) => device,
+        Err(e) => {
+            return WriteOutcome::Failed {
+                message: e.to_string(),
+            }
+        }
+    };
+    let Some(_flight) = InFlight::claim(host.edit(), &target.row_id) else {
+        return WriteOutcome::Busy;
+    };
+    let one = OneWrite {
+        wire,
+        host,
+        target,
+        editing,
+    };
+    let basis = Basis::Seen {
+        seen: &request.seen,
+        to: &request.to,
+        device,
+    };
+    let (outcome, landed) = send_one(&one, &basis, answer).await;
+    with_undo(host.edit(), target, outcome, landed)
+}
+
+/// A drop of the occurrences `scope` names, sent as a scoped save is: claim the row and its series
+/// (known from the mirror row, so before any read, L2), plan again from fresh copies, check it is the
+/// plan the user chose (`choice`) and that Send / Don't send was answered where it would email anyone
+/// (R9), then send and land it. "This event" lands with an Undo; the rest have none (plan C16).
+async fn move_series<W: Wire, H: Host>(
+    ctx: &SeriesWrite<'_, W, H>,
+    request: &MoveRequest,
+    scope: Scope,
+    choice: Option<&str>,
+    notify: Option<Notify>,
+) -> WriteOutcome {
+    let master = match ctx
+        .host
+        .with_conn(|conn| calendar::event_by_id(conn, &ctx.target.row_id))
+    {
+        Ok(row) => row
+            .and_then(|row| row.series_id)
+            .filter(|id| is_plain_segment(id)),
+        Err(e) => {
+            return WriteOutcome::Failed {
+                message: e.to_string(),
+            }
+        }
+    };
+    let mut keys = vec![ctx.target.row_id.clone()];
+    keys.extend(
+        master
+            .as_deref()
+            .map(|m| series_key(&ctx.target.remote_calendar, m)),
+    );
+    let Some(_flight) = InFlight::claim_all(ctx.host.edit(), &keys) else {
+        return WriteOutcome::Busy;
+    };
+    let request = ChoiceRequest::Move(request.clone());
+    let (mirror, planning) = match prepared_for(ctx, &request, None, master.as_deref(), scope).await
+    {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let plan = match planned_or_refused(ctx, &planning, &request, scope, notify) {
+        Ok(plan) => plan,
+        Err(outcome) => return outcome,
+    };
+    if !choice_matches(choice, &plan.choice_digest(&planning.bind), ctx.missing_ok) {
+        return WriteOutcome::needs_scope();
+    }
+    // R9: it would email someone, and nobody answered. The token, checked first, binds who.
+    if plan.needs_notify() {
+        return WriteOutcome::needs_notify(plan.guests.clone().unwrap_or_default());
+    }
+    // A "this and following" move's new series is claimed too, as a save's is (C9a-3b critique M9).
+    let _tail = match new_series(&plan) {
+        Some(tail) => {
+            let key = series_key(&ctx.target.remote_calendar, tail);
+            match InFlight::claim(ctx.host.edit(), &key) {
+                Some(claim) => Some(claim),
+                None => return WriteOutcome::Busy,
+            }
+        }
+        None => None,
+    };
+    send_series(ctx, &mirror, &planning, plan, Landing::Move).await
+}
+
+/// How long past its seconds an Undo's record stays: the button goes at [`UNDO`], and an Undo
+/// pressed then may still be on its way.
+const UNDO_GRACE: Duration = Duration::from_secs(2);
+
+/// An Undo PM no longer holds: its window ended, a later write of the event let it go, it was used,
+/// or PM restarted (C16 critique C2-M10).
+const UNDO_GONE: &str = "That can't be undone any more.";
+
+/// The Undo would email other guests than the move did, so it isn't sent.
+const UNDO_GUESTS: &str = "Its guests changed in Google since, so PM didn't undo it. Change it in \
+                           the event's Edit.";
+
+/// A write that can still be undone (C16a): the event, what goes back and what must still be there,
+/// whom it emails, and when the offer lapses.
+struct ChangeUndo {
+    target: Target,
+    /// Google's values of the keys the write sent, from before it (`null` where it had none).
+    before: serde_json::Map<String, Value>,
+    /// Google's values of the same keys after it, as its answer held them: what Google must still
+    /// hold for the Undo to go ahead (C16 critique C2-M7: Google may write a value its own way).
+    after: serde_json::Map<String, Value>,
+    /// The write's answer (R7a): the Undo emails whom the write did.
+    notify: Notify,
+    /// Who the write would have emailed: the Undo is refused once that changed.
+    guests: Option<GuestNotice>,
+    until: Instant,
+}
+
+/// A fresh random token for an Undo: PM's own, never an event's id (R5).
+fn new_undo_ref() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+impl CalendarEditState {
+    /// Keep `landed`, a write to `target` Google answered, as an Undo until [`UNDO`] and its grace
+    /// have passed from `now`, lapsed ones let go first: its offer, or `None` for a write that sent
+    /// anything but the core fields ([`patch::UNDOABLE`]).
+    fn offer_undo(&self, target: &Target, landed: Landed, now: Instant) -> Option<UndoOffer> {
+        let core = !landed.before.is_empty()
+            && landed
+                .before
+                .keys()
+                .all(|k| patch::UNDOABLE.contains(&k.as_str()));
+        if !core {
+            return None;
+        }
+        let mut undos = self.undos.lock().ok()?;
+        undos.retain(|_, u| u.until > now);
+        let undo_token = new_undo_ref();
+        undos.insert(
+            undo_token.clone(),
+            ChangeUndo {
+                target: target.clone(),
+                before: landed.before,
+                after: landed.after,
+                notify: landed.notify,
+                guests: landed.guests,
+                until: now + UNDO + UNDO_GRACE,
+            },
+        );
+        Some(UndoOffer {
+            undo_token,
+            undo_seconds: UNDO.as_secs(),
+        })
+    }
+
+    /// The event an Undo still in its window at `now` is for.
+    fn undo_target(&self, token: &str, now: Instant) -> Option<Target> {
+        let undos = self.undos.lock().ok()?;
+        undos
+            .get(token)
+            .filter(|u| u.until > now)
+            .map(|u| u.target.clone())
+    }
+
+    /// Take an Undo: once, whatever comes of it. Whether it is still in its window is
+    /// [`Self::undo_target`]'s to say, first.
+    fn take_undo(&self, token: &str) -> Option<ChangeUndo> {
+        let mut undos = self.undos.lock().ok()?;
+        undos.remove(token)
+    }
+
+    /// A landing wrote `rows` (PM's row ids): their Undos go, as Google's copy is no longer the one
+    /// they were for (one per row). Taken alone, with the DB lock let go (C16 critique C1-M6).
+    fn retire_undos(&self, rows: &[String]) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Ok(mut undos) = self.undos.lock() {
+            undos.retain(|_, u| !rows.contains(&u.target.row_id));
+        }
+    }
+}
+
+/// `outcome`, with an Undo of the write when it saved with nothing to say beside it (`landed`, what
+/// Google held before and after) and sent only the core fields. Kept after the landing, which let
+/// go of any earlier Undo of the row, so the newest is the one kept.
+fn with_undo(
+    edit: &CalendarEditState,
+    target: &Target,
+    outcome: WriteOutcome,
+    landed: Option<Landed>,
+) -> WriteOutcome {
+    match (outcome, landed) {
+        (
+            WriteOutcome::Saved {
+                warnings,
+                left_behind,
+                milestone_moves,
+                undo: None,
+            },
+            Some(landed),
+        ) if warnings.is_empty() => WriteOutcome::Saved {
+            undo: edit.offer_undo(target, landed, Instant::now()),
+            warnings,
+            left_behind,
+            milestone_moves,
+        },
+        (outcome, _) => outcome,
+    }
+}
+
+/// Put back what a move just changed, within its Undo window: Google's exact values from before it,
+/// sent only while Google still holds what the move left, and emailing whom the move emailed (R7a).
+/// An Undo has no Undo of its own.
+#[tauri::command]
+pub async fn undo_calendar_change(
+    app: AppHandle,
+    window: tauri::Window,
+    undo_token: String,
+) -> Result<WriteOutcome> {
+    require_main_window(&window)?;
+    require_owner(&app)?;
+    if !cfg!(debug_assertions) {
+        return Ok(WriteOutcome::Failed {
+            message: MOVE_NOT_YET.into(),
+        });
+    }
+    let state = app.state::<AppState>();
+    let Some(target) = state.calendar_edit.undo_target(&undo_token, Instant::now()) else {
+        return Ok(WriteOutcome::Failed {
+            message: UNDO_GONE.into(),
+        });
+    };
+    #[cfg(debug_assertions)]
+    {
+        let allowed = dev_allow::check(&*state.conn()?, &target.remote_calendar, false)?;
+        if let Err(message) = allowed {
+            return Ok(WriteOutcome::Failed {
+                message: message.into(),
+            });
+        }
+    }
+    let token_key = target.token_key.clone();
+    Ok(undo_change(&GoogleWire(&token_key), &app, &undo_token).await)
+}
+
+/// [`undo_calendar_change`] past its shell: editing must still be on; the row is claimed before the
+/// record is taken, so a write on its way leaves the Undo where it was (C16 critique C1-L6); once
+/// taken it is gone, whatever comes of it.
+async fn undo_change<W: Wire, H: Host>(wire: &W, host: &H, token: &str) -> WriteOutcome {
+    let gone = || WriteOutcome::Failed {
+        message: UNDO_GONE.into(),
+    };
+    let edit = host.edit();
+    let Some(target) = edit.undo_target(token, Instant::now()) else {
+        return gone();
+    };
+    let editing = match editing_now(host, &target) {
+        Ok(editing) => editing,
+        Err(outcome) => return outcome,
+    };
+    let Some(_flight) = InFlight::claim(edit, &target.row_id) else {
+        return WriteOutcome::Busy;
+    };
+    let Some(record) = edit.take_undo(token) else {
+        return gone();
+    };
+    let one = OneWrite {
+        wire,
+        host,
+        target: &record.target,
+        editing,
+    };
+    send_one(&one, &Basis::Undo(&record), &GuestAnswer::default())
+        .await
+        .0
+}
+
 // --- replying to an invitation (C14) ---
 
 /// Google answered a reply as if it were a change to the shared event: it didn't read
@@ -2739,6 +3404,7 @@ async fn land_reply<W: Wire, H: Host>(
                 warnings: Vec::new(),
                 left_behind: Vec::new(),
                 milestone_moves: None,
+                undo: None,
             },
             _ => saved_pending(host, target),
         };
@@ -2851,6 +3517,7 @@ async fn land_every_reply<W: Wire, H: Host>(
         warnings,
         left_behind: kept,
         milestone_moves: None,
+        undo: None,
     }
 }
 
@@ -2868,7 +3535,7 @@ const WINDOW_FIELDS: &str = "nextPageToken,items(id,status,recurringEventId,orig
 /// What a change to a repeating occurrence offers: "This event", "This and following" and "All
 /// events", each planned now against Google's copies, so the dialog shows what each would do, or why
 /// it can't (DS12). Only reads go to Google. `ChoiceRequest::Edit` names an open editor and its
-/// draft, `Delete` a mirror row and what the user saw of it.
+/// draft, `Delete` a mirror row and what the user saw of it, `Move` a drag of one (C16a).
 #[tauri::command]
 pub async fn series_choices(
     app: AppHandle,
@@ -2889,7 +3556,8 @@ pub async fn series_choices(
             };
             (open.target.clone(), Some(open))
         }
-        ChoiceRequest::Delete { event_id, .. } => {
+        ChoiceRequest::Delete { event_id, .. }
+        | ChoiceRequest::Move(MoveRequest { event_id, .. }) => {
             let resolved = resolve_target(&*state.conn()?, event_id)?;
             match resolved {
                 Ok(target) => (target, None),
@@ -3450,8 +4118,12 @@ struct Planning {
     opened_master: Option<FreshEvent>,
     series: Series,
     change: Change,
-    /// What the token binds: the session and the draft (an edit), or the row and what the user saw
-    /// (a delete).
+    /// The change an edit's plan is built from: the editor's draft, or a drop's time said in the
+    /// event's own zone (C16a; its draft needs Google's copy, so it is made here). Empty for a delete.
+    draft: EventPatchDraft,
+    /// What the token binds: the session and the draft (an edit), the row and what the user saw (a
+    /// delete), or the row, what the user saw, where it was dropped and this computer's zone (a
+    /// move).
     bind: String,
     /// The account the calendar is read with: the user, never a guest Google emails (C12).
     me: String,
@@ -3536,8 +4208,8 @@ fn plan_scope(
     }
     let input = planning.input(calendar);
     Planned::Planned(match request {
-        ChoiceRequest::Edit { draft, .. } => {
-            plan_series_edit(scope, &input, draft, tail_id, notify)
+        ChoiceRequest::Edit { .. } | ChoiceRequest::Move(_) => {
+            plan_series_edit(scope, &input, &planning.draft, tail_id, notify)
         }
         ChoiceRequest::Delete { seen, .. } => plan_series_delete(scope, &input, seen, notify),
     })
@@ -3559,7 +4231,7 @@ fn stop_held(draft: &EventPatchDraft, stop_ok: bool) -> bool {
 }
 
 /// Fetch and check what a change is planned from: the occurrence, the gate on it, what the user saw
-/// (a delete), and its series.
+/// (a delete, a move), and its series.
 async fn prepare_change<W: Wire>(
     wire: &W,
     target: &Target,
@@ -3569,23 +4241,26 @@ async fn prepare_change<W: Wire>(
     opened: Option<(&Value, Option<&Value>)>,
 ) -> Prepared {
     let refused = Prepared::Refused;
+    let failed = |message: String| Prepared::Refused(WriteOutcome::Failed { message });
     // Before anything is read: the choices and a save alike.
     if let ChoiceRequest::Edit { draft, .. } = request {
         if stop_held(draft, REPEAT_STOP_OK) {
-            return refused(WriteOutcome::Failed {
-                message: REPEAT_STOP_NOT_YET.into(),
-            });
+            return failed(REPEAT_STOP_NOT_YET.into());
         }
     }
+    // A timed drop needs this computer's zone (R6): refused before anything is read.
+    let device = match request {
+        ChoiceRequest::Move(m) => match move_zone(m) {
+            Ok(device) => device,
+            Err(e) => return failed(e.to_string()),
+        },
+        ChoiceRequest::Edit { .. } | ChoiceRequest::Delete { .. } => None,
+    };
     // An edit is checked against what the user opened, never against Google's copies alone.
     let opened = match (request, opened) {
-        (ChoiceRequest::Edit { .. }, None) => {
-            return refused(WriteOutcome::Failed {
-                message: SESSION_ENDED.into(),
-            })
-        }
+        (ChoiceRequest::Edit { .. }, None) => return failed(SESSION_ENDED.into()),
         (ChoiceRequest::Edit { .. }, Some(opened)) => Some(opened),
-        (ChoiceRequest::Delete { .. }, _) => None,
+        (ChoiceRequest::Delete { .. } | ChoiceRequest::Move(_), _) => None,
     };
     let fresh = match get(wire, &target.remote_calendar, &target.remote_event).await {
         Fetched::Event(fresh) if patch::is_gone(&fresh) => return Prepared::Gone(Some(fresh)),
@@ -3603,16 +4278,23 @@ async fn prepare_change<W: Wire>(
         ChoiceRequest::Delete { .. } => {
             (!perms.delete).then(|| gate::reason_for(&perms, gate::Field::Delete))
         }
+        ChoiceRequest::Move(_) => {
+            (!perms.time).then(|| gate::reason_for(&perms, gate::Field::Time))
+        }
     };
     if let Some(reason) = closed {
         return refused(WriteOutcome::ReadOnly { reason });
     }
-    if let ChoiceRequest::Delete { seen, .. } = request {
-        match patch::delete_still_matches(seen, &fresh) {
-            DeleteCheck::Matches => {}
-            DeleteCheck::Gone => return Prepared::Gone(Some(fresh)),
-            DeleteCheck::Changed(fields) => return Prepared::Changed { fresh, fields },
-        }
+    // What the user saw must still be Google's: all of it for a delete, the time for a move.
+    let still = match request {
+        ChoiceRequest::Delete { seen, .. } => patch::delete_still_matches(seen, &fresh),
+        ChoiceRequest::Move(m) => patch::timing_still_matches(&m.seen, &fresh),
+        ChoiceRequest::Edit { .. } => DeleteCheck::Matches,
+    };
+    match still {
+        DeleteCheck::Matches => {}
+        DeleteCheck::Gone => return Prepared::Gone(Some(fresh)),
+        DeleteCheck::Changed(fields) => return Prepared::Changed { fresh, fields },
     }
     let series = match gather(wire, target, &fresh, mirror, false).await {
         Ok(Some(series)) => series,
@@ -3631,19 +4313,46 @@ async fn prepare_change<W: Wire>(
         ),
         None => (instance.clone(), Some(series.master_fresh.clone())),
     };
-    let (change, bind) = match request {
+    let (change, draft, bind) = match request {
         ChoiceRequest::Edit { session, draft } => {
             match Change::of(draft, &instance, &series.master) {
-                Ok(change) => (change, format!("{session}\u{1f}{draft:?}")),
-                Err(e) => {
-                    return refused(WriteOutcome::Failed {
-                        message: e.to_string(),
-                    })
-                }
+                Ok(change) => (
+                    change,
+                    (**draft).clone(),
+                    format!("{session}\u{1f}{draft:?}"),
+                ),
+                Err(e) => return failed(e.to_string()),
             }
         }
-        ChoiceRequest::Delete { event_id, seen } => {
-            (Change::delete(), format!("{event_id}\u{1f}{seen:?}"))
+        ChoiceRequest::Delete { event_id, seen } => (
+            Change::delete(),
+            EventPatchDraft::default(),
+            format!("{event_id}\u{1f}{seen:?}"),
+        ),
+        // A drop is the editor's time draft for it, said in the event's own zone (C16a): what the
+        // plan is built from, made on the occurrence Google holds now.
+        ChoiceRequest::Move(m) => {
+            let time = match time::retime_draft(&m.to, device, instance.json()) {
+                Ok(time) => time,
+                Err(e) => return failed(e.to_string()),
+            };
+            let draft = EventPatchDraft {
+                time: Some(time),
+                ..Default::default()
+            };
+            match Change::of(&draft, &instance, &series.master) {
+                Ok(change) => {
+                    let MoveRequest {
+                        event_id,
+                        seen,
+                        to,
+                        device_zone,
+                    } = m;
+                    let bind = format!("{event_id}\u{1f}{seen:?}\u{1f}{to:?}\u{1f}{device_zone:?}");
+                    (change, draft, bind)
+                }
+                Err(e) => return failed(e.to_string()),
+            }
         }
     };
     Prepared::Ready(Box::new(Planning {
@@ -3652,6 +4361,7 @@ async fn prepare_change<W: Wire>(
         opened_master,
         series,
         change,
+        draft,
         bind,
         me: target.email.clone(),
     }))
@@ -3866,10 +4576,12 @@ struct SeriesWrite<'a, W, H> {
     new_series_id: fn() -> String,
 }
 
-/// Who a series write lands for: the editor that saved it (its session), or a held delete.
+/// Who a series write lands for: the editor that saved it (its session), a held delete, or a drop
+/// (C16a), whose "This event" lands with an Undo.
 enum Landing<'a> {
     Edit { session: &'a str },
     Delete,
+    Move,
 }
 
 /// Plan the claimed scope again, as the dialog's row did, and refuse what a row would. `notify`:
@@ -3926,6 +4638,7 @@ async fn prepared_for<W: Wire, H: Host>(
     let not_repeating = match request {
         ChoiceRequest::Edit { .. } => NOT_REPEATING,
         ChoiceRequest::Delete { .. } => NOT_REPEATING_DELETE,
+        ChoiceRequest::Move(_) => NOT_REPEATING_MOVE,
     };
     let planning =
         match prepare_change(ctx.wire, ctx.target, ctx.editing, &mirror, request, opened).await {
@@ -4342,7 +5055,11 @@ async fn land_series<W: Wire, H: Host>(
     if plan.scope == Scope::This {
         return match (&landing, &plan.steps[0].op) {
             (Landing::Edit { session }, Op::Patch { body, .. }) => match reply {
-                Some(saved) => land_saved(host, target, session, saved, body),
+                Some(saved) => land_saved(host, target, Some(session), saved, body),
+                None => saved_pending(host, target),
+            },
+            (Landing::Move, Op::Patch { body, .. }) => match reply {
+                Some(saved) => moved_this(host, target, plan, saved, body),
                 None => saved_pending(host, target),
             },
             _ => {
@@ -4362,13 +5079,14 @@ async fn land_series<W: Wire, H: Host>(
                     let gone = plan.removes.rows(cal, &before, zone, floor.as_deref());
                     record(conn, host.edit(), cal, Vec::new(), &[], gone)
                 });
-                match landed {
+                match retire_landed(host, landed) {
                     Ok(()) => {
                         host.landed(cal);
                         WriteOutcome::Saved {
                             warnings: Vec::new(),
                             left_behind: Vec::new(),
                             milestone_moves: None,
+                            undo: None,
                         }
                     }
                     Err(_) => saved_pending(host, target),
@@ -4492,7 +5210,7 @@ async fn land_series<W: Wire, H: Host>(
         deletes.retain(|d| !upserts.iter().any(|u| u.id == d.row_id));
         record(conn, host.edit(), cal, upserts, &created, deletes)
     });
-    match landed {
+    match retire_landed(host, landed) {
         Ok(()) => {
             host.landed(cal);
             series_saved(Vec::new(), left_behind)
@@ -4580,7 +5298,7 @@ async fn land_one_event<W: Wire, H: Host>(
         };
         record(conn, host.edit(), cal, upserts, &created, gone)
     });
-    if landed.is_err() {
+    if retire_landed(host, landed).is_err() {
         return said_outside(pending(), outside);
     }
     host.landed(cal);
@@ -4595,6 +5313,33 @@ async fn land_one_event<W: Wire, H: Host>(
     series_saved(warnings, Vec::new())
 }
 
+/// "This event" of a drop, landed (C16a): Google's answer `saved` into the row, with an Undo that
+/// puts back the step's own record of Google's values before it, emailing whom the step did
+/// (DECISIONS 17-10 #4).
+fn moved_this(
+    host: &impl Host,
+    target: &Target,
+    plan: &SeriesPlan,
+    saved: Value,
+    body: &serde_json::Map<String, Value>,
+) -> WriteOutcome {
+    let step = &plan.steps[0];
+    let landed = match &step.shows {
+        Shows::Fields { old, .. } => {
+            let keys: Vec<&str> = body.keys().map(String::as_str).collect();
+            Some(Landed {
+                before: old.clone(),
+                after: snapshot(&saved, &keys),
+                notify: step.notify,
+                guests: plan.guests.clone(),
+            })
+        }
+        _ => None,
+    };
+    let outcome = land_saved(host, target, None, saved, body);
+    with_undo(host.edit(), target, outcome, landed)
+}
+
 /// `Saved`, with `LeftOnOldSeries` when occurrences were left behind.
 fn series_saved(mut warnings: Vec<WriteWarning>, left_behind: Vec<String>) -> WriteOutcome {
     if !left_behind.is_empty() {
@@ -4604,6 +5349,7 @@ fn series_saved(mut warnings: Vec<WriteWarning>, left_behind: Vec<String>) -> Wr
         warnings,
         left_behind,
         milestone_moves: None,
+        undo: None,
     }
 }
 
@@ -4635,7 +5381,7 @@ fn stale_saved(
         Removes::Series { series } | Removes::From { series, .. } => Some(series.clone()),
         _ => None,
     };
-    let _ = host.with_conn(|conn| {
+    let landed = host.with_conn(|conn| {
         let now = match &series {
             Some(series) => calendar::series_rows(conn, cal, &[series.as_str()])?,
             None => Vec::new(),
@@ -4649,6 +5395,7 @@ fn stale_saved(
         );
         record(conn, host.edit(), cal, Vec::new(), &[], gone)
     });
+    let _ = retire_landed(host, landed);
     host.landed(cal);
     series_saved(vec![WriteWarning::MirrorRefreshPending], left_behind)
 }
@@ -5051,6 +5798,7 @@ async fn with_moves<W: Wire, H: Host>(
             warnings,
             left_behind,
             milestone_moves: None,
+            undo: None,
         } => (warnings, left_behind),
         other => return other,
     };
@@ -5084,6 +5832,7 @@ async fn with_moves<W: Wire, H: Host>(
             warnings,
             left_behind,
             milestone_moves: None,
+            undo: None,
         };
     }
     let mut copy = inserted_copy(ran, facts.insert).cloned();
@@ -5134,6 +5883,7 @@ async fn with_moves<W: Wire, H: Host>(
             today: ctx.host.today_in(zone),
             milestones,
         })),
+        undo: None,
     }
 }
 
@@ -5560,7 +6310,7 @@ fn land_series_gone(
     moments: &[String],
 ) -> WriteOutcome {
     let floor = diff::floor_of(moments.iter().map(String::as_str));
-    let _ = host.with_conn(|conn| {
+    let landed = host.with_conn(|conn| {
         let before = rows_union(snapshot, calendar::series_rows(conn, cal, &[master])?);
         let gone = Removes::Series {
             series: master.to_string(),
@@ -5568,6 +6318,7 @@ fn land_series_gone(
         .rows(cal, &before, zone, floor.as_deref());
         record(conn, host.edit(), cal, Vec::new(), &[], gone)
     });
+    let _ = retire_landed(host, landed);
     host.landed(cal);
     WriteOutcome::Gone
 }
@@ -5578,7 +6329,7 @@ fn land_series_gone(
 fn land_tail_removed(host: &impl Host, cal: &str, facts: &SplitFacts, seen: &[Option<&Value>]) {
     let moments: Vec<String> = seen.iter().filter_map(|copy| updated_of(*copy)).collect();
     let floor = diff::floor_of(moments.iter().map(String::as_str));
-    let _ = host.with_conn(|conn| {
+    let landed = host.with_conn(|conn| {
         let mut rows = calendar::series_rows(conn, cal, &[facts.tail.as_str()])?;
         rows.extend(calendar::event_by_id(
             conn,
@@ -5596,6 +6347,7 @@ fn land_tail_removed(host: &impl Host, cal: &str, facts: &SplitFacts, seen: &[Op
         );
         record(conn, host.edit(), cal, Vec::new(), &[], gone)
     });
+    let _ = retire_landed(host, landed);
     host.landed(cal);
 }
 
@@ -5830,7 +6582,7 @@ async fn land_split_done<W: Wire, H: Host>(
         deletes.retain(|d| !upserts.iter().any(|u| u.id == d.row_id));
         record(conn, host.edit(), cal, upserts, &created, deletes)
     });
-    let saved = match landed {
+    let saved = match retire_landed(host, landed) {
         Ok(()) => {
             host.landed(cal);
             series_saved(Vec::new(), left_behind)
@@ -7029,34 +7781,44 @@ const QUOTA: &str = "This Google account has reached one of Google Calendar's us
                      Google isn't taking changes for now. Try again later; the limit usually lifts \
                      within a day.";
 
-/// A save whose answer never arrived: GET the event and see whether it landed. `before`: the copy it
-/// was sent on. `repeats`: the save gave a one-off a repeat, which starts there ([`shown_by`]). Part
-/// of it there is a save that happened, never "nothing was saved" (C13 review round 1).
+/// A one-event write whose answer never arrived: GET the event and see whether it landed. `before`:
+/// the copy it was sent on; `ready`, what it sent (a one-off given a repeat is read by where the rule
+/// starts, [`shown_by`]). Part of it there is a save that happened, never "nothing was saved" (C13
+/// review round 1); all of it there lands with what an Undo needs, as an answer would.
 async fn after_lost_answer<W: Wire, H: Host>(
-    wire: &W,
-    host: &H,
-    target: &Target,
-    session: &str,
+    one: &OneWrite<'_, W, H>,
+    session: Option<&str>,
     before: &Value,
-    body: &serde_json::Map<String, Value>,
-    repeats: Option<&SeriesStart>,
-) -> WriteOutcome {
+    ready: &Ready,
+) -> (WriteOutcome, Option<Landed>) {
+    let (wire, host, target) = (one.wire, one.host, one.target);
     match get(wire, &target.remote_calendar, &target.remote_event).await {
-        Fetched::Event(now) => match shown_by(before, &now, body, repeats) {
-            Shown::Landed => {
-                landed_save(wire, host, target, session, now, body, &repeats.copied()).await
-            }
+        Fetched::Event(now) => match shown_by(before, &now, &ready.body, ready.repeats.as_ref()) {
+            Shown::Landed => landed_one(one, session, before, now, ready).await,
             Shown::Partly => {
-                landed_in_part(wire, host, target, session, now, body, &repeats.copied()).await
+                let outcome = landed_in_part(
+                    wire,
+                    host,
+                    target,
+                    session,
+                    now,
+                    &ready.body,
+                    &ready.repeats,
+                )
+                .await;
+                (outcome, None)
             }
-            Shown::NotThere => WriteOutcome::Failed {
-                message: "PM lost touch with Google, and your change isn't there. Nothing was \
-                          saved; try again."
-                    .into(),
-            },
-            Shown::Unsure => WriteOutcome::Unconfirmed,
+            Shown::NotThere => (
+                WriteOutcome::Failed {
+                    message: "PM lost touch with Google, and your change isn't there. Nothing was \
+                              saved; try again."
+                        .into(),
+                },
+                None,
+            ),
+            Shown::Unsure => (WriteOutcome::Unconfirmed, None),
         },
-        _ => WriteOutcome::Unconfirmed,
+        _ => (WriteOutcome::Unconfirmed, None),
     }
 }
 
@@ -7082,6 +7844,7 @@ fn outcome_for(verdict: Verdict, editing: EditingStatus) -> WriteOutcome {
             warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         },
         Verdict::Conflict => WriteOutcome::Conflict { fields: Vec::new() },
         Verdict::Gone => WriteOutcome::Gone,
@@ -7281,14 +8044,23 @@ fn land_on(
     created: &[String],
     deletes: Vec<GoneRow>,
 ) -> Result<()> {
-    host.with_conn(|conn| record(conn, host.edit(), calendar_id, upserts, created, deletes))?;
+    let landed =
+        host.with_conn(|conn| record(conn, host.edit(), calendar_id, upserts, created, deletes));
+    retire_landed(host, landed)?;
     host.landed(calendar_id);
     Ok(())
 }
 
+/// After a mirror write ([`record`]), with the DB lock let go: any Undo of a row it wrote goes, since
+/// Google's copy is no longer the one it was for (one per row; C16 critique C1-M6).
+fn retire_landed(host: &impl Host, landed: Result<Vec<String>>) -> Result<()> {
+    landed.map(|rows| host.edit().retire_undos(&rows))
+}
+
 /// One mirror write, then the same rows remembered for the next sync, inside the DB lock (lock
 /// order: the DB, then the recent writes): `created` ones as new (a list that lags can't take them
-/// off the screen), the other upserts as changed, and each gone row with the version removed.
+/// off the screen), the other upserts as changed, and each gone row with the version removed. The
+/// rows it wrote come back, for [`retire_landed`] once the lock is let go.
 fn record(
     conn: &Connection,
     edit: &CalendarEditState,
@@ -7296,8 +8068,10 @@ fn record(
     upserts: Vec<CalendarEvent>,
     created: &[String],
     deletes: Vec<GoneRow>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let delete_ids: Vec<String> = deletes.iter().map(|d| d.row_id.clone()).collect();
+    let mut written: Vec<String> = upserts.iter().map(|r| r.id.clone()).collect();
+    written.extend(delete_ids.iter().cloned());
     calendar::apply_write_effect(conn, calendar_id, &upserts, &delete_ids)?;
     let mut recent = edit
         .recent
@@ -7314,7 +8088,7 @@ fn record(
     for gone in deletes {
         recent.record_delete(calendar_id, &gone.row_id, gone.etag, gone.updated, now);
     }
-    Ok(())
+    Ok(written)
 }
 
 /// The `calendar://write-outcome` payload: a calendar whose mirror a save just changed.
@@ -7330,6 +8104,7 @@ fn saved_pending(host: &impl Host, target: &Target) -> WriteOutcome {
         warnings: vec![WriteWarning::MirrorRefreshPending],
         left_behind: Vec::new(),
         milestone_moves: None,
+        undo: None,
     }
 }
 
@@ -7372,23 +8147,27 @@ fn land_deleted(host: &impl Host, target: &Target, deleted: &Value) -> WriteOutc
             warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         },
         Err(_) => saved_pending(host, target),
     }
 }
 
-/// A save landed: Google's copy now (its reply, or a fresh GET) goes into the mirror, and the session
-/// moves onto it for the fields this save `sent` (see [`rebase_sent`]).
+/// A save landed: Google's copy now (its reply, or a fresh GET) goes into the mirror, and an editor's
+/// session (`None` for a move or an Undo) moves onto it for the fields this save `sent` (see
+/// [`rebase_sent`]).
 fn land_saved(
     host: &impl Host,
     target: &Target,
-    session: &str,
+    session: Option<&str>,
     saved: Value,
     sent: &serde_json::Map<String, Value>,
 ) -> WriteOutcome {
-    if let Ok(mut sessions) = host.edit().sessions.lock() {
-        if let Some(open) = sessions.get_mut(session) {
-            rebase_sent(&mut open.base, &saved, sent);
+    if let Some(session) = session {
+        if let Ok(mut sessions) = host.edit().sessions.lock() {
+            if let Some(open) = sessions.get_mut(session) {
+                rebase_sent(&mut open.base, &saved, sent);
+            }
         }
     }
     let row = calendar::parse_event(&target.calendar_id, &saved);
@@ -7397,6 +8176,7 @@ fn land_saved(
             warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         },
         // Saved, but not as a row PM could mirror, or the mirror write failed: the next sync shows it.
         _ => saved_pending(host, target),
@@ -9639,10 +10419,11 @@ mod tests {
             ..invited.clone()
         };
         assert!(facts_from_row(&modifiable, &calendars[0]).guests_can_modify);
-        let rights = |edit_block, can_delete, can_respond| ListRights {
+        let rights = |edit_block, can_delete, can_respond, can_retime| ListRights {
             edit_block,
             can_delete,
             can_respond,
+            can_retime,
         };
         let rows = [
             mine,
@@ -9654,20 +10435,23 @@ mod tests {
             invited,
             no_address,
             locked,
+            modifiable,
         ];
         // C14c: someone else's event opens in the editor for the user's own settings, and is never
-        // deleted from PM (Remove is a later layer's).
+        // deleted from PM (Remove is a later layer's). C16a: a drag only where the gate opens the
+        // time: never on someone else's event unless they let guests change it, nor a locked copy.
         let want = vec![
-            rights(None, true, false),
-            rights(None, false, false),
-            rights(Some(ReadOnlyReason::NotGoogle), false, false),
-            rights(None, true, false),
-            rights(None, true, false),
+            rights(None, true, false, true),
+            rights(None, false, false, false),
+            rights(Some(ReadOnlyReason::NotGoogle), false, false, false),
+            rights(None, true, false, true),
+            rights(None, true, false, true),
             // Yours, with your own entry: the organiser may reply too.
-            rights(None, true, true),
-            rights(None, false, true),
-            rights(None, false, false),
-            rights(None, false, true),
+            rights(None, true, true, true),
+            rights(None, false, true, false),
+            rights(None, false, false, false),
+            rights(None, false, true, false),
+            rights(None, false, true, true),
         ];
         let got = list_rights(&conn, &rows).unwrap();
         assert_eq!(got.len(), want.len());
@@ -11625,6 +12409,7 @@ mod tests {
             warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         }
     }
 
@@ -11633,6 +12418,7 @@ mod tests {
             warnings: vec![WriteWarning::MirrorRefreshPending],
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         }
     }
 
@@ -12419,6 +13205,7 @@ mod tests {
                 warnings: vec![WriteWarning::LeftOnOldSeries],
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
+                undo: None,
             }
         );
         assert_eq!(
@@ -15226,6 +16013,7 @@ mod tests {
                 warnings: vec![WriteWarning::LeftOnOldSeries],
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
+                undo: None,
             }
         );
         assert!(split_rows(&host)
@@ -17681,6 +18469,7 @@ mod tests {
             warnings: vec![WriteWarning::OutsideMirror],
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         };
         assert!(outcome == outside, "saved, and said to be outside");
         let row = host
@@ -17987,6 +18776,7 @@ mod tests {
             warnings: vec![WriteWarning::PartlyApplied],
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         };
         let patch = |answer: Scripted| Step::write(Method::Patch, "/events/solo", "\"s1\"", answer);
         let maybe = Scripted::Reply {
@@ -18080,6 +18870,7 @@ mod tests {
                     warnings: vec![WriteWarning::PartlyApplied],
                     left_behind: Vec::new(),
                     milestone_moves: None,
+                    undo: None,
                 },
             "applied, never ignored"
         );
@@ -18136,6 +18927,7 @@ mod tests {
                     warnings: vec![WriteWarning::PartlyApplied],
                     left_behind: Vec::new(),
                     milestone_moves: None,
+                    undo: None,
                 },
             "saved, said to be in part"
         );
@@ -18839,7 +19631,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!((literals, gated), (4, 3), "the three shells and the settle");
+        // The save's, the held delete's two, the move's (C16a), and the settle's.
+        assert_eq!((literals, gated), (5, 4), "the four shells and the settle");
         // And the gate itself is a dev build's only.
         assert!(
             shipped.contains("const MISSING_CHOICE_OK: bool = cfg!(debug_assertions);"),
@@ -18916,6 +19709,11 @@ mod tests {
                 wall: "01:30".into(),
             },
             TimeError::EndBeforeStart,
+            // A drop on the second pass of an hour the event's zone repeats (C16a).
+            TimeError::RepeatedHour {
+                zone: "Europe/London".into(),
+                wall: "25-10-2026 01:30".into(),
+            },
         ];
         let refusals: Vec<SeriesRefusal> = recur
             .into_iter()
@@ -19004,6 +19802,11 @@ mod tests {
                 NO_STAMP_REPLY,
                 LOST_REPLY,
                 GUESTS_SHRANK,
+                // Moving an event, and putting a move back (C16a).
+                MOVE_NOT_YET,
+                NOT_REPEATING_MOVE,
+                UNDO_GONE,
+                UNDO_GUESTS,
             ]
             .iter()
             .map(|l| l.to_string()),
@@ -20068,6 +20871,7 @@ mod tests {
                     warnings: vec![WriteWarning::OutsideMirror],
                     left_behind: Vec::new(),
                     milestone_moves: None,
+                    undo: None,
                 },
             "saved in Google, and said to be outside"
         );
@@ -20666,6 +21470,7 @@ mod tests {
             warnings: vec![WriteWarning::OutsideMirror],
             left_behind: Vec::new(),
             milestone_moves: None,
+            undo: None,
         };
         // Monday 10-01-2028 is past the window; Monday 01-06-2026 three times ends before it.
         for draft in [
@@ -21413,7 +22218,7 @@ mod tests {
             milestones: vec![launch_offer(launch, "2026-10-19")],
         };
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(moves) }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(moves), undo: None }
                 if warnings.is_empty() && left_behind.is_empty() && **moves == want),
             "Launch is offered, the new part named from the insert's answer"
         );
@@ -21597,7 +22402,7 @@ mod tests {
         for looked in [true, false] {
             let (outcome, launch) = finish_left_behind(looked).await;
             assert!(
-                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m) }
+                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
                     if *left_behind == ["2026-11-02"]
                         && warnings.contains(&WriteWarning::MirrorRefreshPending) != looked
                         && m.milestones == [launch_offer(launch, "2026-10-26")]),
@@ -21884,7 +22689,7 @@ mod tests {
             steps.extend(refetch_after_carry(&exception, left));
             let outcome = split_with(&host, &exception, events, steps).await;
             assert!(
-                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None }
+                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None }
                     if *warnings == [WriteWarning::LeftOnOldSeries] && *left_behind == ["2026-10-26"]),
                 "saved with its occurrence left behind, nothing offered"
             );
@@ -21922,7 +22727,7 @@ mod tests {
         }
         let outcome = split_with(&host, &exception, events, steps).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None }
                 if *warnings == [WriteWarning::MirrorRefreshPending, WriteWarning::LeftOnOldSeries]
                     && *left_behind == ["2026-10-26"]),
             "pending, the occurrence left behind, and nothing offered"
@@ -21982,7 +22787,7 @@ mod tests {
             .any(|r| r.start.starts_with("2026-10-27"));
         assert!(kept, "the mirror keeps the occurrence on the earlier part");
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m) }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
                 if *warnings == [WriteWarning::MirrorRefreshPending, WriteWarning::LeftOnOldSeries]
                     && *left_behind == ["2026-10-26"]
                     && m.milestones == [launch_offer(launch, "2026-10-27")]),
@@ -22010,7 +22815,7 @@ mod tests {
         steps.extend(refetch_after_carry(&exception, left));
         let outcome = split_with(&host, &exception, events, steps).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None }
                 if !warnings.contains(&WriteWarning::MirrorRefreshPending)
                     && *left_behind == ["2026-10-26"]),
             "saved from Google's read, the occurrence left behind, and nothing offered"
@@ -22244,7 +23049,7 @@ mod tests {
         );
         let outcome = split_from_moved(&host, &opened, events).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m) }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
                 if warnings.is_empty() && left_behind.is_empty()
                     && m.milestones == [launch_offer(launch, "2026-10-18")]
                     && m.first_day.as_deref() == Some("2026-10-18")
@@ -22282,7 +23087,7 @@ mod tests {
         );
         let outcome = split_from_moved(&host, &opened, events).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m) }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
                 if warnings.is_empty() && left_behind.is_empty()
                     && m.milestones == [launch_offer(launch, "2026-10-17")]
                     && m.first_day.as_deref() == Some("2026-10-17")
@@ -23300,6 +24105,7 @@ mod tests {
                     warnings: vec![WriteWarning::KeptOwnReply],
                     left_behind: vec!["2026-10-19".into()],
                     milestone_moves: None,
+                    undo: None,
                 },
             "saved, with the occurrence that kept its own answer"
         );
@@ -23361,6 +24167,7 @@ mod tests {
                     ],
                     left_behind: vec!["2026-10-19".into()],
                     milestone_moves: None,
+                    undo: None,
                 },
             "saved, shown after the next refresh, with the occurrence that kept its own answer"
         );
@@ -23426,6 +24233,7 @@ mod tests {
                     warnings: vec![WriteWarning::KeptOwnReply],
                     left_behind: vec!["2026-10-19".into()],
                     milestone_moves: None,
+                    undo: None,
                 },
             "landed from the second listing, only the occurrence answered on its own said"
         );
@@ -23873,6 +24681,1565 @@ mod tests {
                     message: SeriesRefusal::InvitationFollowing.to_string()
                 },
             "this and following, refused in words"
+        );
+    }
+
+    // --- moving an event, and putting a move back (C16a) ---
+
+    /// What the user saw of `event`'s time: the mirror row the drag started from.
+    fn seen_times(event: &Value) -> SeenTimes {
+        let row = calendar::parse_event("cal", event).expect("a row");
+        SeenTimes {
+            start: row.start,
+            end: row.end,
+            all_day: row.all_day,
+        }
+    }
+
+    /// A drop of `event` at `start`-`end` on `day`, on a computer in London.
+    fn drop_at(event: &Value, day: &str, start: &str, end: &str) -> MoveRequest {
+        MoveRequest {
+            event_id: target(event).row_id,
+            seen: seen_times(event),
+            to: MoveTo::Timed {
+                start_date: day.into(),
+                start_time: start.into(),
+                end_date: day.into(),
+                end_time: end.into(),
+            },
+            device_zone: Some("Europe/London".into()),
+        }
+    }
+
+    /// A drop of `event` onto the days `first` to `last`.
+    fn drop_on_days(event: &Value, first: &str, last: &str) -> MoveRequest {
+        MoveRequest {
+            to: MoveTo::AllDay {
+                first_day: first.into(),
+                last_day: last.into(),
+            },
+            ..drop_at(event, first, "00:00", "00:00")
+        }
+    }
+
+    /// A London node, as PM sends one.
+    fn london(at: &str) -> Value {
+        json!({ "dateTime": at, "timeZone": "Europe/London" })
+    }
+
+    /// The dentist (09:00-10:00 on 12-10) as Google holds it moved to 10:00-11:00, at "s2".
+    fn dentist_at_ten() -> Value {
+        written(
+            &dentist(),
+            &[
+                ("start", london("2026-10-12T10:00:00+01:00")),
+                ("end", london("2026-10-12T11:00:00+01:00")),
+            ],
+            "\"s2\"",
+        )
+    }
+
+    /// Move `event` (held in `host`) as `request` says, Google answering the move's own GET with
+    /// `event`, then as `answers` say.
+    async fn move_one(
+        host: &TestHost,
+        event: &Value,
+        request: &MoveRequest,
+        answers: Vec<Step>,
+        answer: GuestAnswer,
+    ) -> (WriteOutcome, Script) {
+        let path = format!("/events/{}", event["id"].as_str().unwrap());
+        let mut steps = vec![Step::get(&path, "", event.clone())];
+        steps.extend(answers);
+        let script = Script::new(steps);
+        let outcome = move_event(
+            &script,
+            host,
+            &target(event),
+            request,
+            EditingStatus::On,
+            &answer,
+        )
+        .await;
+        (outcome, script)
+    }
+
+    /// The dentist moved to ten in `host`, Google answering with [`dentist_at_ten`]: its Undo.
+    async fn moved_to_ten(host: &TestHost) -> String {
+        let event = dentist();
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            Scripted::Json(dentist_at_ten()),
+        );
+        let (outcome, script) =
+            move_one(host, &event, &request, vec![patch], GuestAnswer::default()).await;
+        script.asked_all();
+        offered(&outcome).expect("an Undo").undo_token.clone()
+    }
+
+    /// The Undo a `Saved` offers.
+    fn offered(outcome: &WriteOutcome) -> Option<&UndoOffer> {
+        match outcome {
+            WriteOutcome::Saved { undo, .. } => undo.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// `Saved` with an Undo for 8 s and nothing else to say (C16 critique C1-M5: compared without
+    /// printing the outcome).
+    fn saved_with_undo(outcome: &WriteOutcome) -> bool {
+        matches!(outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: Some(u) }
+            if warnings.is_empty() && left_behind.is_empty() && u.undo_seconds == 8
+                && u.undo_token.len() == 32)
+    }
+
+    /// §5.5: a drop reads Google's copy, then sends one PATCH of its start and end on that copy's
+    /// etag, emailing nobody; Google's answer lands in the row, with an Undo.
+    #[tokio::test]
+    async fn reschedule_sends_only_start_and_end_on_the_fresh_etag() {
+        let event = dentist();
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            Scripted::Json(dentist_at_ten()),
+        );
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script) =
+            move_one(&host, &event, &request, vec![patch], GuestAnswer::default()).await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "moved, with an Undo");
+        assert_eq!(host.row("solo").start, "2026-10-12T09:00:00Z");
+        assert_eq!(host.told(), ["cal"]);
+        assert!(
+            first_write(&script).body
+                == Some(json!({
+                    "start": london("2026-10-12T10:00:00+01:00"),
+                    "end": london("2026-10-12T11:00:00+01:00"),
+                })),
+            "its start and end, nothing else"
+        );
+    }
+
+    /// R2 for a drop: Google moved it since the row was drawn. Nothing is sent, and Google's copy
+    /// lands, so the event shows where Google has it and the next drag starts from there.
+    #[tokio::test]
+    async fn reschedule_refuses_when_google_moved_it_and_shows_googles_copy() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let elsewhere = written(
+            &event,
+            &[
+                ("start", json!({ "dateTime": "2026-10-12T14:00:00+01:00" })),
+                ("end", json!({ "dateTime": "2026-10-12T15:00:00+01:00" })),
+            ],
+            "\"s3\"",
+        );
+        let (outcome, script) = move_one(
+            &host,
+            &elsewhere,
+            &request,
+            Vec::new(),
+            GuestAnswer::default(),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::Conflict {
+                    fields: vec!["start".into(), "end".into()]
+                },
+            "refused on its time"
+        );
+        assert_eq!(host.row("solo").start, "2026-10-12T13:00:00Z");
+    }
+
+    /// A title changed in Google since is no reason to refuse a drop: it sends only times, and
+    /// Google's new title stays.
+    #[tokio::test]
+    async fn reschedule_saves_over_a_title_changed_in_google() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let renamed = written(&event, &[("summary", json!("Dentist (Dr Lee)"))], "\"s3\"");
+        let landed = written(
+            &dentist_at_ten(),
+            &[("summary", json!("Dentist (Dr Lee)"))],
+            "\"s4\"",
+        );
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s3\"",
+            Scripted::Json(landed),
+        );
+        let (outcome, script) = move_one(
+            &host,
+            &renamed,
+            &request,
+            vec![patch],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome));
+        let row = host.row("solo");
+        assert_eq!(
+            (row.summary.as_str(), row.start.as_str()),
+            ("Dentist (Dr Lee)", "2026-10-12T09:00:00Z")
+        );
+    }
+
+    /// R9 after the gate (C16 critique C1-L3): an occurrence dropped with no choice asks which
+    /// occurrences, with only a GET sent; one PM can't change says why first; so does a locked copy.
+    #[tokio::test]
+    async fn reschedule_on_an_occurrence_without_a_scope_asks_for_one() {
+        let theirs = with(
+            with(
+                dentist_occurrence(),
+                "organizer",
+                json!({ "email": "o@x.org" }),
+            ),
+            "attendees",
+            json!([{ "email": "o@x.org", "organizer": true }]),
+        );
+        for (event, want) in [
+            (dentist_occurrence(), WriteOutcome::needs_scope()),
+            (
+                theirs,
+                WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer,
+                },
+            ),
+            (
+                with(dentist(), "locked", json!(true)),
+                WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::Locked,
+                },
+            ),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+            let (outcome, script) =
+                move_one(&host, &event, &request, Vec::new(), GuestAnswer::default()).await;
+            script.finished();
+            assert!(outcome == want, "the reason first, else which occurrences");
+            assert_eq!(script.sent().len(), 1);
+        }
+    }
+
+    /// R9 for a drop with guests: asked first, with only a GET sent; an answer given for other
+    /// numbers is asked again; the answer goes to Google as chosen.
+    #[tokio::test]
+    async fn reschedule_asks_who_to_email_and_asks_again_when_guests_changed() {
+        let event = with_a_guest(dentist());
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let two = GuestNotice {
+            updated: 2,
+            people: 2,
+            emails: 2,
+            ..one_updated()
+        };
+        for (answer, want) in [
+            (
+                GuestAnswer::default(),
+                WriteOutcome::needs_notify(one_updated()),
+            ),
+            (
+                answered(Notify::All, two),
+                WriteOutcome::needs_notify_again(one_updated()),
+            ),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script) = move_one(&host, &event, &request, Vec::new(), answer).await;
+            script.finished();
+            assert!(outcome == want, "asked, nothing sent");
+        }
+        let landed = written(&with_a_guest(dentist_at_ten()), &[], "\"s2\"");
+        for (notify, query) in [
+            (Notify::All, "sendUpdates=all"),
+            (Notify::None, "sendUpdates=none"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let patch = told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                query,
+                Scripted::Json(landed.clone()),
+            );
+            let (outcome, script) = move_one(
+                &host,
+                &event,
+                &request,
+                vec![patch],
+                answered(notify, one_updated()),
+            )
+            .await;
+            script.asked_all();
+            assert!(saved_with_undo(&outcome), "sent as chosen");
+        }
+    }
+
+    /// A 412 gets one fresh look: the time still the one dragged, the PATCH goes on the new etag. A
+    /// second 412 is a conflict, and Google's copy lands, so "PM now shows Google's version" is
+    /// true (C16 critique C2-M10).
+    #[tokio::test]
+    async fn reschedule_rounds_a_412_once() {
+        let event = dentist();
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let touched = written(&event, &[("colorId", json!("3"))], "\"s2\"");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script) = move_one(
+            &host,
+            &event,
+            &request,
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Status(412),
+                ),
+                Step::get("/events/solo", "", touched.clone()),
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s2\"",
+                    Scripted::Json(written(&dentist_at_ten(), &[], "\"s3\"")),
+                ),
+            ],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "sent on the new etag");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let renamed = written(&touched, &[("summary", json!("Dentist?"))], "\"s4\"");
+        let (outcome, script) = move_one(
+            &host,
+            &event,
+            &request,
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Status(412),
+                ),
+                Step::get("/events/solo", "", touched),
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s2\"",
+                    Scripted::Status(412),
+                ),
+                Step::get("/events/solo", "", renamed),
+            ],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == WriteOutcome::Conflict { fields: Vec::new() });
+        assert_eq!(host.row("solo").summary, "Dentist?", "Google's copy shows");
+    }
+
+    /// A drop whose answer never came looks: there, it landed, with its Undo; Google's reply that
+    /// isn't JSON lands nothing and offers no Undo (`saved_pending`).
+    #[tokio::test]
+    async fn a_lost_answer_looks_and_lands_with_an_undo() {
+        let event = dentist();
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script) = move_one(
+            &host,
+            &event,
+            &request,
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Lost { retried: false },
+                ),
+                Step::get("/events/solo", "", dentist_at_ten()),
+            ],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "it landed, with an Undo");
+        assert_eq!(host.row("solo").start, "2026-10-12T09:00:00Z");
+    }
+
+    /// An Undo needs Google's answer: a reply PM can't read is saved, pending, with none.
+    #[tokio::test]
+    async fn an_undo_needs_googles_reply() {
+        let event = dentist();
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let unread = Scripted::Reply {
+            status: 200,
+            body: None,
+            date: None,
+            maybe_applied: false,
+        };
+        let (outcome, script) = move_one(
+            &host,
+            &event,
+            &request,
+            vec![Step::write(Method::Patch, "/events/solo", "\"s1\"", unread)],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome == pending(),
+            "saved, PM's calendar catching up, no Undo"
+        );
+        assert!(host.edit.undos.lock().unwrap().is_empty());
+    }
+
+    /// R6: a timed drop with no zone for this computer is refused before anything is read, the
+    /// choices for one too; an all-day drop needs none.
+    #[tokio::test]
+    async fn a_timed_drop_without_a_zone_is_refused() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = MoveRequest {
+            device_zone: None,
+            ..drop_at(&event, "2026-10-12", "10:00", "11:00")
+        };
+        let silent = Script::new(Vec::new());
+        let outcome = move_event(
+            &silent,
+            &*host,
+            &target(&event),
+            &request,
+            EditingStatus::On,
+            &GuestAnswer::default(),
+        )
+        .await;
+        silent.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: time::TimeError::NoZone.to_string()
+                }
+        );
+        let occurrence = monday_19();
+        let blind = MoveRequest {
+            device_zone: None,
+            ..drop_at(&occurrence, "2026-10-19", "10:00", "11:00")
+        };
+        let got = ask_on(
+            &host,
+            &silent,
+            &occurrence,
+            ChoiceRequest::Move(blind),
+            None,
+            &["abc"],
+        )
+        .await;
+        assert!(matches!(
+            got,
+            SeriesChoices::Refused {
+                result: WriteOutcome::Failed { .. }
+            }
+        ));
+        silent.asked_all();
+    }
+
+    /// An all-day event dropped in the hours takes this computer's zone and sends `date` as null
+    /// (`events.patch` merges the node); a resize keeps the untouched start as Google holds it,
+    /// seconds and all.
+    #[tokio::test]
+    async fn all_day_to_timed_nulls_date_and_a_resize_keeps_the_start() {
+        let day = written(
+            &dentist(),
+            &[
+                ("start", json!({ "date": "2026-10-12" })),
+                ("end", json!({ "date": "2026-10-13" })),
+            ],
+            "\"s1\"",
+        );
+        let host = TestHost::holding(std::slice::from_ref(&day));
+        let request = drop_at(&day, "2026-10-12", "14:00", "15:00");
+        let timed = written(
+            &day,
+            &[
+                ("start", london("2026-10-12T14:00:00+01:00")),
+                ("end", london("2026-10-12T15:00:00+01:00")),
+            ],
+            "\"s2\"",
+        );
+        let (outcome, script) = move_one(
+            &host,
+            &day,
+            &request,
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(timed),
+            )],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome));
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-12T14:00:00+01:00", "timeZone": "Europe/London",
+                    "date": null })
+        );
+        // The start Google holds has seconds: a resize of the end sends it back byte for byte.
+        let start = json!({ "dateTime": "2026-10-12T09:00:30+01:00" });
+        let odd = written(&dentist(), &[("start", start.clone())], "\"s1\"");
+        let host = TestHost::holding(std::slice::from_ref(&odd));
+        let request = drop_at(&odd, "2026-10-12", "09:00", "11:00");
+        let resized = written(
+            &odd,
+            &[("end", london("2026-10-12T11:00:00+01:00"))],
+            "\"s2\"",
+        );
+        let (outcome, script) = move_one(
+            &host,
+            &odd,
+            &request,
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(resized),
+            )],
+            GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome));
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(body["start"], start, "Google's own start");
+        assert_eq!(body["end"], london("2026-10-12T11:00:00+01:00"));
+    }
+
+    /// C16a ships behind a release gate until the views that drag land (C16b): both shells say
+    /// so first, before anything is read.
+    #[test]
+    fn release_refuses_moving_until_the_views_land() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        for shell in [
+            "pub async fn reschedule_calendar_event(",
+            "pub async fn undo_calendar_change(",
+        ] {
+            let start = shipped.find(shell).expect("the shell");
+            let body = &shipped[start..];
+            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+            let at = |needle: &str| body.find(needle).unwrap_or(usize::MAX);
+            assert!(
+                at("if !cfg!(debug_assertions) {") < at("message: MOVE_NOT_YET.into(),"),
+                "{shell} refuses in release builds"
+            );
+            assert!(
+                at("message: MOVE_NOT_YET.into(),") < at("app.state::<AppState>()"),
+                "{shell} refuses before anything is read"
+            );
+        }
+    }
+
+    /// §5.7: the Undo puts back Google's exact nodes: a zone the move added goes as null. It is
+    /// sent on the copy Google holds now, and an Undo is offered no Undo.
+    #[tokio::test]
+    async fn undo_puts_googles_exact_nodes_back() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", dentist_at_ten()),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(outcome == saved(), "put back, with no Undo of its own");
+        assert!(
+            first_write(&script).body
+                == Some(json!({
+                    "start": { "dateTime": "2026-10-12T09:00:00+01:00", "timeZone": null },
+                    "end": { "dateTime": "2026-10-12T10:00:00+01:00", "timeZone": null },
+                })),
+            "Google's own nodes from before, the zone the move added taken off"
+        );
+        assert_eq!(host.row("solo").etag.as_deref(), Some("\"s3\""));
+    }
+
+    /// Moved onto a day and undone: the date the move added goes as null.
+    #[tokio::test]
+    async fn undo_after_a_kind_switch_nulls_the_other_kind() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = drop_on_days(&event, "2026-10-13", "2026-10-13");
+        let day = written(
+            &event,
+            &[
+                ("start", json!({ "date": "2026-10-13" })),
+                ("end", json!({ "date": "2026-10-14" })),
+            ],
+            "\"s2\"",
+        );
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            Scripted::Json(day.clone()),
+        );
+        let (outcome, script) =
+            move_one(&host, &event, &request, vec![patch], GuestAnswer::default()).await;
+        script.asked_all();
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        assert_eq!(
+            first_write(&script).body.unwrap()["start"],
+            json!({ "date": "2026-10-13", "dateTime": null, "timeZone": null })
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", day),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(outcome == saved());
+        assert_eq!(
+            first_write(&script).body.unwrap()["start"],
+            json!({ "dateTime": "2026-10-12T09:00:00+01:00", "date": null })
+        );
+    }
+
+    /// Google moved it again since the drop: the Undo sends nothing and shows Google's copy.
+    #[tokio::test]
+    async fn undo_refuses_after_google_changed_it() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let again = written(
+            &dentist_at_ten(),
+            &[
+                ("start", london("2026-10-12T15:00:00+01:00")),
+                ("end", london("2026-10-12T16:00:00+01:00")),
+            ],
+            "\"s3\"",
+        );
+        let script = Script::new(vec![Step::get("/events/solo", "", again)]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.finished();
+        let fields = match outcome {
+            WriteOutcome::Conflict { fields } => sorted(fields),
+            _ => Vec::new(),
+        };
+        assert_eq!(fields, ["end", "start"], "refused on its time");
+        assert_eq!(host.row("solo").start, "2026-10-12T14:00:00Z");
+    }
+
+    /// A title edited in Google after the drop doesn't stop its Undo, which sends only times, on
+    /// Google's newer copy.
+    #[tokio::test]
+    async fn undo_goes_ahead_when_only_another_field_changed() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let renamed = written(&dentist_at_ten(), &[("summary", json!("Dr Lee"))], "\"s3\"");
+        let back = written(&event, &[("summary", json!("Dr Lee"))], "\"s4\"");
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", renamed),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s3\"",
+                Scripted::Json(back),
+            ),
+        ]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(outcome == saved());
+        let body = first_write(&script).body.unwrap();
+        let keys = sorted(body.as_object().unwrap().keys().cloned().collect());
+        assert_eq!(keys, ["end", "start"]);
+        assert_eq!(host.row("solo").summary, "Dr Lee");
+    }
+
+    /// R7a: the Undo emails exactly whom the move did, Send or Don't send alike; once Google's guests
+    /// differ from those, it sends nothing (C16 critique C1-L7: checked whatever the move sent).
+    #[tokio::test]
+    async fn undo_emails_whom_the_write_did_and_not_once_the_guests_changed() {
+        let event = with_a_guest(dentist());
+        let at_ten = with_a_guest(dentist_at_ten());
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        for (notify, query) in [
+            (Notify::All, "sendUpdates=all"),
+            (Notify::None, "sendUpdates=none"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let patch = told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                query,
+                Scripted::Json(at_ten.clone()),
+            );
+            let (outcome, script) = move_one(
+                &host,
+                &event,
+                &request,
+                vec![patch],
+                answered(notify, one_updated()),
+            )
+            .await;
+            script.asked_all();
+            let token = offered(&outcome).expect("an Undo").undo_token.clone();
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", at_ten.clone()),
+                told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s2\"",
+                    query,
+                    Scripted::Json(written(&event, &[], "\"s3\"")),
+                ),
+            ]);
+            assert!(undo_change(&script, &*host, &token).await == saved());
+            script.asked_all();
+        }
+        // Moved with nobody to email; a guest added in Google since.
+        let host = TestHost::holding(&[dentist()]);
+        let token = moved_to_ten(&host).await;
+        let script = Script::new(vec![Step::get(
+            "/events/solo",
+            "",
+            written(&at_ten, &[], "\"s3\""),
+        )]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.finished();
+        let refused = WriteOutcome::Failed {
+            message: UNDO_GUESTS.into(),
+        };
+        assert!(outcome == refused);
+        // Moved with Send to one guest; a second added in Google since.
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let patch = told(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            "sendUpdates=all",
+            Scripted::Json(at_ten.clone()),
+        );
+        let (outcome, _) = move_one(
+            &host,
+            &event,
+            &request,
+            vec![patch],
+            answered(Notify::All, one_updated()),
+        )
+        .await;
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        let two = with(
+            at_ten.clone(),
+            "attendees",
+            json!([
+                { "email": "me@example.com", "self": true, "organizer": true },
+                { "email": "a@x.org" },
+                { "email": "b@x.org" }
+            ]),
+        );
+        let script = Script::new(vec![Step::get("/events/solo", "", two)]);
+        assert!(undo_change(&script, &*host, &token).await == refused);
+        script.finished();
+    }
+
+    /// An Undo past its window is gone, with nothing read; one used is gone too.
+    #[tokio::test]
+    async fn an_undo_lapses_and_is_taken_once() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let long_ago = Instant::now()
+            .checked_sub(UNDO + UNDO_GRACE + Duration::from_secs(1))
+            .expect("a clock past that");
+        let lapsed = host
+            .edit
+            .offer_undo(&target(&event), timing_landed(), long_ago)
+            .expect("offered")
+            .undo_token;
+        let silent = Script::new(Vec::new());
+        let gone = WriteOutcome::Failed {
+            message: UNDO_GONE.into(),
+        };
+        assert!(undo_change(&silent, &*host, &lapsed).await == gone);
+        let token = moved_to_ten(&host).await;
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", dentist_at_ten()),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        assert!(undo_change(&script, &*host, &token).await == saved());
+        assert!(undo_change(&silent, &*host, &token).await == gone, "once");
+        silent.asked_all();
+        assert!(silent.sent().is_empty());
+    }
+
+    /// A move's Undo as offered for the dentist: its times before and after.
+    fn timing_landed() -> Landed {
+        let keys = ["start", "end"];
+        Landed {
+            before: snapshot(&dentist(), &keys),
+            after: snapshot(&dentist_at_ten(), &keys),
+            notify: Notify::None,
+            guests: None,
+        }
+    }
+
+    /// One Undo per row: a second move, an editor's save, Google's copy landed on a conflict, and a
+    /// change to every occurrence each let the earlier Undo go, which would otherwise be a sure
+    /// conflict; another row's stays.
+    #[tokio::test]
+    async fn a_later_write_of_the_row_retires_its_undo() {
+        let event = dentist();
+        let gone = WriteOutcome::Failed {
+            message: UNDO_GONE.into(),
+        };
+        // A second move: its own Undo is the one left.
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let first = moved_to_ten(&host).await;
+        let other = host
+            .edit
+            .offer_undo(&target(&monday_19()), timing_landed(), Instant::now())
+            .expect("offered")
+            .undo_token;
+        let request = drop_at(&dentist_at_ten(), "2026-10-12", "12:00", "13:00");
+        let later = written(
+            &dentist_at_ten(),
+            &[
+                ("start", london("2026-10-12T12:00:00+01:00")),
+                ("end", london("2026-10-12T13:00:00+01:00")),
+            ],
+            "\"s3\"",
+        );
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s2\"",
+            Scripted::Json(later),
+        );
+        let (outcome, _) = move_one(
+            &host,
+            &dentist_at_ten(),
+            &request,
+            vec![patch],
+            GuestAnswer::default(),
+        )
+        .await;
+        let second = offered(&outcome).expect("an Undo").undo_token.clone();
+        let silent = Script::new(Vec::new());
+        assert!(undo_change(&silent, &*host, &first).await == gone);
+        assert!(host.edit.undo_target(&second, Instant::now()).is_some());
+        assert!(
+            host.edit.undo_target(&other, Instant::now()).is_some(),
+            "another row's stays"
+        );
+        // An editor's save of the event.
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &dentist_at_ten(),
+            target(&event),
+            &title("Retro"),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(retitled(&dentist_at_ten(), "\"s3\"")),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome == saved(),
+            "an editor's save offers no Undo yet (C16d)"
+        );
+        assert!(undo_change(&silent, &*host, &token).await == gone);
+        // Google's copy, landed on a conflict.
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let request = drop_at(&dentist(), "2026-10-12", "12:00", "13:00");
+        let (outcome, _) = move_one(
+            &host,
+            &dentist_at_ten(),
+            &request,
+            Vec::new(),
+            GuestAnswer::default(),
+        )
+        .await;
+        assert!(matches!(outcome, WriteOutcome::Conflict { .. }));
+        assert!(undo_change(&silent, &*host, &token).await == gone);
+        // Every occurrence retitled: the occurrence's Undo goes with the series' landing.
+        let host = TestHost::holding(&october());
+        let (series, instance) = (weekly(), monday_19());
+        let token = host
+            .edit
+            .offer_undo(&target(&instance), timing_landed(), Instant::now())
+            .expect("offered")
+            .undo_token;
+        let mut steps = october_reads();
+        steps.push(series_patch(Scripted::Json(retitled(&series, "\"m2\""))));
+        steps.push(refetch_read(Scripted::Json(page(retitled_october(), None))));
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &instance,
+            &series,
+            title("Retro"),
+            Scope::All,
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved());
+        assert!(host.edit.undo_target(&token, Instant::now()).is_none());
+        silent.asked_all();
+    }
+
+    /// C16 critique C1-L6: an Undo claims the row before it takes the record, so one pressed while
+    /// a write of the event is on its way is Busy and still there to press; editing turned off
+    /// meanwhile refuses it, still there too; a field Google closed since says why.
+    #[tokio::test]
+    async fn an_undo_waits_for_a_write_on_its_way_and_editing() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let silent = Script::new(Vec::new());
+        {
+            let _claim = InFlight::claim(&host.edit, "cal:solo").expect("free");
+            assert!(undo_change(&silent, &*host, &token).await == WriteOutcome::Busy);
+        }
+        *host.editing.lock().unwrap() = EditingStatus::Paused;
+        assert!(
+            undo_change(&silent, &*host, &token).await
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::EditingOff
+                }
+        );
+        silent.asked_all();
+        assert!(host.edit.undo_target(&token, Instant::now()).is_some());
+        *host.editing.lock().unwrap() = EditingStatus::On;
+        let locked = written(&dentist_at_ten(), &[("locked", json!(true))], "\"s3\"");
+        let script = Script::new(vec![Step::get("/events/solo", "", locked)]);
+        assert!(
+            undo_change(&script, &*host, &token).await
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::Locked
+                }
+        );
+        script.finished();
+    }
+
+    /// §5.7: only a write of the core fields is offered an Undo. One that sent guests, what they may
+    /// do, notifications, colour or a repeat isn't, nor one that sent nothing.
+    #[test]
+    fn a_save_that_sent_anything_else_offers_none() {
+        let host = TestHost::holding(&[]);
+        let on = target(&dentist());
+        let landed = |keys: &[&str]| Landed {
+            before: keys.iter().map(|k| (k.to_string(), Value::Null)).collect(),
+            after: keys.iter().map(|k| (k.to_string(), Value::Null)).collect(),
+            notify: Notify::None,
+            guests: None,
+        };
+        let now = Instant::now();
+        assert!(host
+            .edit
+            .offer_undo(&on, landed(&["summary", "start", "end"]), now)
+            .is_some());
+        for keys in [
+            &["start", "end", "attendees"][..],
+            &["guestsCanModify"],
+            &["reminders"],
+            &["colorId"],
+            &["recurrence"],
+            &[],
+        ] {
+            assert!(
+                host.edit.offer_undo(&on, landed(keys), now).is_none(),
+                "{keys:?}"
+            );
+        }
+    }
+
+    /// The choices for dragging an occurrence to another time on its day: every row planned, with
+    /// its token; "this and following" is a part of its own from there.
+    #[tokio::test]
+    async fn move_choices_offer_three_rows_for_a_same_day_drag() {
+        let (series, instance) = (weekly(), monday_19());
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], october()));
+        let request = ChoiceRequest::Move(drop_at(&instance, "2026-10-19", "10:00", "11:00"));
+        let got = ask_on(
+            &TestHost::holding(&[]),
+            &script,
+            &instance,
+            request,
+            None,
+            &["abc"],
+        )
+        .await;
+        let SeriesChoices::Ready {
+            this,
+            following,
+            all,
+            notice: None,
+        } = got
+        else {
+            panic!("no rows");
+        };
+        assert!(matches!(&this, ScopeRow::Offered { warnings, .. } if warnings.is_empty()));
+        assert!(matches!(&following, ScopeRow::Offered { .. }));
+        assert!(matches!(&all, ScopeRow::Offered { .. }));
+        for row in [&this, &following, &all] {
+            assert_eq!(token(row).len(), 16);
+        }
+        assert_ne!(token(&this), token(&all));
+    }
+
+    /// Dragged between timed and all day: "This event" moves the one occurrence; every occurrence
+    /// is rebuilt from the rule, as the editor's kind change is (C11 §12.4).
+    #[tokio::test]
+    async fn move_choices_for_a_kind_change() {
+        let (series, instance) = (weekly(), monday_19());
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], october()));
+        let request = ChoiceRequest::Move(drop_on_days(&instance, "2026-10-19", "2026-10-19"));
+        let got = ask_on(
+            &TestHost::holding(&[]),
+            &script,
+            &instance,
+            request,
+            None,
+            &["abc"],
+        )
+        .await;
+        let SeriesChoices::Ready { this, .. } = got else {
+            panic!("no rows");
+        };
+        assert!(matches!(this, ScopeRow::Offered { .. }));
+    }
+
+    /// A drop onto another day asks C9b-1's question for "all events": the days it repeats on move.
+    #[tokio::test]
+    async fn a_move_to_another_day_asks_the_repeat_day_question() {
+        let (series, instance) = (weekly(), monday_19());
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], october()));
+        let request = ChoiceRequest::Move(drop_at(&instance, "2026-10-20", "09:00", "10:00"));
+        let got = ask_on(
+            &TestHost::holding(&[]),
+            &script,
+            &instance,
+            request,
+            None,
+            &["abc"],
+        )
+        .await;
+        let SeriesChoices::Ready { all, .. } = got else {
+            panic!("no rows");
+        };
+        assert!(
+            warnings(&all)
+                .iter()
+                .any(|w| matches!(w, SeriesWarningDto::RepeatDayChanges { shift_days: 1, .. })),
+            "the repeat-day question"
+        );
+    }
+
+    /// C14c, C16 critique C2-M11: an invitation whose organiser lets guests change it: one
+    /// occurrence can be dragged; "this and following" is refused, and so is moving every
+    /// occurrence, whose times are the organiser's.
+    #[tokio::test]
+    async fn an_invitations_move_refuses_this_and_following() {
+        let modify = |event: Value| with(event, "guestsCanModify", json!(true));
+        let (series, instance) = (modify(weekly_invite()), modify(monday_invite()));
+        let window: Vec<Value> = october()
+            .into_iter()
+            .map(invitation_of)
+            .map(modify)
+            .collect();
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], window));
+        let request = ChoiceRequest::Move(drop_at(&instance, "2026-10-19", "10:00", "11:00"));
+        let got = ask_on(
+            &TestHost::holding(&[]),
+            &script,
+            &instance,
+            request,
+            None,
+            &["abc"],
+        )
+        .await;
+        let SeriesChoices::Ready {
+            this,
+            following,
+            all,
+            ..
+        } = got
+        else {
+            panic!("no rows");
+        };
+        assert!(
+            matches!(
+                this,
+                ScopeRow::Offered {
+                    guests: Some(_),
+                    ..
+                }
+            ),
+            "asks who to email"
+        );
+        assert!(
+            following
+                == ScopeRow::Refused {
+                    message: SeriesRefusal::InvitationFollowing.to_string()
+                }
+        );
+        assert!(
+            all == ScopeRow::Refused {
+                message: SeriesRefusal::InvitationRule.to_string()
+            }
+        );
+    }
+
+    /// A move's choices on an occurrence Google moved since the row was drawn: refused, with
+    /// Google's copy landed behind them.
+    #[tokio::test]
+    async fn a_move_choice_on_a_changed_occurrence_shows_googles_copy() {
+        let instance = monday_19();
+        let host = TestHost::holding(&october());
+        let request = ChoiceRequest::Move(drop_at(&instance, "2026-10-19", "10:00", "11:00"));
+        let moved = written(
+            &instance,
+            &[
+                ("start", london("2026-10-19T12:00:00+01:00")),
+                ("end", london("2026-10-19T13:00:00+01:00")),
+            ],
+            "\"i2\"",
+        );
+        let script = Script::new(vec![instance_read(&moved)]);
+        let got = ask_on(&host, &script, &instance, request, None, &["abc"]).await;
+        assert!(matches!(
+            got,
+            SeriesChoices::Refused {
+                result: WriteOutcome::Conflict { .. }
+            }
+        ));
+        assert_eq!(
+            host.row("abc_20261019T080000Z").start,
+            "2026-10-19T11:00:00Z"
+        );
+    }
+
+    /// "This event" of a drop: one PATCH of the occurrence, Google's answer in its row, and an Undo
+    /// that puts back the step's own record of Google's values before it.
+    #[tokio::test]
+    async fn a_this_event_move_lands_and_has_an_undo() {
+        let host = TestHost::holding(&october());
+        let instance = monday_19();
+        let path = "/events/abc_20261019T080000Z";
+        let request = drop_at(&instance, "2026-10-19", "10:00", "11:00");
+        let moved = written(
+            &instance,
+            &[
+                ("start", london("2026-10-19T10:00:00+01:00")),
+                ("end", london("2026-10-19T11:00:00+01:00")),
+            ],
+            "\"i2\"",
+        );
+        let etag = instance["etag"].as_str().unwrap();
+        let mut steps = october_reads();
+        steps.push(Step::write(
+            Method::Patch,
+            path,
+            etag,
+            Scripted::Json(moved.clone()),
+        ));
+        let script = Script::new(steps);
+        let on = target(&instance);
+        let outcome = move_series(
+            &writer(&script, &host, &on),
+            &request,
+            Scope::This,
+            None,
+            None,
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "moved, with an Undo");
+        assert!(
+            first_write(&script).body
+                == Some(json!({
+                    "start": london("2026-10-19T10:00:00+01:00"),
+                    "end": london("2026-10-19T11:00:00+01:00"),
+                }))
+        );
+        assert_eq!(
+            host.row("abc_20261019T080000Z").start,
+            "2026-10-19T09:00:00Z"
+        );
+        let token = offered(&outcome).unwrap().undo_token.clone();
+        let script = Script::new(vec![
+            Step::get(path, "", moved),
+            Step::write(
+                Method::Patch,
+                path,
+                "\"i2\"",
+                Scripted::Json(written(&instance, &[], "\"i3\"")),
+            ),
+        ]);
+        assert!(undo_change(&script, &*host, &token).await == saved());
+        script.asked_all();
+        assert!(
+            first_write(&script).body
+                == Some(json!({ "start": instance["start"], "end": instance["end"] })),
+            "Google's values from before"
+        );
+    }
+
+    /// "All events" of a drop has no Undo (plan C16), nor has "this and following": only a one-off's
+    /// move and "This event" are offered one, which the code says by where the offer is made.
+    #[tokio::test]
+    async fn following_and_all_have_no_undo() {
+        let host = TestHost::holding(&october());
+        let (moved_series, occurrences) = an_hour_later();
+        let mut steps = october_reads();
+        steps.push(series_patch(Scripted::Json(moved_series)));
+        steps.push(refetch_read(Scripted::Json(page(occurrences, None))));
+        let script = Script::new(steps);
+        let instance = monday_19();
+        let on = target(&instance);
+        let request = drop_at(&instance, "2026-10-19", "10:00", "11:00");
+        let outcome = move_series(
+            &writer(&script, &host, &on),
+            &request,
+            Scope::All,
+            None,
+            None,
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "every occurrence moved, no Undo");
+        assert!(host.edit.undos.lock().unwrap().is_empty());
+        // The offer is made in two places only: a one-off's move and "This event"'s landing.
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            shipped
+                .matches("with_undo(host.edit(), target, outcome, landed)")
+                .count(),
+            2
+        );
+        let land = &shipped[shipped.find("async fn land_series<").expect("the landing")..];
+        let this = land.find("if plan.scope == Scope::This {").expect("This");
+        let moved = land
+            .find("moved_this(host, target, plan, saved, body)")
+            .expect("moved");
+        let next = land
+            .find("// \"Does not repeat\" for every occurrence")
+            .expect("All");
+        assert!(this < moved && moved < next, "only under \"This event\"");
+    }
+
+    /// The token binds the drop: another place, or another zone, than the one the choices were
+    /// planned for is asked again, with only reads sent.
+    #[tokio::test]
+    async fn the_move_token_binds_seen_to_and_zone() {
+        let (series, instance) = (weekly(), monday_19());
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], october()));
+        let asked = drop_at(&instance, "2026-10-19", "10:00", "11:00");
+        let got = ask_on(
+            &TestHost::holding(&[]),
+            &script,
+            &instance,
+            ChoiceRequest::Move(asked.clone()),
+            None,
+            &["abc"],
+        )
+        .await;
+        let SeriesChoices::Ready { this, .. } = got else {
+            panic!("no rows");
+        };
+        let chosen = token(&this).to_string();
+        let elsewhere = drop_at(&instance, "2026-10-19", "11:00", "12:00");
+        let abroad = MoveRequest {
+            device_zone: Some("Europe/Lisbon".into()),
+            ..asked.clone()
+        };
+        for request in [elsewhere, abroad] {
+            let host = TestHost::holding(&october());
+            let script = Script::new(october_reads());
+            let on = target(&instance);
+            let outcome = move_series(
+                &writer(&script, &host, &on),
+                &request,
+                Scope::This,
+                Some(&chosen),
+                None,
+            )
+            .await;
+            script.finished();
+            assert!(outcome == WriteOutcome::needs_scope(), "choose again");
+        }
+        // The same drop, sent with its token, goes.
+        let host = TestHost::holding(&october());
+        let mut steps = october_reads();
+        steps.push(Step::write(
+            Method::Patch,
+            "/events/abc_20261019T080000Z",
+            instance["etag"].as_str().unwrap(),
+            Scripted::Json(written(
+                &instance,
+                &[
+                    ("start", london("2026-10-19T10:00:00+01:00")),
+                    ("end", london("2026-10-19T11:00:00+01:00")),
+                ],
+                "\"i2\"",
+            )),
+        ));
+        let script = Script::new(steps);
+        let on = target(&instance);
+        let outcome = move_series(
+            &writer(&script, &host, &on),
+            &asked,
+            Scope::This,
+            Some(&chosen),
+            None,
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome));
+    }
+
+    /// A drop on an event a write is already on its way to is Busy, before anything is read; one
+    /// on the new part of a change PM is still making waits for it, after only a read.
+    #[tokio::test]
+    async fn a_drop_waits_for_a_write_on_its_way() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        {
+            let _claim = InFlight::claim(&host.edit, "cal:solo").expect("free");
+            let silent = Script::new(Vec::new());
+            let outcome = move_event(
+                &silent,
+                &*host,
+                &target(&event),
+                &request,
+                EditingStatus::On,
+                &GuestAnswer::default(),
+            )
+            .await;
+            silent.asked_all();
+            assert!(outcome == WriteOutcome::Busy);
+        }
+        let _split = Splitting::mark(&host.edit, series_key(CALENDAR, "solo"));
+        let (outcome, script) =
+            move_one(&host, &event, &request, Vec::new(), GuestAnswer::default()).await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::Busy,
+            "the change it's part of first"
+        );
+    }
+
+    /// Google's answer to a drop that PM can't put in its calendar (it came back repeating) lands
+    /// nothing, and so has no Undo: nothing says what PM would put back.
+    #[tokio::test]
+    async fn a_reply_pm_cant_mirror_offers_no_undo() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = drop_at(&event, "2026-10-12", "10:00", "11:00");
+        let repeating = written(
+            &dentist_at_ten(),
+            &[("recurrence", json!(["RRULE:FREQ=DAILY"]))],
+            "\"s2\"",
+        );
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            Scripted::Json(repeating),
+        );
+        let (outcome, script) =
+            move_one(&host, &event, &request, vec![patch], GuestAnswer::default()).await;
+        script.asked_all();
+        assert!(
+            outcome == pending(),
+            "saved in Google, PM's calendar catching up, no Undo"
+        );
+        assert!(host.edit.undos.lock().unwrap().is_empty());
+    }
+
+    /// A drag of someone else's occurrence they don't let guests change: its choices say why, after
+    /// one read, rather than offer rows that lead nowhere.
+    #[tokio::test]
+    async fn move_choices_say_why_first_on_an_invitation() {
+        let instance = monday_invite();
+        let script = Script::new(vec![instance_read(&instance)]);
+        let request = ChoiceRequest::Move(drop_at(&instance, "2026-10-19", "10:00", "11:00"));
+        let got = ask_on(
+            &TestHost::holding(&[]),
+            &script,
+            &instance,
+            request,
+            None,
+            &["abc"],
+        )
+        .await;
+        assert!(
+            got == SeriesChoices::Refused {
+                result: WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer
+                }
+            }
+        );
+    }
+
+    /// One Undo per row, every landing alike: each mirror write of a series, as `land_on`'s, lets
+    /// the Undos of the rows it wrote go (C16 critique C1-M6). And a drop or an Undo fails closed on
+    /// a body with anything but what it may send.
+    #[test]
+    fn every_landing_retires_and_every_body_fails_closed() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let records = shipped.matches("record(conn, host.edit(),").count();
+        let retired = shipped.matches("retire_landed(host, landed)").count();
+        assert_eq!(records, 8, "land_on and the seven series landings");
+        assert_eq!(retired, records, "each lets the rows' Undos go");
+        for (shell, check) in [
+            (
+                "async fn ready_move<",
+                ".any(|k| !patch::TIMING_KEYS.contains(&k.as_str()))",
+            ),
+            (
+                "fn ready_undo<",
+                ".any(|k| !patch::UNDOABLE.contains(&k.as_str()))",
+            ),
+        ] {
+            let start = shipped.find(shell).expect("the round");
+            let body = &shipped[start..];
+            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+            assert!(body.contains(check), "{shell} fails closed");
+        }
+    }
+
+    /// An editor's second 412 is a conflict that keeps its draft: nothing more is read, and no
+    /// copy of Google's lands under the editor (only a drop or an Undo shows Google's copy then).
+    #[tokio::test]
+    async fn an_editors_second_412_keeps_its_draft() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let renamed = written(&event, &[("location", json!("Low St"))], "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &title("Retro"),
+            vec![
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Status(412),
+                ),
+                Step::get("/events/solo", "", renamed),
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s2\"",
+                    Scripted::Status(412),
+                ),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == WriteOutcome::Conflict { fields: Vec::new() });
+        assert_eq!(host.row("solo").location, None, "nothing landed");
+    }
+
+    /// A drop of occurrences claims the row and its series before anything is read, so one on its
+    /// way makes it Busy; with guests to email and no answer it asks, with only reads sent (R9).
+    #[tokio::test]
+    async fn a_scoped_move_waits_and_asks_first() {
+        let instance = monday_19();
+        let request = drop_at(&instance, "2026-10-19", "10:00", "11:00");
+        let host = TestHost::holding(&october());
+        {
+            let _claim = InFlight::claim(&host.edit, "cal:abc_20261019T080000Z").expect("free");
+            let silent = Script::new(Vec::new());
+            let on = target(&instance);
+            let outcome = move_series(
+                &writer(&silent, &host, &on),
+                &request,
+                Scope::This,
+                None,
+                None,
+            )
+            .await;
+            silent.asked_all();
+            assert!(outcome == WriteOutcome::Busy);
+        }
+        let modify = |event: Value| with(event, "guestsCanModify", json!(true));
+        let (series, invited) = (modify(weekly_invite()), modify(monday_invite()));
+        let window: Vec<Value> = october()
+            .into_iter()
+            .map(invitation_of)
+            .map(modify)
+            .collect();
+        let host = TestHost::holding(&window);
+        let script = Script::new(reads(&invited, &series, vec![series.clone()], window));
+        let on = target(&invited);
+        let request = drop_at(&invited, "2026-10-19", "10:00", "11:00");
+        let outcome = move_series(
+            &writer(&script, &host, &on),
+            &request,
+            Scope::This,
+            None,
+            None,
+        )
+        .await;
+        script.finished();
+        assert!(
+            matches!(&outcome, WriteOutcome::NeedsChoice { scope: false, guests: Some(g), .. }
+                if g.people == 2),
+            "asks whether Google emails the organiser and the other guest"
         );
     }
 }

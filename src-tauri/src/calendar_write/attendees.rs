@@ -928,6 +928,43 @@ mod tests {
         }
     }
 
+    /// M1-M5 (C16a): a move sends a start and end, which every guest shares, so it tells every
+    /// guest but the user and rooms of a change; on someone else's event the organiser too. The
+    /// editor's `moveNotice` runs the same rows from the mirror's row (guests.test.ts; M5, a list
+    /// Google cut short, has no mirror form).
+    #[test]
+    fn notify_required_for_a_move_table() {
+        let times = body(json!({
+            "start": { "dateTime": "2026-10-12T10:00:00+01:00" },
+            "end": { "dateTime": "2026-10-12T11:00:00+01:00" },
+        }));
+        let organiser = json!({ "email": "o@x.org", "organizer": true });
+        let mut invitation = event(&[organiser, json!({ "email": "me@x.org", "self": true }), a()]);
+        invitation["organizer"] = json!({ "email": "o@x.org" });
+        invitation["guestsCanModify"] = json!(true);
+        let mut cut_short = event(&[me(), a()]);
+        cut_short["attendeesOmitted"] = json!(true);
+        type Row<'a> = (&'a str, Value, Option<GuestNotice>);
+        let rows: Vec<Row> = vec![
+            ("M1", event(&[me()]), None),
+            ("M2", event(&[me(), a()]), Some(notice(1, 0, 0))),
+            ("M3", event(&[me(), room()]), None),
+            ("M4", invitation, Some(notice(2, 0, 0))),
+            (
+                "M5",
+                cut_short,
+                Some(GuestNotice {
+                    complete: false,
+                    ..notice(1, 0, 0)
+                }),
+            ),
+        ];
+        for (name, before, want) in rows {
+            let own = Own::of(&["cal@x.org"], &[&before]);
+            assert!(notify_required(&before, &times, &own) == want, "{name}");
+        }
+    }
+
     /// D1-D5: a delete tells every guest but the user and rooms; the mirror's row, which has no room
     /// flag, by the room's address.
     #[test]
