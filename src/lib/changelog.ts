@@ -24,6 +24,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.158.0-alpha",
+    date: "2026-10-28",
+    highlights: [
+      "Move events by dragging them. In Day and Week, drag an event to another time or day, or drag its top or bottom edge to change when it starts or ends. In the all-day row, drag an event's ends to change its days, and drag between the all-day row and the hours to switch it between all-day and timed. In Month, drag an event to another day and it keeps its time. PM shows where it will land as you drag, and the event keeps its own time zone. Like + New event, this needs editing turned on for that account in Settings → Connectors.",
+      "As in Google Calendar, a repeating event asks which occurrences to move, and an event with guests asks whether Google should email them. Press Esc, or let go outside the calendar, to put an event back. If its time changed in Google since PM last showed it, PM doesn't move it and shows you Google's version instead, and an event PM can't move says why, right by the pointer.",
+      "Changed your mind? Undo, or Ctrl+Z (⌘Z on a Mac), puts a moved event or occurrence back for a few seconds. It now works after saving in the editor too, notifications and colour included, unless the save changed the guests or how the event repeats. When guests were emailed about the change, the notice tells you they'll get a second email if you undo.",
+      "Create events straight on the calendar. Click an empty time to make one there, or drag down to choose how long it lasts; click the all-day row or a day in Month for an all-day event, or drag across days for one that lasts several. Quick create opens right beside what you picked, and typing a date that isn't on screen takes the calendar there.",
+    ],
+  },
+  {
     version: "3.157.0-alpha",
     date: "2026-10-22",
     highlights: [
