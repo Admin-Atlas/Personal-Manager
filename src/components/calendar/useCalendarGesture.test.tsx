@@ -313,10 +313,43 @@ describe("useCalendarGesture: a drop", () => {
       end: { day: D1, min: 600 },
     });
     onCommit.mockClear();
-    // A press on the card's own box near its bottom (its border, say) is a move.
-    press(screen.getByTestId("card"), 200, 499);
-    moveTo(200, 539);
-    release(200, 539);
+    // A press on the card's own box, off its strips, is a move.
+    press(screen.getByTestId("card"), 200, 495);
+    moveTo(200, 535);
+    release(200, 535);
+    expect(onCommit.mock.calls[0][0].resize).toBe(false);
+  });
+
+  it("the line drawn as the card's bottom (its border, which clips the strip) takes the end", () => {
+    const { onCommit } = mount();
+    const card = screen.getByTestId("card");
+    // As EventCard draws it (`border`): 1 px all round.
+    card.style.border = "1px solid";
+    press(card, 200, 499.5);
+    moveTo(200, 539.5);
+    release(200, 539.5);
+    expect(onCommit.mock.calls[0][0].resize).toBe(true);
+    expect(onCommit.mock.calls[0][0].to).toEqual({
+      kind: "timed",
+      start: { day: D1, min: 540 },
+      end: { day: D1, min: 660 },
+    });
+    onCommit.mockClear();
+    // And its top border the start.
+    press(card, 200, 460.5);
+    moveTo(200, 420.5);
+    release(200, 420.5);
+    expect(onCommit.mock.calls[0][0].to).toEqual({
+      kind: "timed",
+      start: { day: D1, min: 480 },
+      end: { day: D1, min: 600 },
+    });
+    onCommit.mockClear();
+    // A border with no strip beside it (an end that may not move) is the body's.
+    card.querySelector('[data-edge="end"]')?.remove();
+    press(card, 200, 499.5);
+    moveTo(200, 539.5);
+    release(200, 539.5);
     expect(onCommit.mock.calls[0][0].resize).toBe(false);
   });
 

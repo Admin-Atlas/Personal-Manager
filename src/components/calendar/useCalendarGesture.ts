@@ -164,6 +164,23 @@ function streamBox(stream: HTMLElement): Box {
 const surfaceOf = (s: string | undefined): Surface | null =>
   s === "grid" || s === "band" || s === "month" ? s : null;
 
+/** The edge a press at `y` on `t` inside `card` took (its strip's `data-edge`), or undefined for the
+ *  body. A press on a strip takes that edge: the strip shows the resize cursor, so what looks like an
+ *  edge is one (Month draws none). So does a press on the card's own top or bottom border beside a
+ *  strip: the card clips its strips inside its border, and that line is what's drawn as the event's
+ *  edge. */
+function edgeTaken(card: HTMLElement, t: Element, y: number): string | undefined {
+  const strip = t.closest<HTMLElement>("[data-edge]");
+  if (strip && card.contains(strip)) return strip.dataset.edge;
+  if (t !== card) return undefined;
+  const r = card.getBoundingClientRect();
+  const css = getComputedStyle(card);
+  const has = (edge: string) => card.querySelector(`[data-edge="${edge}"]`) !== null;
+  if (y < r.top + (Number.parseFloat(css.borderTopWidth) || 0) && has("start")) return "start";
+  if (y >= r.bottom - (Number.parseFloat(css.borderBottomWidth) || 0) && has("end")) return "end";
+  return undefined;
+}
+
 /** A no-break space, written as its code so it stays visible in the source. */
 const NBSP = String.fromCharCode(0xa0);
 
@@ -691,14 +708,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
         const row = h.rowById(card.dataset.eventId ?? "");
         const surface = surfaceOf(card.closest<HTMLElement>("[data-surface]")?.dataset.surface);
         if (!row || !surface) return null;
-        // An edge is taken by pressing the strip the card draws for it (Month draws none): the
-        // strip shows the resize cursor too, so what looks like an edge is one, to the pixel. Its
-        // own border, outside the strips, is the body's, as its cursor says.
-        const strip = t.closest<HTMLElement>("[data-edge]");
-        const grab: Grab = grabOf(
-          surface,
-          strip && card.contains(strip) ? strip.dataset.edge : undefined,
-        );
+        const grab: Grab = grabOf(surface, edgeTaken(card, t, e.clientY));
         return {
           ...base,
           on: {
