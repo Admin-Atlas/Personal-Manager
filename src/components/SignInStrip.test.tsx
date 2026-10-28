@@ -233,6 +233,21 @@ describe("SignInStrip", () => {
     expect(screen.getByTestId("place0").contains(document.activeElement)).toBe(true);
   });
 
+  it("a click to blank space while PM has focus lets go of it: the strip going doesn't pull it back", async () => {
+    await mount();
+    open(DRIVE);
+    open(PROTON);
+    const copy = screen.getByRole("button", { name: copyName("Google Drive") });
+    act(() => copy.focus());
+    // Focus leaves for nothing focusable while the window keeps it.
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    fireEvent.blur(copy, { relatedTarget: null });
+    hasFocus.mockRestore();
+    act(() => copy.blur());
+    close(1);
+    expect(screen.getByTestId("place0").contains(document.activeElement)).toBe(false);
+  });
+
   it("an end that never matched a start changes nothing", async () => {
     await mount();
     open(DRIVE);
