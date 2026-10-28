@@ -94,6 +94,16 @@ describe("movingArg", () => {
     expect(movingArg(["--verbose", "-v", "-vv"])).toBeNull();
     // A value after a value-taking short flag is that flag's, not more flags.
     expect(movingArg(["-fdummy"])).toBeNull();
+    // Other `tauri bundle` options and their values, long and short, pass through untouched.
+    for (const args of [
+      ["--features", "updater"],
+      ["-c", "dist.json"],
+      ["-cdist.json"],
+      ["-bdeb"],
+      ["--skip-stapling"],
+    ]) {
+      expect(movingArg(args)).toBeNull();
+    }
   });
 
   it("names an argument that would move the rpm out of target/release", () => {
@@ -156,6 +166,14 @@ describe("pickBuilt", () => {
       { name: "PM-3.155.1+alpha-1.aarch64.rpm", sig: "5:30:10" },
     ];
     expect(() => pickBuilt([], after, V, L)).toThrow(/found 2/);
+  });
+
+  it("matches the label as a whole version, not a neighbour that contains it", () => {
+    const neighbours = [
+      { name: "PM-3.155.1+alpha.2-1.x86_64.rpm", sig: "1:1:2" },
+      { name: "PM-13.155.1+alpha-1.x86_64.rpm", sig: "1:1:2" },
+    ];
+    expect(() => pickBuilt([], neighbours, V, L)).toThrow(/found 0/);
   });
 
   it("refuses when the pass wrote nothing here, whatever is lying around", () => {
