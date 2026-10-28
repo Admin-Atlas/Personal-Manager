@@ -59,9 +59,46 @@ export function renamesFor(fileNames, version, label) {
     .map((name) => [name, name.replace(from, to)]);
 }
 
-/** The first passed-through argument that would move Tauri's output away from target/release, or null. */
+/**
+ * The first passed-through argument that would move Tauri's output away from target/release, or
+ * null. An early, plainer refusal only: pickBuilt below is what actually stops a moved rpm, or a
+ * leftover one, being reported as built.
+ */
 export function movingArg(args) {
-  return args.find((a) => /^(-t|--target|-d|--debug)(=.*)?$/.test(a)) ?? null;
+  for (const a of args) {
+    if (/^--(target|debug)(=.*)?$/.test(a)) return a;
+    if (!/^-[^-]/.test(a)) continue;
+    // A cluster of short flags (-vd, -dt x, -tx86_64-...): clap reads letters until one that
+    // takes a value (b, c, f or t), and the rest of the cluster is that value.
+    for (const c of a.slice(1)) {
+      if (c === "d" || c === "t") return a;
+      if ("bcf=".includes(c)) break;
+    }
+  }
+  return null;
+}
+
+/**
+ * From the rpm folder's files ({name, mtimeMs}), the renames to make and the one rpm this run
+ * built. Only files written since `started` count, so an rpm Tauri wrote somewhere else (a
+ * --target, CARGO_BUILD_TARGET or a cargo [build] target moves it) fails here instead of a
+ * leftover from an earlier run passing as the new build.
+ */
+export function pickBuilt(entries, version, label, started) {
+  // Two seconds' slack for filesystems that keep coarse timestamps.
+  const fresh = entries.filter((e) => e.mtimeMs >= started - 2000).map((e) => e.name);
+  const renames = renamesFor(fresh, version, label);
+  const after = fresh.map((name) => renames.find(([from]) => from === name)?.[1] ?? name);
+  const built = after.filter((name) => name.endsWith(".rpm") && name.includes(`-${version}-`));
+  if (built.length !== 1) {
+    throw new Error(
+      `expected one newly built rpm for ${version}, found ${built.length}` +
+        (built.length ? `: ${built.join(", ")}` : "") +
+        ". This script makes the host's release rpm only; --target, --debug, CARGO_BUILD_TARGET " +
+        "or a cargo [build] target puts it somewhere else.",
+    );
+  }
+  return { renames, built: built[0] };
 }
 
 /** Where cargo, and so Tauri, puts the target dir: Tauri asks `cargo metadata` from src-tauri. */
@@ -93,28 +130,25 @@ function main() {
     JSON.stringify({ version: label }),
     ...process.argv.slice(2),
   ];
+  const dir = join(cargoTargetDir(), "release", "bundle", "rpm");
   console.log(`bundle-rpm: labelling the rpm ${label} (PM ${version})`);
+  const started = Date.now();
   const run = spawnSync(tauri, args, { cwd: repoRoot, stdio: "inherit" });
   if (run.error) throw run.error;
   if (run.status !== 0) process.exit(run.status ?? 1);
 
-  const dir = join(cargoTargetDir(), "release", "bundle", "rpm");
-  if (!existsSync(dir)) throw new Error(`tauri bundle left no rpm folder at ${dir}`);
-  const files = readdirSync(dir).filter((name) => statSync(join(dir, name)).isFile());
-  for (const [from, to] of renamesFor(files, version, label)) {
+  const entries = existsSync(dir)
+    ? readdirSync(dir)
+        .map((name) => ({ name, stat: statSync(join(dir, name)) }))
+        .filter((e) => e.stat.isFile())
+        .map((e) => ({ name: e.name, mtimeMs: e.stat.mtimeMs }))
+    : [];
+  const { renames, built } = pickBuilt(entries, version, label, started);
+  for (const [from, to] of renames) {
     renameSync(join(dir, from), join(dir, to));
     console.log(`bundle-rpm: ${from} -> ${to}`);
   }
-
-  const built = readdirSync(dir).filter(
-    (name) => name.endsWith(".rpm") && name.includes(`-${version}-`),
-  );
-  if (built.length !== 1) {
-    throw new Error(
-      `expected exactly one rpm for ${version} in ${dir}, found ${built.length}: ${built.join(", ")}`,
-    );
-  }
-  console.log(`bundle-rpm: ${join(dir, built[0])}`);
+  console.log(`bundle-rpm: ${join(dir, built)}`);
 }
 
 // Run only when invoked directly, so the test can import the pure helpers.

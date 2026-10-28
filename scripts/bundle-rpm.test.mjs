@@ -4,15 +4,15 @@
 // The rpm's version label. The release and the Linux dry-run are the only places the bundling
 // itself runs, so what's pinned here is the part they depend on: every label this produces is
 // legal for both Tauri (semver) and rpm, PM's real version labels cleanly today, the renaming
-// back touches only the rpm that was just built, and arguments that would make Tauri write the
-// rpm somewhere else are refused.
+// back touches only the rpm that was just built, an rpm this run didn't write never passes as
+// built, and arguments that would make Tauri write the rpm somewhere else are refused.
 //
 // Importing the module does not run the bundler (entry-point guard at the bottom of it).
 
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { movingArg, renamesFor, rpmVersion } from "./bundle-rpm.mjs";
+import { movingArg, pickBuilt, renamesFor, rpmVersion } from "./bundle-rpm.mjs";
 
 // The characters rpm-rs 0.30 allows in a Version tag, quoted from its error message.
 const RPM_LEGAL = /^[A-Za-z0-9._+%{}~^]+$/;
@@ -89,7 +89,9 @@ describe("renamesFor", () => {
 describe("movingArg", () => {
   it("lets output-neutral arguments through", () => {
     expect(movingArg([])).toBeNull();
-    expect(movingArg(["--verbose", "-v"])).toBeNull();
+    expect(movingArg(["--verbose", "-v", "-vv"])).toBeNull();
+    // A value after a value-taking short flag is that flag's, not more flags.
+    expect(movingArg(["-fdummy"])).toBeNull();
   });
 
   it("names an argument that would move the rpm out of target/release", () => {
@@ -100,5 +102,53 @@ describe("movingArg", () => {
     expect(movingArg(["-t", "x"])).toBe("-t");
     expect(movingArg(["--debug"])).toBe("--debug");
     expect(movingArg(["-d"])).toBe("-d");
+  });
+
+  it("finds them inside clusters of short flags, as clap accepts them", () => {
+    for (const a of ["-vd", "-dv", "-vvd", "-dt", "-vt", "-tx86_64-unknown-linux-gnu", "-t=x"]) {
+      expect(movingArg([a])).toBe(a);
+    }
+  });
+});
+
+describe("pickBuilt", () => {
+  const started = 1_000_000;
+  const now = started + 30_000;
+  const old = started - 60_000;
+
+  it("renames the rpm this run wrote under its label", () => {
+    expect(
+      pickBuilt(
+        [
+          { name: "PM-3.155.1+alpha-1.x86_64.rpm", mtimeMs: now },
+          { name: "PM-3.155.0-alpha-1.x86_64.rpm", mtimeMs: old },
+        ],
+        "3.155.1-alpha",
+        "3.155.1+alpha",
+        started,
+      ),
+    ).toEqual({
+      renames: [["PM-3.155.1+alpha-1.x86_64.rpm", "PM-3.155.1-alpha-1.x86_64.rpm"]],
+      built: "PM-3.155.1-alpha-1.x86_64.rpm",
+    });
+  });
+
+  it("refuses a leftover rpm from an earlier run when this run wrote none here", () => {
+    const leftover = [{ name: "PM-3.155.1-alpha-1.x86_64.rpm", mtimeMs: old }];
+    expect(() => pickBuilt(leftover, "3.155.1-alpha", "3.155.1+alpha", started)).toThrow(
+      /expected one newly built rpm for 3\.155\.1-alpha, found 0/,
+    );
+    expect(() => pickBuilt([], "3.155.1-alpha", "3.155.1+alpha", started)).toThrow(/found 0/);
+  });
+
+  it("takes a release version's rpm as it is, if this run wrote it", () => {
+    const rpm = "PM-4.0.0-1.x86_64.rpm";
+    expect(pickBuilt([{ name: rpm, mtimeMs: now }], "4.0.0", "4.0.0", started)).toEqual({
+      renames: [],
+      built: rpm,
+    });
+    expect(() => pickBuilt([{ name: rpm, mtimeMs: old }], "4.0.0", "4.0.0", started)).toThrow(
+      /found 0/,
+    );
   });
 });
