@@ -32,6 +32,13 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # The Tauri CLI is pinned at 2.12.2 in package.json. From 2.12.3 its bundler checks
+    # the rpm Version tag, which can't hold a hyphen, so every "-alpha" build fails to make
+    # the rpm. Only the known-bad releases are skipped: a later one still arrives as a PR,
+    # and the Linux bundle dry-run on that PR shows whether it builds the rpm again.
+    ignore:
+      - dependency-name: "@tauri-apps/cli"
+        versions: ["2.12.3", "2.12.4"]
 
   # --- Python sidecar (sidecar/requirements*.txt) ---
   # The last ecosystem without coverage, and the one that matters most per-dependency: these
