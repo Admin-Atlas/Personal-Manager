@@ -3,8 +3,9 @@
 
 // Dragging on the calendar grid (#884, C16b): moving an event in Day and Week, changing when it starts
 // or ends by its top or bottom edge, an all-day event's days by its ends, and between the all-day row
-// and the hours. The pure half is `calendarDrag` (where a drop lands) and `calendarGesture` (what each
-// press, frame, release or cancel does); this is the half that touches the page.
+// and the hours; in Month, moving it to another day, keeping its times (C16c). The pure half is
+// `calendarDrag` (where a drop lands) and `calendarGesture` (what each press, frame, release or
+// cancel does); this is the half that touches the page.
 //
 // THE PRESS IS ONE WINDOW LISTENER FOR THE HOOK'S LIFE, AND OWNERSHIP IS GEOMETRY. The swipe's lesson
 // (`useHorizontalWheelShift`, #698): the day columns are keyed by date, so a swipe or ← mid-drag
@@ -38,14 +39,18 @@ import {
   inCancelZone,
   planClick,
   planGesture,
+  resolveMonthTarget,
   resolveTimeGridTarget,
   slotRect,
   timingOf,
   type Box,
   type DragCapability,
   type Grab,
+  type MonthGeom,
   type Plan,
   type Press,
+  type Surface,
+  type Target,
   type TimeGridGeom,
   type Timing,
 } from "../../lib/calendarDrag";
@@ -69,7 +74,8 @@ type Create = Extract<GestureEffect, { effect: "create" }>;
 export interface GestureHost {
   /** The calendar's grid wrapper, which isn't keyed: the pointer is held here, never on a card. */
   wrapper: () => HTMLElement | null;
-  /** The view on screen drags now (Day and Week, with a Google account that has editing on). */
+  /** The view on screen drags now (Day, Week and Month, with a Google account that has editing
+   *  on). */
   surfaceOk: () => boolean;
   /** The event as drawn, by id, read at the press: the drop is made from it. */
   rowById: (id: string) => CalendarEvent | undefined;
@@ -119,6 +125,11 @@ const CONTROLS = "button, a, input, select, textarea, [data-no-create]";
 
 const boxOf = (r: DOMRect): Box => ({ left: r.left, top: r.top, right: r.right, bottom: r.bottom });
 
+/** An event's surface, from its `data-surface`: the hours, the all-day row or Month; anything else
+ *  isn't the drag's. */
+const surfaceOf = (s: string | undefined): Surface | null =>
+  s === "grid" || s === "band" || s === "month" ? s : null;
+
 /** A no-break space, written as its code so it stays visible in the source. */
 const NBSP = String.fromCharCode(0xa0);
 
@@ -128,30 +139,58 @@ export function sayAgain(was: string, text: string): string {
   return was === text ? `${text}${NBSP}` : text;
 }
 
-/** The time grid inside `wrapper` as laid out now, with the body that scrolls it; null when no time
- *  grid is drawn there. */
-function measureTimeGrid(wrapper: HTMLElement): { geom: TimeGridGeom; body: HTMLElement } | null {
+/** The grid inside `wrapper` as laid out now, with the element that scrolls it: the time grid's
+ *  hours, or Month's weeks. Null when neither is drawn there. */
+type Measured =
+  | { kind: "time"; geom: TimeGridGeom; scroller: HTMLElement }
+  | { kind: "month"; geom: MonthGeom; scroller: HTMLElement };
+
+function measure(wrapper: HTMLElement): Measured | null {
+  const outer = boxOf(wrapper.getBoundingClientRect());
   const body = wrapper.querySelector<HTMLElement>("[data-time-body]");
-  if (!body) return null;
-  const cols = Array.from(wrapper.querySelectorAll<HTMLElement>('[data-surface="grid"]'), (el) => {
-    const r = el.getBoundingClientRect();
-    return { day: el.dataset.day ?? "", left: r.left, right: r.right };
-  });
-  const band = wrapper.querySelector<HTMLElement>('[data-surface="band"]');
+  if (body) {
+    const cols = Array.from(
+      wrapper.querySelectorAll<HTMLElement>('[data-surface="grid"]'),
+      (el) => {
+        const r = el.getBoundingClientRect();
+        return { day: el.dataset.day ?? "", left: r.left, right: r.right };
+      },
+    );
+    const band = wrapper.querySelector<HTMLElement>('[data-surface="band"]');
+    return {
+      kind: "time",
+      scroller: body,
+      geom: {
+        wrapper: outer,
+        body: boxOf(body.getBoundingClientRect()),
+        scrollTop: body.scrollTop,
+        rowH: Number(body.dataset.rowH),
+        cols,
+        band: band
+          ? { ...boxOf(band.getBoundingClientRect()), days: band.dataset.days?.split(",") ?? [] }
+          : null,
+      },
+    };
+  }
+  const stream = wrapper.querySelector<HTMLElement>('[data-surface="month"]');
+  if (!stream) return null;
   return {
-    body,
+    kind: "month",
+    scroller: stream,
     geom: {
-      wrapper: boxOf(wrapper.getBoundingClientRect()),
-      body: boxOf(body.getBoundingClientRect()),
-      scrollTop: body.scrollTop,
-      rowH: Number(body.dataset.rowH),
-      cols,
-      band: band
-        ? { ...boxOf(band.getBoundingClientRect()), days: band.dataset.days?.split(",") ?? [] }
-        : null,
+      wrapper: outer,
+      stream: boxOf(stream.getBoundingClientRect()),
+      scrollTop: stream.scrollTop,
+      weekH: Number(stream.dataset.weekH),
+      gridStart: stream.dataset.gridStart ?? "",
+      weeks: Number(stream.dataset.weeks),
     },
   };
 }
+
+/** Where the pointer at (x, y) is on the grid `m`. */
+const targetIn = (m: Measured, x: number, y: number): Target | null =>
+  m.kind === "time" ? resolveTimeGridTarget(m.geom, x, y) : resolveMonthTarget(m.geom, x, y);
 
 /** Whether a press may change anything once dragged: empty space (which only gets this far where it
  *  may create), or an event's part it may move. */
@@ -223,23 +262,26 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     };
 
     /** The plan with the pointer at (x, y), the grid measured now; `scroll` first scrolls the hours
-     *  when the pointer is at their top or bottom edge, or below them. */
+     *  (or Month's weeks) when the pointer is at their top or bottom edge, or past it. */
     const planAt = (press: Press, x: number, y: number, scroll: boolean): Plan | null => {
       const h = hostRef.current;
       const wrapper = h.wrapper();
-      const found = wrapper ? measureTimeGrid(wrapper) : null;
+      const found = wrapper ? measure(wrapper) : null;
       if (found && scroll) {
         const g = found.geom;
-        // Only over the hours or past their bottom: never from the all-day row or the headers.
-        if (y >= g.body.top && !inCancelZone(g.wrapper, x, y)) {
-          const d = autoScrollDelta(y, g.body.top, g.body.bottom);
+        const { top, bottom } = found.kind === "time" ? found.geom.body : found.geom.stream;
+        // The hours only over them or past their bottom, never from the all-day row or the
+        // headers; Month's weeks from its weekday row too, which reads as the top week.
+        const over = found.kind === "month" || y >= top;
+        if (over && !inCancelZone(g.wrapper, x, y)) {
+          const d = autoScrollDelta(y, top, bottom);
           if (d !== 0) {
-            found.body.scrollTop += d;
-            g.scrollTop = found.body.scrollTop;
+            found.scroller.scrollTop += d;
+            g.scrollTop = found.scroller.scrollTop;
           }
         }
       }
-      const target = found ? resolveTimeGridTarget(found.geom, x, y) : null;
+      const target = found ? targetIn(found, x, y) : null;
       const row = press.on.kind === "event" ? press.on.row : null;
       return planGesture(press, target, { lengthMin: h.lengthFor(row), zone: h.zone() });
     };
@@ -247,7 +289,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     /** Where a new event's slot is on screen, for quick create to open beside. */
     const anchorFor = (t: Timing): DOMRect | null => {
       const wrapper = hostRef.current.wrapper();
-      const found = wrapper ? measureTimeGrid(wrapper) : null;
+      const found = wrapper ? measure(wrapper) : null;
       const b = found ? slotRect(found.geom, t) : null;
       return b ? new DOMRect(b.left, b.top, b.right - b.left, b.bottom - b.top) : null;
     };
@@ -478,8 +520,8 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       // A press on something drawn over the grid but outside it (the details, a notice, quick
       // create) is that thing's, whatever box it sits in.
       if (!(t instanceof Element) || !wrapper.contains(t)) return null;
-      const found = measureTimeGrid(wrapper);
-      const at = found ? resolveTimeGridTarget(found.geom, e.clientX, e.clientY) : null;
+      const found = measure(wrapper);
+      const at = found ? targetIn(found, e.clientX, e.clientY) : null;
       if (!at) return null;
       const base = {
         pointerId: e.pointerId,
@@ -493,15 +535,18 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       const card = t.closest<HTMLElement>("[data-event-id]");
       if (card) {
         const row = h.rowById(card.dataset.eventId ?? "");
-        const surface = card.closest<HTMLElement>("[data-surface]")?.dataset.surface;
-        if (!row || (surface !== "grid" && surface !== "band")) return null;
+        const surface = surfaceOf(card.closest<HTMLElement>("[data-surface]")?.dataset.surface);
+        if (!row || !surface) return null;
         const r = card.getBoundingClientRect();
-        // The ends the card draws as draggable are the ones it may be dragged by.
+        // The ends the card draws as draggable are the ones it may be dragged by; Month draws
+        // none.
         const has = (edge: string) => card.querySelector(`[data-edge="${edge}"]`) !== null;
-        const grab =
+        const grab: Grab =
           surface === "grid"
             ? cardHitZone(e.clientY - r.top, r.height, { start: has("start"), end: has("end") })
-            : bandHitZone(e.clientX - r.left, r.width, { left: has("left"), right: has("right") });
+            : surface === "band"
+              ? bandHitZone(e.clientX - r.left, r.width, { left: has("left"), right: has("right") })
+              : "body";
         return {
           ...base,
           on: {
@@ -516,7 +561,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
         };
       }
       if (t.closest(CONTROLS) || !t.closest("[data-surface]") || !h.canCreate()) return null;
-      const surface = at.zone === "timed" ? "grid" : "band";
+      const surface: Surface = at.zone === "timed" ? "grid" : at.zone;
       return {
         ...base,
         on: {

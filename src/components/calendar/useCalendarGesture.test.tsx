@@ -728,3 +728,142 @@ describe("useCalendarGesture: the all-day row", () => {
     });
   });
 });
+
+/** Month as the view marks it (C16c): the weekday row, then three weeks of 100 px from Monday
+ *  12-10, seven 100 px days across, Gym's chip on Monday and the holiday's band on Monday, and a
+ *  "+1 more" on Tuesday. */
+function MonthGrid({
+  host,
+  rows,
+}: {
+  host: Partial<GestureHost>;
+  rows: Map<string, CalendarEvent>;
+}) {
+  const wrapper = useRef<HTMLDivElement>(null);
+  const view = useCalendarGesture({
+    wrapper: () => wrapper.current,
+    surfaceOk: () => true,
+    rowById: (id) => rows.get(id),
+    capability: canMove,
+    canCreate: () => false,
+    overlayOpen: () => false,
+    lengthFor: () => 60,
+    zone: () => "Europe/London",
+    onCommit: () => {},
+    onCreate: () => {},
+    announce: () => {},
+    ...host,
+  });
+  return (
+    <div ref={wrapper} data-testid="m-wrapper">
+      <div data-testid="weekdays" />
+      <div
+        data-surface="month"
+        data-grid-start={D1}
+        data-week-h="100"
+        data-weeks="3"
+        data-testid="stream"
+      >
+        <div data-day={D1} data-testid="mon">
+          <div data-event-id="e1" data-testid="chip" />
+        </div>
+        <div data-day={D2} data-testid="tue">
+          <span data-no-create="" data-testid="more">
+            +1 more
+          </span>
+        </div>
+        <div data-event-id="a1" data-testid="m-bar" />
+      </div>
+      {view.ghost && <div data-testid="ghost">{view.ghost.label}</div>}
+    </div>
+  );
+}
+
+function mountMonth(host: Partial<GestureHost> = {}) {
+  const spies: Spies = {
+    onCommit: vi.fn<GestureHost["onCommit"]>(),
+    onCreate: vi.fn<GestureHost["onCreate"]>(),
+    announce: vi.fn<GestureHost["announce"]>(),
+  };
+  const rows = new Map([
+    [GYM.id, GYM],
+    [HOLIDAY.id, HOLIDAY],
+  ]);
+  render(<MonthGrid host={{ ...spies, ...host }} rows={rows} />);
+  place(screen.getByTestId("m-wrapper"), 0, 0, 700, 340);
+  place(screen.getByTestId("weekdays"), 0, 0, 700, 40);
+  place(screen.getByTestId("stream"), 0, 40, 700, 340);
+  place(screen.getByTestId("mon"), 0, 40, 100, 140);
+  place(screen.getByTestId("tue"), 100, 40, 200, 140);
+  place(screen.getByTestId("chip"), 2, 70, 98, 84);
+  place(screen.getByTestId("more"), 104, 120, 160, 134);
+  place(screen.getByTestId("m-bar"), 0, 50, 100, 64);
+  return { ...spies, rows };
+}
+
+describe("useCalendarGesture: Month", () => {
+  it("moves a chip to another day, keeping its time", () => {
+    const { onCommit, announce } = mountMonth();
+    press(screen.getByTestId("chip"), 50, 77);
+    // Thursday of the next week.
+    moveTo(350, 177);
+    expect(announce).toHaveBeenCalledWith("Moving “Gym”.");
+    expect(screen.getByTestId("ghost").textContent).toMatch(/22-10/);
+    release(350, 177);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    const commit = onCommit.mock.calls[0][0];
+    expect(commit.row).toBe(GYM);
+    expect(commit.resize).toBe(false);
+    expect(commit.to).toEqual({
+      kind: "timed",
+      start: { day: "2026-10-22", min: 540 },
+      end: { day: "2026-10-22", min: 600 },
+    });
+  });
+
+  it("moves an all-day band by whole days, with no ends to drag", () => {
+    const { onCommit } = mountMonth();
+    // Its very left end: in Month that's still the body.
+    press(screen.getByTestId("m-bar"), 1, 57);
+    moveTo(251, 57);
+    release(251, 57);
+    expect(onCommit.mock.calls[0][0].to).toEqual({
+      kind: "all_day",
+      first: "2026-10-14",
+      last: "2026-10-14",
+    });
+    expect(onCommit.mock.calls[0][0].resize).toBe(false);
+  });
+
+  it("scrolls the weeks while dragging near the bottom, and up from the weekday row", () => {
+    mountMonth();
+    const s = screen.getByTestId("stream");
+    // Held at the bottom without passing the threshold: no scroll.
+    press(screen.getByTestId("chip"), 50, 77);
+    fireEvent.pointerMove(document.body, at(51, 77));
+    frame();
+    expect(s.scrollTop).toBe(0);
+    // Picked up on this frame; it scrolls from the next.
+    moveTo(50, 335);
+    expect(s.scrollTop).toBe(0);
+    frame();
+    const down = s.scrollTop;
+    expect(down).toBeGreaterThan(0);
+    frame();
+    expect(s.scrollTop).toBeGreaterThan(down);
+    // Over the weekday row, which reads as the top week: back up.
+    moveTo(50, 20);
+    frame();
+    expect(s.scrollTop).toBeLessThan(down);
+    release(50, 20);
+  });
+
+  it("letting go beside the calendar puts it back", () => {
+    const { onCommit, announce } = mountMonth();
+    press(screen.getByTestId("chip"), 50, 77);
+    moveTo(350, 177);
+    release(750, 177);
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(announce).toHaveBeenLastCalledWith(PUT_BACK);
+  });
+});

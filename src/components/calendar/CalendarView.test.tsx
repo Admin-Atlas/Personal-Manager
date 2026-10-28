@@ -325,6 +325,25 @@ describe("CalendarView: dragging in Week", () => {
     expect(cards("e1")).toHaveLength(1);
     expect(cards("e2")).toHaveLength(0);
   });
+
+  // C16c: Month drags on the same terms.
+  // jsdom lays out no weeks, so the stream is looked at, not the events in it.
+  it("marks Month's weeks for the drag only where events can be dragged", async () => {
+    localStorage.setItem("pm.calendar.view", "month");
+    rows = [movable];
+    const { CalendarView } = await import("./CalendarView");
+    const first = render(<CalendarView />);
+    await screen.findByRole("button", { name: "+ New event" });
+    await act(async () => {});
+    expect(document.querySelector('[data-surface="month"]')).not.toBeNull();
+    first.unmount();
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    render(<CalendarView />);
+    await act(async () => {});
+    await act(async () => {});
+    expect(document.querySelector("[data-calendar-grid] .overflow-y-auto")).not.toBeNull();
+    expect(document.querySelector("[data-surface]")).toBeNull();
+  });
 });
 
 describe("CalendarView: a new event", () => {

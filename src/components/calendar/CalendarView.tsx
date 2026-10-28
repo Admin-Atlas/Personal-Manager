@@ -13,8 +13,8 @@
 // event they declined is struck through, as Google draws it. "+ New event" and `c` open the editor
 // for a new one, on a calendar the user picks, and Shift+C a quick box under the button, whose
 // draft is drawn on the grid as it's typed (C10). In Day and Week an event can be dragged to a new
-// time, or by its edges to a new start or end, asking what a save would ask (C16b,
-// `useCalendarGesture` and `edit/MoveFlow`); everything else stays read-only. The two
+// time, or by its edges to a new start or end, and in Month to another day, asking what a save would
+// ask (C16b-c, `useCalendarGesture` and `edit/MoveFlow`); everything else stays read-only. The two
 // first-party overlays — project milestones (click opens their project) and freeform pinboard
 // timeline entries (click opens the Pinboard) — are each an all-day event in its own hue, injected
 // here and never written back to any calendar.
@@ -937,10 +937,11 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // The polite live region's words: "Moving …", "Put back.", why it can't move.
   const [said, setSaid] = useState("");
   const announce = useCallback((text: string) => setSaid((was) => sayAgain(was, text)), []);
-  // Day and Week drag, on the pixel grid, once a Google account has editing on; Terminal draws no
-  // grid, and Focus's read-only one has no gesture at all.
+  // Day, Week and Month drag, on the pixel grid, once a Google account has editing on; Terminal
+  // draws no grid, and Focus's read-only one has no gesture at all.
   const editingOn = overview ? Object.values(overview.editing).some((s) => s === "on") : false;
-  const interactive = !isTerminal && (view === "day" || view === "week") && editingOn;
+  const interactive =
+    !isTerminal && (view === "day" || view === "week" || view === "month") && editingOn;
   // Moves being asked about or saved: drawn dashed where they were dropped, and not dragged again
   // until they land ("Saving…"). One that landed is Google's already and can be.
   const movingIds = useMemo(
@@ -1135,6 +1136,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             onFocusDate={onFocusDate}
             now={now}
             onEventClick={onEventClick}
+            interaction={
+              interactive
+                ? {
+                    originId: gesture.originId,
+                    ghost: gesture.ghost,
+                    pendingIds: movingIds,
+                    live: gesture.live,
+                  }
+                : undefined
+            }
           />
         );
       case "year":
