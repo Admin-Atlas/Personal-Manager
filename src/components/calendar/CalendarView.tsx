@@ -12,7 +12,9 @@
 // invited to offers Yes, No and Maybe (#884; every change goes through `edit/useEventWrites`); an
 // event they declined is struck through, as Google draws it. "+ New event" and `c` open the editor
 // for a new one, on a calendar the user picks, and Shift+C a quick box under the button, whose
-// draft is drawn on the grid as it's typed (C10); everything else stays read-only. The two
+// draft is drawn on the grid as it's typed (C10). In Day and Week an event can be dragged to a new
+// time, or by its edges to a new start or end, asking what a save would ask (C16b,
+// `useCalendarGesture` and `edit/MoveFlow`); everything else stays read-only. The two
 // first-party overlays — project milestones (click opens their project) and freeform pinboard
 // timeline entries (click opens the Pinboard) — are each an all-day event in its own hue, injected
 // here and never written back to any calendar.
@@ -31,9 +33,11 @@ import {
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
 import { copyRank, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
+import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
 import { isRepeating } from "../../lib/calendarEdit/saveChoices";
 import {
+  accountLength,
   createdWhere,
   createReasonFor,
   createTargets,
@@ -97,7 +101,7 @@ import {
   useTheme,
   useUserTime,
 } from "../../theme";
-import { Callout, Skeleton } from "../ui";
+import { Callout, Skeleton, VisuallyHidden } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
 import { CalendarEventPopover, type PopoverEditing } from "./parts/CalendarEventPopover";
 import { whenText } from "./parts/whenText";
@@ -107,7 +111,10 @@ import { EventEditor } from "./edit/EventEditor";
 import { NewEventEditor, type CreateHandover } from "./edit/NewEventEditor";
 import { QuickCreatePopover, type LeftDraft } from "./edit/QuickCreatePopover";
 import { WriteNotices } from "./edit/WriteNotices";
+import { MoveFlow } from "./edit/MoveFlow";
+import { useMoveDrops } from "./edit/useMoveDrops";
 import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
+import { sayAgain, useCalendarGesture } from "./useCalendarGesture";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -613,6 +620,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     (dir) => setCursor((c) => addDays(c, dir * swipeDays(windowDays(view, dayCount)))),
     (view === "day" || view === "week") && eventPopup === null && creating === null,
   );
+  // The same box holds the pointer while an event is dragged (C16b): it isn't keyed, so it outlives
+  // every column a drag passes over.
+  const gridWrapperRef = useRef<HTMLDivElement | null>(null);
+  const setGridWrapper = useCallback(
+    (el: HTMLDivElement | null) => {
+      gridWrapperRef.current = el;
+      gridRef(el);
+    },
+    [gridRef],
+  );
 
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today, `c` starts a
   // new event in the full editor and Shift+C in quick create. Ignored while a field is focused, a
@@ -758,6 +775,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       if (hidden.has(e.calendar_id) || writes.hiddenIds.has(e.id)) continue;
       const key = occurrenceKey(e);
       if (key !== null && deleting.has(key)) continue;
+      // Another account's copy of an event just moved shows at the old time until that account's
+      // own read catches up: hidden meanwhile, the moved row itself kept (C16b).
+      const twin = key !== null ? writes.twins.get(key) : undefined;
+      if (twin && twin.except !== e.id) continue;
       copies.push(e);
       if (key !== null) {
         const i = at.get(key);
@@ -770,14 +791,30 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       out.push(e);
     }
     const address = new Map(overview?.calendars.map((c) => [c.id, c.remote_id]) ?? []);
-    const marked = markDeclined(out, copies, (id) => address.get(id) ?? null);
+    // A move being asked about, saved, or landed and not yet read back is drawn where it was
+    // dropped. After the dedup: before it, the moved copy's key would change, and the other
+    // account's copy would come back at the old time.
+    const shown = applyPending(
+      markDeclined(out, copies, (id) => address.get(id) ?? null),
+      writes.moves,
+    );
     // Both first-party overlays ride on top, each toggleable like a calendar via the same `hidden` set.
     // Their events carry a null uid + a unique calendar_id, so they skip the dedup and hide filter
     // cleanly.
-    if (!hidden.has(MILESTONE_CALENDAR_ID)) marked.push(...milestoneEvents);
-    if (!hidden.has(PINBOARD_CALENDAR_ID)) marked.push(...pinboardEvents);
-    return marked;
-  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, rights, overview]);
+    if (!hidden.has(MILESTONE_CALENDAR_ID)) shown.push(...milestoneEvents);
+    if (!hidden.has(PINBOARD_CALENDAR_ID)) shown.push(...pinboardEvents);
+    return shown;
+  }, [
+    events,
+    hidden,
+    milestoneEvents,
+    pinboardEvents,
+    writes.hiddenIds,
+    writes.twins,
+    writes.moves,
+    rights,
+    overview,
+  ]);
 
   // The new event's ghost (C10c): quick create's draft in its calendar's colour, saying how far it
   // has got, or a saved one's waiting for its row. It joins after the hide filter, so it shows on a
@@ -894,6 +931,79 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
   const label = viewLabel(view, cursor, dayCount);
   const isTerminal = system === "terminal";
+
+  // --- dragging an event to move it (#884, C16b) ---
+
+  // The polite live region's words: "Moving …", "Put back.", why it can't move.
+  const [said, setSaid] = useState("");
+  const announce = useCallback((text: string) => setSaid((was) => sayAgain(was, text)), []);
+  // Day and Week drag, on the pixel grid, once a Google account has editing on; Terminal draws no
+  // grid, and Focus's read-only one has no gesture at all.
+  const editingOn = overview ? Object.values(overview.editing).some((s) => s === "on") : false;
+  const interactive = !isTerminal && (view === "day" || view === "week") && editingOn;
+  // Moves being asked about or saved: drawn dashed where they were dropped, and not dragged again
+  // until they land ("Saving…"). One that landed is Google's already and can be.
+  const movingIds = useMemo(
+    () =>
+      new Set([...writes.moves.values()].filter((m) => m.phase !== "landed").map((m) => m.eventId)),
+    [writes.moves],
+  );
+  const capability = useCallback(
+    (ev: CalendarEvent) =>
+      dragCapability(ev, {
+        rights: rights(ev),
+        pending: movingIds.has(ev.id),
+        zoneKnown: deviceTimeZoneOrNull() !== null,
+      }),
+    [rights, movingIds],
+  );
+  const shownById = useMemo(() => new Map(shownEvents.map((e) => [e.id, e])), [shownEvents]);
+
+  // After a drop, focus goes to the moved event's first piece, as it does to an edited one.
+  const focusEvent = useCallback((id: string) => {
+    requestAnimationFrame(() => {
+      const pieces = gridWrapperRef.current?.querySelectorAll<HTMLElement>("[data-event-id]") ?? [];
+      for (const el of pieces) {
+        if (el.dataset.eventId === id && el.tabIndex === 0) {
+          el.focus({ preventScroll: true });
+          return;
+        }
+      }
+    });
+  }, []);
+
+  // A drop: shown at once where it went, sent at once when it asks nothing, else asked about in
+  // `MoveFlow`, one at a time.
+  const drops = useMoveDrops({
+    accountOf,
+    free: () => !isAnyDialogOpen() && !popoverOpenRef.current,
+    focus: focusEvent,
+  });
+  const moveAsk = drops.ask;
+
+  const gesture = useCalendarGesture({
+    wrapper: () => gridWrapperRef.current,
+    surfaceOk: () => interactive,
+    rowById: (id) => shownById.get(id),
+    capability,
+    // Creating by clicking or dragging on the grid comes with C17.
+    canCreate: () => false,
+    // The details aren't a dialog, nor is any other popover (the add-zone list, the range menu).
+    overlayOpen: () =>
+      isAnyDialogOpen() ||
+      popoverOpenRef.current ||
+      document.querySelector("[data-popover-panel]") !== null,
+    lengthFor: (ev) => {
+      const cal = ev ? overview?.calendars.find((c) => c.id === ev.calendar_id) : undefined;
+      return overview
+        ? accountLength(overview, cal?.source_id ?? null) / 60_000
+        : DEFAULT_LENGTH_MIN;
+    },
+    zone: deviceTimeZoneOrNull,
+    onCommit: drops.drop,
+    onCreate: () => {},
+    announce,
+  });
 
   // "Outside the synced range" hint: fires when the visible window falls before mirror_start or after
   // mirror_end (the mirror is a fixed −1…+13-month band, so paging far enough leaves it). Neutral, not
@@ -1051,6 +1161,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             onZonesChange={onZonesChange}
             now={now}
             onEventClick={onEventClick}
+            interaction={
+              interactive
+                ? {
+                    capability,
+                    originId: gesture.originId,
+                    ghost: gesture.ghost,
+                    pendingIds: movingIds,
+                  }
+                : undefined
+            }
           />
         );
     }
@@ -1129,10 +1249,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         // resolved, and the day columns inside it are keyed by date, so a step unmounts the one
         // leaving the window. `useHorizontalWheelShift` owns neither problem from here — it listens on the
         // window and hit-tests this element's box, so it needs only to be told which box (its
-        // header has the two failure modes that shape came from). `data-calendar-grid` is where the
-        // drag gesture will hold the pointer (C16b); until then the pointer-capture probe (LD1, a
-        // devtools snippet) finds it by that.
-        <div ref={gridRef} className="flex min-h-0 flex-1 flex-col" data-calendar-grid="">
+        // header has the two failure modes that shape came from). The drag holds the pointer on it
+        // too (C16b), for the same reason; `data-calendar-grid` is how the pointer-capture probe (LD1,
+        // a devtools snippet) finds it.
+        <div ref={setGridWrapper} className="flex min-h-0 flex-1 flex-col" data-calendar-grid="">
           {/* key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the
               keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not
               JS). The day component of the key (from the minute tick) remounts the body when the
@@ -1277,6 +1397,36 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         }
         onHold={writes.holdMoveBack}
       />
+      {/* A drop that asks (C16b): which occurrences, or whether to email the guests. Keyed by its
+          flow, so each drop asks afresh. */}
+      {moveAsk && (
+        <MoveFlow
+          key={moveAsk.flow}
+          ask={moveAsk}
+          account={accountOf(moveAsk.drop.event)}
+          announce={announce}
+          onDone={() => {
+            drops.end(moveAsk);
+            focusEvent(moveAsk.drop.event.id);
+          }}
+        />
+      )}
+      {/* Why the event pressed can't be dragged, by the pointer while the button is down. The live
+          region below says the same, so this is hidden from screen readers. Placed by the drag
+          itself as the pointer moves, not by a render. */}
+      {gesture.chip && (
+        <div
+          ref={gesture.chipRef}
+          aria-hidden="true"
+          data-drag-reason=""
+          className="pointer-events-none fixed z-50 max-w-xs rounded-[var(--radius-sm)] border border-[var(--ink4)] bg-panel px-2 py-1 text-xs leading-snug text-ink2 shadow-md"
+        >
+          {gesture.chip}
+        </div>
+      )}
+      <VisuallyHidden role="status" aria-live="polite">
+        {said}
+      </VisuallyHidden>
     </div>
   );
 }

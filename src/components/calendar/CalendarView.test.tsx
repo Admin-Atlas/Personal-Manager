@@ -268,6 +268,65 @@ describe("CalendarView: the grid's box", () => {
   });
 });
 
+// C16b: Day and Week drag once a Google account has editing on. A drop is drawn where it went at once
+// (dashed, and not dragged again until Google has it), and another account's copy of the event hides
+// until that account's own read catches up, so it never shows at the old time meanwhile.
+describe("CalendarView: dragging in Week", () => {
+  const cards = (id: string) =>
+    document.querySelectorAll<HTMLElement>(`[data-time-body] [data-event-id="${id}"]`);
+  // Yours, and the list says its time can change.
+  const movable = row({ can_retime: true });
+
+  it("marks the grid for the drag only where events can be dragged", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    rows = [movable];
+    const first = await mount();
+    expect(document.querySelector("[data-time-body]")).not.toBeNull();
+    // A half-hour card at the unmeasured row height has room for its bottom edge only.
+    expect(cards("e1")[0].querySelector('[data-edge="end"]')).not.toBeNull();
+    first.unmount();
+    // Editing off: the same Week, drawn as it always was.
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    await mount();
+    expect(screen.getByRole("button", { name: /Standup/ })).toBeTruthy();
+    expect(document.querySelector("[data-time-body], [data-event-id]")).toBeNull();
+  });
+
+  it("a drop shows where it went at once, and hides another account's copy meanwhile", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    const copy = row({ id: "e2", calendar_id: WORK_CAL });
+    rows = [movable, copy];
+    await mount();
+    // One occurrence, two copies: one drawn.
+    expect(cards("e1")).toHaveLength(1);
+    expect(cards("e2")).toHaveLength(0);
+    expect(cards("e1")[0].querySelector('[data-edge="end"]')).not.toBeNull();
+    const top = parseFloat(cards("e1")[0].style.top);
+    const writes = await import("./edit/useEventWrites");
+    const from = {
+      kind: "timed" as const,
+      start: { day: today, min: 420 },
+      end: { day: today, min: 450 },
+    };
+    const to = {
+      kind: "timed" as const,
+      start: { day: today, min: 540 },
+      end: { day: today, min: 570 },
+    };
+    act(() => void writes.beginMove(writes.dropOf(movable, from, to, false)));
+    const moved = cards("e1")[0];
+    expect(parseFloat(moved.style.top)).toBeGreaterThan(top);
+    expect(moved.className).toContain("opacity-70");
+    // "Saving…": no edge to take until it lands.
+    expect(moved.querySelectorAll("[data-edge]")).toHaveLength(0);
+    // Google has the move on this account; the other account's copy is still at the old time.
+    rows = [{ ...movable, start: `${today}T09:00:00`, end: `${today}T09:30:00` }, copy];
+    await act(async () => writeLanded());
+    expect(cards("e1")).toHaveLength(1);
+    expect(cards("e2")).toHaveLength(0);
+  });
+});
+
 describe("CalendarView: a new event", () => {
   it("Shift+C opens quick create, non-modal, under + New event; c the full editor", async () => {
     await mount();

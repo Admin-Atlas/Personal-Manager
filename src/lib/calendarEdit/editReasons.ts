@@ -1002,6 +1002,26 @@ export function moveBackText(outcome: WriteOutcome, title: string): { tone: Tone
   }
 }
 
+/** A drop asked about again and still not settled (the plan or the guests changed in Google while
+ *  the user answered), or one whose question can't be asked now: put back, and the user drags it
+ *  again then (C16b, as a delete says "delete it again"). */
+export function moveChangedText(title: string): { tone: Tone; text: string } {
+  return {
+    tone: "warn",
+    text: `${quote(title)} changed in Google while you were choosing, so it wasn't moved. Drag it again.`,
+  };
+}
+
+/** Above the email question after a drop, when Google's copy has guests PM's calendar didn't show:
+ *  the drag asked nothing, since the event looked as if it had none (C16b). */
+export const MOVE_NEW_GUESTS =
+  "This event has guests in Google that PM's calendar didn't show yet.";
+
+/** Above the email question after a drop, asked again because Google's numbers differ from those
+ *  the user answered: the editor's line, for a move. */
+export const MOVE_CHECKED =
+  "PM checked with Google before moving it, and these are the numbers it found.";
+
 // --- creating an event (C10) ---
 
 /** The backend's words for a new event's retry token it no longer holds (PM restarted, or eight

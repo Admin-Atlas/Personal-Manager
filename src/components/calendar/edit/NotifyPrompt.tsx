@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The email question on its own, for a write that asks nothing else (#884, C12): a one-off's save or
-// delete, or a new event. Google's "Send update emails to guests?" with its Back, Don't send and Send
-// as PM draws it: the question as the title, who would get what, two radios with nothing picked, and
-// Save (Delete, Create) off until one is. Focus starts on Back, so Enter on open goes back and never
-// answers (C12 spec §0.5 row 2). It sends nothing itself: the caller saves with the answer.
+// delete, a new event, or an event dragged to a new time (C16b). Google's "Send update emails to
+// guests?" with its Back, Don't send and Send as PM draws it: the question as the title, who would
+// get what, two radios with nothing picked, and Save (Delete, Create) off until one is. Focus starts
+// on Back, so Enter on open goes back and never answers (C12 spec §0.5 row 2). It sends nothing
+// itself: the caller saves with the answer.
 
 import { useRef, useState } from "react";
 import { notifyOf, notifyQuestion, type NotifyKind } from "../../../lib/calendarEdit/guests";
@@ -20,6 +21,11 @@ interface Props {
   from: string | null;
   /** The backend asked: who Google would email isn't what the editor counted. */
   again: boolean;
+  /** What `again` says, where the editor's line doesn't fit (a drop asked nothing first, C16b). */
+  againText?: string;
+  /** A line above the choice: Google's warning on an invitation the organiser lets guests change
+   *  (C16b, as the editor shows it). */
+  note?: string | null;
   onSend: (n: Notify) => void;
   onBack: () => void;
 }
@@ -27,7 +33,16 @@ interface Props {
 const CONFIRM: Record<NotifyKind, string> = { save: "Save", delete: "Delete", create: "Create" };
 
 /** Rendered only while open (the caller mounts it), so every question starts unanswered. */
-export function NotifyPrompt({ notice, kind, from, again, onSend, onBack }: Props) {
+export function NotifyPrompt({
+  notice,
+  kind,
+  from,
+  again,
+  againText,
+  note = null,
+  onSend,
+  onBack,
+}: Props) {
   const [value, setValue] = useState<Notify | null>(null);
   // Once: a second press before the caller closes it sends nothing (C12 critique C1).
   const sent = useRef(false);
@@ -52,9 +67,10 @@ export function NotifyPrompt({ notice, kind, from, again, onSend, onBack }: Prop
           this can be the first question. */}
       {again && (
         <Callout tone="warning" size="md" className="mt-1">
-          PM checked with Google before saving, and these are the numbers it found.
+          {againText ?? "PM checked with Google before saving, and these are the numbers it found."}
         </Callout>
       )}
+      {note && <p className="mt-1 text-xs leading-relaxed text-ink3">{note}</p>}
       <NotifyChoice
         notice={notice}
         kind={kind}

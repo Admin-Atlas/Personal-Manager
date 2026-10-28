@@ -381,6 +381,16 @@ export function isEventPast(ev: CalendarEvent, now: Date): boolean {
  *  surface greys past events identically. */
 export const PAST_EVENT_CLASS = "opacity-60 saturate-[0.4]";
 
+/** An event being moved, drawn where it was dropped while PM asks about it or saves it (#884,
+ *  C16b): a draft's dashed edge, a little less faded. Still, not a shimmer: the skeleton's sweep
+ *  moves a gradient, and an event's fill is flat. It replaces the past look rather than joining
+ *  it, so only one opacity utility is ever on a card (`cn` doesn't resolve conflicting ones). */
+export const PENDING_EVENT_CLASS =
+  "opacity-70 outline-dashed outline-1 -outline-offset-1 outline-ink3";
+
+/** The event being dragged, where it was: dimmed in place while its ghost shows where it goes. */
+export const DRAG_ORIGIN_CLASS = "opacity-40";
+
 // --- timed-event overlap lanes -------------------------------------------------------------------
 
 export interface TimedInput {

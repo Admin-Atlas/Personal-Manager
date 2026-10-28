@@ -10,7 +10,10 @@
 // equal-width lane columns via calendar-layout. Only all-day events lift into the AllDayBand: a timed
 // event that runs past midnight fills its hours in every day it touches, one piece per day
 // (`timedSegments`), each opening the same event. Today's column gets an accent-soft tint and the
-// now-line. Every colour is a token or the passed source colour — no hex.
+// now-line. Every colour is a token or the passed source colour — no hex. Given an `interaction`
+// (the calendar's Day and Week, C16b), it draws what a drag needs: data attributes the drag measures,
+// the ends that may be dragged, the ghost in each column it touches, and the pending look; the drag
+// itself is the calendar's (`useCalendarGesture`), which listens on the window.
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
@@ -33,10 +36,12 @@ import { hourRowHeight } from "../../../lib/calendarGeom";
 import { formatClock } from "../../../lib/format";
 import { useDepth } from "../../../theme";
 import { cn } from "../../ui";
+import type { DragCapability } from "../../../lib/calendarDrag";
 import { ZoneGutter } from "../ZoneGutter";
 import { EventCard } from "../parts/EventCard";
 import { NowLine } from "../parts/NowLine";
-import { AllDayBand } from "../parts/AllDayBand";
+import { AllDayBand, type BandDrag } from "../parts/AllDayBand";
+import { DragGhost, type GhostView } from "../parts/DragGhost";
 import { whenText } from "../parts/whenText";
 import { eventColour } from "../../../theme/eventPalette";
 import { isDeclined } from "../../../lib/calendarEdit/rsvp";
@@ -74,6 +79,23 @@ interface Props {
   now?: Date;
   /** Open an event's detail popup, anchored at the event's on-screen rect. */
   onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
+  /** Events can be dragged here (the calendar's Day and Week, C16b): the grid marks its body,
+   *  columns, strip and events for the drag's hit test, shows the ends that may be dragged, the
+   *  ghost and the pending look, and keeps the all-day row. Absent (Focus's read-only grid), the DOM
+   *  is as it always was. */
+  interaction?: GridInteraction;
+}
+
+/** What a dragging calendar tells the grid. */
+export interface GridInteraction {
+  /** What a press on an event may do. */
+  capability: (ev: CalendarEvent) => DragCapability;
+  /** The event being dragged: its pieces dim in place (lanes don't re-pack mid-drag). */
+  originId: string | null;
+  /** Where it would go. */
+  ghost: GhostView | null;
+  /** Moves being asked about or saved, drawn where they were dropped. */
+  pendingIds: ReadonlySet<string>;
 }
 
 const LOCAL_COL = 54; // width of the local hour column (px)
@@ -135,6 +157,7 @@ export function TimeGridView({
   minRowHeight = MIN_ROW_H,
   now,
   onEventClick,
+  interaction,
 }: Props) {
   const { minimal, showPower } = useDepth();
   const nowDate = now ?? new Date();
@@ -313,6 +336,26 @@ export function TimeGridView({
     }
   }, [rowH, scrollKey]);
 
+  // A timed ghost's pieces, one per visible day it touches (an all-day one is the strip's).
+  const ghost = interaction?.ghost ?? null;
+  const ghostPieces = useMemo(
+    () => (ghost && !ghost.event.all_day ? timedSegments(ghost.event, days) : []),
+    [ghost, days],
+  );
+  const capability = interaction?.capability;
+  const bandDrag = useMemo<BandDrag | undefined>(
+    () =>
+      interaction && capability
+        ? {
+            bandEdges: (ev) => capability(ev).bandEdges,
+            originId: interaction.originId,
+            pendingIds: interaction.pendingIds,
+            ghost: interaction.ghost,
+          }
+        : undefined,
+    [interaction, capability],
+  );
+
   const nowMin = minutesFromLocalMidnight(nowDate);
   // Hour rules as one crisp 1px line per hour, each snapped to a whole pixel so it lands on the
   // device-pixel grid and renders identically. A repeating-linear-gradient at a fractional rowH
@@ -369,12 +412,17 @@ export function TimeGridView({
         showLabel={!minimal}
         now={nowDate}
         onEventClick={onEventClick}
+        drag={bandDrag}
       />
 
-      {/* Scrollable time body */}
+      {/* Scrollable time body. On a grid that drags, the drag reads its scroll and row height
+          here, and it isn't selectable (Google's grid isn't either), so a slow start to a drag
+          never paints a selection. */}
       <div
         ref={scrollRef}
-        className="min-h-0 flex-1 overflow-y-auto"
+        className={cn("min-h-0 flex-1 overflow-y-auto", interaction && "select-none")}
+        data-time-body={interaction ? "" : undefined}
+        data-row-h={interaction ? rowH : undefined}
         onScroll={(e) => {
           const top = e.currentTarget.scrollTop;
           if (top === ownTopRef.current) return; // the grid's own write, reported
@@ -417,13 +465,15 @@ export function TimeGridView({
             </div>
           </div>
           {/* Day columns */}
-          {columns.map((c) => (
+          {columns.map((c, d) => (
             <div
               key={dayKey(c.day)}
               className={cn(
                 "relative flex-1 border-l",
                 c.isToday ? "border-border bg-accent-soft" : "border-rule",
               )}
+              data-surface={interaction ? "grid" : undefined}
+              data-day={interaction ? dayKey(c.day) : undefined}
             >
               {/* Hour rules — one crisp 1px line per hour, painted under the cards so today's tint
                   shows through. Explicit divs (not a repeating gradient) stay crisp at any rowH. On
@@ -438,30 +488,69 @@ export function TimeGridView({
                   style={{ top }}
                 />
               ))}
-              {c.cards.map((card) => (
-                <EventCard
-                  key={card.ev.id}
-                  summary={card.ev.summary}
-                  color={colorOf(card.ev.calendar_id)}
-                  own={eventColour(card.ev.color_id)}
-                  timeLabel={card.timeLabel}
-                  location={card.ev.location}
-                  topPx={(card.startMin / 60) * rowH}
-                  // A piece that runs on to the next day reaches the bottom of this one: no gap.
-                  heightPx={Math.max((card.durMin / 60) * rowH - (card.continuesAfter ? 0 : 3), 14)}
-                  leftPct={card.leftPct}
-                  widthPct={card.widthPct}
-                  showTime={!minimal}
-                  showLocation={showPower}
-                  isPast={isEventPast(card.ev, nowDate)}
-                  ghost={draftNote(card.ev)}
-                  declined={isDeclined(card.ev)}
-                  continuesBefore={card.continuesBefore}
-                  continuesAfter={card.continuesAfter}
-                  tabStop={card.tabStop}
-                  onSelect={onEventClick ? (rect) => onEventClick(card.ev, rect) : undefined}
-                />
-              ))}
+              {c.cards.map((card) => {
+                const cap = capability?.(card.ev);
+                return (
+                  <EventCard
+                    key={card.ev.id}
+                    summary={card.ev.summary}
+                    color={colorOf(card.ev.calendar_id)}
+                    own={eventColour(card.ev.color_id)}
+                    timeLabel={card.timeLabel}
+                    location={card.ev.location}
+                    topPx={(card.startMin / 60) * rowH}
+                    // A piece that runs on to the next day reaches the bottom of this one: no gap.
+                    heightPx={Math.max(
+                      (card.durMin / 60) * rowH - (card.continuesAfter ? 0 : 3),
+                      14,
+                    )}
+                    leftPct={card.leftPct}
+                    widthPct={card.widthPct}
+                    showTime={!minimal}
+                    showLocation={showPower}
+                    isPast={isEventPast(card.ev, nowDate)}
+                    ghost={draftNote(card.ev)}
+                    declined={isDeclined(card.ev)}
+                    continuesBefore={card.continuesBefore}
+                    continuesAfter={card.continuesAfter}
+                    tabStop={card.tabStop}
+                    onSelect={onEventClick ? (rect) => onEventClick(card.ev, rect) : undefined}
+                    drag={
+                      interaction && cap
+                        ? {
+                            eventId: card.ev.id,
+                            day: dayKey(c.day),
+                            // The top edge on its first piece, the bottom on its last.
+                            edges: {
+                              start: cap.resizeStart && !card.continuesBefore,
+                              end: cap.resizeEnd && !card.continuesAfter,
+                            },
+                            dimmed: interaction.originId === card.ev.id,
+                            pending: interaction.pendingIds.has(card.ev.id),
+                          }
+                        : undefined
+                    }
+                  />
+                );
+              })}
+              {ghost &&
+                ghostPieces
+                  .filter((p) => p.dayIndex === d)
+                  .map((p) => (
+                    <DragGhost
+                      key="ghost"
+                      ghost={ghost}
+                      color={colorOf(ghost.event.calendar_id)}
+                      box={{
+                        top: `${(p.startMin / 60) * rowH}px`,
+                        height: `${Math.max(((p.endMin - p.startMin) / 60) * rowH - (p.continuesAfter ? 0 : 3), 14)}px`,
+                        left: "1px",
+                        width: "calc(100% - 2px)",
+                      }}
+                      continuesBefore={p.continuesBefore}
+                      continuesAfter={p.continuesAfter}
+                    />
+                  ))}
               {c.isToday && <NowLine topPx={(nowMin / 60) * rowH} />}
             </div>
           ))}

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { Calendar, CalendarAccount, CalendarOverview } from "../types";
 import { formatDateLocal } from "../format";
 import {
+  accountLength,
   createdWhere,
   createNotes,
   createReasonFor,
@@ -188,6 +189,15 @@ describe("lengthFor", () => {
     for (const odd of [0, -5, 1441, 2.5, Number.NaN]) {
       expect(lengthFor(overview({ default_length: { [ME]: odd } }), target)).toBe(60 * 60_000);
     }
+  });
+
+  // C16b: an all-day event dragged into the hours takes its own account's length.
+  it("accountLength reads an account by its id, and an unknown one is an hour", () => {
+    const o = overview({ default_length: { [ME]: 45 } });
+    expect(accountLength(o, ME)).toBe(45 * 60_000);
+    expect(accountLength(o, "gcal:other@x.com")).toBe(60 * 60_000);
+    expect(accountLength(o, null)).toBe(60 * 60_000);
+    expect(accountLength(overview({ default_length: { [ME]: 2.5 } }), ME)).toBe(60 * 60_000);
   });
 });
 

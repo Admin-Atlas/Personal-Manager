@@ -2658,11 +2658,7 @@ async fn send_delete<W: Wire, H: Host>(
     WriteOutcome::Conflict { fields: Vec::new() }
 }
 
-// --- moving an event, and putting a move back (C16a) ---
-
-/// Moving by dragging, held back from release builds until the views that drag land (C16b), as
-/// creating was (C10). Dev builds move, for the probes.
-const MOVE_NOT_YET: &str = "Moving events by dragging isn't available yet.";
+// --- moving an event, and putting a move back (C16a; release builds since C16b) ---
 
 /// A drop on an occurrence of a repeating event that doesn't repeat any more: the drag's own words.
 const NOT_REPEATING_MOVE: &str = "That event doesn't repeat any more. Drag it again.";
@@ -2687,11 +2683,6 @@ pub async fn reschedule_calendar_event(
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
-    if !cfg!(debug_assertions) {
-        return Ok(WriteOutcome::Failed {
-            message: MOVE_NOT_YET.into(),
-        });
-    }
     let state = app.state::<AppState>();
     let (target, editing_choice) = {
         let conn = state.conn()?;
@@ -2974,11 +2965,6 @@ pub async fn undo_calendar_change(
 ) -> Result<WriteOutcome> {
     require_main_window(&window)?;
     require_owner(&app)?;
-    if !cfg!(debug_assertions) {
-        return Ok(WriteOutcome::Failed {
-            message: MOVE_NOT_YET.into(),
-        });
-    }
     let state = app.state::<AppState>();
     let Some(target) = state.calendar_edit.undo_target(&undo_token, Instant::now()) else {
         return Ok(WriteOutcome::Failed {
@@ -19803,7 +19789,6 @@ mod tests {
                 LOST_REPLY,
                 GUESTS_SHRANK,
                 // Moving an event, and putting a move back (C16a).
-                MOVE_NOT_YET,
                 NOT_REPEATING_MOVE,
                 UNDO_GONE,
                 UNDO_GUESTS,
@@ -25229,15 +25214,20 @@ mod tests {
         assert_eq!(body["end"], london("2026-10-12T11:00:00+01:00"));
     }
 
-    /// C16a ships behind a release gate until the views that drag land (C16b): both shells say
-    /// so first, before anything is read.
+    /// C16a held moving back from release builds until the views that drag landed; C16b lifts
+    /// it. Neither shell refuses in a release build any more, and the words are gone (the needle
+    /// is built in pieces, so this test doesn't find itself).
     #[test]
-    fn release_refuses_moving_until_the_views_land() {
+    fn release_builds_move_now_the_views_have_landed() {
         let source = include_str!("calendar_edit.rs");
         let shipped = source
             .split("#[cfg(test)]\nmod tests {")
             .next()
             .unwrap_or_default();
+        assert!(
+            !shipped.contains(concat!("MOVE_", "NOT_YET")),
+            "the release gate's words are gone"
+        );
         for shell in [
             "pub async fn reschedule_calendar_event(",
             "pub async fn undo_calendar_change(",
@@ -25245,15 +25235,11 @@ mod tests {
             let start = shipped.find(shell).expect("the shell");
             let body = &shipped[start..];
             let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
-            let at = |needle: &str| body.find(needle).unwrap_or(usize::MAX);
             assert!(
-                at("if !cfg!(debug_assertions) {") < at("message: MOVE_NOT_YET.into(),"),
-                "{shell} refuses in release builds"
+                !body.contains("if !cfg!(debug_assertions)"),
+                "{shell} moves in release builds"
             );
-            assert!(
-                at("message: MOVE_NOT_YET.into(),") < at("app.state::<AppState>()"),
-                "{shell} refuses before anything is read"
-            );
+            assert!(body.contains("app.state::<AppState>()"), "{shell} found");
         }
     }
 
