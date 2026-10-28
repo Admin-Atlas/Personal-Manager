@@ -572,7 +572,7 @@ describe("CalendarEventPopover", () => {
     try {
       const call = "https://meet.google.com/abc-defg-hij";
       const page = "https://www.google.com/calendar/event?eid=ZTE";
-      const { getAllByRole } = render(
+      const { getByRole } = render(
         <CalendarEventPopover
           event={calendarEvent({ conference_url: call, html_link: page })}
           anchor={rect(100)}
@@ -582,14 +582,13 @@ describe("CalendarEventPopover", () => {
           onClose={() => {}}
         />,
       );
-      const copies = getAllByRole("button", { name: "Copy link" });
-      expect(copies).toHaveLength(2);
+      // Each says what it copies, so the two can be told apart by name alone.
       await act(async () => {
-        fireEvent.click(copies[0]);
+        fireEvent.click(getByRole("button", { name: "Copy link to the call" }));
       });
       expect(writeText).toHaveBeenLastCalledWith(call);
       await act(async () => {
-        fireEvent.click(copies[1]);
+        fireEvent.click(getByRole("button", { name: "Copy link to this event" }));
       });
       expect(writeText).toHaveBeenLastCalledWith(page);
     } finally {
@@ -608,7 +607,7 @@ describe("CalendarEventPopover", () => {
         onClose={() => {}}
       />,
     );
-    expect(queryByRole("button", { name: "Copy link" })).toBeNull();
+    expect(queryByRole("button", { name: /^Copy link/ })).toBeNull();
   });
 
   // The colour an event was given in Google is named, not only shown: the fill's hue alone doesn't

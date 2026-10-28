@@ -249,39 +249,63 @@ pub struct SignInPage {
 /// ends, however it ends (the redirect, an error, the timeout).
 pub struct SignInShown {
     app: AppHandle,
-    id: u64,
+    page: SignInPage,
+}
+
+impl SignInShown {
+    /// Offer `url`, `provider`'s sign-in page, in PM's window, before any browser is asked to open
+    /// it: a launcher can block until the browser it started quits (xdg-open does on a desktop it
+    /// doesn't know), and the link is wanted most then.
+    pub fn show(app: &AppHandle, provider: &'static str, url: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let page = SignInPage {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            provider,
+            url: url.to_string(),
+            opened: true,
+        };
+        let _ = app.emit("signin://open", &page);
+        SignInShown {
+            app: app.clone(),
+            page,
+        }
+    }
+
+    /// The page as shown, for [`open_browser`], which can then run without holding whatever holds
+    /// this.
+    pub fn page(&self) -> SignInPage {
+        self.page.clone()
+    }
 }
 
 impl Drop for SignInShown {
     fn drop(&mut self) {
-        let _ = self.app.emit("signin://closed", self.id);
+        let _ = self.app.emit("signin://closed", self.page.id);
+    }
+}
+
+/// Open the default browser on a page already shown. When it won't open, the window is told so (the
+/// same id again, `opened: false`), and the link is the way in. The error is logged by its kind only:
+/// a launcher's message repeats its command line, the link included.
+pub fn open_browser(app: &AppHandle, mut page: SignInPage) {
+    if let Err(e) = open::that(&page.url) {
+        eprintln!(
+            "sign-in: couldn't open the browser for {} ({:?})",
+            page.provider,
+            e.kind()
+        );
+        page.opened = false;
+        let _ = app.emit("signin://open", &page);
     }
 }
 
 /// Open the default browser on `url`, `provider`'s sign-in page, and offer the link in PM's window
-/// while PM waits. A browser that won't open no longer ends the sign-in: the window says so, and the
-/// link still works pasted into one, until the wait times out.
+/// while PM waits ([`SignInShown`]). A browser that won't open no longer ends the sign-in: the
+/// window says so, and the link still works pasted into one, until the wait times out.
 pub fn open_sign_in(app: &AppHandle, provider: &'static str, url: &str) -> SignInShown {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let opened = match open::that(url) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("sign-in: couldn't open the browser for {provider}: {e}");
-            false
-        }
-    };
-    let page = SignInPage {
-        id,
-        provider,
-        url: url.to_string(),
-        opened,
-    };
-    let _ = app.emit("signin://open", page);
-    SignInShown {
-        app: app.clone(),
-        id,
-    }
+    let shown = SignInShown::show(app, provider, url);
+    open_browser(app, shown.page());
+    shown
 }
 
 // --- per-key refresh lock ---

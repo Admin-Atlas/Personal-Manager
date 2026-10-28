@@ -82,7 +82,7 @@ export function ProtonDriveSection({
             >
               Get the Proton Drive CLI&hellip;
             </Button>
-            <CopyLinkButton url={proton.install_url} size="md" />
+            <CopyLinkButton url={proton.install_url} to="the Proton Drive CLI" size="md" />
             <Button variant="secondary" onClick={() => void locateCli()} disabled={locating}>
               {locating ? "Locating…" : "Locate manually…"}
             </Button>

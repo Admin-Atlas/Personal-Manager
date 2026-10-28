@@ -380,7 +380,12 @@ export function CalendarEventPopover({
                 Join the call →
               </button>
               {/* For joining from another browser, or sending the link on. */}
-              <CopyLinkButton url={event.conference_url} size="xs" className="shrink-0" />
+              <CopyLinkButton
+                url={event.conference_url}
+                to="the call"
+                size="xs"
+                className="shrink-0"
+              />
             </span>
           </Field>
         )}
@@ -447,7 +452,7 @@ export function CalendarEventPopover({
             <Button variant="secondary" size="sm" onClick={() => void openUrl(event.html_link!)}>
               {sourceLabel(calendar?.provider)}
             </Button>
-            <CopyLinkButton url={event.html_link} />
+            <CopyLinkButton url={event.html_link} to="this event" />
           </>
         )}
         {milestone && onOpenProject && (

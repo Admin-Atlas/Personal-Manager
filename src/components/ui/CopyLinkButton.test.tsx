@@ -63,6 +63,17 @@ describe("CopyLinkButton", () => {
     expect(getByRole("button").textContent).toBe("Copy link");
   });
 
+  it("names what it copies when told, and says it copied it", async () => {
+    clipboard(vi.fn().mockResolvedValue(undefined));
+    const { getByRole } = render(<CopyLinkButton url={URL_} to="the call" />);
+    const button = getByRole("button", { name: "Copy link to the call" });
+    expect(button.textContent).toBe("Copy link");
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    expect(getByRole("button", { name: "Copied link to the call" })).toBe(button);
+  });
+
   it("is a small tertiary button unless asked otherwise", () => {
     const { getByRole, rerender } = render(<CopyLinkButton url={URL_} />);
     expect(getByRole("button").dataset.variant).toBe("tertiary");
