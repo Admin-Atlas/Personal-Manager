@@ -12,10 +12,10 @@
 // (`useHorizontalWheelShift`, #698): the day columns are keyed by date, so a swipe or ← mid-drag
 // unmounts the column a drag began over, and anything bound to it goes with it. So cards carry data
 // attributes and nothing else; one capture listener on the window reads what a press took from them,
-// and every frame measures the grid afresh (nothing is kept from the press but the row it took, and
-// how far the grid was scrolled, to tell a scrollbar's press), so a column re-keyed under the pointer
-// just reads differently on the next frame. The press listener
-// never prevents the default: the mousedown after it still closes the event's details and any other
+// and every frame measures the grid afresh (nothing is kept from the press but the row it took, and,
+// by the grid's right edge, how far it was scrolled, to tell a scrollbar's press), so a column
+// re-keyed under the pointer just reads differently on the next frame. The press listener never
+// prevents the default: the mousedown after it still closes the event's details and any other
 // popover, and whether one was open is read first, so that press only closes it.
 //
 // The phase lives here, not in React state: each listener steps the machine and runs what it says
@@ -26,10 +26,11 @@
 //
 // Letting go on a valid place that changes something is the only way a drop happens. Escape, the
 // window losing focus or being hidden, the pointer being cancelled or captured away, a dialog
-// opening, or the calendar going all put it back; a press the grid scrolls under before it becomes a
-// drag was a scrollbar's, and just ends. It imports no write and names no command: a drop is
-// handed to the calendar (`onCommit`), which asks and moves through the write hook, and a new event's
-// slot to quick create (`onCreate`), which saves nothing until its own Save.
+// opening, or the calendar going all put it back; a press by the grid's right edge that the grid,
+// still until then, scrolls under before it becomes a drag was a scrollbar's, and just ends. It
+// imports no write and names no command: a drop is handed to the calendar (`onCommit`), which asks
+// and moves through the write hook, and a new event's slot to quick create (`onCreate`), which saves
+// nothing until its own Save.
 //
 // Touch never drags (Q14): a touch press is taken only on empty space, where a tap creates; the mouse
 // events the browser follows that tap with are eaten, so they can't close the quick create it opened.
@@ -136,6 +137,16 @@ const TAP_MOUSE_MS = 800;
 
 /** What a press elsewhere on the grid leaves alone: controls (the add-zone button among them). */
 const CONTROLS = "button, a, input, select, textarea, [data-no-create]";
+
+/** How far in from the right edge of what scrolls the grid a scrollbar floating over it reaches, in
+ *  px: it widens under the pointer to about 13 (GTK) or 16 (a Mac). PM is laid out left to right,
+ *  so the bar is always down the right. */
+const FLOAT_BAR_PX = 20;
+
+/** How long the grid can go without a scroll event and still be moving on its own, in ms: a
+ *  wheel's or a fling's glide, the snap onto a week that follows one in Month, and Month's own
+ *  scroll to a month each scroll it on every frame until they stop. */
+const SETTLE_MS = 150;
 
 const boxOf = (r: DOMRect): Box => ({ left: r.left, top: r.top, right: r.right, bottom: r.bottom });
 
@@ -326,16 +337,37 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     let unarm: (() => void) | null = null;
     /** Takes off the eating of a touch tap's mouse events (`eatTapMouse`). */
     let untap: (() => void) | null = null;
-    /** What scrolls the grid, and where it stood at the press. */
+    /** What scrolls the grid, and where it stood at a press a floating scrollbar could have made
+     *  (`watchUnder`); null for any other press. */
     let under: { el: HTMLElement; top: number } | null = null;
+    /** When each element last scrolled, by `performance.now()`: whether the grid is still moving. */
+    const scrolledAt = new WeakMap<EventTarget, number>();
+    const onScroll = (e: Event) => {
+      if (e.target) scrolledAt.set(e.target, performance.now());
+    };
 
-    /** Whether the grid scrolled under a press that isn't a drag yet. A scrollbar that floats over
-     *  the days may let its press reach the day beneath (where it lands can't say which it was),
-     *  but it scrolls them, at once on its track or as its thumb is dragged, and a click on a day
-     *  never does. The drag's own scrolling starts only once it's a drag, so this one was the
-     *  scrollbar's (or a wheel's): the press just ends, creating or moving nothing. */
+    /** Whether the grid scrolled under a press that isn't a drag yet, one `watchUnder` took. A
+     *  scrollbar that floats over the days may let its press reach the day beneath (where it lands
+     *  can't say which it was), but it scrolls them, at once on its track or as its thumb is
+     *  dragged, and a click on a day of a still grid never does. The drag's own scrolling starts
+     *  only once it's a drag, so this one was the scrollbar's (or a wheel's): the press just ends,
+     *  creating or moving nothing. */
     const scrolledUnder = () =>
       now().phase === "pressed" && under !== null && under.el.scrollTop !== under.top;
+
+    /** What `scrolledUnder` watches for a press at `x` on `t`: the element that scrolls the grid
+     *  (`scroller`) and where it stands, only when a floating scrollbar could have made the press:
+     *  on what it scrolls, within the bar's reach of its right edge, with the grid still. Anywhere
+     *  else (the rest of the days, the all-day row), or while the grid still glides or snaps from a
+     *  wheel or a fling, or scrolls itself to a month, the grid moves for reasons that aren't the
+     *  press's, and the press acts as ever (null), as a click on a moving grid does in Google. */
+    const watchUnder = (x: number, t: EventTarget | null, scroller: HTMLElement | undefined) => {
+      if (!scroller || !(t instanceof Node) || !scroller.contains(t)) return null;
+      if (x < scroller.getBoundingClientRect().right - FLOAT_BAR_PX) return null;
+      const last = scrolledAt.get(scroller);
+      if (last !== undefined && performance.now() - last < SETTLE_MS) return null;
+      return { el: scroller, top: scroller.scrollTop };
+    };
 
     /** A tap that created: the browser follows a touch with a mousedown, mouseup and click at the
      *  same spot, which quick create (open by then) would read as a press outside it, and close.
@@ -720,8 +752,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       // (it never passes the threshold, so it is always a click).
       if (e.pointerType === "touch" && press.on.kind !== "empty") return;
       pos.current = { x: e.clientX, y: e.clientY };
-      const scroller = measure(wrapper)?.scroller;
-      under = scroller ? { el: scroller, top: scroller.scrollTop } : null;
+      under = watchUnder(e.clientX, e.target, measure(wrapper)?.scroller);
       dispatch({ type: "press", press });
       attach(press, wrapper);
       raf = requestAnimationFrame(tick);
@@ -729,8 +760,11 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
 
     // Passive: it never prevents the default (see the header).
     window.addEventListener("pointerdown", onDown, { capture: true, passive: true });
+    // A scroll doesn't bubble, but the window sees every element's on the way down.
+    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
     return () => {
       window.removeEventListener("pointerdown", onDown, { capture: true });
+      window.removeEventListener("scroll", onScroll, { capture: true });
       cancel("unmount");
       end();
       unarm?.();

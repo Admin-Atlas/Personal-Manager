@@ -1169,16 +1169,100 @@ describe("useCalendarGesture: creating", () => {
     body.scrollTop = 200;
     moveTo(790, 400);
     release(790, 400);
-    // Or over Gym's card.
-    press(screen.getByTestId("card"), 200, 480);
+    // Or over Gym's card, with Gym's day drawn last so the card meets the bar.
+    place(screen.getByTestId("col1"), 427, 100, 800, 600);
+    place(screen.getByTestId("col2"), 54, 100, 427, 600);
+    place(screen.getByTestId("card"), 428, 460, 799, 500);
+    press(screen.getByTestId("card"), 790, 480);
     body.scrollTop = 400;
-    moveTo(200, 560);
-    release(200, 560);
+    moveTo(790, 560);
+    release(790, 560);
     expect(onCreate).not.toHaveBeenCalled();
     expect(onCommit).not.toHaveBeenCalled();
     expect(capture).not.toHaveBeenCalled();
     // Quietly: nothing was picked up, so nothing is put back.
     expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("by the scrollbar, a press as the weeks still settle from a scroll acts as ever", () => {
+    const { onCreate } = mountMonth(creates);
+    const stream = screen.getByTestId("stream");
+    const sun = screen.getByTestId("sun");
+    const clock = vi.spyOn(performance, "now").mockReturnValue(1000);
+    // A wheel turned: the weeks scroll past a week's start, and Sunday is clicked by the bar as
+    // they snap back onto it, before the next frame and after it.
+    stream.scrollTop = 30;
+    fireEvent.scroll(stream);
+    clock.mockReturnValue(1100);
+    press(sun, 695, 60);
+    stream.scrollTop = 10;
+    fireEvent.scroll(stream);
+    frame();
+    stream.scrollTop = 0;
+    release(695, 60);
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    expect(onCreate.mock.calls[0][0].timing).toEqual({
+      kind: "all_day",
+      first: "2026-10-18",
+      last: "2026-10-18",
+    });
+    // Pressed as they settle and dragged down a week, it's picked up and creates over both.
+    stream.scrollTop = 20;
+    fireEvent.scroll(stream);
+    press(sun, 695, 60);
+    stream.scrollTop = 0;
+    fireEvent.scroll(stream);
+    moveTo(695, 160);
+    release(695, 160);
+    expect(onCreate.mock.calls[1][0].timing).toEqual({
+      kind: "all_day",
+      first: "2026-10-18",
+      last: "2026-10-25",
+    });
+    // Once they've stood still a moment, a press they scroll under by the bar is its own again.
+    clock.mockReturnValue(1300);
+    press(sun, 695, 60);
+    stream.scrollTop = 100;
+    release(695, 60);
+    expect(onCreate).toHaveBeenCalledTimes(2);
+  });
+
+  it("away from Month's scrollbar, a press acts though the weeks move under it", () => {
+    const { onCreate, onCommit } = mountMonth(creates);
+    const stream = screen.getByTestId("stream");
+    // Tuesday clicked as the weeks start to snap onto a week.
+    press(screen.getByTestId("tue"), 150, 60);
+    stream.scrollTop = 40;
+    frame();
+    release(150, 60);
+    expect(onCreate.mock.calls[0][0].timing).toEqual({ kind: "all_day", first: D2, last: D2 });
+    // Gym's chip pressed as they move is picked up and moved.
+    press(screen.getByTestId("chip"), 50, 77);
+    stream.scrollTop = 0;
+    moveTo(350, 177);
+    release(350, 177);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+  });
+
+  it("away from the hours' scrollbar, and on the all-day row, a press acts though the hours move", () => {
+    const { onCreate, onCommit } = mount(creates);
+    const body = screen.getByTestId("body");
+    // Gym pressed as the hours glide on from a fling, and dragged to the next day.
+    press(screen.getByTestId("card"));
+    body.scrollTop = 40;
+    moveTo(600, 520);
+    release(600, 520);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(onCommit.mock.calls[0][0].to).toEqual({
+      kind: "timed",
+      start: { day: D2, min: 660 },
+      end: { day: D2, min: 720 },
+    });
+    // The all-day row at its right end, above where the hours' bar floats, as they glide.
+    press(screen.getByTestId("band"), 790, 70);
+    body.scrollTop = 80;
+    release(790, 70);
+    expect(onCreate.mock.calls[0][0].timing).toEqual({ kind: "all_day", first: D2, last: D2 });
   });
 
   it("only the scrolling element's own press can be on its scrollbar: the all-day row still creates", () => {

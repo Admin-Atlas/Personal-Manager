@@ -9,8 +9,8 @@
 // frame inside the same 15-minute step re-renders nothing.
 //
 // Only letting go on a valid plan that changes something moves an event. A pointercancel, a blur, a
-// hidden window, a lost capture, a dialog opening, Escape or an unmount puts it back, and the grid
-// scrolling under a press before it's a drag ends that press.
+// hidden window, a lost capture, a dialog opening, Escape or an unmount puts it back, and the grid,
+// still until then, scrolling under a press by its right edge before it's a drag ends that press.
 
 import {
   exceedsThreshold,
@@ -43,8 +43,8 @@ export type CancelWhy =
   | "unmount"
   /** A dialog opened mid-drag (a shortcut, a delete asking again): it owns the pointer now. */
   | "dialog"
-  /** The grid scrolled under a press that wasn't a drag yet: it was on a scrollbar (or a wheel
-   *  turned), and just ends. */
+  /** The grid, still at the press, scrolled under a press by its right edge that wasn't a drag
+   *  yet: it was on a scrollbar that floats there (or a wheel turned), and just ends. */
   | "scrolled";
 
 export type GestureAction =
