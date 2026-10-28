@@ -42,6 +42,9 @@ export function SignInStrip() {
         held.current = true;
       }}
       onBlur={(e) => {
+        // PM's window losing focus (to the browser, for the sign-in) blurs the button too, with
+        // nothing to go to: focus is still there for when the window comes back.
+        if (e.relatedTarget === null && !document.hasFocus()) return;
         held.current = box.current?.contains(e.relatedTarget as Node | null) ?? false;
       }}
     >

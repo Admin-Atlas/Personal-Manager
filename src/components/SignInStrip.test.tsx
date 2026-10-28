@@ -218,6 +218,21 @@ describe("SignInStrip", () => {
     outside.remove();
   });
 
+  it("focus kept through PM's window losing focus to the browser, then the strip going", async () => {
+    await mount();
+    open(DRIVE);
+    open(PROTON);
+    const copy = screen.getByRole("button", { name: copyName("Google Drive") });
+    act(() => copy.focus());
+    // The window goes to the browser: the button blurs with nowhere to go, and the document has
+    // no focus.
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    fireEvent.blur(copy, { relatedTarget: null });
+    hasFocus.mockRestore();
+    close(1);
+    expect(screen.getByTestId("place0").contains(document.activeElement)).toBe(true);
+  });
+
   it("an end that never matched a start changes nothing", async () => {
     await mount();
     open(DRIVE);
