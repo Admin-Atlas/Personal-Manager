@@ -323,7 +323,7 @@ async fn run_consent_inner(
         scope,
         login_hint,
     )?;
-    let shown = oauth_loopback::open_sign_in(app, "Google", &auth_url);
+    let shown = oauth_loopback::open_sign_in(app, "Google", success_label, &auth_url);
 
     // Wait for Google to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();

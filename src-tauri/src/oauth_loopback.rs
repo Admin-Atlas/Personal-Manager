@@ -238,6 +238,8 @@ pub struct SignInPage {
     pub id: u64,
     /// Whose page it is, as the window names it ("Google").
     pub provider: &'static str,
+    /// What it signs in for ("Google Drive backup"), so two of one provider's can be told apart.
+    pub label: String,
     /// The page. It carries the sign-in's one-time state, so it is only ever shown for copying and
     /// opening, never written to a log or an error.
     pub url: String,
@@ -250,17 +252,22 @@ pub struct SignInPage {
 pub struct SignInShown {
     app: AppHandle,
     page: SignInPage,
+    /// Whether the sign-in is still waiting. The browser opens on a thread of its own, which may
+    /// only report a failure while this holds, and under its lock, so no `signin://open` can follow
+    /// the `signin://closed` and leave a link nothing will take away.
+    live: Arc<Mutex<bool>>,
 }
 
 impl SignInShown {
-    /// Offer `url`, `provider`'s sign-in page, in PM's window, before any browser is asked to open
-    /// it: a launcher can block until the browser it started quits (xdg-open does on a desktop it
-    /// doesn't know), and the link is wanted most then.
-    pub fn show(app: &AppHandle, provider: &'static str, url: &str) -> Self {
+    /// Offer `url`, `provider`'s sign-in page for `label`, in PM's window. Before any browser is
+    /// asked to open it: a launcher can block until the browser it started quits (xdg-open does on
+    /// a desktop it doesn't know), and the link is wanted most then.
+    pub fn show(app: &AppHandle, provider: &'static str, label: &str, url: &str) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let page = SignInPage {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             provider,
+            label: label.to_string(),
             url: url.to_string(),
             opened: true,
         };
@@ -268,43 +275,55 @@ impl SignInShown {
         SignInShown {
             app: app.clone(),
             page,
+            live: Arc::new(Mutex::new(true)),
         }
     }
 
-    /// The page as shown, for [`open_browser`], which can then run without holding whatever holds
-    /// this.
-    pub fn page(&self) -> SignInPage {
-        self.page.clone()
+    /// Open the default browser on the page, on a thread of its own, so a launcher that blocks
+    /// holds up neither the wait for the browser to come back (a link copied to another browser
+    /// can finish meanwhile) nor whatever called this. When it won't open, the window is told so
+    /// (the same id again, `opened: false`) and the link is the way in. The error is logged by its
+    /// kind only: a launcher's message repeats its command line, the link included.
+    pub fn open_browser(&self) {
+        let app = self.app.clone();
+        let mut page = self.page.clone();
+        let live = Arc::clone(&self.live);
+        std::thread::spawn(move || {
+            if let Err(e) = open::that(&page.url) {
+                eprintln!(
+                    "sign-in: couldn't open the browser for {} ({:?})",
+                    page.provider,
+                    e.kind()
+                );
+                let live = live.lock().unwrap_or_else(|e| e.into_inner());
+                if *live {
+                    page.opened = false;
+                    let _ = app.emit("signin://open", &page);
+                }
+            }
+        });
     }
 }
 
 impl Drop for SignInShown {
     fn drop(&mut self) {
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        *live = false;
         let _ = self.app.emit("signin://closed", self.page.id);
     }
 }
 
-/// Open the default browser on a page already shown. When it won't open, the window is told so (the
-/// same id again, `opened: false`), and the link is the way in. The error is logged by its kind only:
-/// a launcher's message repeats its command line, the link included.
-pub fn open_browser(app: &AppHandle, mut page: SignInPage) {
-    if let Err(e) = open::that(&page.url) {
-        eprintln!(
-            "sign-in: couldn't open the browser for {} ({:?})",
-            page.provider,
-            e.kind()
-        );
-        page.opened = false;
-        let _ = app.emit("signin://open", &page);
-    }
-}
-
-/// Open the default browser on `url`, `provider`'s sign-in page, and offer the link in PM's window
-/// while PM waits ([`SignInShown`]). A browser that won't open no longer ends the sign-in: the
-/// window says so, and the link still works pasted into one, until the wait times out.
-pub fn open_sign_in(app: &AppHandle, provider: &'static str, url: &str) -> SignInShown {
-    let shown = SignInShown::show(app, provider, url);
-    open_browser(app, shown.page());
+/// Open the default browser on `url`, `provider`'s sign-in page for `label`, and offer the link in
+/// PM's window while PM waits ([`SignInShown`]). A browser that won't open no longer ends the
+/// sign-in: the window says so, and the link still works pasted into one, until the wait times out.
+pub fn open_sign_in(
+    app: &AppHandle,
+    provider: &'static str,
+    label: &str,
+    url: &str,
+) -> SignInShown {
+    let shown = SignInShown::show(app, provider, label, url);
+    shown.open_browser();
     shown
 }
 

@@ -1234,6 +1234,8 @@ export interface SignInPage {
   id: number;
   /** Whose page it is: "Google", "Microsoft" or "Proton". */
   provider: string;
+  /** What it signs in for ("Google Drive backup"), so two of one provider's can be told apart. */
+  label: string;
   url: string;
   /** Whether PM opened the default browser on it. When it didn't, the link is the only way in. */
   opened: boolean;

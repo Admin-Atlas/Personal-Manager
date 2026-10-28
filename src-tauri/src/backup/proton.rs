@@ -490,21 +490,20 @@ type Shown = std::sync::Mutex<Option<crate::oauth_loopback::SignInShown>>;
 /// Google/Microsoft OAuth flows do: the link in PM's window for another browser, and the user's
 /// default browser ([`crate::oauth_loopback::open_sign_in`]).
 fn open_url_once(line: &str, app: &AppHandle, shown: &Shown) {
-    let page = {
-        let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
-        if shown.is_some() {
-            return;
-        }
-        let Some(url) = first_https_url(line) else {
-            return;
-        };
-        let now = crate::oauth_loopback::SignInShown::show(app, "Proton", &url);
-        let page = now.page();
-        *shown = Some(now);
-        page
-    };
-    // Outside the lock: a launcher that blocks mustn't stall the other stream's scanner.
-    crate::oauth_loopback::open_browser(app, page);
+    let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+    if shown.is_some() {
+        return;
+    }
+    if let Some(url) = first_https_url(line) {
+        // The browser opens on a thread of its own, so a launcher that blocks stalls neither this
+        // scanner, the other one, nor the wait for the CLI.
+        *shown = Some(crate::oauth_loopback::open_sign_in(
+            app,
+            "Proton",
+            "Proton Drive",
+            &url,
+        ));
+    }
 }
 
 /// Drain a child stream line-by-line (lossy UTF-8, so odd bytes never stall it), opening the

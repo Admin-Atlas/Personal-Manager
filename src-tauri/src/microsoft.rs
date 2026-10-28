@@ -98,7 +98,7 @@ pub async fn run_consent(app: &AppHandle, scope: &str, success_label: &str) -> R
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
     let auth_url = build_auth_url(&client_id, &redirect_uri, &challenge, &state, scope)?;
-    let shown = oauth_loopback::open_sign_in(app, "Microsoft", &auth_url);
+    let shown = oauth_loopback::open_sign_in(app, "Microsoft", success_label, &auth_url);
 
     // Wait for Microsoft to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();

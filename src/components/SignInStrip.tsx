@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { useLayoutEffect, useRef, useState } from "react";
+
 import { openUrl } from "../lib/ipc";
 import { useSignInPages } from "../lib/signInPages";
 import type { SignInPage } from "../lib/types";
@@ -22,17 +24,39 @@ import { Button, Callout, CopyLinkButton } from "./ui";
  */
 export function SignInStrip() {
   const pages = useSignInPages();
+  const box = useRef<HTMLDivElement>(null);
+  // Whether focus was on one of the strips. A strip goes on its own when its sign-in ends, and the
+  // focus on it would fall to the page's body, outside the Settings dialog it sat in: it's kept
+  // here instead. Engines send no focusout for an element taken away, so this still holds then.
+  const held = useRef(false);
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (el && held.current && !el.contains(document.activeElement)) el.focus();
+  }, [pages]);
   return (
-    <>
+    <div
+      ref={box}
+      tabIndex={-1}
+      className="outline-none"
+      onFocus={() => {
+        held.current = true;
+      }}
+      onBlur={(e) => {
+        held.current = box.current?.contains(e.relatedTarget as Node | null) ?? false;
+      }}
+    >
       {pages.map((page) => (
         <SignInRow key={page.id} page={page} />
       ))}
-    </>
+    </div>
   );
 }
 
 /** One sign-in waiting. Keyed by its id, so nothing (a "Copied ✓") carries over to another. */
 function SignInRow({ page }: { page: SignInPage }) {
+  // A browser that wouldn't open, then did from here, has the page open after all.
+  const [reopened, setReopened] = useState(false);
+  const opened = page.opened || reopened;
   return (
     <Callout
       tone="info"
@@ -43,19 +67,29 @@ function SignInRow({ page }: { page: SignInPage }) {
       className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5"
     >
       <span>
-        {page.opened
-          ? `Finish signing in to ${page.provider} in your browser.`
-          : `PM couldn't open your browser to sign in to ${page.provider}.`}{" "}
+        {opened
+          ? `${page.label}: finish signing in to ${page.provider} in your browser.`
+          : `${page.label}: PM couldn't open your browser to sign in to ${page.provider}.`}{" "}
         <span className="text-ink3">
-          {page.opened
+          {opened
             ? "To use a different browser on this computer, copy the link and open it there."
             : "Copy the link and open it in a browser on this computer."}
         </span>
       </span>
       <span className="flex shrink-0 gap-2">
-        <CopyLinkButton url={page.url} to={`the ${page.provider} sign-in`} />
-        <Button variant="tertiary" size="sm" onClick={() => void openUrl(page.url).catch(() => {})}>
-          {page.opened ? "Open again" : "Try opening it"}
+        <CopyLinkButton url={page.url} to={`the ${page.label} sign-in`} />
+        <Button
+          variant="tertiary"
+          size="sm"
+          aria-label={`${opened ? "Open again" : "Try opening it"}: the ${page.label} sign-in`}
+          onClick={() =>
+            void openUrl(page.url).then(
+              () => setReopened(true),
+              () => {},
+            )
+          }
+        >
+          {opened ? "Open again" : "Try opening it"}
         </Button>
       </span>
     </Callout>
