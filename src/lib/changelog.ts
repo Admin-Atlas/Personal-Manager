@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.158.2-alpha",
+    date: "2026-10-28",
+    highlights: [
+      "Changing an event's length by dragging its edge is easier to catch. In Day and Week, the top and bottom edges you can drag reach further into the event, so grabbing near the bottom changes when it ends instead of moving the whole event. The ends of all-day events in the all-day row work the same way.",
+    ],
+  },
+  {
     version: "3.158.1-alpha",
     date: "2026-10-28",
     highlights: [

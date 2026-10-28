@@ -164,7 +164,12 @@ export const AUTOSCROLL_EDGE_PX = 32;
 export const AUTOSCROLL_MAX_PX = 14;
 /** How far a press moves before it's a drag. Touch never drags (a tap may still create). */
 export const THRESHOLD_PX = { mouse: 4, pen: 6 } as const;
-export const HANDLE_MAX_PX = 6;
+/** How far into an event its draggable edge reaches, at most. 6 px proved too thin to hit: a press a
+ *  little way up from the bottom moved the event instead of changing its length. */
+export const HANDLE_MAX_PX = 10;
+/** An edge takes at most one part in this many of its card or bar (a third), so a short one keeps a
+ *  body to move it by. */
+export const HANDLE_PARTS = 3;
 export const TOP_HANDLE_MIN_H = 24;
 export const BOTTOM_HANDLE_MIN_H = 10;
 
@@ -278,7 +283,7 @@ export function autoScrollDelta(y: number, top: number, bottom: number): number 
 /** How tall a card's edges are: the same numbers size the strips drawn on it, so what looks like an
  *  edge is one. A short card keeps its body, so it can always be moved. */
 export function handleSizes(heightPx: number): { top: number; bottom: number } {
-  const size = Math.min(HANDLE_MAX_PX, heightPx / 4);
+  const size = Math.min(HANDLE_MAX_PX, heightPx / HANDLE_PARTS);
   return {
     top: heightPx >= TOP_HANDLE_MIN_H ? size : 0,
     bottom: heightPx >= BOTTOM_HANDLE_MIN_H ? size : 0,
@@ -304,7 +309,7 @@ export function bandHitZone(
   widthPx: number,
   edges: { left: boolean; right: boolean },
 ): Grab {
-  const size = Math.min(HANDLE_MAX_PX, widthPx / 4);
+  const size = Math.min(HANDLE_MAX_PX, widthPx / HANDLE_PARTS);
   if (edges.left && offsetX < size) return "left";
   if (edges.right && offsetX >= widthPx - size) return "right";
   return "body";

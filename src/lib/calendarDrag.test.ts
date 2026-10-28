@@ -187,14 +187,22 @@ describe("snapping, pixels and days", () => {
 describe("hitting an event", () => {
   it("handleSizes and cardHitZone", () => {
     const both = { start: true, end: true };
-    expect(handleSizes(60)).toEqual({ top: 6, bottom: 6 });
+    expect(handleSizes(60)).toEqual({ top: 10, bottom: 10 });
     expect(cardHitZone(2, 60, both)).toBe("start");
     expect(cardHitZone(30, 60, both)).toBe("body");
     expect(cardHitZone(57, 60, both)).toBe("end");
-    // Short: no top edge, a small bottom one.
-    expect(handleSizes(20)).toEqual({ top: 0, bottom: 5 });
+    // A press a little way in from either end still takes the edge (6 px was too thin to hit).
+    expect(cardHitZone(8, 60, both)).toBe("start");
+    expect(cardHitZone(51, 60, both)).toBe("end");
+    expect(cardHitZone(49, 60, both)).toBe("body");
+    // Short: no top edge, a bottom one of a third, and the rest to move it by.
+    expect(handleSizes(20)).toEqual({ top: 0, bottom: 20 / 3 });
     expect(cardHitZone(1, 20, both)).toBe("body");
-    expect(cardHitZone(16, 20, both)).toBe("end");
+    expect(cardHitZone(13, 20, both)).toBe("body");
+    expect(cardHitZone(14, 20, both)).toBe("end");
+    // Tall enough for a top edge: a third each, and a third of body between them.
+    expect(handleSizes(24)).toEqual({ top: 8, bottom: 8 });
+    expect(cardHitZone(12, 24, both)).toBe("body");
     // Shorter still: all body, so it can always be moved.
     expect(handleSizes(8)).toEqual({ top: 0, bottom: 0 });
     expect(cardHitZone(7, 8, both)).toBe("body");
@@ -205,6 +213,8 @@ describe("hitting an event", () => {
 
   it("bandHitZone keeps continuing ends", () => {
     expect(bandHitZone(1, 100, { left: true, right: true })).toBe("left");
+    expect(bandHitZone(9, 100, { left: true, right: true })).toBe("left");
+    expect(bandHitZone(91, 100, { left: true, right: true })).toBe("right");
     expect(bandHitZone(1, 100, { left: false, right: true })).toBe("body");
     expect(bandHitZone(98, 100, { left: true, right: true })).toBe("right");
     expect(bandHitZone(98, 100, { left: true, right: false })).toBe("body");

@@ -26,7 +26,7 @@ import {
   spokenName,
   type BandInput,
 } from "../../../lib/calendar-layout";
-import { HANDLE_MAX_PX } from "../../../lib/calendarDrag";
+import { HANDLE_MAX_PX, HANDLE_PARTS } from "../../../lib/calendarDrag";
 import { declinedName, isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
@@ -69,8 +69,8 @@ export interface BandDrag {
 }
 
 const LANE_H = 20;
-/** A bar's draggable end: `bandHitZone`'s size, the handle's width or a quarter of the bar. */
-const EDGE_W = `min(${HANDLE_MAX_PX}px, 25%)`;
+/** A bar's draggable end: `bandHitZone`'s size, the handle's width or its share of the bar. */
+const EDGE_W = `min(${HANDLE_MAX_PX}px, ${100 / HANDLE_PARTS}%)`;
 
 interface Placed extends BandInput {
   ev: CalendarEvent;

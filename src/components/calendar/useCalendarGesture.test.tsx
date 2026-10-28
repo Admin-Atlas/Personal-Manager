@@ -276,8 +276,8 @@ describe("useCalendarGesture: a drop", () => {
 
   it("resizes from the bottom edge, in its own column", () => {
     const { onCommit } = mount();
-    // The bottom 6 px of the 40 px card are its edge.
-    press(screen.getByTestId("card"), 200, 497);
+    // The bottom 10 px of the 40 px card are its edge: a press 8 px up from it still takes it.
+    press(screen.getByTestId("card"), 200, 492);
     moveTo(600, 540);
     release(600, 540);
     const commit = onCommit.mock.calls[0][0];
