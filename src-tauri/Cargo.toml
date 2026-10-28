@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.155.0-alpha"
+version = "3.155.1-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -66,7 +66,7 @@ zeroize = "1"
 tempfile = "3"
 # Bundle the data folder (store snapshot + Markdown vault) into one .zip for the
 # "Export all data" button. default-features off keeps it to deflate (no bzip2/zstd/aes).
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Encrypted backup (Proton Drive / user cloud): the portable `.pmbackup` archive is
 # zstd-compressed at level 19 (cold storage — ratio over speed) before the passphrase
 # encryption layer. Streaming Encoder/Decoder keeps peak memory flat over a large DB.
