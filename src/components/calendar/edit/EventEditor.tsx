@@ -770,11 +770,20 @@ export function EventEditor({
     // The choices or the email question opened again from here: focus is theirs.
     let reasked = false;
     try {
-      const outcome = await saveEdit(what.session, what.changes, picked, what.title, notify, asked);
+      const outcome = await saveEdit(
+        what.session,
+        what.changes,
+        picked,
+        what.title,
+        notify,
+        asked,
+        row.id,
+      );
       if (outcome.outcome !== "needs_choice") heldNotice.current = null;
       switch (outcome.outcome) {
         case "saved":
-          // "Does not repeat" leaves one event, never a repeating one.
+          // "Does not repeat" leaves one event, never a repeating one. The row and the answer
+          // sent go with it, for an Undo the backend offers (C16d).
           noteSaved(
             what.title,
             outcome,
@@ -782,6 +791,7 @@ export function EventEditor({
             what.from,
             what.changes.recurrence?.kind === "once",
             picked?.asAll ?? false,
+            { rowId: row.id, sent: notify },
           );
           stayOpen = false;
           onClose();

@@ -91,9 +91,11 @@ import {
   moveText,
   replyNoticeText,
   retryAfter,
+  saveBackText,
   savedNotice,
   settleText,
   undoMoveLabel,
+  undoSaveLabel,
   type CreatedWhere,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
@@ -112,7 +114,8 @@ import { isAnyDialogOpen } from "../../../lib/useDialogLayer";
 import { deviceTimeZoneOrNull } from "../../../theme";
 import { whenText } from "../parts/whenText";
 
-/** What an Undo undoes: a held delete, or a write that landed (a move, C16a). */
+/** What an Undo undoes: a held delete, or a write that landed (a move, C16a, or an editor's save,
+ *  C16d). */
 export type UndoKind = "delete" | "change";
 
 /** A line the calendar shows about a write: what happened, and an Undo while one is offered. */
@@ -526,7 +529,7 @@ export function latestUndo(
   return null;
 }
 
-/** Press an Undo of either kind: a held delete's, or a move's (C16a). */
+/** Press an Undo of either kind: a held delete's, or a move's or a save's (C16a, C16d). */
 export function undo(token: string, kind: UndoKind): void {
   if (kind === "change") void undoChange(token);
   else void undoDelete(token);
@@ -587,6 +590,10 @@ let nextFlow = 1;
  *  the Send / Don't send it went with, for the words. Kept while the Undo is offered. */
 const undoable = new Map<string, { drop: Drop; sent: Notify | null }>();
 
+/** Editor saves the backend offered an Undo for, by its token: the event's title, for the words
+ *  (C16d). Nothing is drawn while one is put back: the read its landing starts redraws the row. */
+const undoableSaves = new Map<string, string>();
+
 /** `moves` with `eventId`'s entry set to `entry`, or taken out (null). */
 function withMove(eventId: string, entry: PendingMove | null): Map<string, PendingMove> {
   const moves = new Map(state.moves);
@@ -617,6 +624,7 @@ function stripUndo(rowId: string) {
   for (const n of state.notices) {
     if (n.undoRow === rowId && n.undoToken) {
       undoable.delete(n.undoToken);
+      undoableSaves.delete(n.undoToken);
       put({ id: n.id, tone: n.tone, text: n.text });
     }
   }
@@ -824,14 +832,16 @@ const dayOf = (t: Timing) => (t.kind === "timed" ? t.start.day : t.first);
 /** Tokens with a move's Undo on its way, so a second press sends nothing. */
 const undoingChanges = new Set<string>();
 
-/** Put back a move (its Undo button, or Ctrl+Z): the button goes at once, the event is drawn back
- *  where it was while the backend puts it back, and the notice says how that went. Busy (a write of
- *  the event on its way) leaves the Undo where it was, button and all (C16 critique C1-L6). */
+/** Put back a move or an editor's save (its Undo button, or Ctrl+Z): the button goes at once, a
+ *  moved event is drawn back where it was while the backend puts it back, and the notice says how
+ *  that went. Busy (a write of the event on its way) leaves the Undo where it was, button and all
+ *  (C16 critique C1-L6). */
 export async function undoChange(token: string): Promise<void> {
   const shown = state.notices.find((n) => n.undoToken === token);
   if (!shown || undoingChanges.has(token)) return;
   undoingChanges.add(token);
   const kept = undoable.get(token);
+  const savedTitle = undoableSaves.get(token);
   put({ id: shown.id, tone: shown.tone, text: shown.text });
   const id = kept?.drop.event.id;
   if (kept && id) {
@@ -862,6 +872,13 @@ export async function undoChange(token: string): Promise<void> {
     return;
   }
   undoable.delete(token);
+  undoableSaves.delete(token);
+  if (savedTitle !== undefined) {
+    // A save put back: read the calendar again, as for any write that settled.
+    if (outcome.outcome === "saved") update({ settles: state.settles + 1 });
+    put({ id: shown.id, ...saveBackText(outcome, savedTitle) });
+    return;
+  }
   const title = kept?.drop.event.summary ?? "";
   if (kept && id) {
     if (outcome.outcome === "saved") {
@@ -941,7 +958,8 @@ export type SaveAnswer = WriteOutcome & { newPartial?: boolean };
  *  when the save would email guests, and `asked` the numbers the question showed (a repeating
  *  event's token binds them instead). The outcome comes back as data; the editor explains it. A
  *  change PM couldn't finish keeps its notice and buttons here, in the store, so it outlives the
- *  editor and the Calendar tab. */
+ *  editor and the Calendar tab. `rowId`, the row being edited: an Undo still offered for an
+ *  earlier write of it goes, as the backend retires it once this lands (C16 critique C1-L9). */
 export async function saveEdit(
   session: string,
   changes: EventPatchDraft,
@@ -949,7 +967,9 @@ export async function saveEdit(
   title: string,
   notify: Notify | null = null,
   asked: GuestNotice | null = null,
+  rowId: string | null = null,
 ): Promise<SaveAnswer> {
+  if (rowId !== null) stripUndo(rowId);
   const outcome = await updateCalendarEvent(
     session,
     changes,
@@ -1033,7 +1053,9 @@ export function noteSeriesNotice(text: string) {
  *  saved, which have no Undo, so the notice says how to change them back; `from` (YYYY-MM-DD) is
  *  where a "this and following" save starts; `stops`: the save made it "Does not repeat", which
  *  leaves one event; `asAll`: the "this and following" row picked saved every occurrence
- *  (`Picked.asAll`). */
+ *  (`Picked.asAll`). `more`, from an editor: the row it saved and the Send / Don't send it went
+ *  with, so a save the backend offers an Undo for shows it for its seconds (C16d), the words
+ *  saying when an Undo would email the guests again. */
 export function noteSaved(
   summary: string,
   outcome: WriteOutcome,
@@ -1041,10 +1063,35 @@ export function noteSaved(
   from?: string,
   stops = false,
   asAll = false,
+  more?: { rowId: string; sent: Notify | null },
 ) {
   if (outcome.outcome !== "saved") return;
-  put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+  const offer = outcome.undo;
+  // Only an editor's save, which names its row, shows an offer.
+  if (!more || !offer) {
+    put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+    offerMoves(outcome);
+    return;
+  }
+  undoableSaves.set(offer.undo_token, summary);
+  const notice: WriteNotice = {
+    id: nextNotice++,
+    ...savedNotice(summary, outcome, scope, from, stops, asAll, { sent: more.sent }),
+    undoToken: offer.undo_token,
+    undoLabel: undoSaveLabel(summary, more.sent),
+    undoKind: "change",
+    undoRow: more.rowId,
+  };
+  put(notice);
   offerMoves(outcome);
+  // When the window closes the Undo goes, and the words say how to change it back again; the
+  // notice then goes by itself like any done one.
+  setTimeout(() => {
+    undoableSaves.delete(offer.undo_token);
+    if (state.notices.includes(notice)) {
+      put({ id: notice.id, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+    }
+  }, offer.undo_seconds * 1000);
 }
 
 // --- how a repeating event repeats, and moving its milestones (C9b-2) ---

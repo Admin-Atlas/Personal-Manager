@@ -513,9 +513,10 @@ pub enum WriteOutcome {
         /// so every outcome (and every `Result` that carries one as its error) stays small.
         #[serde(skip_serializing_if = "Option::is_none")]
         milestone_moves: Option<Box<MilestoneMoves>>,
-        /// Undo for a few seconds: a move of a one-off, or of "This event" of a repeating one, that
-        /// Google answered and that changed only the core fields ([`super::patch::UNDOABLE`]).
-        /// `None`, and left out, for every other write.
+        /// Undo for a few seconds: a move or an editor's save of a one-off, or of "This event" of a
+        /// repeating one (C16d), that Google answered with nothing to say beside it and that changed
+        /// only what an Undo may put back ([`super::patch::UNDOABLE`]: the core fields, the
+        /// notifications and the colour). `None`, and left out, for every other write.
         #[serde(skip_serializing_if = "Option::is_none")]
         undo: Option<UndoOffer>,
     },

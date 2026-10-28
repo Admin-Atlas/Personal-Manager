@@ -767,8 +767,12 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
 }
 
 /** A save that landed, said once the editor has closed. `scope` names the occurrences of a
- *  repeating event it was for: there's no Undo after one (DECISIONS 17-10 #4), so the notice says
- *  how to change it back, and for "this and following", which makes an event of its own from `from`
+ *  repeating event it was for. A save of one event or of "This event" that the backend offers an
+ *  Undo for (C16d) says so through `undo`, the Send / Don't send it went with: the Undo button says
+ *  how to change it back, and where the save emailed guests the words say an Undo emails them again.
+ *  Without one (a save that changed guests or how it repeats, or one of several occurrences, which
+ *  never has one, DECISIONS 17-10 #4), the notice says how to change it back, and for "this and
+ *  following", which makes an event of its own from `from`
  *  (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). `stops`: "Does not
  *  repeat" was saved, so one event is left, never a repeating one nor every occurrence (C11c review,
  *  C11d review 1). `asAll`: the "this and following" row was the first occurrence's, which saves
@@ -784,6 +788,7 @@ export function savedNotice(
   from?: string,
   stops = false,
   asAll = false,
+  undo: { sent: Notify | null } | null = null,
 ): { tone: Tone; text: string } {
   const t = quote(title);
   // A new event or a one-off made to repeat whose occurrences all fall outside the months PM syncs
@@ -792,6 +797,8 @@ export function savedNotice(
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const day = from ? formatDateOnly(from) : null;
   const saved: SeriesScope | null = asAll && scope === "following" ? "all" : scope;
+  // The Undo on offer says how to change it back (C16d); only one or "This event" has one.
+  const undoing = undo !== null && (saved === null || saved === "this");
   let first: string;
   let back: string | null;
   switch (saved) {
@@ -801,7 +808,7 @@ export function savedNotice(
       break;
     case "this":
       first = `Saved ${t} for this occurrence.`;
-      back = "To change it back, edit it again.";
+      back = undoing ? null : "To change it back, edit it again.";
       break;
     case "following": {
       // Like the choices' own line: a separate event from the part before it.
@@ -836,7 +843,64 @@ export function savedNotice(
   const parts = [first, ...said.words];
   // With occurrences left on the earlier part, changing it back isn't the whole story.
   if (back && !outcome.warnings.includes("left_on_old_series")) parts.push(back);
+  if (undoing && emailsGuests(undo?.sent ?? null)) {
+    parts.push("Guests will get a second email if you undo.");
+  }
   return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
+}
+
+/** The Undo button's name after an editor's save (C16d): what it undoes, and that the guests get a
+ *  second email where the save emailed them. */
+export function undoSaveLabel(title: string, sent: Notify | null): string {
+  return `Undo saving ${quote(title)}${emailsGuests(sent) ? " (guests get a second email)" : ""}`;
+}
+
+/** What undoing an editor's save of the event called `title` came to (C16d): `moveBackText`'s
+ *  answers, in a save's words. */
+export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone; text: string } {
+  const t = quote(title);
+  const notBack = (why: string, tone: Tone = "error") => ({
+    tone,
+    text: `Couldn't undo the save of ${t}. ${why}`,
+  });
+  switch (outcome.outcome) {
+    case "saved":
+      return {
+        tone: "ok",
+        text: outcome.warnings.includes("mirror_refresh_pending")
+          ? `Put ${t} back in Google. ${writeWarningText("mirror_refresh_pending", "save")}`
+          : `Put ${t} back as it was.`,
+      };
+    case "no_change":
+      return { tone: "ok", text: `${t} is already as it was.` };
+    case "conflict":
+      return { tone: "warn", text: `${t} changed in Google since, so PM didn't undo the save.` };
+    case "gone":
+      return { tone: "warn", text: `${t} isn't in Google any more.` };
+    case "busy":
+      return notBack("PM is still changing it. Wait a moment, then press Undo again.", "warn");
+    case "read_only":
+      return notBack(reasonText(outcome.reason));
+    case "reauth":
+      return notBack(REAUTH);
+    case "unconfirmed":
+    case "ambiguous":
+      return {
+        tone: "warn",
+        text: `PM lost touch with Google and can't tell whether ${t} was put back. It will show Google's version after the next refresh.`,
+      };
+    case "ignored_by_google":
+      return notBack("Google answered as if it did, but kept it as it was.", "warn");
+    // Never an Undo's answer: it names the very event it changed, and refuses a change of guests.
+    case "needs_choice":
+    case "partial_split":
+    case "split_removed":
+      return notBack("Edit it again instead.", "warn");
+    case "failed":
+      return notBack(outcome.message);
+    default:
+      return unreachable(outcome);
+  }
 }
 
 /** A saved outcome's warnings in words, in one order for every notice that says a save landed

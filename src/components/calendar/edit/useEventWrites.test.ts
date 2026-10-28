@@ -2272,3 +2272,159 @@ describe("moving an event", () => {
     expect(hook.result.current.writes.moves.size).toBe(0);
   });
 });
+
+// C16d: an editor's save of one event or of "This event" that the backend offers an Undo for shows
+// it for its seconds, through the same notice and Ctrl+Z as a move's.
+describe("undoing a save", () => {
+  const offer = { undo_token: "s1", undo_seconds: 8 };
+  const withUndo: WriteOutcome = { outcome: "saved", warnings: [], undo: offer };
+  const plain: WriteOutcome = { outcome: "saved", warnings: [] };
+
+  it("an editor save's notice offers Undo for its seconds", async () => {
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved("Gym", withUndo, "this", "2026-10-12", false, false, {
+        rowId: event.id,
+        sent: null,
+      }),
+    );
+    const [notice] = hook.result.current.notices;
+    expect(notice).toEqual({
+      id: 1,
+      tone: "ok",
+      // The button says how to change it back.
+      text: "Saved “Gym” for this occurrence.",
+      undoToken: "s1",
+      undoLabel: "Undo saving “Gym”",
+      undoKind: "change",
+      undoRow: event.id,
+    });
+    expect(mod.latestUndo(hook.result.current.notices)).toEqual({ token: "s1", kind: "change" });
+    act(() => {
+      vi.advanceTimersByTime(8000);
+    });
+    // The window closed: no Undo, and the words say how again; then it goes like any done one.
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "ok",
+        text: "Saved “Gym” for this occurrence. To change it back, edit it again.",
+      },
+    ]);
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(hook.result.current.notices).toEqual([]);
+  });
+
+  it("after Send, the words and the button say the guests get a second email", async () => {
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved("Gym", withUndo, null, undefined, false, false, {
+        rowId: event.id,
+        sent: "all",
+      }),
+    );
+    expect(hook.result.current.notices[0]).toMatchObject({
+      text: "Saved “Gym”. Guests will get a second email if you undo.",
+      undoLabel: "Undo saving “Gym” (guests get a second email)",
+    });
+  });
+
+  it("Ctrl+Z after a save puts it back, and the calendar reads again", async () => {
+    undoCalendarChange.mockResolvedValue(plain);
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved("Gym", withUndo, null, undefined, false, false, {
+        rowId: event.id,
+        sent: null,
+      }),
+    );
+    const settles = hook.result.current.settles;
+    let pressed = false;
+    await act(async () => {
+      pressed = mod.undoLatest();
+    });
+    expect(pressed).toBe(true);
+    expect(undoCalendarChange).toHaveBeenCalledWith("s1");
+    expect(hook.result.current.notices[0]).toEqual({
+      id: 1,
+      tone: "ok",
+      text: "Put “Gym” back as it was.",
+    });
+    expect(hook.result.current.settles).toBe(settles + 1);
+    // Nothing is drawn meanwhile: the read redraws the row.
+    expect(hook.result.current.moves.size).toBe(0);
+  });
+
+  it("an Undo of a save Google changed since says so in a save's words", async () => {
+    undoCalendarChange.mockResolvedValue({ outcome: "conflict", fields: [] });
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved("Gym", withUndo, null, undefined, false, false, {
+        rowId: event.id,
+        sent: null,
+      }),
+    );
+    const settles = hook.result.current.settles;
+    await act(() => mod.undoChange("s1"));
+    expect(hook.result.current.notices[0]).toEqual({
+      id: 1,
+      tone: "warn",
+      text: "“Gym” changed in Google since, so PM didn't undo the save.",
+    });
+    expect(hook.result.current.settles).toBe(settles);
+  });
+
+  it("a save without an offer keeps C9b-1's words", async () => {
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved("Gym", plain, "this", "2026-10-12", false, false, {
+        rowId: event.id,
+        sent: null,
+      }),
+    );
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "ok",
+        text: "Saved “Gym” for this occurrence. To change it back, edit it again.",
+      },
+    ]);
+    // A move of several occurrences names no row: an offer there is never shown.
+    act(() => mod.noteSaved("Gym", withUndo, "all"));
+    expect(hook.result.current.notices[1].undoToken).toBeUndefined();
+  });
+
+  it("saving the same event again takes the first Undo away", async () => {
+    updateCalendarEvent.mockResolvedValue(plain);
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved("Gym", withUndo, null, undefined, false, false, {
+        rowId: event.id,
+        sent: null,
+      }),
+    );
+    act(() =>
+      mod.noteSaved(
+        "Lunch",
+        { ...withUndo, undo: { ...offer, undo_token: "s2" } },
+        null,
+        undefined,
+        false,
+        false,
+        {
+          rowId: "another",
+          sent: null,
+        },
+      ),
+    );
+    await act(() =>
+      mod.saveEdit("session", { summary: "Gym 2" }, null, "Gym 2", null, null, event.id),
+    );
+    const [first, other] = hook.result.current.notices;
+    expect(first).toEqual({ id: 1, tone: "ok", text: "Saved “Gym”." });
+    expect(other.undoToken).toBe("s2");
+    expect(mod.latestUndo(hook.result.current.notices)?.token).toBe("s2");
+  });
+});

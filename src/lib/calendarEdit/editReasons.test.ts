@@ -11,7 +11,9 @@ import type {
   CalendarOverview,
   GuestNotice,
   MilestoneMove,
+  Notify,
   ReadOnlyReason,
+  SeriesScope,
   SplitAction,
   WriteOutcome,
   WriteWarning,
@@ -33,7 +35,9 @@ import {
   heldCreateText,
   moveBackText,
   moveText,
+  saveBackText,
   undoMoveLabel,
+  undoSaveLabel,
   type EventRights,
   retryAfter,
   earlierChangeText,
@@ -579,6 +583,63 @@ describe("a repeating event's save, said once the editor has closed", () => {
     expect(savedNotice("Gym", saved(["mirror_refresh_pending"]), "all").text).toBe(
       "Saved “Gym” for every occurrence. PM's calendar will show it after the next refresh. To change it back, edit it again.",
     );
+  });
+
+  // C16d: with an Undo on offer the button says how to change it back, and after Send the words say
+  // an Undo emails the guests again. Only one event or "This event" ever has one.
+  it("words a save with an Undo, each scope, and after Send", () => {
+    const said = (scope: SeriesScope | null, sent: Notify | null) =>
+      savedNotice("Gym", saved([]), scope, "2026-10-21", false, false, { sent }).text;
+    expect(said(null, null)).toBe("Saved “Gym”.");
+    expect(said("this", null)).toBe("Saved “Gym” for this occurrence.");
+    expect(said(null, "all")).toBe("Saved “Gym”. Guests will get a second email if you undo.");
+    expect(said("this", "external_only")).toBe(
+      "Saved “Gym” for this occurrence. Guests will get a second email if you undo.",
+    );
+    expect(said(null, "none")).toBe("Saved “Gym”.");
+    // Several occurrences never have one: their words are as ever, whatever is passed.
+    expect(said("all", "all")).toBe(savedNotice("Gym", saved([]), "all").text);
+    expect(said("following", "all")).toBe(
+      savedNotice("Gym", saved([]), "following", "2026-10-21").text,
+    );
+    expect(undoSaveLabel("Gym", null)).toBe("Undo saving “Gym”");
+    expect(undoSaveLabel("Gym", "all")).toBe("Undo saving “Gym” (guests get a second email)");
+  });
+
+  it("says what undoing a save came to, in a save's words", () => {
+    expect(saveBackText(saved([]), "Gym")).toEqual({
+      tone: "ok",
+      text: "Put “Gym” back as it was.",
+    });
+    expect(saveBackText({ outcome: "conflict", fields: ["summary"] }, "Gym")).toEqual({
+      tone: "warn",
+      text: "“Gym” changed in Google since, so PM didn't undo the save.",
+    });
+    expect(saveBackText({ outcome: "failed", message: "Google said no." }, "Gym")).toEqual({
+      tone: "error",
+      text: "Couldn't undo the save of “Gym”. Google said no.",
+    });
+    expect(saveBackText(saved(["mirror_refresh_pending"]), "Gym").text).toBe(
+      "Put “Gym” back in Google. PM's calendar will show it after the next refresh.",
+    );
+    const all: WriteOutcome[] = [
+      { outcome: "no_change" },
+      { outcome: "needs_choice", scope: true },
+      { outcome: "ignored_by_google", split: false },
+      { outcome: "partial_split", token: "s", offers: ["check"], from: "2026-10-20" },
+      { outcome: "split_removed" },
+      { outcome: "gone" },
+      { outcome: "read_only", reason: "locked" },
+      { outcome: "busy" },
+      { outcome: "reauth" },
+      { outcome: "unconfirmed" },
+      { outcome: "ambiguous", retry_token: "r" },
+    ];
+    for (const o of all) {
+      const text = saveBackText(o, "Gym").text;
+      expect(text).toMatch(/\.$/);
+      expect(text).not.toMatch(/series|instance|exception|master|drag/i);
+    }
   });
 
   // C13 review round 1: a save Google applied without keeping all of it (a colour it wouldn't clear

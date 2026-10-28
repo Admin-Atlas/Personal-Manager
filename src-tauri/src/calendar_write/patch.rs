@@ -98,11 +98,12 @@ pub const CREATABLE: &[&str] = &[
 /// before it goes, failing closed.
 pub const TIMING_KEYS: &[&str] = &["start", "end"];
 
-/// The fields an Undo may put back: the C6 set, the event's core fields. A write that sent anything
-/// else (guests and what they may do, notifications, colour, how it repeats) is offered no Undo.
-/// Its own list, not [`PATCHABLE`], which grew with guests (C12) and notifications and colour
-/// (C13): none of them becomes undoable by being added there. `undoable_is_the_core_fields_only`
-/// pins it.
+/// The fields an Undo may put back: the C6 set, the event's core fields, and its notifications and
+/// colour (C16d, Q3 as the C16 critique restated it: C13 gave both an absent value PM can send,
+/// `{"useDefault": true}` and `colorId: null`). A write that sent anything else (guests and what
+/// they may do, how it repeats) is offered no Undo: putting a guest list back would email people
+/// again. Its own list, not [`PATCHABLE`]: nothing becomes undoable by being added there.
+/// `undoable_is_the_core_fields_notifications_and_colour` pins it.
 pub const UNDOABLE: &[&str] = &[
     "summary",
     "location",
@@ -111,6 +112,8 @@ pub const UNDOABLE: &[&str] = &[
     "end",
     "transparency",
     "visibility",
+    "reminders",
+    "colorId",
 ];
 
 /// Google's limits on an event's own notifications (the events reference): five at most, each 0 to
@@ -775,8 +778,10 @@ pub fn still_holds(fresh: &Value, after: &Map<String, Value>) -> Vec<String> {
 /// Google's own node, with every key the node now has that the old one lacked sent as `null` (a
 /// `timeZone` the write added, the other kind's keys after a switch): `events.patch` merges nested
 /// objects, so a key left out would stay. Text that was absent goes back as `""`, as a save clears
-/// it; busy or free and visibility as Google's defaults. `None` for a field PM doesn't put back, or
-/// a start or end that was never there.
+/// it; busy or free and visibility as Google's defaults. Notifications go back as a save sends them
+/// (C16d): the calendar's defaults when there were none of its own, over a list Google holds now as
+/// an empty one; the colour as it was, or `null` (the calendar's) when there was none. `None` for a
+/// field PM doesn't put back, a start or end that was never there, or notifications it can't read.
 pub fn undo_body(fresh: &Value, before: &Map<String, Value>) -> Option<Map<String, Value>> {
     let mut body = Map::new();
     for (key, was) in before {
@@ -796,6 +801,22 @@ pub fn undo_body(fresh: &Value, before: &Map<String, Value>) -> Option<Map<Strin
             }
             "transparency" => Value::String(was.as_str().unwrap_or("opaque").to_string()),
             "visibility" => Value::String(was.as_str().unwrap_or("default").to_string()),
+            "reminders" => {
+                let draft = reminders_read(Some(was))?;
+                let mut value = reminders_value(&draft);
+                let held = fresh
+                    .pointer("/reminders/overrides")
+                    .and_then(Value::as_array)
+                    .is_some_and(|list| !list.is_empty());
+                if draft.use_default && held {
+                    value["overrides"] = Value::Array(Vec::new());
+                }
+                value
+            }
+            "colorId" => match was.as_str().filter(|id| !id.is_empty()) {
+                Some(id) => Value::String(id.to_string()),
+                None => Value::Null,
+            },
             _ => return None,
         };
         body.insert(key.clone(), value);
@@ -1551,9 +1572,10 @@ mod tests {
         );
     }
 
-    /// The fields an Undo puts back are the C6 set, and nothing `PATCHABLE` gained since.
+    /// The fields an Undo puts back are the C6 set, the notifications and the colour (C16d, Q3), and
+    /// nothing else `PATCHABLE` gained since: guests, what they may do, and how it repeats.
     #[test]
-    fn undoable_is_the_core_fields_only() {
+    fn undoable_is_the_core_fields_notifications_and_colour() {
         assert_eq!(
             UNDOABLE,
             [
@@ -1563,12 +1585,20 @@ mod tests {
                 "start",
                 "end",
                 "transparency",
-                "visibility"
+                "visibility",
+                "reminders",
+                "colorId"
             ]
         );
         assert!(UNDOABLE.iter().all(|k| PATCHABLE.contains(k)));
-        for later in ["attendees", "guestsCanModify", "reminders", "colorId"] {
-            assert!(PATCHABLE.contains(&later) && !UNDOABLE.contains(&later));
+        for later in [
+            "attendees",
+            "guestsCanModify",
+            "guestsCanInviteOthers",
+            "guestsCanSeeOtherGuests",
+            "recurrence",
+        ] {
+            assert!(!UNDOABLE.contains(&later), "{later}");
         }
         assert!(TIMING_KEYS.iter().all(|k| UNDOABLE.contains(k)));
         assert_eq!(TIMING_KEYS, ["start", "end"]);
@@ -1644,12 +1674,58 @@ mod tests {
                     "date": null })
         );
         // Nothing PM doesn't put back, and no start that was never there.
-        let colour: Map<String, Value> =
-            [("colorId".to_string(), json!("5"))].into_iter().collect();
-        assert!(undo_body(&fresh(), &colour).is_none());
+        let guests: Map<String, Value> =
+            [("attendees".to_string(), json!([]))].into_iter().collect();
+        assert!(undo_body(&fresh(), &guests).is_none());
         let nothing: Map<String, Value> =
             [("start".to_string(), Value::Null)].into_iter().collect();
         assert!(undo_body(&fresh(), &nothing).is_none());
+    }
+
+    /// C16d, Q3: notifications and the colour go back as a save sends them. The calendar's defaults
+    /// where there were none of the event's own (over a list Google holds now, an empty one, since a
+    /// PATCH merges the object), a list whole, a colour as it was or `null` for the calendar's; and
+    /// notifications PM can't read put nothing back.
+    #[test]
+    fn undo_body_puts_notifications_and_colour_back() {
+        let one = |key: &str, was: Value| -> Map<String, Value> {
+            [(key.to_string(), was)].into_iter().collect()
+        };
+        let mut listed = fresh();
+        listed["reminders"] =
+            json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 5 }] });
+        listed["colorId"] = json!("5");
+        let undo = |was: Map<String, Value>| Value::Object(undo_body(&listed, &was).unwrap());
+        assert_eq!(
+            undo(one("reminders", Value::Null)),
+            json!({ "reminders": { "useDefault": true, "overrides": [] } })
+        );
+        assert_eq!(
+            undo(one("reminders", json!({ "useDefault": true }))),
+            json!({ "reminders": { "useDefault": true, "overrides": [] } })
+        );
+        // Over Google's defaults, the defaults alone.
+        assert_eq!(
+            Value::Object(undo_body(&fresh(), &one("reminders", Value::Null)).unwrap()),
+            json!({ "reminders": { "useDefault": true } })
+        );
+        let list = json!({ "useDefault": false, "overrides": [
+            { "method": "email", "minutes": 60 }, { "method": "popup", "minutes": 10 }
+        ] });
+        assert_eq!(
+            undo(one("reminders", list.clone())),
+            json!({ "reminders": list })
+        );
+        assert_eq!(
+            undo(one("colorId", json!("11"))),
+            json!({ "colorId": "11" })
+        );
+        assert_eq!(
+            undo(one("colorId", Value::Null)),
+            json!({ "colorId": null })
+        );
+        let unreadable = json!({ "useDefault": false, "overrides": [{ "method": "popup" }] });
+        assert!(undo_body(&listed, &one("reminders", unreadable)).is_none());
     }
 
     // --- creating an event (C10) ---

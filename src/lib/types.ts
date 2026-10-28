@@ -2037,8 +2037,9 @@ export type WriteOutcome =
       warnings: WriteWarning[];
       left_behind?: string[];
       milestone_moves?: MilestoneMoves;
-      /** Undo for a few seconds: a move of a one-off, or of one occurrence, that Google answered
-       *  and that changed only the core fields (C16a). Left out otherwise. */
+      /** Undo for a few seconds: a move or an editor's save of a one-off, or of one occurrence,
+       *  that Google answered and that changed only the core fields, notifications or colour
+       *  (C16a, C16d). Left out otherwise. */
       undo?: UndoOffer;
     }
   | { outcome: "no_change" }

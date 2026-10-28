@@ -1111,8 +1111,10 @@ async fn save_event<W: Wire, H: Host>(
         open,
         draft,
     };
-    // An editor's save offers no Undo yet: that comes with the editor's own (C16d).
-    send_one(&one, &basis, answer).await.0
+    // A save that landed with nothing to say beside it, and sent only what an Undo may put back,
+    // can be undone for a few seconds, as a move can (C16d).
+    let (outcome, landed) = send_one(&one, &basis, answer).await;
+    with_undo(host.edit(), &open.target, outcome, landed)
 }
 
 // --- one write to one event: an editor's save, a drop, an Undo (C16a) ---
@@ -1558,6 +1560,8 @@ fn undo_refused(
             "description" => (perms.description, Field::Description),
             "transparency" => (perms.show_as, Field::ShowAs),
             "visibility" => (perms.visibility, Field::Visibility),
+            "reminders" => (perms.reminders, Field::Reminders),
+            "colorId" => (perms.colour, Field::Colour),
             // Never in an Undo: its body fails closed on it.
             _ => return None,
         };
@@ -2927,8 +2931,9 @@ impl CalendarEditState {
 }
 
 /// `outcome`, with an Undo of the write when it saved with nothing to say beside it (`landed`, what
-/// Google held before and after) and sent only the core fields. Kept after the landing, which let
-/// go of any earlier Undo of the row, so the newest is the one kept.
+/// Google held before and after) and sent only what an Undo may put back ([`patch::UNDOABLE`]: the
+/// core fields, notifications and colour). Kept after the landing, which let go of any earlier Undo
+/// of the row, so the newest is the one kept. A move's and an editor's save's alike (C16d).
 fn with_undo(
     edit: &CalendarEditState,
     target: &Target,
@@ -2954,9 +2959,9 @@ fn with_undo(
     }
 }
 
-/// Put back what a move just changed, within its Undo window: Google's exact values from before it,
-/// sent only while Google still holds what the move left, and emailing whom the move emailed (R7a).
-/// An Undo has no Undo of its own.
+/// Put back what a move or an editor's save just changed (C16a, C16d), within its Undo window:
+/// Google's exact values from before it, sent only while Google still holds what the write left,
+/// and emailing whom the write emailed (R7a). An Undo has no Undo of its own.
 #[tauri::command]
 pub async fn undo_calendar_change(
     app: AppHandle,
@@ -5041,11 +5046,11 @@ async fn land_series<W: Wire, H: Host>(
     if plan.scope == Scope::This {
         return match (&landing, &plan.steps[0].op) {
             (Landing::Edit { session }, Op::Patch { body, .. }) => match reply {
-                Some(saved) => land_saved(host, target, Some(session), saved, body),
+                Some(saved) => landed_this(host, target, plan, Some(session), saved, body),
                 None => saved_pending(host, target),
             },
             (Landing::Move, Op::Patch { body, .. }) => match reply {
-                Some(saved) => moved_this(host, target, plan, saved, body),
+                Some(saved) => landed_this(host, target, plan, None, saved, body),
                 None => saved_pending(host, target),
             },
             _ => {
@@ -5299,13 +5304,14 @@ async fn land_one_event<W: Wire, H: Host>(
     series_saved(warnings, Vec::new())
 }
 
-/// "This event" of a drop, landed (C16a): Google's answer `saved` into the row, with an Undo that
-/// puts back the step's own record of Google's values before it, emailing whom the step did
-/// (DECISIONS 17-10 #4).
-fn moved_this(
+/// "This event" of a drop (C16a) or an editor's save (C16d, the editor's `session` moving onto it),
+/// landed: Google's answer `saved` into the row, with an Undo that puts back the step's own record of
+/// Google's values before it, emailing whom the step did (DECISIONS 17-10 #4).
+fn landed_this(
     host: &impl Host,
     target: &Target,
     plan: &SeriesPlan,
+    session: Option<&str>,
     saved: Value,
     body: &serde_json::Map<String, Value>,
 ) -> WriteOutcome {
@@ -5322,7 +5328,7 @@ fn moved_this(
         }
         _ => None,
     };
-    let outcome = land_saved(host, target, None, saved, body);
+    let outcome = land_saved(host, target, session, saved, body);
     with_undo(host.edit(), target, outcome, landed)
 }
 
@@ -9474,7 +9480,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(outcome == saved(), "saved, emailing nobody");
+        assert!(saved_with_undo(&outcome), "saved, emailing nobody");
     }
 
     /// C12 §4.2: a 412's second round asks when Google's copy now reaches someone the first didn't
@@ -10101,7 +10107,7 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "saved, as chosen");
+            assert!(saved_with_undo(&outcome), "saved, as chosen");
         }
     }
 
@@ -10134,7 +10140,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(outcome == saved(), "saved, nobody asked or emailed");
+        assert!(saved_with_undo(&outcome), "saved, nobody asked or emailed");
     }
 
     /// C12 §5.3: the answer given before the hold is the one the delete sends after it.
@@ -12655,7 +12661,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert_eq!(outcome, saved());
+        assert!(saved_with_undo(&outcome), "landed, with an Undo (C16d)");
         assert_eq!(
             first_write(&script).body,
             Some(json!({ "summary": "Retro" }))
@@ -15636,7 +15642,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert_eq!(outcome, saved());
+        assert!(saved_with_undo(&outcome), "saved");
     }
 
     /// Review M1, for the new part and a series delete: blocked before the hold.
@@ -16318,7 +16324,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert_eq!(outcome, saved());
+        assert!(saved_with_undo(&outcome), "saved");
         assert_eq!(host.journal().len(), 1);
         // Its exceptions not read whole: PM can't say it shows twice, so it can't check it now.
         let unknown = Orphaned {
@@ -16747,7 +16753,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert_eq!(outcome, saved());
+        assert!(saved_with_undo(&outcome), "saved");
         assert!(host.journal().is_empty());
     }
 
@@ -17363,7 +17369,13 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert_eq!(outcome, saved(), "{scope:?}");
+            // "This event" can be undone for a few seconds; the rest can't (C16d).
+            let as_planned = if scope == Scope::This {
+                saved_with_undo(&outcome)
+            } else {
+                outcome == saved()
+            };
+            assert!(as_planned, "{scope:?}");
         }
     }
 
@@ -17986,7 +17998,13 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert_eq!(outcome, expected);
+            // A title that landed can be undone for a few seconds (C16d).
+            let as_expected = if expected == saved() {
+                saved_with_undo(&outcome)
+            } else {
+                outcome == expected
+            };
+            assert!(as_expected, "as expected, the title now {title_now}");
             let row = host
                 .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
                 .unwrap()
@@ -18619,7 +18637,8 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "{key} saved");
+            // Undone for a few seconds as a title is (C16d, Q3).
+            assert!(saved_with_undo(&outcome), "{key} saved");
             let sent = first_write(&script);
             assert!(sent.body == Some(only(key, value)), "{key} alone");
             assert!(!sent.url.contains("eventLabelVersion"), "{key}");
@@ -18670,7 +18689,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(outcome == saved(), "notifications saved");
+        assert!(saved_with_undo(&outcome), "notifications saved");
     }
 
     /// Plan C6/C13: Google's lock leaves notifications and colour open, so a locked event saves them.
@@ -18701,7 +18720,7 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "{key} saved");
+            assert!(saved_with_undo(&outcome), "{key} saved");
         }
     }
 
@@ -18820,7 +18839,10 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "the next title saves, no conflict");
+            assert!(
+                saved_with_undo(&outcome),
+                "the next title saves, no conflict"
+            );
         }
     }
 
@@ -18957,7 +18979,7 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "landed");
+            assert!(saved_with_undo(&outcome), "landed");
         }
     }
 
@@ -18995,7 +19017,7 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "{key} saved without asking");
+            assert!(saved_with_undo(&outcome), "{key} saved without asking");
         }
     }
 
@@ -19445,7 +19467,7 @@ mod tests {
         ])
         .await;
         script.asked_all();
-        assert_eq!(outcome, saved());
+        assert!(saved_with_undo(&outcome), "the title saves");
         assert!(host.journal().is_empty());
         // The original's repeat changed in Google since: said once, the record forgotten, and the
         // next save goes with only its own read before it.
@@ -19473,7 +19495,7 @@ mod tests {
         assert!(host.journal().is_empty(), "said once, then forgotten");
         let (outcome, script) = save_new_part(&host, &one_off, &gym, vec![patch()]).await;
         script.asked_all();
-        assert!(outcome == saved(), "the next save goes");
+        assert!(saved_with_undo(&outcome), "the next save goes");
     }
 
     /// C11 critique 1 L11: a one-off given a repeat becomes a whole repeating event, so a dev build's
@@ -23141,7 +23163,11 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(outcome == saved(), "this event: saved, nothing offered");
+        // No milestone to move; an Undo, as any "This event" save of its title has (C16d).
+        assert!(
+            saved_with_undo(&outcome),
+            "this event: saved, no move offered"
+        );
         let (host, _) = linked_host("2026-10-13");
         let mut steps = october_reads();
         steps.push(series_patch(Scripted::Json(retitled(&series, "\"m2\""))));
@@ -24392,7 +24418,7 @@ mod tests {
                 )
                 .await;
                 script.asked_all();
-                assert!(outcome == saved(), "{key}: saved without asking");
+                assert!(saved_with_undo(&outcome), "{key}: saved without asking");
                 let body = first_write(&script).body.unwrap();
                 assert!(body == json!({ key: value }), "{key} alone");
             }
@@ -24451,7 +24477,7 @@ mod tests {
             )
             .await;
             script.asked_all();
-            assert!(outcome == saved(), "saved, as chosen");
+            assert!(saved_with_undo(&outcome), "saved, as chosen");
         }
     }
 
@@ -25273,6 +25299,218 @@ mod tests {
         assert_eq!(host.row("solo").etag.as_deref(), Some("\"s3\""));
     }
 
+    /// C16d: an editor's save of a one-off's title is offered an Undo, which puts Google's title
+    /// from before back on its copy now, emailing nobody, with no Undo of its own.
+    #[tokio::test]
+    async fn an_editor_save_of_core_fields_offers_an_undo() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let renamed = retitled(&event, "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &title("Retro"),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(renamed.clone()),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "saved, with an Undo");
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", renamed),
+            told(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                "sendUpdates=none",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(outcome == saved(), "put back, with no Undo of its own");
+        assert!(
+            first_write(&script).body == Some(json!({ "summary": "Dentist" })),
+            "Google's title from before"
+        );
+        assert_eq!(host.row("solo").summary, "Dentist");
+    }
+
+    /// C16d (DECISIONS 17-10 #4): an editor's save of "This event" is offered an Undo too, which
+    /// puts the occurrence's own title back on the occurrence alone.
+    #[tokio::test]
+    async fn a_this_event_editor_save_has_an_undo_too() {
+        let host = TestHost::holding(&october());
+        let (series, instance) = (weekly(), monday_19());
+        let path = "/events/abc_20261019T080000Z";
+        let renamed = retitled(&instance, "\"i2\"");
+        let mut steps = october_reads();
+        steps.push(Step::write(
+            Method::Patch,
+            path,
+            instance["etag"].as_str().unwrap(),
+            Scripted::Json(renamed.clone()),
+        ));
+        let script = Script::new(steps);
+        let (outcome, _) = save(
+            &host,
+            &script,
+            &instance,
+            &series,
+            title("Retro"),
+            Scope::This,
+        )
+        .await;
+        script.asked_all();
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        let script = Script::new(vec![
+            Step::get(path, "", renamed),
+            Step::write(
+                Method::Patch,
+                path,
+                "\"i2\"",
+                Scripted::Json(written(&instance, &[], "\"i3\"")),
+            ),
+        ]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(outcome == saved(), "put back");
+        assert!(
+            first_write(&script).body == Some(json!({ "summary": instance["summary"].clone() })),
+            "the occurrence's own title, on the occurrence"
+        );
+        assert_eq!(
+            host.row("abc_20261019T080000Z").summary,
+            instance["summary"].as_str().unwrap()
+        );
+    }
+
+    /// C16d, Q3: notifications are undone as a title is, back to the calendar's defaults over the
+    /// list Google holds now (a PATCH merges the object). A guest added isn't (putting the list
+    /// back would email people again): `the_answer_goes_to_google_as_chosen` saves with none.
+    #[tokio::test]
+    async fn an_editor_save_of_notifications_is_undone_to_the_defaults() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let list =
+            json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 10 }] });
+        let landed = written(&event, &[("reminders", list)], "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &notifying(&[("popup", 10)]),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed.clone()),
+            )],
+        )
+        .await;
+        script.asked_all();
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", landed),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(outcome == saved(), "put back");
+        assert!(
+            first_write(&script).body
+                == Some(json!({ "reminders": { "useDefault": true, "overrides": [] } })),
+            "the calendar's defaults, over Google's list"
+        );
+    }
+
+    /// C16d: an Undo of a colour asks the colour's own gate on Google's copy now: a label given in
+    /// Google since holds the colour, so nothing is sent and the label's reason is given.
+    #[tokio::test]
+    async fn an_undo_of_a_colour_is_refused_once_a_label_holds_it() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let landed = written(&event, &[("colorId", json!("3"))], "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &colouring("3"),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed.clone()),
+            )],
+        )
+        .await;
+        script.asked_all();
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        let labelled = with(landed, "eventLabelId", json!("label-1"));
+        let script = Script::new(vec![Step::get("/events/solo", "", labelled)]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::LabelReadOnly
+                },
+            "the label's reason, nothing sent"
+        );
+    }
+
+    /// C16d: an Undo of notifications asks their own gate too: Google now holding them in a shape
+    /// PM can't read, nothing is sent and that reason is given.
+    #[tokio::test]
+    async fn an_undo_of_notifications_is_refused_once_pm_cant_read_them() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let list =
+            json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 10 }] });
+        let landed = written(&event, &[("reminders", list)], "\"s2\"");
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &notifying(&[("popup", 10)]),
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed.clone()),
+            )],
+        )
+        .await;
+        script.asked_all();
+        let token = offered(&outcome).expect("an Undo").undo_token.clone();
+        let unreadable = with(
+            landed,
+            "reminders",
+            json!({ "useDefault": false, "overrides": [{ "method": "popup" }] }),
+        );
+        let script = Script::new(vec![Step::get("/events/solo", "", unreadable)]);
+        let outcome = undo_change(&script, &*host, &token).await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::RemindersUnreadable
+                },
+            "the notifications' reason, nothing sent"
+        );
+    }
+
     /// Moved onto a day and undone: the date the move added goes as null.
     #[tokio::test]
     async fn undo_after_a_kind_switch_nulls_the_other_kind() {
@@ -25569,11 +25807,10 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(
-            outcome == saved(),
-            "an editor's save offers no Undo yet (C16d)"
-        );
+        // The save's own Undo is the one left (C16d).
+        let saved_undo = offered(&outcome).expect("an Undo").undo_token.clone();
         assert!(undo_change(&silent, &*host, &token).await == gone);
+        assert!(host.edit.undo_target(&saved_undo, Instant::now()).is_some());
         // Google's copy, landed on a conflict.
         let host = TestHost::holding(std::slice::from_ref(&event));
         let token = moved_to_ten(&host).await;
@@ -25649,8 +25886,9 @@ mod tests {
         script.finished();
     }
 
-    /// §5.7: only a write of the core fields is offered an Undo. One that sent guests, what they may
-    /// do, notifications, colour or a repeat isn't, nor one that sent nothing.
+    /// §5.7, Q3 as C16d builds it: a write of the core fields, the notifications or the colour is
+    /// offered an Undo. One that sent guests, what they may do or a repeat isn't, nor one that sent
+    /// nothing.
     #[test]
     fn a_save_that_sent_anything_else_offers_none() {
         let host = TestHost::holding(&[]);
@@ -25662,15 +25900,21 @@ mod tests {
             guests: None,
         };
         let now = Instant::now();
-        assert!(host
-            .edit
-            .offer_undo(&on, landed(&["summary", "start", "end"]), now)
-            .is_some());
+        for keys in [
+            &["summary", "start", "end"][..],
+            &["reminders"],
+            &["colorId"],
+            &["summary", "reminders", "colorId"],
+        ] {
+            assert!(
+                host.edit.offer_undo(&on, landed(keys), now).is_some(),
+                "{keys:?}"
+            );
+        }
         for keys in [
             &["start", "end", "attendees"][..],
             &["guestsCanModify"],
-            &["reminders"],
-            &["colorId"],
+            &["reminders", "guestsCanInviteOthers"],
             &["recurrence"],
             &[],
         ] {
@@ -25937,27 +26181,33 @@ mod tests {
         script.asked_all();
         assert!(outcome == saved(), "every occurrence moved, no Undo");
         assert!(host.edit.undos.lock().unwrap().is_empty());
-        // The offer is made in two places only: a one-off's move and "This event"'s landing.
+        // The offer is made in three places only: a one-off's move, a one-off's save (C16d), and
+        // "This event"'s landing, for a drop and a save alike.
         let source = include_str!("calendar_edit.rs");
         let shipped = source
             .split("#[cfg(test)]\nmod tests {")
             .next()
             .unwrap_or_default();
+        assert_eq!(shipped.matches("with_undo(host.edit(), ").count(), 3);
         assert_eq!(
             shipped
-                .matches("with_undo(host.edit(), target, outcome, landed)")
+                .matches("with_undo(host.edit(), &open.target, outcome, landed)")
                 .count(),
-            2
+            1
         );
         let land = &shipped[shipped.find("async fn land_series<").expect("the landing")..];
         let this = land.find("if plan.scope == Scope::This {").expect("This");
-        let moved = land
-            .find("moved_this(host, target, plan, saved, body)")
-            .expect("moved");
         let next = land
             .find("// \"Does not repeat\" for every occurrence")
             .expect("All");
-        assert!(this < moved && moved < next, "only under \"This event\"");
+        for arm in [
+            "landed_this(host, target, plan, Some(session), saved, body)",
+            "landed_this(host, target, plan, None, saved, body)",
+        ] {
+            let at = land.find(arm).expect("the arm");
+            assert!(this < at && at < next, "only under \"This event\"");
+        }
+        assert_eq!(shipped.matches("landed_this(host, ").count(), 2);
     }
 
     /// The token binds the drop: another place, or another zone, than the one the choices were
