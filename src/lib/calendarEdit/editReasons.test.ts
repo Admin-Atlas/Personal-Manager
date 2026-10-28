@@ -7,9 +7,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  CalendarEvent,
+  CalendarOverview,
   GuestNotice,
   MilestoneMove,
+  Notify,
   ReadOnlyReason,
+  SeriesScope,
   SplitAction,
   WriteOutcome,
   WriteWarning,
@@ -20,12 +24,21 @@ import {
   CREATE_CHANGED,
   CREATE_LOST,
   conflictFields,
+  copyRank,
   createdText,
   createReasonText,
   createText,
   deleteText,
+  emailsGuests,
   endsRetry,
+  eventRights,
   heldCreateText,
+  moveBackText,
+  moveText,
+  saveBackText,
+  undoMoveLabel,
+  undoSaveLabel,
+  type EventRights,
   retryAfter,
   earlierChangeText,
   keepLabel,
@@ -572,6 +585,63 @@ describe("a repeating event's save, said once the editor has closed", () => {
     );
   });
 
+  // C16d: with an Undo on offer the button says how to change it back, and after Send the words say
+  // an Undo emails the guests again. Only one event or "This event" ever has one.
+  it("words a save with an Undo, each scope, and after Send", () => {
+    const said = (scope: SeriesScope | null, sent: Notify | null) =>
+      savedNotice("Gym", saved([]), scope, "2026-10-21", false, false, { sent }).text;
+    expect(said(null, null)).toBe("Saved “Gym”.");
+    expect(said("this", null)).toBe("Saved “Gym” for this occurrence.");
+    expect(said(null, "all")).toBe("Saved “Gym”. Guests will get a second email if you undo.");
+    expect(said("this", "external_only")).toBe(
+      "Saved “Gym” for this occurrence. Guests will get a second email if you undo.",
+    );
+    expect(said(null, "none")).toBe("Saved “Gym”.");
+    // Several occurrences never have one: their words are as ever, whatever is passed.
+    expect(said("all", "all")).toBe(savedNotice("Gym", saved([]), "all").text);
+    expect(said("following", "all")).toBe(
+      savedNotice("Gym", saved([]), "following", "2026-10-21").text,
+    );
+    expect(undoSaveLabel("Gym", null)).toBe("Undo saving “Gym”");
+    expect(undoSaveLabel("Gym", "all")).toBe("Undo saving “Gym” (guests get a second email)");
+  });
+
+  it("says what undoing a save came to, in a save's words", () => {
+    expect(saveBackText(saved([]), "Gym")).toEqual({
+      tone: "ok",
+      text: "Put “Gym” back as it was.",
+    });
+    expect(saveBackText({ outcome: "conflict", fields: ["summary"] }, "Gym")).toEqual({
+      tone: "warn",
+      text: "“Gym” changed in Google since, so PM didn't undo the save.",
+    });
+    expect(saveBackText({ outcome: "failed", message: "Google said no." }, "Gym")).toEqual({
+      tone: "error",
+      text: "Couldn't undo the save of “Gym”. Google said no.",
+    });
+    expect(saveBackText(saved(["mirror_refresh_pending"]), "Gym").text).toBe(
+      "Put “Gym” back in Google. PM's calendar will show it after the next refresh.",
+    );
+    const all: WriteOutcome[] = [
+      { outcome: "no_change" },
+      { outcome: "needs_choice", scope: true },
+      { outcome: "ignored_by_google", split: false },
+      { outcome: "partial_split", token: "s", offers: ["check"], from: "2026-10-20" },
+      { outcome: "split_removed" },
+      { outcome: "gone" },
+      { outcome: "read_only", reason: "locked" },
+      { outcome: "busy" },
+      { outcome: "reauth" },
+      { outcome: "unconfirmed" },
+      { outcome: "ambiguous", retry_token: "r" },
+    ];
+    for (const o of all) {
+      const text = saveBackText(o, "Gym").text;
+      expect(text).toMatch(/\.$/);
+      expect(text).not.toMatch(/series|instance|exception|master|drag/i);
+    }
+  });
+
   // C13 review round 1: a save Google applied without keeping all of it (a colour it wouldn't clear
   // beside a new title) is saved, never "nothing changed", and never a plain "Saved": it says to look.
   it("says when Google didn't keep all of a save", () => {
@@ -1081,5 +1151,202 @@ describe("move words", () => {
     expect(milestoneStayedText({ ...launch, earlierLastDay: "2026-10-19" })).toMatch(
       /stays on the earlier part, which ended on 19-10, and shows as overdue\. Unlink/,
     );
+  });
+});
+
+// One predicate for the popover's Edit and Delete, the dedup and a drag (C16a, §6.4).
+describe("an event's rights in the calendar", () => {
+  const ACCOUNT = "gcal:me@x.org";
+  const CAL = "gcal:me@x.org:me@x.org";
+  // Only what `eventRights` reads of the overview: each calendar's provider and account, and the
+  // account's editing status.
+  const overview = (editing: "on" | "off") =>
+    ({
+      calendars: [
+        { id: CAL, provider: "google", source_id: ACCOUNT },
+        { id: "ical:feed", provider: "ical", source_id: "ical:feed" },
+      ],
+      editing: { [ACCOUNT]: editing },
+    }) as unknown as CalendarOverview;
+  const row = (over: Partial<CalendarEvent>): CalendarEvent => ({
+    id: `${CAL}:e1`,
+    calendar_id: CAL,
+    summary: "Retro",
+    description: null,
+    location: null,
+    start: "2026-10-20T09:00:00Z",
+    end: "2026-10-20T10:00:00Z",
+    all_day: false,
+    html_link: null,
+    uid: "e1@google.com",
+    organizer_self: true,
+    edit_block: null,
+    can_delete: true,
+    can_respond: false,
+    can_retime: true,
+    ...over,
+  });
+  const theirs = { organizer_self: false, can_delete: false, can_respond: true };
+
+  it("offers a drag exactly where the list says the time may change", () => {
+    const on = overview("on");
+    const rows: [string, CalendarEvent, CalendarOverview, EventRights][] = [
+      ["one-off", row({}), on, { canEdit: true, canDelete: true, canRetime: true, reason: null }],
+      [
+        "locked",
+        row({ locked: true, can_delete: false, can_retime: false }),
+        on,
+        { canEdit: true, canDelete: false, canRetime: false, reason: reasonText("locked") },
+      ],
+      [
+        "invitation",
+        row({ ...theirs, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: false,
+          canRetime: false,
+          reason: notOrganizerText(true, true),
+        },
+      ],
+      [
+        "invitation with modify",
+        row({ ...theirs, guests_can_modify: true, can_retime: true }),
+        on,
+        { canEdit: true, canDelete: false, canRetime: true, reason: A11_NOTE },
+      ],
+      [
+        "editing off",
+        row({}),
+        overview("off"),
+        { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("editing_off") },
+      ],
+      [
+        "a birthday",
+        row({ edit_block: "special_type", can_delete: false, can_retime: false }),
+        on,
+        { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("special_type") },
+      ],
+      [
+        "a subscription",
+        row({ calendar_id: "ical:feed" }),
+        on,
+        { canEdit: false, canDelete: false, canRetime: false, reason: null },
+      ],
+      [
+        "a milestone",
+        row({ calendar_id: "pm:milestones" }),
+        on,
+        { canEdit: false, canDelete: false, canRetime: false, reason: null },
+      ],
+      [
+        "a row the list didn't mark",
+        row({ can_delete: undefined, can_retime: undefined }),
+        on,
+        { canEdit: true, canDelete: false, canRetime: false, reason: null },
+      ],
+    ];
+    for (const [name, ev, view, want] of rows) {
+      expect([name, eventRights(ev, view)]).toEqual([name, want]);
+    }
+  });
+
+  it("ranks the copy you organise first, then any you can change (C14 §9.5)", () => {
+    const on = overview("on");
+    const rank = (ev: CalendarEvent, view = on) => copyRank(eventRights(ev, view), ev);
+    expect(rank(row({}))).toBe(2);
+    expect(rank(row(theirs))).toBe(1);
+    expect(rank(row({}), overview("off"))).toBe(0);
+  });
+});
+
+// What a move came to, and its Undo (C16a, §13.1).
+describe("move words", () => {
+  const saved = (warnings: WriteWarning[] = [], undo = true): WriteOutcome => ({
+    outcome: "saved",
+    warnings,
+    ...(undo ? { undo: { undo_token: "u1", undo_seconds: 8 } } : {}),
+  });
+  const when = "20-10 · 10:00–11:00";
+
+  it("says where it is now, and that guests get a second email if a move that emailed them is undone", () => {
+    expect(moveText(saved(), "Retro", when, null)).toEqual({
+      tone: "ok",
+      text: "“Retro” is now 20-10 · 10:00–11:00.",
+    });
+    for (const sent of ["all", "external_only"] as const) {
+      expect(moveText(saved(), "Retro", when, sent).text).toBe(
+        "“Retro” is now 20-10 · 10:00–11:00. Guests will get a second email if you undo.",
+      );
+      expect(undoMoveLabel("Retro", sent)).toBe("Undo moving “Retro” (guests get a second email)");
+    }
+    expect(moveText(saved(), "Retro", when, "none").text).not.toContain("second email");
+    expect(undoMoveLabel("Retro", "none")).toBe("Undo moving “Retro”");
+    // No Undo, no words about one.
+    expect(moveText(saved([], false), "Retro", when, "all").text).not.toContain("second email");
+    // "all day" mid-sentence (C2-L18).
+    expect(moveText(saved(), "", "All day · 20-10", null).text).toBe(
+      "“(no title)” is now all day · 20-10.",
+    );
+    expect(moveText(saved(["mirror_refresh_pending"], false), "Retro", when, null)).toEqual({
+      tone: "ok",
+      text: "Moved “Retro” in Google. PM's calendar will show it after the next refresh.",
+    });
+  });
+
+  it("says why a move didn't happen, and promises only what's true", () => {
+    const words = (o: WriteOutcome) => moveText(o, "Retro", when, null).text;
+    expect(words({ outcome: "conflict", fields: ["start"] })).toBe(
+      "“Retro” changed in Google since PM last showed it, so it wasn't moved. PM now shows Google's version.",
+    );
+    expect(words({ outcome: "read_only", reason: "locked" })).toBe(
+      `“Retro” wasn't moved. ${reasonText("locked")}`,
+    );
+    expect(words({ outcome: "failed", message: "Google didn't accept the change." })).toBe(
+      "“Retro” wasn't moved. Google didn't accept the change.",
+    );
+    expect(words({ outcome: "unconfirmed" })).toBe(
+      "PM lost touch with Google and can't tell whether “Retro” moved. It will show Google's version after the next refresh.",
+    );
+    expect(words({ outcome: "gone" })).toBe("“Retro” isn't in Google any more.");
+    // Every outcome has words, none of them jargon.
+    const all: WriteOutcome[] = [
+      saved(),
+      { outcome: "no_change" },
+      { outcome: "needs_choice", scope: true },
+      { outcome: "ignored_by_google", split: false },
+      { outcome: "partial_split", token: "s", offers: ["check"], from: "2026-10-20" },
+      { outcome: "split_removed" },
+      { outcome: "conflict", fields: [] },
+      { outcome: "gone" },
+      { outcome: "read_only", reason: "not_organizer" },
+      { outcome: "busy" },
+      { outcome: "reauth" },
+      { outcome: "unconfirmed" },
+      { outcome: "ambiguous", retry_token: "r" },
+      { outcome: "failed", message: "Google had a problem with this." },
+    ];
+    for (const o of all) {
+      for (const text of [words(o), moveBackText(o, "Retro").text]) {
+        expect(text).toMatch(/\.$/);
+        expect(text).not.toMatch(/series|instance|exception|master|pointer|drag handle/i);
+      }
+    }
+  });
+
+  it("says what putting a move back came to", () => {
+    expect(moveBackText(saved([], false), "Retro")).toEqual({
+      tone: "ok",
+      text: "Moved “Retro” back.",
+    });
+    expect(moveBackText({ outcome: "conflict", fields: ["start"] }, "Retro")).toEqual({
+      tone: "warn",
+      text: "“Retro” changed in Google since, so it wasn't moved back.",
+    });
+    expect(
+      moveBackText({ outcome: "failed", message: "That can't be undone any more." }, "Retro").text,
+    ).toBe("Couldn't move “Retro” back. That can't be undone any more.");
+    expect(emailsGuests("all") && emailsGuests("external_only")).toBe(true);
+    expect(emailsGuests("none") || emailsGuests(null)).toBe(false);
   });
 });

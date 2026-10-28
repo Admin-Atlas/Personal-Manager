@@ -18,7 +18,7 @@ use chrono::{
 use chrono_tz::Tz;
 use serde_json::{json, Value};
 
-use super::dto::TimeDraft;
+use super::dto::{MoveTo, TimeDraft};
 use crate::calendar_recur::wire;
 use crate::calendar_recur::SeriesStart;
 
@@ -36,6 +36,12 @@ pub enum TimeError {
         wall: String,
     },
     EndBeforeStart,
+    /// A drop lands on the second time an hour happens in the event's zone (the clocks go back), and
+    /// a wall time can only name the first (R6), so PM can't set it (C16a).
+    RepeatedHour {
+        zone: String,
+        wall: String,
+    },
 }
 
 impl fmt::Display for TimeError {
@@ -55,6 +61,12 @@ impl fmt::Display for TimeError {
                  outside that hour."
             ),
             TimeError::EndBeforeStart => write!(f, "The event has to end after it starts."),
+            // No "set it in Edit": the editor also sets only the first (C16 critique C2-M10).
+            TimeError::RepeatedHour { zone, wall } => write!(
+                f,
+                "{wall} happens twice in {zone} that night (the clocks go back), and PM can only \
+                 set the first."
+            ),
         }
     }
 }
@@ -264,7 +276,10 @@ pub fn resolve_against(
         } => {
             let (start, start_at) = half(start_date, start_time, start_zone, current_start)?;
             let (end, end_at) = half(end_date, end_time, end_zone, current_end)?;
-            if end_at <= start_at {
+            // Google holds events that end as they start (an import with no end, say) and moves
+            // them: one Google already holds that way may keep it, but PM never makes one.
+            let kept_instant = end_at == start_at && ends_as_it_starts(current_start, current_end);
+            if end_at < start_at || (end_at == start_at && !kept_instant) {
                 return Err(TimeError::EndBeforeStart);
             }
             Ok(GoogleWhen {
@@ -295,6 +310,17 @@ fn timed(t: DateTime<Tz>) -> Value {
         "dateTime": t.to_rfc3339_opts(SecondsFormat::Secs, false),
         "timeZone": t.timezone().name(),
     })
+}
+
+/// Whether Google's copy of a timed event, `start` and `end` as it holds them, ends at the very
+/// instant it starts.
+fn ends_as_it_starts(start: Option<&Value>, end: Option<&Value>) -> bool {
+    let at = |node: Option<&Value>| {
+        node.and_then(|n| n.get("dateTime"))
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
+    };
+    matches!((at(start), at(end)), (Some(s), Some(e)) if s == e)
 }
 
 /// One half of a timed draft, with its instant: Google's own node when it already names this wall
@@ -332,6 +358,111 @@ fn held_wall_time(
     let local = at.with_timezone(&tz);
     (local.date_naive() == date && local.hour() == time.hour() && local.minute() == time.minute())
         .then_some(at)
+}
+
+/// The editor's time draft for a drop (C16a). `to` is wall time in `device`, this computer's zone:
+/// each half the drop moved is resolved there (a time the clocks skip refused, a repeated one its
+/// first) and said again in the zone Google keeps for that half, else the other half's, else
+/// `unzoned`, the zone the editor reads an event that names none in (its calendar's; `None`:
+/// `device`), so a drag never changes which zone an event is in, and writes the zone an Edit of it
+/// would. A half the drop left where Google has it is said as Google holds it, so
+/// [`resolve_against`] keeps Google's own node, seconds and the second pass of a repeated hour
+/// included. An all-day drop needs no zone; a timed one without it is refused (R6).
+pub fn retime_draft(
+    to: &MoveTo,
+    device: Option<Tz>,
+    unzoned: Option<Tz>,
+    fresh: &Value,
+) -> Result<TimeDraft, TimeError> {
+    let (start_date, start_time, end_date, end_time) = match to {
+        MoveTo::AllDay {
+            first_day,
+            last_day,
+        } => {
+            return Ok(TimeDraft::AllDay {
+                first_day: first_day.clone(),
+                last_day: last_day.clone(),
+            })
+        }
+        MoveTo::Timed {
+            start_date,
+            start_time,
+            end_date,
+            end_time,
+        } => (start_date, start_time, end_date, end_time),
+    };
+    let device = device.ok_or(TimeError::NoZone)?;
+    let unzoned = unzoned.unwrap_or(device);
+    let (start, end) = (fresh.get("start"), fresh.get("end"));
+    let start_zone = zone_of(start).or_else(|| zone_of(end)).unwrap_or(unzoned);
+    let end_zone = zone_of(end).or_else(|| zone_of(start)).unwrap_or(unzoned);
+    let (start_date, start_time, start_zone) =
+        retimed_half(start_date, start_time, start, start_zone, device)?;
+    let (end_date, end_time, end_zone) = retimed_half(end_date, end_time, end, end_zone, device)?;
+    Ok(TimeDraft::Timed {
+        start_date,
+        start_time,
+        start_zone,
+        end_date,
+        end_time,
+        end_zone,
+    })
+}
+
+/// The zone a timed start or end `node` names, when PM knows it. An all-day node has none.
+fn zone_of(node: Option<&Value>) -> Option<Tz> {
+    let node = node.filter(|n| n.get("dateTime").is_some_and(Value::is_string))?;
+    parse_zone(node.get("timeZone")?.as_str()?).ok()
+}
+
+/// One half of a drop, `date` `time` on this computer (`device`), as the editor's date, `HH:MM` and
+/// zone: Google's own instant in its own zone (`zone` for a node that names none) when `node` names
+/// that very wall time here (kept), else the drop resolved on this computer and said in `zone`. A
+/// wall time that happens twice in `zone` can only name the first: a drop on the second is refused
+/// rather than moved an hour.
+fn retimed_half(
+    date: &str,
+    time: &str,
+    node: Option<&Value>,
+    zone: Tz,
+    device: Tz,
+) -> Result<(String, String, String), TimeError> {
+    let (date, time) = (parse_date(date)?, parse_time(time)?);
+    let held = node
+        .and_then(|n| n.get("dateTime"))
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok());
+    if let Some(at) = held {
+        let here = at.with_timezone(&device);
+        if here.date_naive() == date && here.hour() == time.hour() && here.minute() == time.minute()
+        {
+            let own = node
+                .and_then(|n| n.get("timeZone"))
+                .and_then(Value::as_str)
+                .and_then(|z| parse_zone(z).ok())
+                .unwrap_or(zone);
+            return Ok(wall_in(at.with_timezone(&own)));
+        }
+    }
+    let at = resolve_wall_time(device, date, time)?;
+    let local = at.with_timezone(&zone);
+    let (day, clock) = (local.date_naive(), local.time());
+    if resolve_wall_time(zone, day, clock)? != at {
+        return Err(TimeError::RepeatedHour {
+            zone: zone.name().to_string(),
+            wall: format!("{} {}", day.format("%d-%m-%Y"), clock.format("%H:%M")),
+        });
+    }
+    Ok(wall_in(local))
+}
+
+/// An instant as the editor's date, `HH:MM` and zone.
+fn wall_in(t: DateTime<Tz>) -> (String, String, String) {
+    (
+        t.format("%Y-%m-%d").to_string(),
+        t.format("%H:%M").to_string(),
+        t.timezone().name().to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -715,6 +846,256 @@ mod tests {
         assert_eq!(
             shifted(&unread, 1),
             Err(TimeError::BadDate("someday".into()))
+        );
+    }
+
+    // --- a drop's time (C16a): this computer's wall time, said in the event's own zone ---
+
+    fn dropped(sd: &str, st: &str, ed: &str, et: &str) -> MoveTo {
+        MoveTo::Timed {
+            start_date: sd.into(),
+            start_time: st.into(),
+            end_date: ed.into(),
+            end_time: et.into(),
+        }
+    }
+
+    fn london_event(start: &str, end: &str) -> Value {
+        json!({ "start": node(start), "end": node(end) })
+    }
+
+    /// A London event dragged on a New York laptop stays in London's zone: the drop is New York's
+    /// wall time, said again in London's, so `resolve_against` sends London nodes.
+    #[test]
+    fn a_drop_keeps_the_events_own_zone() {
+        let fresh = london_event("2026-11-03T09:00:00Z", "2026-11-03T10:00:00Z");
+        let to = dropped("2026-11-03", "05:00", "2026-11-03", "06:00");
+        let draft = retime_draft(&to, Some(chrono_tz::America::New_York), None, &fresh).unwrap();
+        assert_eq!(
+            draft,
+            timed_draft(
+                "2026-11-03",
+                "10:00",
+                "Europe/London",
+                "2026-11-03",
+                "11:00",
+                "Europe/London",
+            )
+        );
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, node("2026-11-03T10:00:00+00:00"));
+        assert_eq!(when.end, node("2026-11-03T11:00:00+00:00"));
+    }
+
+    /// A resize leaves the start where Google has it, seconds and the second 01:30 included: the
+    /// start is said as Google holds it, and `resolve_against` keeps Google's node byte for byte.
+    #[test]
+    fn a_resize_keeps_the_untouched_half_byte_for_byte() {
+        // 01:30:15 GMT on 25-10-2026: the second 01:30 in London.
+        let start = node("2026-10-25T01:30:15Z");
+        let fresh = json!({ "start": start, "end": node("2026-10-25T02:30:00Z") });
+        let to = dropped("2026-10-25", "01:30", "2026-10-25", "03:00");
+        let draft = retime_draft(&to, Some(chrono_tz::Europe::London), None, &fresh).unwrap();
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, start, "Google's own start");
+        assert_eq!(
+            when.end,
+            node("2026-10-25T03:00:00+00:00"),
+            "only the end moved"
+        );
+        // A node with no zone of its own is kept too, read on this computer.
+        let bare = json!({ "dateTime": "2026-07-01T08:00:30Z" });
+        let fresh = json!({ "start": bare, "end": { "dateTime": "2026-07-01T09:00:00Z" } });
+        let to = dropped("2026-07-01", "09:00", "2026-07-01", "11:00");
+        let draft = retime_draft(&to, Some(chrono_tz::Europe::London), None, &fresh).unwrap();
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, bare);
+        // A London event on a New York laptop whose start is the second 01:30 there (01-11-2026,
+        // 06:30 GMT): read again as New York's 01:30 it would be the first, an hour earlier. Kept.
+        let start = node("2026-11-01T06:30:00Z");
+        let fresh = json!({ "start": start, "end": node("2026-11-01T07:30:00Z") });
+        let to = dropped("2026-11-01", "01:30", "2026-11-01", "03:00");
+        let draft = retime_draft(&to, Some(chrono_tz::America::New_York), None, &fresh).unwrap();
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, start, "Google's own start, not an hour earlier");
+        assert_eq!(when.end, node("2026-11-01T08:00:00+00:00"));
+    }
+
+    /// A drop in the hour this computer's clocks skip is refused, never nudged.
+    #[test]
+    fn a_drop_in_the_device_zones_skipped_hour_is_refused() {
+        let fresh = london_event("2027-03-27T09:00:00Z", "2027-03-27T10:00:00Z");
+        let to = dropped("2027-03-28", "01:30", "2027-03-28", "02:30");
+        assert!(matches!(
+            retime_draft(&to, Some(chrono_tz::Europe::London), None, &fresh),
+            Err(TimeError::Gap { .. })
+        ));
+    }
+
+    /// 21:30 in New York on 24-10-2026 is 01:30 GMT on the 25th: the second 01:30 in London, which
+    /// a wall time there can't name. Refused with its words, never moved an hour; the first is fine.
+    #[test]
+    fn a_drop_on_the_events_second_pass_is_refused() {
+        let fresh = london_event("2026-10-24T18:00:00Z", "2026-10-24T19:00:00Z");
+        let second = dropped("2026-10-24", "21:30", "2026-10-24", "22:30");
+        let refused = retime_draft(&second, Some(chrono_tz::America::New_York), None, &fresh);
+        assert_eq!(
+            refused,
+            Err(TimeError::RepeatedHour {
+                zone: "Europe/London".into(),
+                wall: "25-10-2026 01:30".into(),
+            })
+        );
+        let words = refused.unwrap_err().to_string();
+        assert!(words.contains("happens twice in Europe/London"), "{words}");
+        assert!(!words.contains("Edit"), "the editor can't set it either");
+        // 20:30 in New York is the first 01:30 (BST): fine.
+        let first = dropped("2026-10-24", "20:30", "2026-10-24", "20:45");
+        let draft = retime_draft(&first, Some(chrono_tz::America::New_York), None, &fresh).unwrap();
+        assert!(matches!(draft, TimeDraft::Timed { ref start_time, .. } if start_time == "01:30"));
+    }
+
+    /// An all-day event dropped in the hours takes this computer's zone, having none of its own;
+    /// one dropped on days needs no zone at all.
+    #[test]
+    fn all_day_to_timed_uses_the_device_zone_and_all_day_needs_none() {
+        let fresh = json!({ "start": { "date": "2026-10-12" }, "end": { "date": "2026-10-13" } });
+        let to = dropped("2026-10-12", "14:00", "2026-10-12", "15:00");
+        let draft = retime_draft(&to, Some(chrono_tz::America::New_York), None, &fresh).unwrap();
+        assert_eq!(
+            draft,
+            timed_draft(
+                "2026-10-12",
+                "14:00",
+                "America/New_York",
+                "2026-10-12",
+                "15:00",
+                "America/New_York",
+            )
+        );
+        let days = MoveTo::AllDay {
+            first_day: "2026-10-14".into(),
+            last_day: "2026-10-15".into(),
+        };
+        assert_eq!(
+            retime_draft(&days, None, None, &fresh),
+            Ok(TimeDraft::AllDay {
+                first_day: "2026-10-14".into(),
+                last_day: "2026-10-15".into(),
+            })
+        );
+        // A half with no zone of its own takes the other half's.
+        let half = json!({
+            "start": { "dateTime": "2026-10-12T09:00:00Z" },
+            "end": node("2026-10-12T10:00:00Z"),
+        });
+        let to = dropped("2026-10-12", "06:00", "2026-10-12", "07:00");
+        let draft = retime_draft(&to, Some(chrono_tz::America::New_York), None, &half).unwrap();
+        assert!(
+            matches!(&draft, TimeDraft::Timed { start_zone, end_zone, .. }
+                if start_zone == "Europe/London" && end_zone == "Europe/London")
+        );
+    }
+
+    /// An event that names no zone (made through the API, say) is in its calendar's, as the editor
+    /// reads it: a drop on a New York laptop of a London calendar's event writes London's zone, as
+    /// an Edit of it would, never this computer's. An all-day event dropped in the hours alike.
+    #[test]
+    fn a_drop_of_an_event_with_no_zone_says_it_in_its_calendars() {
+        let london = Some(chrono_tz::Europe::London);
+        let new_york = Some(chrono_tz::America::New_York);
+        let fresh = json!({
+            "start": { "dateTime": "2026-11-03T09:00:00Z" },
+            "end": { "dateTime": "2026-11-03T10:00:00Z" },
+        });
+        // An hour later: 05:00 in New York is 10:00 in London.
+        let to = dropped("2026-11-03", "05:00", "2026-11-03", "06:00");
+        let draft = retime_draft(&to, new_york, london, &fresh).unwrap();
+        assert_eq!(
+            draft,
+            timed_draft(
+                "2026-11-03",
+                "10:00",
+                "Europe/London",
+                "2026-11-03",
+                "11:00",
+                "Europe/London",
+            )
+        );
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, node("2026-11-03T10:00:00+00:00"));
+        assert_eq!(when.end, node("2026-11-03T11:00:00+00:00"));
+        // A resize keeps the start Google holds, said in the same zone as the end it moves.
+        let to = dropped("2026-11-03", "04:00", "2026-11-03", "06:00");
+        let draft = retime_draft(&to, new_york, london, &fresh).unwrap();
+        assert!(
+            matches!(&draft, TimeDraft::Timed { start_zone, end_zone, .. }
+                if start_zone == "Europe/London" && end_zone == "Europe/London")
+        );
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, fresh["start"], "Google's own start");
+        assert_eq!(when.end, node("2026-11-03T11:00:00+00:00"));
+        // All day into the hours: 14:00 in New York, said as London's 19:00.
+        let days = json!({ "start": { "date": "2026-10-12" }, "end": { "date": "2026-10-13" } });
+        let to = dropped("2026-10-12", "14:00", "2026-10-12", "15:00");
+        let draft = retime_draft(&to, new_york, london, &days).unwrap();
+        assert_eq!(
+            draft,
+            timed_draft(
+                "2026-10-12",
+                "19:00",
+                "Europe/London",
+                "2026-10-12",
+                "20:00",
+                "Europe/London",
+            )
+        );
+    }
+
+    /// An event Google holds as ending when it starts keeps that length when dragged, as Google
+    /// moves it; PM still never makes one, nor shortens one to nothing.
+    #[test]
+    fn a_zero_length_event_moves_and_none_is_made() {
+        let fresh = london_event("2026-11-03T09:00:00Z", "2026-11-03T09:00:00Z");
+        let to = dropped("2026-11-03", "10:00", "2026-11-03", "10:00");
+        let draft = retime_draft(&to, Some(chrono_tz::Europe::London), None, &fresh).unwrap();
+        let when = resolve_against(&draft, fresh.get("start"), fresh.get("end")).unwrap();
+        assert_eq!(when.start, node("2026-11-03T10:00:00+00:00"));
+        assert_eq!(when.end, node("2026-11-03T10:00:00+00:00"));
+        // An hour-long event made to end as it starts is still refused.
+        let hour = london_event("2026-11-03T09:00:00Z", "2026-11-03T10:00:00Z");
+        assert_eq!(
+            resolve_against(&draft, hour.get("start"), hour.get("end")),
+            Err(TimeError::EndBeforeStart)
+        );
+        // And one that ends before it starts, whatever Google holds.
+        let backwards = timed_draft(
+            "2026-11-03",
+            "10:00",
+            "Europe/London",
+            "2026-11-03",
+            "09:45",
+            "Europe/London",
+        );
+        assert_eq!(
+            resolve_against(&backwards, fresh.get("start"), fresh.get("end")),
+            Err(TimeError::EndBeforeStart)
+        );
+    }
+
+    /// R6: a timed drop with no zone for this computer is refused, never read as UTC, even with its
+    /// calendar's zone known.
+    #[test]
+    fn a_timed_drop_without_a_zone_is_refused() {
+        let fresh = london_event("2026-11-03T09:00:00Z", "2026-11-03T10:00:00Z");
+        let to = dropped("2026-11-03", "05:00", "2026-11-03", "06:00");
+        assert_eq!(
+            retime_draft(&to, None, None, &fresh),
+            Err(TimeError::NoZone)
+        );
+        assert_eq!(
+            retime_draft(&to, None, Some(chrono_tz::Europe::London), &fresh),
+            Err(TimeError::NoZone)
         );
     }
 }

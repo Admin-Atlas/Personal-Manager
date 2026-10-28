@@ -53,6 +53,8 @@ const choicesForEdit = vi.fn<(session: string, draft: EventPatchDraft) => Promis
 const settleSplit =
   vi.fn<(token: string, action: SplitAction, title: string) => Promise<WriteOutcome | null>>();
 const noteSaved = vi.fn();
+/** The row a save names, so an earlier Undo of it goes (C16d). */
+const savedRow = vi.fn<(rowId: string | null | undefined) => void>();
 const noteSeriesNotice = vi.fn();
 const respond =
   vi.fn<
@@ -74,7 +76,11 @@ vi.mock("./useEventWrites", () => ({
     t: string,
     n: Notify | null,
     a: GuestNotice | null,
-  ) => saveEdit(s, c, p, t, n, a),
+    r?: string | null,
+  ) => {
+    savedRow(r);
+    return saveEdit(s, c, p, t, n, a);
+  },
   choicesForEdit: (s: string, d: EventPatchDraft) => choicesForEdit(s, d),
   settleSplit: (token: string, action: SplitAction, title: string) =>
     settleSplit(token, action, title),
@@ -319,8 +325,31 @@ describe("EventEditor", () => {
       "2026-10-12",
       false,
       false,
+      { rowId: row.id, sent: null },
     );
     expect(choicesForEdit).not.toHaveBeenCalled();
+  });
+
+  // C16d: the save names its row, so an Undo still offered for an earlier write of it goes, and the
+  // notice gets the row and the answer sent, for the Undo the backend offers and its words.
+  it("a save hands its row and answer to the notice", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const offer = { undo_token: "u1", undo_seconds: 8 };
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [], undo: offer });
+    const onClose = await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(savedRow).toHaveBeenCalledWith(row.id);
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Dentist (moved)",
+      { outcome: "saved", warnings: [], undo: offer },
+      null,
+      "2026-10-12",
+      false,
+      false,
+      { rowId: row.id, sent: null },
+    );
   });
 
   it("turns Close off with Cancel while a save is out, and back on after", async () => {
@@ -959,6 +988,7 @@ describe("EventEditor, a repeating event", () => {
       "2026-10-12",
       false,
       false,
+      { rowId: occurrence.id, sent: null },
     );
   });
 
@@ -984,6 +1014,7 @@ describe("EventEditor, a repeating event", () => {
       "2026-10-12",
       false,
       true,
+      { rowId: occurrence.id, sent: null },
     );
   });
 
@@ -1547,6 +1578,7 @@ describe("EventEditor, how it repeats", () => {
       "2026-10-12",
       true,
       false,
+      expect.objectContaining({ sent: null }),
     );
   });
 

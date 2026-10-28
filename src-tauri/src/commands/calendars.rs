@@ -1407,6 +1407,7 @@ mod tests {
                 edit_block: None,
                 can_delete: true,
                 can_respond: false,
+                can_retime: true,
             },
         };
         let json = serde_json::to_value(&listed).unwrap();
@@ -1414,6 +1415,7 @@ mod tests {
         assert_eq!(json["edit_block"], serde_json::Value::Null);
         assert_eq!(json["can_delete"], true);
         assert_eq!(json["can_respond"], false);
+        assert_eq!(json["can_retime"], true);
         assert!(json.get("rights").is_none(), "flat, not nested");
     }
 }

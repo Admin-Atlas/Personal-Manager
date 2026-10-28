@@ -125,4 +125,18 @@ describe("NotifyPrompt", () => {
     ask();
     expect(screen.queryByText(/PM checked with Google/)).toBeNull();
   });
+
+  // C16b: a drop asked nothing first, so the editor's line would say the wrong thing.
+  it("againText replaces the editor's line, and a note shows above the choice", () => {
+    const words = "This event has guests in Google that PM's calendar didn't show yet.";
+    ask({ again: true, againText: words, note: "The organiser's note." });
+    expect(screen.getByText(words)).toBeTruthy();
+    expect(screen.queryByText(/before saving/)).toBeNull();
+    expect(screen.getByText("The organiser's note.")).toBeTruthy();
+    cleanup();
+    // Only with `again`; and no note unless one is given.
+    ask({ againText: words });
+    expect(screen.queryByText(words)).toBeNull();
+    expect(screen.queryByText("The organiser's note.")).toBeNull();
+  });
 });

@@ -141,6 +141,7 @@ import type {
   EventPatchDraft,
   GuestNotice,
   HeldDeleteInfo,
+  MoveRequest,
   NewEventDraft,
   Notify,
   RepeatPreset,
@@ -1130,6 +1131,24 @@ export const updateCalendarEvent = (
   asked: GuestNotice | null = null,
 ) =>
   invoke<WriteOutcome>("update_calendar_event", { session, draft, scope, choice, notify, asked });
+
+/** Move or resize an event to where it was dropped (C16a). The backend reads Google's copy first and
+ *  moves it only if its time is still what the user dragged (`request.seen`); only its start and end
+ *  are sent, and the event keeps its own zone. `scope` and `choice` as for a save (the choices are
+ *  asked with this same request); `notify` and `asked` likewise. A one-off or one occurrence that
+ *  lands comes back with an Undo offer. Outcomes come back as data, never thrown. */
+export const rescheduleCalendarEvent = (
+  request: MoveRequest,
+  scope: SeriesScope | null = null,
+  choice: string | null = null,
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+) => invoke<WriteOutcome>("reschedule_calendar_event", { request, scope, choice, notify, asked });
+
+/** Put back what a move or an editor's save just changed, by the token its Undo offer named: only
+ *  while Google still holds what that write left, emailing whom it did. Outcomes come back as data. */
+export const undoCalendarChange = (undoToken: string) =>
+  invoke<WriteOutcome>("undo_calendar_change", { undoToken });
 
 /** Reply to an invitation (by its row id): Yes, No or Maybe. `comment` null keeps the note Google
  *  holds, "" removes it. For an occurrence of a repeating event `scope` says this one or all of

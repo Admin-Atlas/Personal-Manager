@@ -107,7 +107,13 @@ export function targetById(t: CreateTargets, id: string): CreateTarget | null {
 /** How long a new event on `target` lasts, in ms: its account's Google default length, else an
  *  hour (none read yet, or none on offer). */
 export function lengthFor(overview: CalendarOverview, target: CreateTarget | null): number {
-  const minutes = target ? overview.default_length[target.account.id] : undefined;
+  return accountLength(overview, target?.account.id ?? null);
+}
+
+/** The Google default length of the account `accountId` (`gcal:` + address), in ms, else an hour:
+ *  how long an all-day event dragged into the hours becomes (C16b), as a new event there would. */
+export function accountLength(overview: CalendarOverview, accountId: string | null): number {
+  const minutes = accountId !== null ? overview.default_length[accountId] : undefined;
   return typeof minutes === "number" && Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440
     ? minutes * 60_000
     : DEFAULT_LENGTH_MS;

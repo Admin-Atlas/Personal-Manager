@@ -12,7 +12,10 @@
 // invited to offers Yes, No and Maybe (#884; every change goes through `edit/useEventWrites`); an
 // event they declined is struck through, as Google draws it. "+ New event" and `c` open the editor
 // for a new one, on a calendar the user picks, and Shift+C a quick box under the button, whose
-// draft is drawn on the grid as it's typed (C10); everything else stays read-only. The two
+// draft is drawn on the grid as it's typed (C10). In Day and Week an event can be dragged to a new
+// time, or by its edges to a new start or end, and in Month to another day, asking what a save would
+// ask (C16b-c, `useCalendarGesture` and `edit/MoveFlow`); a click or drag on empty time, the all-day
+// row or a day in Month opens quick create beside it (C17); everything else stays read-only. The two
 // first-party overlays — project milestones (click opens their project) and freeform pinboard
 // timeline entries (click opens the Pinboard) — are each an all-day event in its own hue, injected
 // here and never written back to any calendar.
@@ -29,11 +32,13 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { A11_NOTE, notOrganizerText, reasonText } from "../../lib/calendarEdit/editReasons";
+import { copyRank, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
+import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
 import { isRepeating } from "../../lib/calendarEdit/saveChoices";
 import {
+  accountLength,
   createdWhere,
   createReasonFor,
   createTargets,
@@ -41,6 +46,7 @@ import {
   lengthFor,
 } from "../../lib/calendarEdit/createTargets";
 import { newEventSeed, type EditorFields } from "../../lib/calendarEdit/eventDraft";
+import { slotSeed } from "../../lib/calendarEdit/slotSeed";
 import {
   clampDayCount,
   readCursorDay,
@@ -80,6 +86,7 @@ import {
   isPinboardEvent,
   MILESTONE_CALENDAR_ID,
   occurrenceKey,
+  parseLocal,
   PINBOARD_CALENDAR_ID,
   startOfDay,
   startOfWeek,
@@ -97,7 +104,7 @@ import {
   useTheme,
   useUserTime,
 } from "../../theme";
-import { Callout, Skeleton } from "../ui";
+import { Callout, Skeleton, VisuallyHidden } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
 import { CalendarEventPopover, type PopoverEditing } from "./parts/CalendarEventPopover";
 import { whenText } from "./parts/whenText";
@@ -107,7 +114,10 @@ import { EventEditor } from "./edit/EventEditor";
 import { NewEventEditor, type CreateHandover } from "./edit/NewEventEditor";
 import { QuickCreatePopover, type LeftDraft } from "./edit/QuickCreatePopover";
 import { WriteNotices } from "./edit/WriteNotices";
+import { MoveFlow } from "./edit/MoveFlow";
+import { useMoveDrops } from "./edit/useMoveDrops";
 import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
+import { overlayShown, sayAgain, useCalendarGesture } from "./useCalendarGesture";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -496,7 +506,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // A new event being made (#884, C10): its starting fields and calendar, and where: the full editor,
   // or quick create under "+ New event" (`anchor`, the button's rect), which More options turns into
   // the full editor carrying its draft (`handover`), and which opens again on a draft that went with
-  // the tab (`resume`). Null = closed.
+  // the tab (`resume`). From a click or drag on the grid (C17), quick create opens beside the slot
+  // (`beside`), and a dragged range is the user's own time (`timeTouched`). Null = closed.
   const [creating, setCreating] = useState<{
     seed: EditorFields;
     calendarId: string;
@@ -504,6 +515,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     anchor: DOMRect | null;
     handover?: CreateHandover;
     resume?: LeftDraft;
+    beside?: boolean;
+    timeTouched?: boolean;
   } | null>(null);
   // The open surface's way to bring its title into focus: "+ New event" again, or a click on the
   // ghost, focuses it, never replaces it.
@@ -612,6 +625,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const gridRef = useHorizontalWheelShift(
     (dir) => setCursor((c) => addDays(c, dir * swipeDays(windowDays(view, dayCount)))),
     (view === "day" || view === "week") && eventPopup === null && creating === null,
+  );
+  // The same box holds the pointer while an event is dragged (C16b): it isn't keyed, so it outlives
+  // every column a drag passes over.
+  const gridWrapperRef = useRef<HTMLDivElement | null>(null);
+  const setGridWrapper = useCallback(
+    (el: HTMLDivElement | null) => {
+      gridWrapperRef.current = el;
+      gridRef(el);
+    },
+    [gridRef],
   );
 
   // Keyboard nav while the tab is mounted: ← / → step the period, `t` jumps to today, `c` starts a
@@ -723,41 +746,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
   const writes = useEventWrites();
 
-  // What PM may do to a synced event (#884): the row's own block, then its account's editing status.
-  // The list computes `edit_block` assuming editing is on; the overview says whether it is.
-  const editingFor = useCallback(
-    (ev: CalendarEvent): { canEdit: boolean; canDelete: boolean; reason: string | null } => {
-      const none = (reason: string | null) => ({ canEdit: false, canDelete: false, reason });
-      const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
-      const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
-      // Someone else's event says what the user may still do from this copy: reply when it's on
-      // the guest list, which the strip above the line offers, their own settings, and how when
-      // editing is off (C14b, C14c).
-      const theirs = ev.organizer_self === false;
-      if (ev.edit_block === "not_organizer") {
-        return none(notOrganizerText(ev.can_respond === true, on));
-      }
-      if (ev.edit_block) return none(reasonText(ev.edit_block));
-      if (cal?.provider !== "google") return none(null);
-      if (!on) {
-        return none(
-          theirs ? notOrganizerText(ev.can_respond === true, false) : reasonText("editing_off"),
-        );
-      }
-      // The gate decides Delete (C14): a locked copy, whose delete Google doesn't document, and an
-      // invitation can't be deleted. A row the list didn't mark gets none. On an invitation the line
-      // says what stays the organiser's, or Google's warning where they let guests change it.
-      const reason = ev.locked
-        ? reasonText("locked")
-        : theirs
-          ? ev.guests_can_modify
-            ? A11_NOTE
-            : notOrganizerText(ev.can_respond === true, true)
-          : null;
-      return { canEdit: true, canDelete: ev.can_delete === true, reason };
-    },
-    [overview],
-  );
+  // What PM may do to a synced event (#884): the row's own rights, then its account's editing
+  // status (`eventRights`, the one predicate the popover, the dedup and a drag read, C16a).
+  const rights = useCallback((ev: CalendarEvent) => eventRights(ev, overview), [overview]);
 
   const visibleEvents = useMemo(() => {
     // Filter to visible calendars, THEN dedup the same physical OCCURRENCE mirrored on two of them
@@ -765,7 +756,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // grid/agenda. Done after the hide filter so hiding one calendar still shows the copy on the
     // calendar left visible. Keyed on the UID alone this also collapsed every recurring series to one
     // occurrence across the whole mirror — see `occurrenceKey`, which FocusUpcoming shares. The copy
-    // kept is the first, unless a later one ranks higher (`keepRank`): the copy you organise and can
+    // kept is the first, unless a later one ranks higher (`copyRank`): the copy you organise and can
     // change, then any you can change. An invitation can be changed too (your own settings, C14c), so
     // being editable no longer means "yours"; the organiser's copy still wins over it.
     //
@@ -782,8 +773,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         .map(occurrenceKey)
         .filter((k): k is string => k !== null),
     );
-    const keepRank = (e: CalendarEvent) =>
-      editingFor(e).canEdit ? (e.organizer_self === true ? 2 : 1) : 0;
+    const keepRank = (e: CalendarEvent) => copyRank(rights(e), e);
     const at = new Map<string, number>();
     const out: CalendarEvent[] = [];
     const copies: CalendarEvent[] = [];
@@ -791,6 +781,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       if (hidden.has(e.calendar_id) || writes.hiddenIds.has(e.id)) continue;
       const key = occurrenceKey(e);
       if (key !== null && deleting.has(key)) continue;
+      // Another account's copy of an event just moved shows at the old time until that account's
+      // own read catches up: hidden meanwhile, the moved row itself kept (C16b).
+      const twin = key !== null ? writes.twins.get(key) : undefined;
+      if (twin && twin.except !== e.id) continue;
       copies.push(e);
       if (key !== null) {
         const i = at.get(key);
@@ -803,14 +797,30 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       out.push(e);
     }
     const address = new Map(overview?.calendars.map((c) => [c.id, c.remote_id]) ?? []);
-    const marked = markDeclined(out, copies, (id) => address.get(id) ?? null);
+    // A move being asked about, saved, or landed and not yet read back is drawn where it was
+    // dropped. After the dedup: before it, the moved copy's key would change, and the other
+    // account's copy would come back at the old time.
+    const shown = applyPending(
+      markDeclined(out, copies, (id) => address.get(id) ?? null),
+      writes.moves,
+    );
     // Both first-party overlays ride on top, each toggleable like a calendar via the same `hidden` set.
     // Their events carry a null uid + a unique calendar_id, so they skip the dedup and hide filter
     // cleanly.
-    if (!hidden.has(MILESTONE_CALENDAR_ID)) marked.push(...milestoneEvents);
-    if (!hidden.has(PINBOARD_CALENDAR_ID)) marked.push(...pinboardEvents);
-    return marked;
-  }, [events, hidden, milestoneEvents, pinboardEvents, writes.hiddenIds, editingFor, overview]);
+    if (!hidden.has(MILESTONE_CALENDAR_ID)) shown.push(...milestoneEvents);
+    if (!hidden.has(PINBOARD_CALENDAR_ID)) shown.push(...pinboardEvents);
+    return shown;
+  }, [
+    events,
+    hidden,
+    milestoneEvents,
+    pinboardEvents,
+    writes.hiddenIds,
+    writes.twins,
+    writes.moves,
+    rights,
+    overview,
+  ]);
 
   // The new event's ghost (C10c): quick create's draft in its calendar's colour, saying how far it
   // has got, or a saved one's waiting for its row. It joins after the hide filter, so it shows on a
@@ -819,12 +829,36 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // covers the grid.
   const ghost = useMemo(() => {
     if (creating?.mode === "quick") {
-      return quickDraft
-        ? draftEvent(quickDraft.draft, quickDraft.calendarId, quickDraft.state)
-        : null;
+      // Until the box first says what it holds, what it opens on: a slot clicked or dragged on the
+      // grid goes from the drag's outline to the draft with no frame of neither (C17).
+      if (!quickDraft) {
+        return draftEvent(creating.resume?.draft ?? creating.seed, creating.calendarId);
+      }
+      return draftEvent(quickDraft.draft, quickDraft.calendarId, quickDraft.state);
     }
     return landed?.ev ?? null;
-  }, [creating?.mode, quickDraft, landed]);
+  }, [creating, quickDraft, landed]);
+
+  // A date typed in quick create that the view doesn't show: the view goes to it, as Google's does
+  // (C16 critique C2-M9), in Day, Week and Month. Only a change of the draft's day moves it, never
+  // the box opening (a slot clicked on Month's first row, from the month before, stays put).
+  const draftDay = quickDraft
+    ? quickDraft.draft.time.kind === "timed"
+      ? quickDraft.draft.time.start_date
+      : quickDraft.draft.time.first_day
+    : null;
+  const lastDraftDay = useRef<string | null>(null);
+  useEffect(() => {
+    const was = lastDraftDay.current;
+    lastDraftDay.current = draftDay;
+    if (draftDay === null || was === null || draftDay === was) return;
+    if (view !== "day" && view !== "week" && view !== "month") return;
+    const day = parseLocal(draftDay, true);
+    if (!day) return;
+    const { start, end } = visibleRange(view, cursor, dayCount);
+    if (day.getTime() >= start.getTime() && day.getTime() < end.getTime()) return;
+    setCursor(view === "week" ? startOfWeek(day) : day);
+  }, [draftDay, view, cursor, dayCount]);
   const shownEvents = useMemo(
     () => (ghost ? [...visibleEvents, ghost] : visibleEvents),
     [visibleEvents, ghost],
@@ -850,7 +884,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return overview?.accounts.find((a) => a.id === cal?.source_id)?.email ?? null;
   };
   const popoverEditing = (ev: CalendarEvent): PopoverEditing => ({
-    ...editingFor(ev),
+    ...rights(ev),
     onEdit: () => {
       setEventPopup(null);
       setEditing(ev);
@@ -927,6 +961,100 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
   const label = viewLabel(view, cursor, dayCount);
   const isTerminal = system === "terminal";
+
+  // --- dragging an event to move it (#884, C16b) ---
+
+  // The polite live region's words: "Moving …", "Put back.", why it can't move.
+  const [said, setSaid] = useState("");
+  const announce = useCallback((text: string) => setSaid((was) => sayAgain(was, text)), []);
+  // Day, Week and Month drag, on the pixel grid, once a Google account has editing on; Terminal
+  // draws no grid, and Focus's read-only one has no gesture at all.
+  const editingOn = overview ? Object.values(overview.editing).some((s) => s === "on") : false;
+  const interactive =
+    !isTerminal && (view === "day" || view === "week" || view === "month") && editingOn;
+  // Moves being asked about or saved: drawn dashed where they were dropped, and not dragged again
+  // until they land ("Saving…"). One that landed is Google's already and can be.
+  const movingIds = useMemo(
+    () =>
+      new Set([...writes.moves.values()].filter((m) => m.phase !== "landed").map((m) => m.eventId)),
+    [writes.moves],
+  );
+  const capability = useCallback(
+    (ev: CalendarEvent) =>
+      dragCapability(ev, {
+        rights: rights(ev),
+        pending: movingIds.has(ev.id),
+        zoneKnown: deviceTimeZoneOrNull() !== null,
+      }),
+    [rights, movingIds],
+  );
+  const shownById = useMemo(() => new Map(shownEvents.map((e) => [e.id, e])), [shownEvents]);
+
+  // After a drop, focus goes to the moved event's first piece, as it does to an edited one.
+  const focusEvent = useCallback((id: string) => {
+    requestAnimationFrame(() => {
+      const pieces = gridWrapperRef.current?.querySelectorAll<HTMLElement>("[data-event-id]") ?? [];
+      for (const el of pieces) {
+        if (el.dataset.eventId === id && el.tabIndex === 0) {
+          el.focus({ preventScroll: true });
+          return;
+        }
+      }
+    });
+  }, []);
+
+  // A drop: shown at once where it went, sent at once when it asks nothing, else asked about in
+  // `MoveFlow`, one at a time.
+  const drops = useMoveDrops({
+    accountOf,
+    free: () => !isAnyDialogOpen() && !popoverOpenRef.current,
+    focus: focusEvent,
+  });
+  const moveAsk = drops.ask;
+
+  // Where a click or drag on empty space creates (C17): the calendar "+ New event" would start on,
+  // and only with this computer's zone, since the slot is its wall time (C16 critique C1-L17).
+  const createTarget = () => {
+    if (!targets || deviceTimeZoneOrNull() === null) return null;
+    return defaultTarget(targets, readLastCreate());
+  };
+
+  const gesture = useCalendarGesture({
+    wrapper: () => gridWrapperRef.current,
+    surfaceOk: () => interactive,
+    rowById: (id) => shownById.get(id),
+    capability,
+    createIn: () => createTarget()?.calendar.id ?? null,
+    // The details aren't a dialog, nor is any other popover (the add-zone list, the range menu).
+    overlayOpen: () => overlayShown(popoverOpenRef.current),
+    // A new event's: its calendar's account's default length, as "+ New event" gives it.
+    lengthFor: (ev) => {
+      if (!overview) return DEFAULT_LENGTH_MIN;
+      if (!ev) return lengthFor(overview, createTarget()) / 60_000;
+      const cal = overview.calendars.find((c) => c.id === ev.calendar_id);
+      return accountLength(overview, cal?.source_id ?? null) / 60_000;
+    },
+    zone: deviceTimeZoneOrNull,
+    onCommit: drops.drop,
+    // Quick create beside the slot, or under "+ New event" when the slot isn't on screen; the
+    // draft it draws takes over from the drag's outline in the same render.
+    onCreate: ({ timing, drag }, anchor) => {
+      const target = createTarget();
+      const zone = deviceTimeZoneOrNull();
+      if (!target || zone === null) return;
+      const under = anchor ? null : (createButtonRef.current?.getBoundingClientRect() ?? null);
+      setLanded(null);
+      setCreating({
+        seed: slotSeed(timing, new Date(), zone),
+        calendarId: target.calendar.id,
+        mode: anchor || under ? "quick" : "full",
+        anchor: anchor ?? under,
+        beside: anchor !== null,
+        timeTouched: drag,
+      });
+    },
+    announce,
+  });
 
   // "Outside the synced range" hint: fires when the visible window falls before mirror_start or after
   // mirror_end (the mirror is a fixed −1…+13-month band, so paging far enough leaves it). Neutral, not
@@ -1058,6 +1186,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             onFocusDate={onFocusDate}
             now={now}
             onEventClick={onEventClick}
+            interaction={
+              interactive
+                ? {
+                    originId: gesture.originId,
+                    ghost: gesture.ghost,
+                    pendingIds: movingIds,
+                    live: gesture.live,
+                  }
+                : undefined
+            }
           />
         );
       case "year":
@@ -1084,6 +1222,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
             onZonesChange={onZonesChange}
             now={now}
             onEventClick={onEventClick}
+            interaction={
+              interactive
+                ? {
+                    capability,
+                    originId: gesture.originId,
+                    ghost: gesture.ghost,
+                    pendingIds: movingIds,
+                  }
+                : undefined
+            }
           />
         );
     }
@@ -1162,8 +1310,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         // resolved, and the day columns inside it are keyed by date, so a step unmounts the one
         // leaving the window. `useHorizontalWheelShift` owns neither problem from here — it listens on the
         // window and hit-tests this element's box, so it needs only to be told which box (its
-        // header has the two failure modes that shape came from).
-        <div ref={gridRef} className="flex min-h-0 flex-1 flex-col">
+        // header has the two failure modes that shape came from). The drag holds the pointer on it
+        // too (C16b), for the same reason; `data-calendar-grid` is how the pointer-capture probe (LD1,
+        // a devtools snippet) finds it.
+        <div ref={setGridWrapper} className="flex min-h-0 flex-1 flex-col" data-calendar-grid="">
           {/* key restarts the 0.25s fade-up on view switch; under prefers-reduced-motion the
               keyframe name doesn't resolve, so this is a no-op (the motion lives in index.css, not
               JS). The day component of the key (from the minute tick) remounts the body when the
@@ -1263,6 +1413,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           returnFocusTo={createButtonRef}
           focusRef={focusCreateRef}
           resume={creating.resume}
+          placement={creating.beside ? "beside" : "below"}
+          timeTouched={creating.timeTouched}
           onDraft={onQuickDraft}
           onMore={onQuickMore}
           onClose={onQuickClose}
@@ -1284,7 +1436,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       />
       <WriteNotices
         notices={writes.notices}
-        onUndo={(token) => void writes.undoDelete(token)}
+        onUndo={(token, kind) => writes.undo(token, kind)}
         onDismiss={writes.dismissNotice}
         onSettle={(token, action, title) => void writes.settleSplit(token, action, title)}
         onCheckCreate={(id) =>
@@ -1308,6 +1460,36 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         }
         onHold={writes.holdMoveBack}
       />
+      {/* A drop that asks (C16b): which occurrences, or whether to email the guests. Keyed by its
+          flow, so each drop asks afresh. */}
+      {moveAsk && (
+        <MoveFlow
+          key={moveAsk.flow}
+          ask={moveAsk}
+          account={accountOf(moveAsk.drop.event)}
+          announce={announce}
+          onDone={() => {
+            drops.end(moveAsk);
+            focusEvent(moveAsk.drop.event.id);
+          }}
+        />
+      )}
+      {/* Why the event pressed can't be dragged, by the pointer while the button is down. The live
+          region below says the same, so this is hidden from screen readers. Placed by the drag
+          itself as the pointer moves, not by a render. */}
+      {gesture.chip && (
+        <div
+          ref={gesture.chipRef}
+          aria-hidden="true"
+          data-drag-reason=""
+          className="pointer-events-none fixed z-50 max-w-xs rounded-[var(--radius-sm)] border border-[var(--ink4)] bg-panel px-2 py-1 text-xs leading-snug text-ink2 shadow-md"
+        >
+          {gesture.chip}
+        </div>
+      )}
+      <VisuallyHidden role="status" aria-live="polite">
+        {said}
+      </VisuallyHidden>
     </div>
   );
 }

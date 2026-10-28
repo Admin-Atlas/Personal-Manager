@@ -388,6 +388,34 @@ export function deleteNotice(row: CalendarEvent, me: string | null = null): Gues
   };
 }
 
+/** Who moving a mirror row would email (C16a), judged as the backend's `notify_required` judges a
+ *  change of times, which every guest shares: everyone on it but the user and rooms, told of a
+ *  change. On an invitation the organiser lets guests change (C14c), the organiser is one of them;
+ *  one they don't is no move of the user's, so nobody. Null when nobody. The backend counts again on
+ *  Google's copy, and has the last word. */
+export function moveNotice(row: CalendarEvent, me: string | null = null): GuestNotice | null {
+  const mine = row.organizer_self === true;
+  if (!mine && !(row.organizer_self === false && row.guests_can_modify === true)) return null;
+  const list = (row.attendees ?? []).map((a) => ({
+    email: a.email,
+    // The organiser of an event the calendar organises is the calendar itself; someone else's is
+    // a guest Google emails.
+    self: a.self || (mine && a.organizer),
+  }));
+  const told = recipients(list, ownOf([list], me)).size;
+  if (told === 0) return null;
+  return {
+    updated: told,
+    invited: 0,
+    removed: 0,
+    told_cancelled: 0,
+    cancelled: false,
+    people: told,
+    emails: told,
+    complete: true,
+  };
+}
+
 // --- the email question ---
 
 /** What the answer is for: a save, a delete, or a new event. */

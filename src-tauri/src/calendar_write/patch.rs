@@ -23,7 +23,8 @@ use serde_json::{Map, Value};
 
 use super::attendees;
 use super::dto::{
-    ColourDraft, EventPatchDraft, NewEventDraft, RemindersDraft, SeenSummary, TimeDraft, Visibility,
+    ColourDraft, EventPatchDraft, NewEventDraft, RemindersDraft, SeenSummary, SeenTimes, TimeDraft,
+    Visibility,
 };
 use super::time::{self, TimeError};
 use crate::calendar::Reminder;
@@ -89,6 +90,28 @@ pub const CREATABLE: &[&str] = &[
     "guestsCanModify",
     "guestsCanInviteOthers",
     "guestsCanSeeOtherGuests",
+    "reminders",
+    "colorId",
+];
+
+/// What a drop may send (C16a): its start and end, nothing else. A move's body is checked against it
+/// before it goes, failing closed.
+pub const TIMING_KEYS: &[&str] = &["start", "end"];
+
+/// The fields an Undo may put back: the C6 set, the event's core fields, and its notifications and
+/// colour (C16d, Q3 as the C16 critique restated it: C13 gave both an absent value PM can send,
+/// `{"useDefault": true}` and `colorId: null`). A write that sent anything else (guests and what
+/// they may do, how it repeats) is offered no Undo: putting a guest list back would email people
+/// again. Its own list, not [`PATCHABLE`]: nothing becomes undoable by being added there.
+/// `undoable_is_the_core_fields_notifications_and_colour` pins it.
+pub const UNDOABLE: &[&str] = &[
+    "summary",
+    "location",
+    "description",
+    "start",
+    "end",
+    "transparency",
+    "visibility",
     "reminders",
     "colorId",
 ];
@@ -738,6 +761,69 @@ pub fn already_applied(fresh: &Value, body: &Map<String, Value>) -> bool {
             .all(|(key, value)| field_eq(key, Some(value), fresh.get(key.as_str())))
 }
 
+/// The keys of `after` (Google's values of the fields a write sent, as its reply held them) that
+/// `fresh` no longer holds: empty when Google still holds what the write left, so an Undo may go
+/// ahead (C16a). Compared the way Google means each field ([`field_eq`]); a field the write didn't
+/// send never counts (a title edited in Google after a move doesn't stop the move's Undo).
+pub fn still_holds(fresh: &Value, after: &Map<String, Value>) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(key, value)| !field_eq(key, Some(value), fresh.get(key.as_str())))
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// The body that puts back `before` (Google's values of the fields a write sent, from before it;
+/// `null` where it had none) onto `fresh`, Google's copy now (C16a). A start or end goes back as
+/// Google's own node, with every key the node now has that the old one lacked sent as `null` (a
+/// `timeZone` the write added, the other kind's keys after a switch): `events.patch` merges nested
+/// objects, so a key left out would stay. Text that was absent goes back as `""`, as a save clears
+/// it; busy or free and visibility as Google's defaults. Notifications go back as a save sends them
+/// (C16d): the calendar's defaults when there were none of its own, over a list Google holds now as
+/// an empty one; the colour as it was, or `null` (the calendar's) when there was none. `None` for a
+/// field PM doesn't put back, a start or end that was never there, or notifications it can't read.
+pub fn undo_body(fresh: &Value, before: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let mut body = Map::new();
+    for (key, was) in before {
+        let value = match key.as_str() {
+            "start" | "end" => {
+                let was = was.as_object()?;
+                let mut node = was.clone();
+                if let Some(now) = fresh.get(key.as_str()).and_then(Value::as_object) {
+                    for extra in now.keys().filter(|k| !was.contains_key(k.as_str())) {
+                        node.insert(extra.clone(), Value::Null);
+                    }
+                }
+                Value::Object(node)
+            }
+            "summary" | "location" | "description" => {
+                Value::String(was.as_str().unwrap_or("").to_string())
+            }
+            "transparency" => Value::String(was.as_str().unwrap_or("opaque").to_string()),
+            "visibility" => Value::String(was.as_str().unwrap_or("default").to_string()),
+            "reminders" => {
+                let draft = reminders_read(Some(was))?;
+                let mut value = reminders_value(&draft);
+                let held = fresh
+                    .pointer("/reminders/overrides")
+                    .and_then(Value::as_array)
+                    .is_some_and(|list| !list.is_empty());
+                if draft.use_default && held {
+                    value["overrides"] = Value::Array(Vec::new());
+                }
+                value
+            }
+            "colorId" => match was.as_str().filter(|id| !id.is_empty()) {
+                Some(id) => Value::String(id.to_string()),
+                None => Value::Null,
+            },
+            _ => return None,
+        };
+        body.insert(key.clone(), value);
+    }
+    Some(body)
+}
+
 /// Whether `now` holds any field `body` changed from `before` (the copy it went out on), as sent: a
 /// field sent as `before` already had it says nothing either way. Beside [`already_applied`] false,
 /// Google applied the save without keeping all of it (a colour it wouldn't clear beside a new
@@ -757,7 +843,9 @@ pub fn none_applied(before: &Value, now: &Value, body: &Map<String, Value>) -> b
         .all(|key| field_eq(key, before.get(key.as_str()), now.get(key.as_str())))
 }
 
-/// The answer to "may this delete still go ahead?" after Google's copy turned out to be newer.
+/// The answer to "may this still go ahead?" after Google's copy turned out to be newer: a delete
+/// ([`delete_still_matches`]) or a move ([`timing_still_matches`]), neither of which sends the
+/// fields it is checked on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteCheck {
     /// What the user saw is still what's there (only the etag moved, say a reminder): delete it.
@@ -796,6 +884,32 @@ pub fn delete_still_matches(seen: &SeenSummary, fresh: &Value) -> DeleteCheck {
         .map(crate::calendar::mirrored_location);
     if location.as_deref().unwrap_or("") != seen.location.as_deref().unwrap_or("") {
         changed.push("location".to_string());
+    }
+    if changed.is_empty() {
+        DeleteCheck::Matches
+    } else {
+        DeleteCheck::Changed(changed)
+    }
+}
+
+/// Whether the time the user dragged (`seen`) is still Google's (C16a): start, end and kind, in the
+/// mirror's own terms. A title or place changed in Google since is no reason to refuse: a move sends
+/// only its start and end, on the fresh etag. The answer is the delete's (`Matches`: it may go
+/// ahead).
+pub fn timing_still_matches(seen: &SeenTimes, fresh: &Value) -> DeleteCheck {
+    if is_gone(fresh) {
+        return DeleteCheck::Gone;
+    }
+    let Some(now) = crate::calendar::parse_event("", fresh) else {
+        // Not a single event PM could mirror (no start, or a series itself): never moved blind.
+        return DeleteCheck::Changed(vec!["start".into()]);
+    };
+    let mut changed = Vec::new();
+    if now.start != seen.start || now.all_day != seen.all_day {
+        changed.push("start".to_string());
+    }
+    if now.end != seen.end {
+        changed.push("end".to_string());
     }
     if changed.is_empty() {
         DeleteCheck::Matches
@@ -1388,6 +1502,230 @@ mod tests {
             delete_still_matches(&seen_none, &no_location),
             DeleteCheck::Matches
         );
+    }
+
+    // --- moving an event, and putting a move back (C16a) ---
+
+    /// What the user saw of `fresh()`'s time, in the mirror's terms.
+    fn seen_times() -> SeenTimes {
+        SeenTimes {
+            start: "2026-10-12T09:00:00Z".into(),
+            end: Some("2026-10-12T10:00:00Z".into()),
+            all_day: false,
+        }
+    }
+
+    /// R2 for a drop: only its start, end and kind count. A title or place changed in Google is no
+    /// reason to refuse it.
+    #[test]
+    fn timing_still_matches_compares_only_times() {
+        let mut renamed = fresh();
+        renamed["summary"] = "Retro".into();
+        renamed["location"] = "Low St".into();
+        renamed["etag"] = "\"200\"".into();
+        assert_eq!(
+            timing_still_matches(&seen_times(), &renamed),
+            DeleteCheck::Matches
+        );
+        let mut later = fresh();
+        later["start"]["dateTime"] = "2026-10-12T10:30:00+01:00".into();
+        assert_eq!(
+            timing_still_matches(&seen_times(), &later),
+            DeleteCheck::Changed(vec!["start".into()])
+        );
+        let mut longer = fresh();
+        longer["end"]["dateTime"] = "2026-10-12T11:30:00+01:00".into();
+        assert_eq!(
+            timing_still_matches(&seen_times(), &longer),
+            DeleteCheck::Changed(vec!["end".into()])
+        );
+        // All day on the same date: the kind changed.
+        let seen_day = SeenTimes {
+            start: "2026-10-12".into(),
+            end: Some("2026-10-13".into()),
+            all_day: true,
+        };
+        let mut day = fresh();
+        day["start"] = json!({ "date": "2026-10-12" });
+        day["end"] = json!({ "date": "2026-10-13" });
+        assert_eq!(timing_still_matches(&seen_day, &day), DeleteCheck::Matches);
+        let flipped = SeenTimes {
+            all_day: false,
+            ..seen_day
+        };
+        assert_eq!(
+            timing_still_matches(&flipped, &day),
+            DeleteCheck::Changed(vec!["start".into()])
+        );
+        let mut gone = fresh();
+        gone["status"] = "cancelled".into();
+        assert_eq!(
+            timing_still_matches(&seen_times(), &gone),
+            DeleteCheck::Gone
+        );
+        // A series itself (a rule, no start PM can mirror): never moved blind.
+        let mut series = fresh();
+        series["recurrence"] = json!(["RRULE:FREQ=WEEKLY"]);
+        assert_eq!(
+            timing_still_matches(&seen_times(), &series),
+            DeleteCheck::Changed(vec!["start".into()])
+        );
+    }
+
+    /// The fields an Undo puts back are the C6 set, the notifications and the colour (C16d, Q3), and
+    /// nothing else `PATCHABLE` gained since: guests, what they may do, and how it repeats.
+    #[test]
+    fn undoable_is_the_core_fields_notifications_and_colour() {
+        assert_eq!(
+            UNDOABLE,
+            [
+                "summary",
+                "location",
+                "description",
+                "start",
+                "end",
+                "transparency",
+                "visibility",
+                "reminders",
+                "colorId"
+            ]
+        );
+        assert!(UNDOABLE.iter().all(|k| PATCHABLE.contains(k)));
+        for later in [
+            "attendees",
+            "guestsCanModify",
+            "guestsCanInviteOthers",
+            "guestsCanSeeOtherGuests",
+            "recurrence",
+        ] {
+            assert!(!UNDOABLE.contains(&later), "{later}");
+        }
+        assert!(TIMING_KEYS.iter().all(|k| UNDOABLE.contains(k)));
+        assert_eq!(TIMING_KEYS, ["start", "end"]);
+    }
+
+    /// An Undo goes ahead only while Google still holds what the write left: the keys it no longer
+    /// holds, compared the way Google means them; a field the write didn't send never counts.
+    #[test]
+    fn still_holds_names_what_google_changed_since() {
+        let after: Map<String, Value> = [
+            ("start".to_string(), fresh()["start"].clone()),
+            ("end".to_string(), fresh()["end"].clone()),
+        ]
+        .into_iter()
+        .collect();
+        let mut retitled = fresh();
+        retitled["summary"] = "Retro".into();
+        assert!(still_holds(&retitled, &after).is_empty());
+        // The same instant written another way still holds.
+        let mut rewritten = fresh();
+        rewritten["start"]["dateTime"] = "2026-10-12T09:00:00Z".into();
+        assert!(still_holds(&rewritten, &after).is_empty());
+        let mut moved = fresh();
+        moved["end"]["dateTime"] = "2026-10-12T12:00:00+01:00".into();
+        assert_eq!(still_holds(&moved, &after), vec!["end".to_string()]);
+    }
+
+    /// The Undo's body: Google's own nodes from before, with every key the write added since sent as
+    /// null (a zone, the other kind's keys); text that was absent cleared; defaults for busy or free
+    /// and visibility; nothing else.
+    #[test]
+    fn undo_body_puts_googles_exact_nodes_back() {
+        let before: Map<String, Value> = [
+            (
+                "start".to_string(),
+                json!({ "dateTime": "2026-10-12T10:00:00+01:00" }),
+            ),
+            (
+                "end".to_string(),
+                json!({ "dateTime": "2026-10-12T11:00:00+01:00" }),
+            ),
+            ("summary".to_string(), Value::Null),
+            ("transparency".to_string(), Value::Null),
+            ("visibility".to_string(), json!("private")),
+        ]
+        .into_iter()
+        .collect();
+        let body = undo_body(&fresh(), &before).unwrap();
+        assert_eq!(
+            Value::Object(body),
+            json!({
+                "start": { "dateTime": "2026-10-12T10:00:00+01:00", "timeZone": null },
+                "end": { "dateTime": "2026-10-12T11:00:00+01:00", "timeZone": null },
+                "summary": "",
+                "transparency": "opaque",
+                "visibility": "private",
+            })
+        );
+        // Moved to all day, and back: the date goes as null.
+        let mut day = fresh();
+        day["start"] = json!({ "date": "2026-10-12" });
+        day["end"] = json!({ "date": "2026-10-13" });
+        let timed: Map<String, Value> = [
+            ("start".to_string(), fresh()["start"].clone()),
+            ("end".to_string(), fresh()["end"].clone()),
+        ]
+        .into_iter()
+        .collect();
+        let body = undo_body(&day, &timed).unwrap();
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-12T10:00:00+01:00", "timeZone": "Europe/London",
+                    "date": null })
+        );
+        // Nothing PM doesn't put back, and no start that was never there.
+        let guests: Map<String, Value> =
+            [("attendees".to_string(), json!([]))].into_iter().collect();
+        assert!(undo_body(&fresh(), &guests).is_none());
+        let nothing: Map<String, Value> =
+            [("start".to_string(), Value::Null)].into_iter().collect();
+        assert!(undo_body(&fresh(), &nothing).is_none());
+    }
+
+    /// C16d, Q3: notifications and the colour go back as a save sends them. The calendar's defaults
+    /// where there were none of the event's own (over a list Google holds now, an empty one, since a
+    /// PATCH merges the object), a list whole, a colour as it was or `null` for the calendar's; and
+    /// notifications PM can't read put nothing back.
+    #[test]
+    fn undo_body_puts_notifications_and_colour_back() {
+        let one = |key: &str, was: Value| -> Map<String, Value> {
+            [(key.to_string(), was)].into_iter().collect()
+        };
+        let mut listed = fresh();
+        listed["reminders"] =
+            json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 5 }] });
+        listed["colorId"] = json!("5");
+        let undo = |was: Map<String, Value>| Value::Object(undo_body(&listed, &was).unwrap());
+        assert_eq!(
+            undo(one("reminders", Value::Null)),
+            json!({ "reminders": { "useDefault": true, "overrides": [] } })
+        );
+        assert_eq!(
+            undo(one("reminders", json!({ "useDefault": true }))),
+            json!({ "reminders": { "useDefault": true, "overrides": [] } })
+        );
+        // Over Google's defaults, the defaults alone.
+        assert_eq!(
+            Value::Object(undo_body(&fresh(), &one("reminders", Value::Null)).unwrap()),
+            json!({ "reminders": { "useDefault": true } })
+        );
+        let list = json!({ "useDefault": false, "overrides": [
+            { "method": "email", "minutes": 60 }, { "method": "popup", "minutes": 10 }
+        ] });
+        assert_eq!(
+            undo(one("reminders", list.clone())),
+            json!({ "reminders": list })
+        );
+        assert_eq!(
+            undo(one("colorId", json!("11"))),
+            json!({ "colorId": "11" })
+        );
+        assert_eq!(
+            undo(one("colorId", Value::Null)),
+            json!({ "colorId": null })
+        );
+        let unreadable = json!({ "useDefault": false, "overrides": [{ "method": "popup" }] });
+        assert!(undo_body(&listed, &one("reminders", unreadable)).is_none());
     }
 
     // --- creating an event (C10) ---

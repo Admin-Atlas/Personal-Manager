@@ -32,6 +32,11 @@
 // occurrence or all of a repeating one. Google tells the organiser, so nothing is asked first. The
 // reply control says what it came to; an answer that comes after the control has gone, or that
 // isn't a success, is a notice here too.
+//
+// And moving an event (C16a): a drop is shown at its new place while it's asked about and saved,
+// and until a read of the mirror has it (the pending moves, settled by the read mark as deletes
+// are), with another account's copy of it hidden meanwhile. A move of one event, or of one
+// occurrence, comes back with an Undo for a few seconds, which Ctrl+Z presses like a delete's.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
@@ -42,10 +47,12 @@ import {
   getSeriesSummary,
   listHeldDeletes,
   onCalendarDeleteSettled,
+  rescheduleCalendarEvent,
   respondToCalendarEvent,
   seriesChoices,
   setMilestoneEvent,
   settleSeriesSplit,
+  undoCalendarChange,
   updateCalendarEvent,
 } from "../../../lib/ipc";
 import type {
@@ -55,11 +62,14 @@ import type {
   EventPatchDraft,
   GuestNotice,
   MilestoneMove,
+  MoveRequest,
+  MoveTo,
   NewEventDraft,
   Notify,
   Rsvp,
   RsvpScope,
   SeenSummary,
+  SeenTimes,
   SeriesChoices,
   SeriesScope,
   SplitAction,
@@ -72,31 +82,55 @@ import {
   deleteText,
   heldCreateText,
   milestoneStayedText,
+  moveBackText,
   movedBackText,
   movedText,
   moveBackFailedText,
   moveFailedText,
   moveOfferText,
+  moveText,
   replyNoticeText,
   retryAfter,
+  saveBackText,
   savedNotice,
   settleText,
+  undoMoveLabel,
+  undoSaveLabel,
   type CreatedWhere,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import type { Picked } from "../../../lib/calendarEdit/saveChoices";
+import { occurrenceKey } from "../../../lib/calendar-layout";
+import {
+  ghostEvent,
+  prunePending,
+  seenTimesOf,
+  toMoveTo,
+  type PendingMove,
+  type Timing,
+} from "../../../lib/calendarDrag";
 import { writeLastCreate } from "../../../lib/calendarPrefs";
 import { isAnyDialogOpen } from "../../../lib/useDialogLayer";
 import { deviceTimeZoneOrNull } from "../../../theme";
+import { whenText } from "../parts/whenText";
+
+/** What an Undo undoes: a held delete, or a write that landed (a move, C16a, or an editor's save,
+ *  C16d). */
+export type UndoKind = "delete" | "change";
 
 /** A line the calendar shows about a write: what happened, and an Undo while one is offered. */
 export interface WriteNotice {
   id: number;
   tone: Tone;
   text: string;
-  /** While a delete waits: the token that undoes it, and the Undo button's accessible name. */
+  /** While a delete waits, or a move can be undone: the token that undoes it, and the Undo
+   *  button's accessible name. */
   undoToken?: string;
   undoLabel?: string;
+  /** What the Undo undoes; absent is a delete (every notice before C16). */
+  undoKind?: UndoKind;
+  /** The row a change's Undo is about, so a later write of the same row takes it away. */
+  undoRow?: string;
   /** A "this and following" change PM couldn't finish: the token it is settled by, what Google's
    *  state allows now (buttons in SPLIT_ORDER), and the event's title for the result's words. */
   split?: { token: string; offers: SplitAction[]; title: string };
@@ -162,15 +196,39 @@ interface State {
    *  row is hidden while any read has it (Google deleted it; only the mirror lags). */
   removed: ReadonlyMap<string, number | null>;
   notices: readonly WriteNotice[];
-  /** How many deletes have settled. The calendar reads the mirror again on each, since the read
-   *  the backend's landing starts can begin before the webview hears the settle. */
+  /** How many writes have settled (deletes, and moves since C16a). The calendar reads the mirror
+   *  again on each, since the read the backend's landing starts can begin before the webview hears
+   *  the settle. */
   settles: number;
+  /** Moves shown at their new place, by row (C16a): while asked about, while saved, and once landed
+   *  until a read has them (`prunePending`). */
+  moves: ReadonlyMap<string, PendingMove>;
+  /** Another account's copies of a moved event to hide, by occurrence key, until that account's own
+   *  read has caught up: `except` is the moved row itself, and `until` when the hiding ends anyway. */
+  twins: ReadonlyMap<string, Twin>;
+}
+
+/** A moved event's occurrence, hidden on any other row that has it. */
+export interface Twin {
+  except: string;
+  until: number;
 }
 
 /** How long a notice with nothing left to do stays up. Anything else stays until dismissed. */
 const NOTICE_MS = 5000;
 
-let state: State = { held: [], removed: new Map(), notices: [], settles: 0 };
+/** How long a move's other copies stay hidden, or a move Google took that PM's calendar doesn't show
+ *  yet stays drawn at its new time, at most: the backend's recent writes' lifetime. */
+const PENDING_MS = 10 * 60 * 1000;
+
+let state: State = {
+  held: [],
+  removed: new Map(),
+  notices: [],
+  settles: 0,
+  moves: new Map(),
+  twins: new Map(),
+};
 const subscribers = new Set<() => void>();
 let nextNotice = 1;
 let listening = false;
@@ -372,6 +430,7 @@ export async function startDelete(
   asked: GuestNotice | null = null,
 ): Promise<"held" | DeleteReask | "refused"> {
   watchHeldDeletes();
+  stripUndo(event.id);
   const title = quoted(event.summary);
   try {
     // A scope never goes without its token: `Picked` carries both.
@@ -457,24 +516,431 @@ export async function undoDelete(token: string): Promise<void> {
   }
 }
 
-/** The newest Undo on screen: the last notice still offering one. Notices hold the truth, not the
- *  held deletes, so a key never undoes what the user can't see (a notice dismissed with ×, or one
- *  whose window has closed). */
-export function latestUndo(notices: readonly WriteNotice[]): string | null {
+/** The newest Undo on screen: the last notice still offering one, and what it undoes. Notices hold
+ *  the truth, not the held deletes, so a key never undoes what the user can't see (a notice
+ *  dismissed with ×, or one whose window has closed). A milestone's Move back is no Undo. */
+export function latestUndo(
+  notices: readonly WriteNotice[],
+): { token: string; kind: UndoKind } | null {
   for (let i = notices.length - 1; i >= 0; i--) {
-    const token = notices[i].undoToken;
-    if (token) return token;
+    const { undoToken: token, undoKind } = notices[i];
+    if (token) return { token, kind: undoKind ?? "delete" };
   }
   return null;
 }
 
+/** Press an Undo of either kind: a held delete's, or a move's or a save's (C16a, C16d). */
+export function undo(token: string, kind: UndoKind): void {
+  if (kind === "change") void undoChange(token);
+  else void undoDelete(token);
+}
+
 /** Press the newest Undo on screen (Ctrl+Z on the Calendar tab). Whether there was one to press.
- *  `undoDelete` takes its button away at once, so pressing again undoes the next newest. */
+ *  An Undo takes its button away at once, so pressing again undoes the next newest. */
 export function undoLatest(): boolean {
-  const token = latestUndo(state.notices);
-  if (!token) return false;
-  void undoDelete(token);
+  const u = latestUndo(state.notices);
+  if (!u) return false;
+  undo(u.token, u.kind);
   return true;
+}
+
+// --- moving an event (C16a) ---
+
+/** A drop, as the view hands it over: the row as the user saw it, where it was and where it went,
+ *  whether it was a resize, and what the backend is sent, worked out once here so the choices and
+ *  the move send the same values (the choice token binds them): what the user saw of the time, the
+ *  new time, and this computer's zone. */
+export interface Drop {
+  event: CalendarEvent;
+  from: Timing;
+  to: Timing;
+  resize: boolean;
+  seen: SeenTimes;
+  moveTo: MoveTo;
+  zone: string | null;
+}
+
+/** `event` dropped from `from` to `to`, with what the backend is sent worked out now. */
+export function dropOf(event: CalendarEvent, from: Timing, to: Timing, resize: boolean): Drop {
+  return {
+    event,
+    from,
+    to,
+    resize,
+    seen: seenTimesOf(event),
+    moveTo: toMoveTo(to),
+    zone: deviceTimeZoneOrNull(),
+  };
+}
+
+/** What the backend is sent for `drop`. */
+const requestOf = (drop: Drop): MoveRequest => ({
+  event_id: drop.event.id,
+  seen: drop.seen,
+  to: drop.moveTo,
+  device_zone: drop.zone,
+});
+
+/** The flows asking about a drop (its dialogs), by the token `beginMove` gave each: an entry being
+ *  asked about whose flow is gone goes on the next read (C16 critique C1-H2). */
+const flows = new Set<string>();
+let nextFlow = 1;
+
+/** Moves the backend offered an Undo for, by its token: the drop (put back at `from` on Undo) and
+ *  the Send / Don't send it went with, for the words. Kept while the Undo is offered. */
+const undoable = new Map<string, { drop: Drop; sent: Notify | null }>();
+
+/** Editor saves the backend offered an Undo for, by its token: the event's title, for the words
+ *  (C16d). Nothing is drawn while one is put back: the read its landing starts redraws the row. */
+const undoableSaves = new Map<string, string>();
+
+/** `moves` with `eventId`'s entry set to `entry`, or taken out (null). */
+function withMove(eventId: string, entry: PendingMove | null): Map<string, PendingMove> {
+  const moves = new Map(state.moves);
+  if (entry) moves.set(eventId, entry);
+  else moves.delete(eventId);
+  return moves;
+}
+
+/** `twins` with `event`'s occurrence hidden on every other row for {@link PENDING_MS}. An event with
+ *  no occurrence key (no iCal UID) has nothing to hide. */
+function withTwin(event: CalendarEvent): ReadonlyMap<string, Twin> {
+  const key = occurrenceKey(event);
+  if (key === null) return state.twins;
+  const twins = new Map(state.twins);
+  twins.set(key, { except: event.id, until: Date.now() + PENDING_MS });
+  return twins;
+}
+
+/** What a row had before a drop of it began, by row: an earlier move of it that landed (still drawn
+ *  where it went, as a landed move can be dragged again) and what was hidden at the occurrence the
+ *  new drop hides. One drop of a row at a time: one being asked about or saved can't be dragged. */
+const beforeDrop = new Map<
+  string,
+  { entry: PendingMove | null; key: string | null; twin: Twin | null }
+>();
+
+/** `eventId`'s drop taken back, or refused with Google's copy left as it was (`asBefore`): the row
+ *  as it was before the drop began, an earlier landed move and the copy it hid included, so another
+ *  account's copy never shows again at the old time (C16 critique C1-L10); only this drop's own
+ *  hiding goes. Otherwise (Google's copy is another now, or may be) none of it stays. */
+function undrop(eventId: string, asBefore: boolean): Pick<State, "moves" | "twins"> {
+  const before = beforeDrop.get(eventId);
+  beforeDrop.delete(eventId);
+  if (!asBefore || !before) {
+    return { moves: withMove(eventId, null), twins: withoutTwin(eventId) };
+  }
+  let twins = state.twins;
+  const key = before.key;
+  if (key !== null && twins.get(key)?.except === eventId) {
+    const next = new Map(twins);
+    if (before.twin) next.set(key, before.twin);
+    else next.delete(key);
+    twins = next;
+  }
+  return { moves: withMove(eventId, before.entry), twins };
+}
+
+/** `twins` without any `eventId` set. */
+function withoutTwin(eventId: string): ReadonlyMap<string, Twin> {
+  const twins = new Map([...state.twins].filter(([, t]) => t.except !== eventId));
+  return twins.size === state.twins.size ? state.twins : twins;
+}
+
+/** A move's answers that leave Google's copy as the drop found it: nothing reached it. */
+const LEFT_AS_IT_WAS: ReadonlySet<WriteOutcome["outcome"]> = new Set([
+  "no_change",
+  "ignored_by_google",
+  "read_only",
+  "busy",
+  "reauth",
+  "failed",
+]);
+
+/** Take the Undo off any notice about `rowId`: a later write of the row retires it in the backend,
+ *  so pressing it would only say it can't be undone (C16 critique C1-L9). */
+function stripUndo(rowId: string) {
+  for (const n of state.notices) {
+    if (n.undoRow === rowId && n.undoToken) {
+      undoable.delete(n.undoToken);
+      undoableSaves.delete(n.undoToken);
+      put({ id: n.id, tone: n.tone, text: n.text });
+    }
+  }
+}
+
+/** Show `drop` at its new place while it's asked about and saved (the pending look), and hide
+ *  another account's copy of it from now, for every scope (C16 critique C1-L10). The token of the
+ *  flow asking about it: the entry goes on a read once that flow has ended unsent. */
+export function beginMove(drop: Drop): string {
+  const flow = `move-${nextFlow++}`;
+  flows.add(flow);
+  const id = drop.event.id;
+  const key = occurrenceKey(drop.event);
+  const was = state.moves.get(id);
+  beforeDrop.set(id, {
+    entry: was?.phase === "landed" ? was : null,
+    key,
+    twin: key === null ? null : (state.twins.get(key) ?? null),
+  });
+  update({
+    moves: withMove(id, {
+      eventId: id,
+      timing: drop.to,
+      phase: "asking",
+      mark: null,
+      until: null,
+      flow,
+      twinKey: occurrenceKey(drop.event),
+    }),
+    twins: withTwin(drop.event),
+  });
+  return flow;
+}
+
+/** The drop was taken back (Back, Escape, refused): it goes back where it was at once, and its
+ *  other copies show again, unless an earlier move of it still hides them. */
+export function cancelMove(eventId: string) {
+  const entry = state.moves.get(eventId);
+  if (entry?.flow) flows.delete(entry.flow);
+  update(undrop(eventId, true));
+}
+
+/** The choices for moving an occurrence: asked with exactly what the move sends, since the token
+ *  binds it. One ask at a time per drop (StrictMode mounts a dialog's effect twice). */
+export function choicesForMove(drop: Drop): Promise<SeriesChoices> {
+  const request = requestOf(drop);
+  const key = JSON.stringify(["move", request]);
+  const waiting = asking.get(key);
+  if (waiting) return waiting;
+  const answer = seriesChoices({ kind: "move", ...request }).finally(() => {
+    asking.delete(key);
+  });
+  asking.set(key, answer);
+  return answer;
+}
+
+/** Moves on their way, by row and where to: a second call for the same drop (StrictMode's second
+ *  commit) gets the first's answer and sends nothing (C16 critique C1-M3). */
+const sendingMoves = new Map<string, Promise<WriteOutcome>>();
+
+/** Move it: `picked` names the occurrences and the plan chosen (a scope never goes without its
+ *  token), `notify` and `asked` the answer about the guests. The outcome comes back as data, for
+ *  the flow; the notice (with its Undo) is said here, except for `needs_choice`, which the flow
+ *  asks about. */
+export function moveEvent(
+  drop: Drop,
+  picked: Picked | null,
+  notify: Notify | null,
+  asked: GuestNotice | null,
+): Promise<WriteOutcome> {
+  const key = JSON.stringify([drop.event.id, drop.moveTo]);
+  const going = sendingMoves.get(key);
+  if (going) return going;
+  const sent = sendDrop(drop, picked, notify, asked).finally(() => sendingMoves.delete(key));
+  sendingMoves.set(key, sent);
+  return sent;
+}
+
+async function sendDrop(
+  drop: Drop,
+  picked: Picked | null,
+  notify: Notify | null,
+  asked: GuestNotice | null,
+): Promise<WriteOutcome> {
+  const id = drop.event.id;
+  // A write of the row retires its earlier Undo, now it's sent and not before (C16 critique C1-L9:
+  // Back keeps an Undo the backend still holds).
+  stripUndo(id);
+  const entry = state.moves.get(id);
+  const flow = entry?.flow ?? null;
+  update({
+    moves: withMove(id, {
+      eventId: id,
+      timing: drop.to,
+      phase: "saving",
+      mark: null,
+      until: null,
+      flow,
+      twinKey: occurrenceKey(drop.event),
+    }),
+  });
+  let outcome: WriteOutcome;
+  try {
+    outcome = await rescheduleCalendarEvent(
+      requestOf(drop),
+      picked?.scope ?? null,
+      picked?.token ?? null,
+      notify,
+      asked,
+    );
+  } catch (e) {
+    outcome = { outcome: "failed", message: message(e) };
+  }
+  settleMove(drop, picked, notify, flow, outcome);
+  return outcome;
+}
+
+/** Where a move's answer leaves it: landed, its notice (with its Undo) said; asked about again, back
+ *  to its flow; anything else, back where it was, with its words. */
+function settleMove(
+  drop: Drop,
+  picked: Picked | null,
+  notify: Notify | null,
+  flow: string | null,
+  outcome: WriteOutcome,
+) {
+  const id = drop.event.id;
+  const title = drop.event.summary;
+  if (outcome.outcome === "needs_choice") {
+    // The flow asks (C16 critique C1-L8): drawn where it was dropped meanwhile.
+    update({
+      moves: withMove(id, {
+        eventId: id,
+        timing: drop.to,
+        phase: "asking",
+        mark: null,
+        until: null,
+        flow,
+        twinKey: occurrenceKey(drop.event),
+      }),
+    });
+    return;
+  }
+  if (flow) flows.delete(flow);
+  if (outcome.outcome !== "saved") {
+    update(undrop(id, LEFT_AS_IT_WAS.has(outcome.outcome)));
+    if (outcome.outcome === "partial_split") notePartial(title, outcome);
+    else if (outcome.outcome !== "no_change") {
+      put({ id: nextNotice++, ...moveText(outcome, title, "", notify) });
+    }
+    return;
+  }
+  landMove(drop, outcome);
+  const scope = picked?.scope ?? null;
+  if (scope === "following" || scope === "all") {
+    noteSaved(title, outcome, scope, dayOf(drop.from), false, picked?.asAll ?? false);
+    return;
+  }
+  const when = whenText(ghostEvent(drop.event, drop.to));
+  const said = moveText(outcome, title, when, notify);
+  if (!outcome.undo) {
+    put({ id: nextNotice++, ...said });
+    return;
+  }
+  const offer = outcome.undo;
+  undoable.set(offer.undo_token, { drop, sent: notify });
+  const notice: WriteNotice = {
+    id: nextNotice++,
+    ...said,
+    undoToken: offer.undo_token,
+    undoLabel: undoMoveLabel(title, notify),
+    undoKind: "change",
+    undoRow: id,
+  };
+  put(notice);
+  // When the window closes the Undo goes, and with it the words about it; the notice then goes by
+  // itself like any done one.
+  setTimeout(() => {
+    undoable.delete(offer.undo_token);
+    if (state.notices.includes(notice)) {
+      put({ id: notice.id, ...moveText(outcome, title, when, null) });
+    }
+  }, offer.undo_seconds * 1000);
+}
+
+/** A move Google took: drawn at its new time until a read that started after it landed (its mark),
+ *  or, when PM's calendar wasn't refreshed with it, until a read shows the new time or
+ *  {@link PENDING_MS} passes (C16 critique C1-M7). The read the bump starts settles it. Its other
+ *  copies stay hidden meanwhile. */
+function landMove(drop: Drop, outcome: Extract<WriteOutcome, { outcome: "saved" }>) {
+  const id = drop.event.id;
+  // This landing is the row's now: nothing from before its drop is put back.
+  beforeDrop.delete(id);
+  const mark = state.settles + 1;
+  const pending = outcome.warnings.includes("mirror_refresh_pending");
+  update({
+    moves: withMove(id, {
+      eventId: id,
+      timing: drop.to,
+      phase: "landed",
+      mark: pending ? null : mark,
+      until: pending ? Date.now() + PENDING_MS : null,
+      flow: null,
+      twinKey: occurrenceKey(drop.event),
+    }),
+    twins: withTwin(drop.event),
+    settles: mark,
+  });
+}
+
+/** The first day of a timing, `YYYY-MM-DD`. */
+const dayOf = (t: Timing) => (t.kind === "timed" ? t.start.day : t.first);
+
+/** Tokens with a move's Undo on its way, so a second press sends nothing. */
+const undoingChanges = new Set<string>();
+
+/** Put back a move or an editor's save (its Undo button, or Ctrl+Z): the button goes at once, a
+ *  moved event is drawn back where it was while the backend puts it back, and the notice says how
+ *  that went. Busy (a write of the event on its way) leaves the Undo where it was, button and all
+ *  (C16 critique C1-L6). */
+export async function undoChange(token: string): Promise<void> {
+  const shown = state.notices.find((n) => n.undoToken === token);
+  if (!shown || undoingChanges.has(token)) return;
+  undoingChanges.add(token);
+  const kept = undoable.get(token);
+  const savedTitle = undoableSaves.get(token);
+  put({ id: shown.id, tone: shown.tone, text: shown.text });
+  const id = kept?.drop.event.id;
+  // The move's own entry, while no read has it yet: drawn again if nothing is sent.
+  const landed = id === undefined ? undefined : state.moves.get(id);
+  if (kept && id) {
+    update({
+      moves: withMove(id, {
+        eventId: id,
+        timing: kept.drop.from,
+        phase: "saving",
+        mark: null,
+        until: null,
+        flow: null,
+        twinKey: occurrenceKey(kept.drop.event),
+      }),
+    });
+  }
+  let outcome: WriteOutcome;
+  try {
+    outcome = await undoCalendarChange(token);
+  } catch (e) {
+    outcome = { outcome: "failed", message: message(e) };
+  } finally {
+    undoingChanges.delete(token);
+  }
+  if (outcome.outcome === "busy") {
+    // Nothing was sent: it stays where the move put it, drawn there until a read has it, as before.
+    if (id) update({ moves: withMove(id, landed ?? null) });
+    put(shown);
+    return;
+  }
+  undoable.delete(token);
+  undoableSaves.delete(token);
+  if (savedTitle !== undefined) {
+    // A save put back: read the calendar again, as for any write that settled.
+    if (outcome.outcome === "saved") update({ settles: state.settles + 1 });
+    put({ id: shown.id, ...saveBackText(outcome, savedTitle) });
+    return;
+  }
+  const title = kept?.drop.event.summary ?? "";
+  if (kept && id) {
+    if (outcome.outcome === "saved") {
+      // Back where it was; another account's copy, which may have caught up with the move, is
+      // hidden where the move had put it.
+      const moved = ghostEvent(kept.drop.event, kept.drop.to);
+      landMove({ ...kept.drop, event: moved, to: kept.drop.from }, outcome);
+    } else {
+      update({ moves: withMove(id, null) });
+    }
+  }
+  put({ id: shown.id, ...moveBackText(outcome, title) });
 }
 
 /** Open an event for editing: Google's fresh copy, what may change, and the session a save names.
@@ -517,6 +983,7 @@ export function respond(
   note: string | null = null,
   scope: RsvpScope | null = null,
 ): Promise<WriteOutcome> {
+  stripUndo(eventId);
   return respondToCalendarEvent(eventId, reply, note, scope);
 }
 
@@ -541,7 +1008,8 @@ export type SaveAnswer = WriteOutcome & { newPartial?: boolean };
  *  when the save would email guests, and `asked` the numbers the question showed (a repeating
  *  event's token binds them instead). The outcome comes back as data; the editor explains it. A
  *  change PM couldn't finish keeps its notice and buttons here, in the store, so it outlives the
- *  editor and the Calendar tab. */
+ *  editor and the Calendar tab. `rowId`, the row being edited: an Undo still offered for an
+ *  earlier write of it goes, as the backend retires it once this lands (C16 critique C1-L9). */
 export async function saveEdit(
   session: string,
   changes: EventPatchDraft,
@@ -549,7 +1017,9 @@ export async function saveEdit(
   title: string,
   notify: Notify | null = null,
   asked: GuestNotice | null = null,
+  rowId: string | null = null,
 ): Promise<SaveAnswer> {
+  if (rowId !== null) stripUndo(rowId);
   const outcome = await updateCalendarEvent(
     session,
     changes,
@@ -633,7 +1103,9 @@ export function noteSeriesNotice(text: string) {
  *  saved, which have no Undo, so the notice says how to change them back; `from` (YYYY-MM-DD) is
  *  where a "this and following" save starts; `stops`: the save made it "Does not repeat", which
  *  leaves one event; `asAll`: the "this and following" row picked saved every occurrence
- *  (`Picked.asAll`). */
+ *  (`Picked.asAll`). `more`, from an editor: the row it saved and the Send / Don't send it went
+ *  with, so a save the backend offers an Undo for shows it for its seconds (C16d), the words
+ *  saying when an Undo would email the guests again. */
 export function noteSaved(
   summary: string,
   outcome: WriteOutcome,
@@ -641,10 +1113,35 @@ export function noteSaved(
   from?: string,
   stops = false,
   asAll = false,
+  more?: { rowId: string; sent: Notify | null },
 ) {
   if (outcome.outcome !== "saved") return;
-  put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+  const offer = outcome.undo;
+  // Only an editor's save, which names its row, shows an offer.
+  if (!more || !offer) {
+    put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+    offerMoves(outcome);
+    return;
+  }
+  undoableSaves.set(offer.undo_token, summary);
+  const notice: WriteNotice = {
+    id: nextNotice++,
+    ...savedNotice(summary, outcome, scope, from, stops, asAll, { sent: more.sent }),
+    undoToken: offer.undo_token,
+    undoLabel: undoSaveLabel(summary, more.sent),
+    undoKind: "change",
+    undoRow: more.rowId,
+  };
+  put(notice);
   offerMoves(outcome);
+  // When the window closes the Undo goes, and the words say how to change it back again; the
+  // notice then goes by itself like any done one.
+  setTimeout(() => {
+    undoableSaves.delete(offer.undo_token);
+    if (state.notices.includes(notice)) {
+      put({ id: notice.id, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+    }
+  }, offer.undo_seconds * 1000);
 }
 
 // --- how a repeating event repeats, and moving its milestones (C9b-2) ---
@@ -956,14 +1453,27 @@ export function readMark(): number {
 
 /** A fresh read of the mirror, started at `startedAt` (a {@link readMark}): rows it no longer has
  *  needn't be hidden any more, nor a row it has whose delete settled before the read began and
- *  left it in Google. Without a mark, only rows the read no longer has. */
+ *  left it in Google. Without a mark, only rows the read no longer has. The same read settles the
+ *  pending moves it has the truth about (`prunePending`), and lets a moved event's other copies show
+ *  again once no row has its old occurrence, or their time is up (C16a). */
 export function pruneRemoved(events: readonly CalendarEvent[], startedAt = -1) {
-  if (state.removed.size === 0) return;
-  const present = new Set(events.map((e) => e.id));
-  const still = [...state.removed].filter(
-    ([id, mark]) => present.has(id) && (mark === null || mark > startedAt),
-  );
-  if (still.length !== state.removed.size) update({ removed: new Map(still) });
+  const next: Partial<State> = {};
+  if (state.removed.size > 0) {
+    const present = new Set(events.map((e) => e.id));
+    const still = [...state.removed].filter(
+      ([id, mark]) => present.has(id) && (mark === null || mark > startedAt),
+    );
+    if (still.length !== state.removed.size) next.removed = new Map(still);
+  }
+  const now = Date.now();
+  const moves = prunePending(state.moves, events, startedAt, { flows, now });
+  if (moves !== state.moves) next.moves = moves;
+  if (state.twins.size > 0) {
+    const keys = new Set(events.map(occurrenceKey));
+    const twins = [...state.twins].filter(([key, t]) => keys.has(key) && now < t.until);
+    if (twins.length !== state.twins.size) next.twins = new Map(twins);
+  }
+  if (Object.keys(next).length > 0) update(next);
 }
 
 /** The calendar's reads of the mirror, with `read`: each one marked, and only the newest one started
@@ -1104,8 +1614,9 @@ export function useDeleteDialog(openElsewhere: () => boolean) {
   return { asked, ask, close, confirm };
 }
 
-/** The calendar's view of the writes in flight: notices, the rows to hide (held or removed), and
- *  how many deletes have settled (read the mirror again when it changes). */
+/** The calendar's view of the writes in flight: notices, the rows to hide (held or removed), how
+ *  many writes have settled (read the mirror again when it changes), and the moves to draw at their
+ *  new place with the other copies of each to hide (C16a). */
 export function useEventWrites() {
   // On first use (and after a reload): hear how held deletes end, and pick up any still waiting.
   useEffect(watchHeldDeletes, []);
@@ -1118,10 +1629,18 @@ export function useEventWrites() {
     notices: snap.notices,
     hiddenIds,
     settles: snap.settles,
+    moves: snap.moves,
+    twins: snap.twins,
     startDelete,
     respond,
     undoDelete,
+    undoChange,
+    undo,
     undoLatest,
+    beginMove,
+    cancelMove,
+    choicesForMove,
+    moveEvent,
     settleSplit,
     checkCreate,
     noteSeriesNotice,

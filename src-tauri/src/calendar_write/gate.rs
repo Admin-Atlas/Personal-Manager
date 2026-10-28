@@ -138,8 +138,8 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
 
 /// What the list offers on a row (see [`ListRights`]): the one reason it shows when nothing in the
 /// editor may change (`None` when something can), Delete exactly where a delete's own check would
-/// allow it, and the reply. Computed from the mirror's copy, so a formatted description (unknown
-/// there) never blocks it.
+/// allow it, the reply, and a drag where a move's own check would allow one (C16a). Computed from
+/// the mirror's copy, so a formatted description (unknown there) never blocks it.
 pub fn list_rights(facts: &EditFacts) -> ListRights {
     let perms = edit_rights(facts);
     ListRights {
@@ -150,6 +150,7 @@ pub fn list_rights(facts: &EditFacts) -> ListRights {
         },
         can_delete: perms.delete,
         can_respond: perms.respond,
+        can_retime: perms.time,
     }
 }
 
@@ -777,16 +778,19 @@ mod tests {
                     edit_block: Some(BecameRepeating),
                     can_delete: false,
                     can_respond: true,
+                    can_retime: false,
                 },
             "no editor, no Delete, the reply"
         );
-        // Your own event: Delete as the gate allows it, and a reply only with an entry of your own.
+        // Your own event: Delete as the gate allows it, a reply only with an entry of your own, and
+        // a drag (C16a).
         assert!(
             list_rights(&editable())
                 == ListRights {
                     edit_block: None,
                     can_delete: true,
                     can_respond: false,
+                    can_retime: true,
                 }
         );
         let locked = EditFacts {
@@ -800,9 +804,39 @@ mod tests {
                     edit_block: None,
                     can_delete: false,
                     can_respond: true,
+                    can_retime: false,
                 },
-            "a lock keeps the delete closed and the reply open"
+            "a lock keeps the delete and the time closed and the reply open"
         );
+    }
+
+    /// C16 critique C2-M4: the list offers a drag exactly where the gate opens the time, so the view
+    /// never offers one the move refuses: your own event, an invitation whose organiser lets guests
+    /// change it; never a lock, someone else's event without that, or a special type.
+    #[test]
+    fn the_list_offers_a_drag_where_the_gate_opens_the_time() {
+        let modify = EditFacts {
+            guests_can_modify: true,
+            ..invitation()
+        };
+        let special = EditFacts {
+            event_type: Some("birthday"),
+            ..editable()
+        };
+        let locked = EditFacts {
+            locked: true,
+            ..editable()
+        };
+        for (row, facts, retime) in [
+            ("yours", editable(), true),
+            ("modify", modify, true),
+            ("theirs", invitation(), false),
+            ("locked", locked, false),
+            ("special", special, false),
+        ] {
+            assert_eq!(list_rights(&facts).can_retime, retime, "{row}");
+            assert_eq!(edit_rights(&facts).time, retime, "{row}");
+        }
     }
 
     /// C14c's allow-list, field by field (`G`: the organiser lets guests change it). Someone else's
@@ -942,12 +976,15 @@ mod tests {
     /// offers Edit with no reason, never Delete, and the reply.
     #[test]
     fn an_invitation_is_editable_in_the_list() {
-        for facts in [
-            invitation(),
-            EditFacts {
-                guests_can_modify: true,
-                ..invitation()
-            },
+        for (facts, retime) in [
+            (invitation(), false),
+            (
+                EditFacts {
+                    guests_can_modify: true,
+                    ..invitation()
+                },
+                true,
+            ),
         ] {
             assert!(
                 list_rights(&facts)
@@ -955,8 +992,9 @@ mod tests {
                         edit_block: None,
                         can_delete: false,
                         can_respond: true,
+                        can_retime: retime,
                     },
-                "editable, no Delete, the reply"
+                "editable, no Delete, the reply, a drag only where guests may change it"
             );
         }
     }

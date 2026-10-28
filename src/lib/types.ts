@@ -1543,6 +1543,9 @@ export interface CalendarEvent {
    *  organises it (C14). */
   can_delete?: boolean;
   can_respond?: boolean;
+  /** From the unified-view list only, as `can_delete`: whether its start and end may change, the
+   *  backend's own rule, so the calendar never offers a drag the move would refuse (C16a). */
+  can_retime?: boolean;
 }
 
 // --- Calendar editing (#884; mirrors `calendar_write::dto`) ---
@@ -1597,6 +1600,40 @@ export type TimeDraft =
       end_zone: string;
     }
   | { kind: "all_day"; first_day: string; last_day: string };
+
+/** What the user saw of an event's time when they dragged it: the mirror row's start, end and kind,
+ *  exactly as the mirror holds them (a date for an all-day event, else a UTC `…Z` instant). A move
+ *  changes only times, so only times decide whether a version Google changed since may still be
+ *  moved. */
+export interface SeenTimes {
+  start: string;
+  end: string | null;
+  all_day: boolean;
+}
+
+/** Where a drag put an event, in this computer's wall time: dates `YYYY-MM-DD`, times `HH:MM`, and
+ *  `last_day` the last day covered (inclusive), as `TimeDraft` holds them. The backend says it again
+ *  in the event's own zone, so moving an event never changes which zone it is in. */
+export type MoveTo =
+  | { kind: "timed"; start_date: string; start_time: string; end_date: string; end_time: string }
+  | { kind: "all_day"; first_day: string; last_day: string };
+
+/** A drag of one event (C16a): the row (its id), what the user saw of its time, where it went, and
+ *  this computer's zone (null when it can't tell; never a guessed UTC). Its choices are asked with
+ *  the same values the move sends, which the choice token binds. */
+export interface MoveRequest {
+  event_id: string;
+  seen: SeenTimes;
+  to: MoveTo;
+  device_zone: string | null;
+}
+
+/** An Undo the backend offers for a write that just landed: its token (PM's own, never an event's
+ *  id) and for how many seconds (8, as a delete's). */
+export interface UndoOffer {
+  undo_token: string;
+  undo_seconds: number;
+}
 
 /** The fields the user touched. Omitted or null means untouched; `""` clears location/description. */
 export interface EventPatchDraft {
@@ -1869,7 +1906,9 @@ export interface SeriesInfo {
  *  a delete of a mirrored row. */
 export type ChoiceRequest =
   | { kind: "edit"; session: string; draft: EventPatchDraft }
-  | { kind: "delete"; event_id: string; seen: SeenSummary };
+  | { kind: "delete"; event_id: string; seen: SeenSummary }
+  /** A drag of an occurrence (C16a): the same values the move sends. */
+  | ({ kind: "move" } & MoveRequest);
 
 /** What the user should know before choosing a row. Dates are `YYYY-MM-DD` in the series' zone. */
 export type SeriesWarning =
@@ -1998,6 +2037,10 @@ export type WriteOutcome =
       warnings: WriteWarning[];
       left_behind?: string[];
       milestone_moves?: MilestoneMoves;
+      /** Undo for a few seconds: a move or an editor's save of a one-off, or of one occurrence,
+       *  that Google answered and that changed only the core fields, notifications or colour
+       *  (C16a, C16d). Left out otherwise. */
+      undo?: UndoOffer;
     }
   | { outcome: "no_change" }
   /** Something must be chosen first; nothing was sent. `scope`: which occurrences (none was named,

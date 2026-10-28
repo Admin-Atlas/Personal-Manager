@@ -6,13 +6,17 @@
 // The Month view draws the event being made (#884, C10c) as its ghost: a chip, or a band across days,
 // dashed and in its calendar's colour, never greyed as past, named as the new event, beside synced
 // events drawn as ever; never folded into "+N more" on a busy day; and at Minimal depth, a dashed
-// ring among the dots.
+// ring among the dots. On a calendar that drags (C16c) it marks what the drag measures and what a
+// press must never create on, draws the ghost over the days it would land on, and stops snapping
+// while a drag scrolls it; without that, nothing changes.
 
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CalendarEvent } from "../../../lib/types";
 import { DRAFT_EVENT_ID } from "../../../lib/calendar-layout";
+import { ghostEvent } from "../../../lib/calendarDrag";
 import { formatClock } from "../../../lib/format";
+import type { MonthInteraction } from "./MonthView";
 
 let depth = "standard";
 
@@ -66,8 +70,8 @@ const ev = (over: Partial<CalendarEvent>): CalendarEvent => ({
 // are built with the helper the view uses and hold in any locale.
 const clock = (h: number) => formatClock(new Date(2026, 9, 13, h));
 
-function month(events: CalendarEvent[]) {
-  render(
+function month(events: CalendarEvent[], interaction?: MonthInteraction) {
+  const view = (i?: MonthInteraction) => (
     <MonthView
       cursor={new Date(2026, 9, 1)}
       events={events}
@@ -76,9 +80,20 @@ function month(events: CalendarEvent[]) {
       // Every event here is over by now: a synced one greys, the ghost doesn't.
       now={new Date(2026, 9, 20)}
       onEventClick={vi.fn()}
-    />,
+      interaction={i}
+    />
   );
+  const utils = render(view(interaction));
+  return { rerender: (i?: MonthInteraction) => utils.rerender(view(i)) };
 }
+
+const still: MonthInteraction = {
+  originId: null,
+  ghost: null,
+  pendingIds: new Set(),
+  live: false,
+};
+const stream = () => document.querySelector<HTMLElement>(".overflow-y-auto")!;
 
 describe("MonthView", () => {
   it("draws the new event's ghost dashed in its calendar's colour, as a chip or a band", () => {
@@ -193,5 +208,125 @@ describe("MonthView", () => {
     expect(within(plain).getByText("Plain").className).not.toContain("line-through");
     const band = screen.getByRole("button", { name: "Away, declined" });
     expect(within(band).getByText("Away").className).toContain("line-through");
+  });
+});
+
+// #884 C16c: Month on a calendar that drags. Each row's text is checked through the attributes and
+// classes the drag and the eye read, since jsdom lays nothing out.
+describe("MonthView: dragging", () => {
+  const busy = [
+    ev({ id: "a", summary: "One", start: "2026-10-13T08:00:00" }),
+    ev({ id: "b", summary: "Two", start: "2026-10-13T09:00:00" }),
+    ev({ id: "c", summary: "Three", start: "2026-10-13T10:00:00" }),
+    ev({ id: "d", summary: "Four", start: "2026-10-13T11:00:00" }),
+    ev({ id: "w", summary: "Away", start: "2026-10-20", end: "2026-10-23", all_day: true }),
+  ];
+
+  it("without interaction nothing changes: no marks, and the weeks snap", () => {
+    month(busy);
+    expect(
+      document.querySelector("[data-surface], [data-event-id], [data-no-create], [data-day]"),
+    ).toBeNull();
+    expect(stream().className).toContain("snap-y");
+    expect(stream().className).not.toContain("select-none");
+  });
+
+  it("marks the weeks, each day, and each chip and band with its event", () => {
+    month(busy, still);
+    const s = stream();
+    expect(s.dataset.surface).toBe("month");
+    // 20 months before October 2026, from its Monday; a sixth of the 600 px pane a week.
+    expect(s.dataset.gridStart).toBe("2025-01-27");
+    expect(s.dataset.weekH).toBe("100");
+    // One row a week, and the drag knows how many.
+    expect(Number(s.dataset.weeks)).toBe(s.children.length);
+    expect(s.children.length).toBeGreaterThan(170);
+    expect(s.className).toContain("select-none");
+    expect(document.querySelector("[data-day='2026-10-13']")).not.toBeNull();
+    const chip = screen.getByRole("button", { name: `${clock(8)}, One` });
+    expect(chip.dataset.eventId).toBe("a");
+    const band = screen.getByRole("button", { name: "Away" });
+    expect(band.dataset.eventId).toBe("w");
+  });
+
+  it("day numbers, month names, more and the counts never create", () => {
+    const marked = () =>
+      [...document.querySelectorAll<HTMLElement>("[data-no-create]")].map((el) => el.textContent);
+    const inCell = (day: string) =>
+      [...document.querySelectorAll<HTMLElement>(`[data-day='${day}'] [data-no-create]`)].map(
+        (el) => el.textContent,
+      );
+    month(busy, still);
+    expect(inCell("2026-10-13")).toEqual(["13", "+1 more"]);
+    const first = new Date(2026, 9, 1).toLocaleDateString(undefined, { month: "short" });
+    expect(inCell("2026-10-01")).toEqual([first, "1"]);
+    cleanup();
+    for (const [d, count] of [
+      ["power", "4"],
+      ["min", "+1"],
+    ] as const) {
+      depth = d;
+      try {
+        month(
+          d === "min"
+            ? [8, 9, 10, 11, 12, 13].map((h) =>
+                ev({ id: `s${h}`, start: `2026-10-13T${String(h).padStart(2, "0")}:00:00` }),
+              )
+            : busy,
+          still,
+        );
+        expect(inCell("2026-10-13")).toContain(count);
+        expect(marked().length).toBeGreaterThan(0);
+      } finally {
+        depth = "standard";
+        cleanup();
+      }
+    }
+  });
+
+  it("a live drag turns snapping off, and it comes back after", () => {
+    const { rerender } = month(busy, still);
+    expect(stream().className).toContain("snap-y");
+    rerender({ ...still, live: true });
+    expect(stream().className).toContain("snap-none");
+    expect(stream().className).not.toContain("snap-y");
+    rerender(still);
+    expect(stream().className).toContain("snap-y");
+    expect(stream().className).not.toContain("snap-none");
+  });
+
+  it("draws the ghost over the days it would land on, in each week it touches", () => {
+    const away = busy[4];
+    // Moved to Saturday 17-10 to Tuesday 20-10: two days in each of two weeks.
+    const event = ghostEvent(away, { kind: "all_day", first: "2026-10-17", last: "2026-10-20" });
+    month(busy, {
+      ...still,
+      live: true,
+      originId: away.id,
+      ghost: { event, kind: "move", invalid: null, label: "17-10 – 20-10" },
+    });
+    const ghosts = [...document.querySelectorAll<HTMLElement>("[data-drag-ghost]")];
+    expect(ghosts).toHaveLength(2);
+    expect(ghosts.map((g) => [parseFloat(g.style.left), parseFloat(g.style.width)])).toEqual([
+      [(5 / 7) * 100, (2 / 7) * 100],
+      [0, (2 / 7) * 100],
+    ]);
+    expect(ghosts[0].getAttribute("aria-hidden")).toBe("true");
+    expect(ghosts[0].textContent).toBe("Away · 17-10 – 20-10");
+  });
+
+  it("the dragged event dims where it was, and one being saved is dashed", () => {
+    month(busy, { ...still, live: true, originId: "a", pendingIds: new Set(["w"]) });
+    const dragged = screen.getByRole("button", { name: `${clock(8)}, One` });
+    expect(dragged.className).toContain("opacity-40");
+    expect(dragged.className).not.toContain("opacity-60");
+    const saving = screen.getByRole("button", { name: "Away" });
+    expect(saving.className).toContain("opacity-70");
+    expect(saving.className).toContain("outline-dashed");
+    expect(saving.className).not.toContain("opacity-60");
+    // Everything else as ever: past, so greyed.
+    expect(screen.getByRole("button", { name: `${clock(9)}, Two` }).className).toContain(
+      "opacity-60",
+    );
   });
 });

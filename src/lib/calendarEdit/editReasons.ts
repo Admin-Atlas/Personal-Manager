@@ -8,8 +8,11 @@
 import type { Tone as CalloutTone } from "../../components/ui/tone";
 import { formatDateOnly } from "../format";
 import type {
+  CalendarEvent,
+  CalendarOverview,
   EditLoad,
   MilestoneMove,
+  Notify,
   ReadOnlyReason,
   Rsvp,
   RsvpScope,
@@ -94,6 +97,71 @@ export function notOrganizerText(canReply: boolean, editingOn: boolean): string 
     return `${NOT_ORGANISER} Turn on editing for this account to ${what} from PM.`;
   }
   return `${THEIRS} ${ownSettings(canReply)}`;
+}
+
+/** What PM may do to a synced event from the calendar view (#884): Edit, Delete and a drag (C16a),
+ *  and the line that says what it can't, or why it is someone else's. */
+export interface EventRights {
+  canEdit: boolean;
+  canDelete: boolean;
+  /** Its start and end may change (a drag, a resize). */
+  canRetime: boolean;
+  reason: string | null;
+}
+
+/** An event's rights in the calendar view, from the row's own (the list's `edit_block`,
+ *  `can_delete` and `can_retime`, each the gate's answer assuming editing is on) and its account's
+ *  editing status in `overview`. One predicate for the popover's Edit and Delete, the dedup and a
+ *  drag (C16a), so none offers what the others refuse; the backend checks again on Google's copy at
+ *  every write. */
+export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null): EventRights {
+  const none = (reason: string | null): EventRights => ({
+    canEdit: false,
+    canDelete: false,
+    canRetime: false,
+    reason,
+  });
+  const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
+  const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
+  // Someone else's event says what the user may still do from this copy: reply when it's on the
+  // guest list, which the strip above the line offers, their own settings, and how when editing is
+  // off (C14b, C14c).
+  const theirs = ev.organizer_self === false;
+  if (ev.edit_block === "not_organizer") {
+    return none(notOrganizerText(ev.can_respond === true, on));
+  }
+  if (ev.edit_block) return none(reasonText(ev.edit_block));
+  if (cal?.provider !== "google") return none(null);
+  if (!on) {
+    return none(
+      theirs ? notOrganizerText(ev.can_respond === true, false) : reasonText("editing_off"),
+    );
+  }
+  // The gate decides Delete (C14) and a drag (C16 critique C2-M4): a locked copy, whose delete Google
+  // doesn't document and whose times it refuses, and an invitation can't be deleted, nor dragged
+  // unless the organiser lets guests change it. A row the list didn't mark gets neither. On an
+  // invitation the line says what stays the organiser's, or Google's warning where they let guests
+  // change it.
+  const reason = ev.locked
+    ? reasonText("locked")
+    : theirs
+      ? ev.guests_can_modify
+        ? A11_NOTE
+        : notOrganizerText(ev.can_respond === true, true)
+      : null;
+  return {
+    canEdit: true,
+    canDelete: ev.can_delete === true,
+    canRetime: ev.can_retime === true,
+    reason,
+  };
+}
+
+/** The calendar's dedup rank for one copy of an occurrence two accounts both show (C14 §9.5): the
+ *  copy the user organises and can change 2, any other they can change 1, else 0. */
+export function copyRank(rights: EventRights, ev: CalendarEvent): number {
+  if (!rights.canEdit) return 0;
+  return ev.organizer_self === true ? 2 : 1;
 }
 
 /** Under the Repeat row of an event someone else organises: how it repeats stays theirs, whatever
@@ -699,8 +767,12 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
 }
 
 /** A save that landed, said once the editor has closed. `scope` names the occurrences of a
- *  repeating event it was for: there's no Undo after one (DECISIONS 17-10 #4), so the notice says
- *  how to change it back, and for "this and following", which makes an event of its own from `from`
+ *  repeating event it was for. A save of one event or of "This event" that the backend offers an
+ *  Undo for (C16d) says so through `undo`, the Send / Don't send it went with: the Undo button says
+ *  how to change it back, and where the save emailed guests the words say an Undo emails them again.
+ *  Without one (a save that changed guests or how it repeats, or one of several occurrences, which
+ *  never has one, DECISIONS 17-10 #4), the notice says how to change it back, and for "this and
+ *  following", which makes an event of its own from `from`
  *  (YYYY-MM-DD), that editing again won't join it back (C9b-1 critique 2 H2). `stops`: "Does not
  *  repeat" was saved, so one event is left, never a repeating one nor every occurrence (C11c review,
  *  C11d review 1). `asAll`: the "this and following" row was the first occurrence's, which saves
@@ -716,6 +788,7 @@ export function savedNotice(
   from?: string,
   stops = false,
   asAll = false,
+  undo: { sent: Notify | null } | null = null,
 ): { tone: Tone; text: string } {
   const t = quote(title);
   // A new event or a one-off made to repeat whose occurrences all fall outside the months PM syncs
@@ -724,6 +797,8 @@ export function savedNotice(
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const day = from ? formatDateOnly(from) : null;
   const saved: SeriesScope | null = asAll && scope === "following" ? "all" : scope;
+  // The Undo on offer says how to change it back (C16d); only one or "This event" has one.
+  const undoing = undo !== null && (saved === null || saved === "this");
   let first: string;
   let back: string | null;
   switch (saved) {
@@ -733,7 +808,7 @@ export function savedNotice(
       break;
     case "this":
       first = `Saved ${t} for this occurrence.`;
-      back = "To change it back, edit it again.";
+      back = undoing ? null : "To change it back, edit it again.";
       break;
     case "following": {
       // Like the choices' own line: a separate event from the part before it.
@@ -768,7 +843,64 @@ export function savedNotice(
   const parts = [first, ...said.words];
   // With occurrences left on the earlier part, changing it back isn't the whole story.
   if (back && !outcome.warnings.includes("left_on_old_series")) parts.push(back);
+  if (undoing && emailsGuests(undo?.sent ?? null)) {
+    parts.push("Guests will get a second email if you undo.");
+  }
   return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
+}
+
+/** The Undo button's name after an editor's save (C16d): what it undoes, and that the guests get a
+ *  second email where the save emailed them. */
+export function undoSaveLabel(title: string, sent: Notify | null): string {
+  return `Undo saving ${quote(title)}${emailsGuests(sent) ? " (guests get a second email)" : ""}`;
+}
+
+/** What undoing an editor's save of the event called `title` came to (C16d): `moveBackText`'s
+ *  answers, in a save's words. */
+export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone; text: string } {
+  const t = quote(title);
+  const notBack = (why: string, tone: Tone = "error") => ({
+    tone,
+    text: `Couldn't undo the save of ${t}. ${why}`,
+  });
+  switch (outcome.outcome) {
+    case "saved":
+      return {
+        tone: "ok",
+        text: outcome.warnings.includes("mirror_refresh_pending")
+          ? `Put ${t} back in Google. ${writeWarningText("mirror_refresh_pending", "save")}`
+          : `Put ${t} back as it was.`,
+      };
+    case "no_change":
+      return { tone: "ok", text: `${t} is already as it was.` };
+    case "conflict":
+      return { tone: "warn", text: `${t} changed in Google since, so PM didn't undo the save.` };
+    case "gone":
+      return { tone: "warn", text: `${t} isn't in Google any more.` };
+    case "busy":
+      return notBack("PM is still changing it. Wait a moment, then press Undo again.", "warn");
+    case "read_only":
+      return notBack(reasonText(outcome.reason));
+    case "reauth":
+      return notBack(REAUTH);
+    case "unconfirmed":
+    case "ambiguous":
+      return {
+        tone: "warn",
+        text: `PM lost touch with Google and can't tell whether ${t} was put back. It will show Google's version after the next refresh.`,
+      };
+    case "ignored_by_google":
+      return notBack("Google answered as if it did, but kept it as it was.", "warn");
+    // Never an Undo's answer: it names the very event it changed, and refuses a change of guests.
+    case "needs_choice":
+    case "partial_split":
+    case "split_removed":
+      return notBack("Edit it again instead.", "warn");
+    case "failed":
+      return notBack(outcome.message);
+    default:
+      return unreachable(outcome);
+  }
 }
 
 /** A saved outcome's warnings in words, in one order for every notice that says a save landed
@@ -793,6 +925,166 @@ function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
   if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
   return { words, warn: partly || outside || left };
 }
+
+// --- moving an event (C16a) ---
+
+/** Whether a write's Send / Don't send emails guests, so an Undo of it would email them again: Send
+ *  to everyone, or to those outside Google Calendar (C16 critique C2-L18). */
+export function emailsGuests(sent: Notify | null): boolean {
+  return sent === "all" || sent === "external_only";
+}
+
+/** `whenText`'s line mid-sentence: "all day" in lower case (C16 critique C2-L18). */
+const midSentence = (when: string) => when.replace(/^All day/, "all day");
+
+/** What a move of the event called `title` came to, as a notice: `when` is where it is now
+ *  (`whenText` of the moved row) and `sent` the Send / Don't send it went with, so the words say
+ *  when an Undo would email the guests again. A move of several occurrences that lands has
+ *  `savedNotice`'s words instead; `needs_choice` is asked, not said, and `no_change` says nothing
+ *  (the event is already there). */
+export function moveText(
+  outcome: WriteOutcome,
+  title: string,
+  when: string,
+  sent: Notify | null,
+): { tone: Tone; text: string } {
+  const t = quote(title);
+  const notMoved = (why: string, tone: Tone = "error") => ({
+    tone,
+    text: `${t} wasn't moved. ${why}`,
+  });
+  const lost = {
+    tone: "warn" as Tone,
+    text: `PM lost touch with Google and can't tell whether ${t} moved. It will show Google's version after the next refresh.`,
+  };
+  switch (outcome.outcome) {
+    case "saved": {
+      // Google didn't keep all of it (a start without its end): saved, and worth a look.
+      if (outcome.warnings.includes("partly_applied")) {
+        return {
+          tone: "warn",
+          text: `Moved ${t} in Google. ${writeWarningText("partly_applied", "save")}`,
+        };
+      }
+      if (outcome.warnings.includes("mirror_refresh_pending")) {
+        return {
+          tone: "ok",
+          text: `Moved ${t} in Google. ${writeWarningText("mirror_refresh_pending", "save")}`,
+        };
+      }
+      const again =
+        outcome.undo && emailsGuests(sent) ? " Guests will get a second email if you undo." : "";
+      return { tone: "ok", text: `${t} is now ${midSentence(when)}.${again}` };
+    }
+    case "no_change":
+      return { tone: "ok", text: `${t} is already there.` };
+    case "needs_choice":
+      return notMoved("PM needs to ask about it first. Drag it again.", "warn");
+    case "conflict":
+      return {
+        tone: "warn",
+        text: `${t} changed in Google since PM last showed it, so it wasn't moved. PM now shows Google's version.`,
+      };
+    case "gone":
+      return { tone: "warn", text: `${t} isn't in Google any more.` };
+    // PM's own write to it on its way, or Google rate-limiting: either way, a moment.
+    case "busy":
+      return {
+        tone: "warn",
+        text: `PM is already changing ${t}, or Google is busy. Wait a moment, then try again.`,
+      };
+    case "read_only":
+      return notMoved(reasonText(outcome.reason));
+    case "reauth":
+      return notMoved(REAUTH);
+    case "unconfirmed":
+    case "ambiguous":
+      return lost;
+    case "ignored_by_google":
+      return notMoved("Google answered as if it moved it, but kept it where it was.", "warn");
+    case "partial_split":
+      return { tone: "warn", text: partialText(outcome.offers, outcome.from, outcome.emails) };
+    case "split_removed":
+      return notMoved("PM removed the new part of an earlier change instead.", "warn");
+    case "failed":
+      return notMoved(outcome.message);
+    default:
+      return unreachable(outcome);
+  }
+}
+
+/** The Undo button's name after a move: what it undoes, and that the guests get a second email
+ *  where the move emailed them. */
+export function undoMoveLabel(title: string, sent: Notify | null): string {
+  return `Undo moving ${quote(title)}${emailsGuests(sent) ? " (guests get a second email)" : ""}`;
+}
+
+/** What putting a move of the event called `title` back came to. */
+export function moveBackText(outcome: WriteOutcome, title: string): { tone: Tone; text: string } {
+  const t = quote(title);
+  const notBack = (why: string, tone: Tone = "error") => ({
+    tone,
+    text: `Couldn't move ${t} back. ${why}`,
+  });
+  switch (outcome.outcome) {
+    case "saved":
+      return {
+        tone: "ok",
+        text: outcome.warnings.includes("mirror_refresh_pending")
+          ? `Moved ${t} back in Google. ${writeWarningText("mirror_refresh_pending", "save")}`
+          : `Moved ${t} back.`,
+      };
+    case "no_change":
+      return { tone: "ok", text: `${t} is already back where it was.` };
+    case "conflict":
+      return { tone: "warn", text: `${t} changed in Google since, so it wasn't moved back.` };
+    case "gone":
+      return { tone: "warn", text: `${t} isn't in Google any more.` };
+    case "busy":
+      return notBack("PM is still changing it. Wait a moment, then press Undo again.", "warn");
+    case "read_only":
+      return notBack(reasonText(outcome.reason));
+    case "reauth":
+      return notBack(REAUTH);
+    case "unconfirmed":
+    case "ambiguous":
+      return {
+        tone: "warn",
+        text: `PM lost touch with Google and can't tell whether ${t} moved back. It will show Google's version after the next refresh.`,
+      };
+    case "ignored_by_google":
+      return notBack("Google answered as if it did, but kept it where it was.", "warn");
+    // Never an Undo's answer: it names the very event it moved, and refuses a change of guests.
+    case "needs_choice":
+    case "partial_split":
+    case "split_removed":
+      return notBack("Drag it back, or change it in Edit.", "warn");
+    case "failed":
+      return notBack(outcome.message);
+    default:
+      return unreachable(outcome);
+  }
+}
+
+/** A drop asked about again and still not settled (the plan or the guests changed in Google while
+ *  the user answered), or one whose question can't be asked now: put back, and the user drags it
+ *  again then (C16b, as a delete says "delete it again"). */
+export function moveChangedText(title: string): { tone: Tone; text: string } {
+  return {
+    tone: "warn",
+    text: `${quote(title)} changed in Google while you were choosing, so it wasn't moved. Drag it again.`,
+  };
+}
+
+/** Above the email question after a drop, when Google's copy has guests PM's calendar didn't show:
+ *  the drag asked nothing, since the event looked as if it had none (C16b). */
+export const MOVE_NEW_GUESTS =
+  "This event has guests in Google that PM's calendar didn't show yet.";
+
+/** Above the email question after a drop, asked again because Google's numbers differ from those
+ *  the user answered: the editor's line, for a move. */
+export const MOVE_CHECKED =
+  "PM checked with Google before moving it, and these are the numbers it found.";
 
 // --- creating an event (C10) ---
 

@@ -24,8 +24,9 @@ import type {
   Milestone,
   WriteOutcome,
 } from "../../lib/types";
-import { dayKey, startOfDay } from "../../lib/calendar-layout";
+import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-layout";
 import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
+import { formatDateLocal, pad2 } from "../../lib/format";
 
 const ipc = vi.hoisted(() => ({
   calendarOverview: vi.fn(),
@@ -257,7 +258,119 @@ function quickCreate(summary: string) {
   fireEvent.change(title(), { target: { value: summary } });
 }
 
+// C16a: the box the drag gesture will hold the pointer in (C16b), which the LD1 probe finds by its
+// attribute: the swipe's own box, holding the event the view draws.
+describe("CalendarView: the grid's box", () => {
+  it("marks the swipe's box, around the events, for the drag and its probe", async () => {
+    await mount();
+    const grids = document.querySelectorAll("[data-calendar-grid]");
+    expect(grids).toHaveLength(1);
+    expect(grids[0].contains(screen.getByRole("button", { name: /Standup/ }))).toBe(true);
+  });
+});
+
+// C16b: Day and Week drag once a Google account has editing on. A drop is drawn where it went at once
+// (dashed, and not dragged again until Google has it), and another account's copy of the event hides
+// until that account's own read catches up, so it never shows at the old time meanwhile.
+describe("CalendarView: dragging in Week", () => {
+  const cards = (id: string) =>
+    document.querySelectorAll<HTMLElement>(`[data-time-body] [data-event-id="${id}"]`);
+  // Yours, and the list says its time can change.
+  const movable = row({ can_retime: true });
+
+  it("marks the grid for the drag only where events can be dragged", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    rows = [movable];
+    const first = await mount();
+    expect(document.querySelector("[data-time-body]")).not.toBeNull();
+    // A half-hour card at the unmeasured row height has room for its bottom edge only.
+    expect(cards("e1")[0].querySelector('[data-edge="end"]')).not.toBeNull();
+    first.unmount();
+    // Editing off: the same Week, drawn as it always was.
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    await mount();
+    expect(screen.getByRole("button", { name: /Standup/ })).toBeTruthy();
+    expect(document.querySelector("[data-time-body], [data-event-id]")).toBeNull();
+  });
+
+  it("a drop shows where it went at once, and hides another account's copy meanwhile", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    const copy = row({ id: "e2", calendar_id: WORK_CAL });
+    rows = [movable, copy];
+    await mount();
+    // One occurrence, two copies: one drawn.
+    expect(cards("e1")).toHaveLength(1);
+    expect(cards("e2")).toHaveLength(0);
+    expect(cards("e1")[0].querySelector('[data-edge="end"]')).not.toBeNull();
+    const top = parseFloat(cards("e1")[0].style.top);
+    const writes = await import("./edit/useEventWrites");
+    const from = {
+      kind: "timed" as const,
+      start: { day: today, min: 420 },
+      end: { day: today, min: 450 },
+    };
+    const to = {
+      kind: "timed" as const,
+      start: { day: today, min: 540 },
+      end: { day: today, min: 570 },
+    };
+    act(() => void writes.beginMove(writes.dropOf(movable, from, to, false)));
+    const moved = cards("e1")[0];
+    expect(parseFloat(moved.style.top)).toBeGreaterThan(top);
+    expect(moved.className).toContain("opacity-70");
+    // "Saving…": no edge to take until it lands.
+    expect(moved.querySelectorAll("[data-edge]")).toHaveLength(0);
+    // Google has the move on this account; the other account's copy is still at the old time.
+    rows = [{ ...movable, start: `${today}T09:00:00`, end: `${today}T09:30:00` }, copy];
+    await act(async () => writeLanded());
+    expect(cards("e1")).toHaveLength(1);
+    expect(cards("e2")).toHaveLength(0);
+  });
+
+  // C16c: Month drags on the same terms.
+  // jsdom lays out no weeks, so the stream is looked at, not the events in it.
+  it("marks Month's weeks for the drag only where events can be dragged", async () => {
+    localStorage.setItem("pm.calendar.view", "month");
+    rows = [movable];
+    const { CalendarView } = await import("./CalendarView");
+    const first = render(<CalendarView />);
+    await screen.findByRole("button", { name: "+ New event" });
+    await act(async () => {});
+    expect(document.querySelector('[data-surface="month"]')).not.toBeNull();
+    first.unmount();
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    render(<CalendarView />);
+    await act(async () => {});
+    await act(async () => {});
+    expect(document.querySelector("[data-calendar-grid] .overflow-y-auto")).not.toBeNull();
+    expect(document.querySelector("[data-surface]")).toBeNull();
+  });
+});
+
 describe("CalendarView: a new event", () => {
+  // C16 critique C2-M9: a date typed in quick create that the view doesn't show moves the view to
+  // it, as Google's does; the box opening on a day already shown moves nothing.
+  it("a date typed in quick create off screen moves the week to it", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    await mount();
+    const week = (d: Date) => `${formatDateLocal(d)} – ${formatDateLocal(addDays(d, 6))}`;
+    const now = startOfWeek(new Date());
+    quickCreate("Dentist");
+    expect(screen.getByText(week(now))).toBeTruthy();
+    const later = addDays(now, 21);
+    const date = within(quick()).getByLabelText<HTMLInputElement>("Date");
+    date.focus();
+    fireEvent.change(date, {
+      target: {
+        value: `${pad2(later.getDate())}-${pad2(later.getMonth() + 1)}-${later.getFullYear()}`,
+      },
+    });
+    fireEvent.blur(date);
+    await act(async () => {});
+    expect(screen.getByText(week(later))).toBeTruthy();
+    expect(quick()).toBeTruthy();
+  });
+
   it("Shift+C opens quick create, non-modal, under + New event; c the full editor", async () => {
     await mount();
     press("C", true);

@@ -43,6 +43,8 @@ export const WEB_ROOT = "src";
 export const WRITE_COMMANDS = [
   ["get_calendar_event_for_edit", "getCalendarEventForEdit"],
   ["update_calendar_event", "updateCalendarEvent"],
+  ["reschedule_calendar_event", "rescheduleCalendarEvent"],
+  ["undo_calendar_change", "undoCalendarChange"],
   ["respond_to_calendar_event", "respondToCalendarEvent"],
   ["create_calendar_event", "createCalendarEvent"],
   ["delete_calendar_event", "deleteCalendarEvent"],

@@ -4,8 +4,8 @@
 // Guests in the editor (#884, C12). Two tables here are the backend's too, row for row
 // (`calendar_write::attendees`): the address check (`an_address_is_checked_as_the_editor_checks_it`)
 // and who a save would email (`notify_required_table`, N1-N15; `a_delete_tells_every_guest_but_you_
-// and_rooms`, D1-D5). A row added to one is added to the other, so the editor asks first exactly
-// when the backend would refuse to send unasked.
+// and_rooms`, D1-D5; `notify_required_for_a_move_table`, M1-M5). A row added to one is added to the
+// other, so the editor asks first exactly when the backend would refuse to send unasked.
 
 import { describe, expect, it } from "vitest";
 
@@ -21,6 +21,7 @@ import {
   isEmail,
   isRoomAddress,
   matchSuggestions,
+  moveNotice,
   notifyOf,
   notifyQuestion,
   REPLY_GLYPH,
@@ -470,6 +471,51 @@ describe("who a delete would tell (the backend's D1-D5, from the calendar's row)
   it("counts the organiser of an event the calendar organises as the user, marked or not", () => {
     const team = { ...who("team@group.x.org"), organizer: true };
     expect(deleteNotice(row([team, who("A@x.org")]))).toEqual(cancelled(1));
+  });
+});
+
+describe("who a move would email (the backend's M1-M5, from the calendar's row)", () => {
+  const who = (email: string, self = false, organizer = self): Attendee => ({
+    email,
+    name: null,
+    response: null,
+    optional: false,
+    organizer,
+    self,
+  });
+  const row = (attendees: Attendee[], over: Partial<CalendarEvent> = {}): CalendarEvent => ({
+    id: "e1",
+    calendar_id: "gcal:me@x.org:me@x.org",
+    summary: "Retro",
+    description: null,
+    location: null,
+    start: "2026-10-20T09:00:00Z",
+    end: "2026-10-20T10:00:00Z",
+    all_day: false,
+    html_link: null,
+    uid: null,
+    attendees,
+    organizer_self: true,
+    ...over,
+  });
+  const theirs = [who("o@x.org", false, true), who("me@x.org", true, false), who("A@x.org")];
+
+  // M5 (a list Google cut short) has no mirror form, as D4: the backend asks with its own count.
+  it("tells every guest but the user and rooms, and on an invitation the organiser", () => {
+    expect(moveNotice(row([who("me@x.org", true)]))).toBeNull(); // M1
+    expect(moveNotice(row([who("me@x.org", true), who("A@x.org")]))).toEqual(told(1)); // M2
+    expect(
+      moveNotice(row([who("me@x.org", true), who("room1@resource.calendar.google.com")])),
+    ).toBeNull(); // M3
+    // M4: the organiser lets guests change it, so the user may move it, and the organiser hears.
+    expect(moveNotice(row(theirs, { organizer_self: false, guests_can_modify: true }))).toEqual(
+      told(2),
+    );
+    // They don't: no move of the user's, so nobody to tell.
+    expect(moveNotice(row(theirs, { organizer_self: false }))).toBeNull();
+    // The account's own address, unmarked in the mirror, is the user.
+    expect(moveNotice(row([who("me@x.org")]), "me@x.org")).toBeNull();
+    expect(moveNotice(row([]))).toBeNull();
   });
 });
 

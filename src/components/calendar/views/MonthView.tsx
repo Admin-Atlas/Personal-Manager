@@ -7,16 +7,25 @@
 // tint so boundaries read at a glance. Scrolling reports the month filling the view up via onFocusDate
 // so the header label tracks it; the nav arrows, Today and the mini-calendar scroll here in turn. The
 // per-week chips + multi-day band overlay reuse buildWeekRows, so they match the single-month grid.
+// Given an `interaction` (the calendar's Month, C16c), it draws what a drag needs: data attributes the
+// drag measures (the stream's weeks, each chip's and band's event), what a press must never create
+// on, the ghost over the days it would land on, and the pending look; and it stops snapping to weeks
+// while a drag scrolls it. The drag itself is the calendar's (`useCalendarGesture`).
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent } from "../../../lib/types";
 import {
   addDays,
+  clampSpanToRange,
+  dayDiff,
   dayKey,
   DRAFT_EVENT_CLASS,
+  DRAG_ORIGIN_CLASS,
   draftNote,
+  eventDaySpan,
   isEventPast,
   PAST_EVENT_CLASS,
+  PENDING_EVENT_CLASS,
   spokenName,
   startOfDay,
 } from "../../../lib/calendar-layout";
@@ -25,6 +34,7 @@ import { scrollBehavior, useDepth } from "../../../theme";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 import { declinedName, isDeclined } from "../../../lib/calendarEdit/rsvp";
+import { DragGhost, type GhostView } from "../parts/DragGhost";
 import { EventChip } from "../parts/EventChip";
 import { SourceDot } from "../parts/SourceDot";
 import {
@@ -50,6 +60,33 @@ interface Props {
   now?: Date;
   /** Open an event's detail popup, anchored at the chip/band's on-screen rect. */
   onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
+  /** Events can be dragged here (the calendar's Month, C16c). Absent, the DOM is as it always was. */
+  interaction?: MonthInteraction;
+}
+
+/** What a dragging calendar tells Month (C16c). Month has no edges to draw: an event moves by whole
+ *  days, keeping its times. */
+export interface MonthInteraction {
+  /** The event being dragged: dimmed where it is (the weeks don't re-pack mid-drag). */
+  originId: string | null;
+  /** Where it would go, or the new event a drag across days would make. */
+  ghost: GhostView | null;
+  /** Moves being asked about or saved, drawn where they were dropped. */
+  pendingIds: ReadonlySet<string>;
+  /** A drag is under way: the weeks stop snapping, so its scrolling isn't pulled back. */
+  live: boolean;
+}
+
+/** A band's look on a dragging Month (a chip's is `EventChip`'s): dimmed while dragged, dashed
+ *  while its move is asked about or saved, else greyed once past. One look, so one opacity utility. */
+function lookOf(
+  ev: CalendarEvent,
+  interaction: MonthInteraction | undefined,
+  past: boolean,
+): string | false {
+  if (interaction?.originId === ev.id) return DRAG_ORIGIN_CLASS;
+  if (interaction?.pendingIds.has(ev.id)) return PENDING_EVENT_CLASS;
+  return past && PAST_EVENT_CLASS;
 }
 
 const BAND_H = 16;
@@ -76,10 +113,15 @@ export function MonthView({
   onFocusDate,
   now,
   onEventClick,
+  interaction,
 }: Props) {
   const { minimal, showMeta, showPower } = useDepth();
   const maxChips = showPower ? 4 : 3;
   const nowDate = now ?? new Date();
+  // What a press on the grid must never create on: the day number, the month's name, the counts.
+  const noCreate = interaction ? "" : undefined;
+  const ghost = interaction?.ghost ?? null;
+  const ghostSpan = useMemo(() => (ghost ? eventDaySpan(ghost.event) : null), [ghost]);
 
   // The rendered window is anchored on a month and rebuilt only when the cursor jumps outside it.
   const [anchor, setAnchor] = useState(() => firstOfMonth(cursor));
@@ -213,211 +255,273 @@ export function MonthView({
       </div>
 
       {/* Scrolling week stream */}
+      {/* Scrolling week stream. On a calendar that drags, the drag reads its weeks here; it isn't
+          selectable, and while a drag is under way it stops snapping to weeks, which would pull
+          the drag's own scrolling back. */}
       <div
         ref={scrollRef}
         onScroll={onScroll}
-        className="min-h-0 flex-1 snap-y snap-proximity overflow-y-auto"
+        className={cn(
+          "min-h-0 flex-1 overflow-y-auto",
+          interaction?.live ? "snap-none" : "snap-y snap-proximity",
+          interaction && "select-none",
+        )}
+        data-surface={interaction ? "month" : undefined}
+        data-grid-start={interaction ? dayKey(gridStart) : undefined}
+        data-week-h={interaction ? weekH : undefined}
+        data-weeks={interaction ? weeks.length : undefined}
       >
         {weekH > 0 &&
-          weeks.map((week) => (
-            <div
-              key={dayKey(week.cells[0].date)}
-              className="relative grid snap-start grid-cols-7 border-b border-rule"
-              style={{ height: `${weekH}px` }}
-            >
-              {week.cells.map((cell) => {
-                const hidden = Math.max(0, cell.chips.length - maxChips) + cell.hiddenBands;
-                const dotsHidden = Math.max(0, cell.chips.length - MAX_DOTS) + cell.hiddenBands;
-                const firstOfM = cell.date.getDate() === 1;
-                const tint = (cell.date.getFullYear() * 12 + cell.date.getMonth()) % 2 === 1;
-                return (
-                  <div
-                    key={dayKey(cell.date)}
-                    className={cn(
-                      "flex min-h-0 flex-col overflow-hidden border-l border-rule px-1 py-1 first:border-l-0",
-                      tint && "bg-panel",
-                    )}
-                  >
-                    <div
-                      className="flex items-start justify-between"
-                      style={{ height: `${NUM_H}px` }}
-                    >
-                      <span className="flex items-center gap-1 overflow-hidden">
-                        {firstOfM && (
-                          <span className="truncate font-head text-[0.625rem] uppercase tracking-wide text-accent-text">
-                            {cell.date.toLocaleDateString(undefined, { month: "short" })}
-                            {cell.date.getMonth() === 0 ? ` ${cell.date.getFullYear()}` : ""}
-                          </span>
-                        )}
-                        <span
-                          className={cn(
-                            "flex h-5 w-5 shrink-0 items-center justify-center font-mono text-xs",
-                            cell.isToday
-                              ? "rounded-full bg-accent font-medium text-accent-ink"
-                              : "text-ink2",
-                          )}
-                        >
-                          {cell.date.getDate()}
-                        </span>
-                      </span>
-                      {showPower && cell.chips.length > 0 && (
-                        <span className="font-mono text-[0.625rem] text-ink4">
-                          {cell.chips.length}
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Reserve room so chips clear the band overlay. */}
-                    <div style={{ height: `${week.laneCount * BAND_H}px` }} />
-
-                    {minimal ? (
-                      <div className="flex flex-wrap items-center gap-0.5">
-                        {chipsShown(cell.chips, MAX_DOTS).map((ev) => {
-                          const note = draftNote(ev);
-                          const dot = (
-                            <SourceDot
-                              key={ev.id}
-                              // The event's own colour when it has one; the shape stays its
-                              // calendar's.
-                              color={eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id)}
-                              shapeIndex={shapeOf?.(ev.calendar_id)}
-                              ghost={note !== null}
-                              className="h-2 w-2"
-                            />
-                          );
-                          if (note === null) return dot;
-                          // The ghost's ring keeps a click on it from closing quick create, and is
-                          // the one dot with a name: the others are saved events, this isn't one.
-                          return (
-                            <span key={ev.id} data-draft-event="" className="inline-flex">
-                              {dot}
-                              <span className="sr-only">{spokenName(note, ev.summary)}</span>
-                            </span>
-                          );
-                        })}
-                        {dotsHidden > 0 && (
-                          <span className="font-mono text-[0.5625rem] text-ink4">
-                            +{dotsHidden}
-                          </span>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
-                        {chipsShown(cell.chips, maxChips).map((ev) => (
-                          <EventChip
-                            key={ev.id}
-                            summary={ev.summary}
-                            color={colorOf(ev.calendar_id)}
-                            own={eventColour(ev.color_id)}
-                            timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
-                            showTime={showMeta}
-                            isPast={isEventPast(ev, nowDate)}
-                            ghost={draftNote(ev)}
-                            declined={isDeclined(ev)}
-                            onClick={onEventClick ? (rect) => onEventClick(ev, rect) : undefined}
-                          />
-                        ))}
-                        {hidden > 0 && (
-                          <span className="pl-1 font-mono text-[0.625rem] text-ink4">
-                            +{hidden} more
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-
-              {/* Multi-day band overlay for this week row, aligned to the in-cell reserved spacer. */}
+          weeks.map((week) => {
+            // The ghost's days in this week, if any.
+            const ghostHere =
+              ghost && ghostSpan
+                ? clampSpanToRange(
+                    dayDiff(week.cells[0].date, ghostSpan.startDay),
+                    dayDiff(week.cells[0].date, ghostSpan.endDay),
+                    6,
+                  )
+                : null;
+            return (
               <div
-                className="pointer-events-none absolute inset-x-0"
-                style={{ top: `${NUM_H + CELL_PAD}px` }}
+                key={dayKey(week.cells[0].date)}
+                className="relative grid snap-start grid-cols-7 border-b border-rule"
+                style={{ height: `${weekH}px` }}
               >
-                {week.bands.map((b) => {
-                  const color = colorOf(b.ev.calendar_id);
-                  const own = eventColour(b.ev.color_id);
-                  const leftPct = (b.startIdx / 7) * 100;
-                  const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
-                  const ghost = draftNote(b.ev);
-                  const declined = isDeclined(b.ev);
+                {week.cells.map((cell) => {
+                  const hidden = Math.max(0, cell.chips.length - maxChips) + cell.hiddenBands;
+                  const dotsHidden = Math.max(0, cell.chips.length - MAX_DOTS) + cell.hiddenBands;
+                  const firstOfM = cell.date.getDate() === 1;
+                  const tint = (cell.date.getFullYear() * 12 + cell.date.getMonth()) % 2 === 1;
                   return (
                     <div
-                      key={b.ev.id}
+                      key={dayKey(cell.date)}
                       className={cn(
-                        // The band overlay is pointer-events-none so day cells stay clickable; a band
-                        // re-enables its own pointer events to open the event popup.
-                        "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
-                        onEventClick && `pointer-events-auto cursor-pointer ${eventHover(own)}`,
-                        ghost !== null
-                          ? DRAFT_EVENT_CLASS
-                          : isEventPast(b.ev, nowDate) && PAST_EVENT_CLASS,
+                        "flex min-h-0 flex-col overflow-hidden border-l border-rule px-1 py-1 first:border-l-0",
+                        tint && "bg-panel",
                       )}
-                      data-draft-event={ghost !== null ? "" : undefined}
-                      style={{
-                        top: `${b.lane * BAND_H}px`,
-                        left: `${leftPct}%`,
-                        width: `${widthPct}%`,
-                        height: `${BAND_H - 2}px`,
-                        background: eventFill(own, color, 20),
-                        borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
-                        borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
-                        borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
-                        borderTopRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
-                        borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
-                      }}
-                      title={b.ev.summary}
-                      // A band's name is its text; the ghost's says first that it's the new event,
-                      // and a declined one's says so last.
-                      aria-label={
-                        ghost !== null || declined
-                          ? declinedName(
-                              spokenName(
-                                ghost,
-                                [b.ev.all_day ? "" : formatClockIso(b.ev.start), b.ev.summary]
-                                  .filter(Boolean)
-                                  .join(", "),
-                              ),
-                              declined,
-                            )
-                          : undefined
-                      }
-                      role={onEventClick ? "button" : undefined}
-                      tabIndex={onEventClick ? 0 : undefined}
-                      onClick={
-                        onEventClick
-                          ? (e) => onEventClick(b.ev, e.currentTarget.getBoundingClientRect())
-                          : undefined
-                      }
-                      onKeyDown={
-                        onEventClick
-                          ? (e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                onEventClick(b.ev, e.currentTarget.getBoundingClientRect());
-                              }
-                            }
-                          : undefined
-                      }
+                      data-day={interaction ? dayKey(cell.date) : undefined}
                     >
-                      <span className="truncate font-head text-ink" style={inkOn(own)}>
-                        {b.continuesLeft ? "‹ " : ""}
-                        {/* A timed event across days says when it starts, so it doesn't read as
-                            an all-day one. --ink2: small text on the tint needs it for 4.5:1. */}
-                        {!b.ev.all_day && !b.continuesLeft && (
-                          <span className="font-mono text-ink2" style={inkOn(own)}>
-                            {formatClockIso(b.ev.start)}{" "}
+                      <div
+                        className="flex items-start justify-between"
+                        style={{ height: `${NUM_H}px` }}
+                      >
+                        <span className="flex items-center gap-1 overflow-hidden">
+                          {firstOfM && (
+                            <span
+                              className="truncate font-head text-[0.625rem] uppercase tracking-wide text-accent-text"
+                              data-no-create={noCreate}
+                            >
+                              {cell.date.toLocaleDateString(undefined, { month: "short" })}
+                              {cell.date.getMonth() === 0 ? ` ${cell.date.getFullYear()}` : ""}
+                            </span>
+                          )}
+                          <span
+                            className={cn(
+                              "flex h-5 w-5 shrink-0 items-center justify-center font-mono text-xs",
+                              cell.isToday
+                                ? "rounded-full bg-accent font-medium text-accent-ink"
+                                : "text-ink2",
+                            )}
+                            data-no-create={noCreate}
+                          >
+                            {cell.date.getDate()}
+                          </span>
+                        </span>
+                        {showPower && cell.chips.length > 0 && (
+                          <span
+                            className="font-mono text-[0.625rem] text-ink4"
+                            data-no-create={noCreate}
+                          >
+                            {cell.chips.length}
                           </span>
                         )}
-                        <span className={declined ? "line-through" : undefined}>
-                          {b.ev.summary}
-                        </span>
-                      </span>
+                      </div>
+
+                      {/* Reserve room so chips clear the band overlay. */}
+                      <div style={{ height: `${week.laneCount * BAND_H}px` }} />
+
+                      {minimal ? (
+                        <div className="flex flex-wrap items-center gap-0.5">
+                          {chipsShown(cell.chips, MAX_DOTS).map((ev) => {
+                            const note = draftNote(ev);
+                            const dot = (
+                              <SourceDot
+                                key={ev.id}
+                                // The event's own colour when it has one; the shape stays its
+                                // calendar's.
+                                color={eventColour(ev.color_id)?.hex ?? colorOf(ev.calendar_id)}
+                                shapeIndex={shapeOf?.(ev.calendar_id)}
+                                ghost={note !== null}
+                                className="h-2 w-2"
+                              />
+                            );
+                            if (note === null) return dot;
+                            // The ghost's ring keeps a click on it from closing quick create, and is
+                            // the one dot with a name: the others are saved events, this isn't one.
+                            return (
+                              <span key={ev.id} data-draft-event="" className="inline-flex">
+                                {dot}
+                                <span className="sr-only">{spokenName(note, ev.summary)}</span>
+                              </span>
+                            );
+                          })}
+                          {dotsHidden > 0 && (
+                            <span
+                              className="font-mono text-[0.5625rem] text-ink4"
+                              data-no-create={noCreate}
+                            >
+                              +{dotsHidden}
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="flex min-h-0 flex-col gap-0.5 overflow-hidden">
+                          {chipsShown(cell.chips, maxChips).map((ev) => (
+                            <EventChip
+                              key={ev.id}
+                              summary={ev.summary}
+                              color={colorOf(ev.calendar_id)}
+                              own={eventColour(ev.color_id)}
+                              timeLabel={ev.all_day ? "" : formatClockIso(ev.start)}
+                              showTime={showMeta}
+                              isPast={isEventPast(ev, nowDate)}
+                              ghost={draftNote(ev)}
+                              declined={isDeclined(ev)}
+                              onClick={onEventClick ? (rect) => onEventClick(ev, rect) : undefined}
+                              drag={
+                                interaction
+                                  ? {
+                                      eventId: ev.id,
+                                      dimmed: interaction.originId === ev.id,
+                                      pending: interaction.pendingIds.has(ev.id),
+                                    }
+                                  : undefined
+                              }
+                            />
+                          ))}
+                          {hidden > 0 && (
+                            <span
+                              className="pl-1 font-mono text-[0.625rem] text-ink4"
+                              data-no-create={noCreate}
+                            >
+                              +{hidden} more
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
+
+                {/* Multi-day band overlay for this week row, aligned to the in-cell reserved spacer. */}
+                <div
+                  className="pointer-events-none absolute inset-x-0"
+                  style={{ top: `${NUM_H + CELL_PAD}px` }}
+                >
+                  {week.bands.map((b) => {
+                    const color = colorOf(b.ev.calendar_id);
+                    const own = eventColour(b.ev.color_id);
+                    const leftPct = (b.startIdx / 7) * 100;
+                    const widthPct = ((b.endIdx - b.startIdx + 1) / 7) * 100;
+                    const draft = draftNote(b.ev);
+                    const declined = isDeclined(b.ev);
+                    return (
+                      <div
+                        key={b.ev.id}
+                        className={cn(
+                          // The band overlay is pointer-events-none so day cells stay clickable; a band
+                          // re-enables its own pointer events to open the event popup.
+                          "absolute overflow-hidden px-1.5 text-[0.6875rem] leading-[0.875rem]",
+                          onEventClick && `pointer-events-auto cursor-pointer ${eventHover(own)}`,
+                          draft !== null
+                            ? DRAFT_EVENT_CLASS
+                            : lookOf(b.ev, interaction, isEventPast(b.ev, nowDate)),
+                        )}
+                        data-draft-event={draft !== null ? "" : undefined}
+                        data-event-id={interaction ? b.ev.id : undefined}
+                        style={{
+                          top: `${b.lane * BAND_H}px`,
+                          left: `${leftPct}%`,
+                          width: `${widthPct}%`,
+                          height: `${BAND_H - 2}px`,
+                          background: eventFill(own, color, 20),
+                          borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
+                          borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
+                          borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
+                          borderTopRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
+                          borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
+                        }}
+                        title={b.ev.summary}
+                        // A band's name is its text; the ghost's says first that it's the new event,
+                        // and a declined one's says so last.
+                        aria-label={
+                          draft !== null || declined
+                            ? declinedName(
+                                spokenName(
+                                  draft,
+                                  [b.ev.all_day ? "" : formatClockIso(b.ev.start), b.ev.summary]
+                                    .filter(Boolean)
+                                    .join(", "),
+                                ),
+                                declined,
+                              )
+                            : undefined
+                        }
+                        role={onEventClick ? "button" : undefined}
+                        tabIndex={onEventClick ? 0 : undefined}
+                        onClick={
+                          onEventClick
+                            ? (e) => onEventClick(b.ev, e.currentTarget.getBoundingClientRect())
+                            : undefined
+                        }
+                        onKeyDown={
+                          onEventClick
+                            ? (e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  onEventClick(b.ev, e.currentTarget.getBoundingClientRect());
+                                }
+                              }
+                            : undefined
+                        }
+                      >
+                        <span className="truncate font-head text-ink" style={inkOn(own)}>
+                          {b.continuesLeft ? "‹ " : ""}
+                          {/* A timed event across days says when it starts, so it doesn't read as
+                            an all-day one. --ink2: small text on the tint needs it for 4.5:1. */}
+                          {!b.ev.all_day && !b.continuesLeft && (
+                            <span className="font-mono text-ink2" style={inkOn(own)}>
+                              {formatClockIso(b.ev.start)}{" "}
+                            </span>
+                          )}
+                          <span className={declined ? "line-through" : undefined}>
+                            {b.ev.summary}
+                          </span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {/* Where a drag would put it, over the days in this week, above the bands (the
+                    weeks don't re-pack mid-drag). */}
+                  {ghost && ghostHere && (
+                    <DragGhost
+                      ghost={ghost}
+                      color={colorOf(ghost.event.calendar_id)}
+                      band
+                      box={{
+                        top: 0,
+                        // The ghost's one line is a little taller than a band's.
+                        height: `${BAND_H + 2}px`,
+                        left: `${(ghostHere.startDay / 7) * 100}%`,
+                        width: `${((ghostHere.endDay - ghostHere.startDay + 1) / 7) * 100}%`,
+                      }}
+                    />
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
       </div>
     </div>
   );

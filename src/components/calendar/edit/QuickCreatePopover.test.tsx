@@ -170,17 +170,17 @@ const sentFor = (summary: string) => ({
 const saved: WriteOutcome = { outcome: "saved", warnings: [], left_behind: [] };
 const ambiguous: WriteOutcome = { outcome: "ambiguous", retry_token: "ref-1" };
 
-/** The header button's rect, as the calendar hands it over. */
-const rect = (): DOMRect =>
+/** The header button's rect, as the calendar hands it over, or another box (a slot on the grid). */
+const rect = (left = 40, top = 10, right = 140, bottom = 38): DOMRect =>
   ({
-    left: 40,
-    top: 10,
-    right: 140,
-    bottom: 38,
-    width: 100,
-    height: 28,
-    x: 40,
-    y: 10,
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    x: left,
+    y: top,
     toJSON: () => ({}),
   }) as DOMRect;
 
@@ -243,13 +243,17 @@ afterEach(() => {
 
 /** The box under a stand-in header button, beside a stand-in grid with the ghost on it, and, when
  *  asked, another popover open elsewhere on the page, a draft to carry on with, or <StrictMode>
- *  around it all (as the app's development build runs: every effect set up twice). */
+ *  around it all (as the app's development build runs: every effect set up twice); or opened
+ *  beside a slot on the grid (C17), with a time the user dragged out. */
 function open(
   over: {
     otherPopover?: boolean;
     resume?: LeftDraft;
     calendarId?: string;
     strict?: boolean;
+    anchor?: DOMRect;
+    placement?: "below" | "beside";
+    timeTouched?: boolean;
   } = {},
 ) {
   const onClose = vi.fn();
@@ -282,7 +286,9 @@ function open(
         </Popover>
       )}
       <QuickCreatePopover
-        anchor={rect()}
+        anchor={over.anchor ?? rect()}
+        placement={over.placement}
+        timeTouched={over.timeTouched}
         seed={seed}
         targets={createTargets(overview)}
         calendarId={over.calendarId ?? PERSONAL}
@@ -585,6 +591,65 @@ describe("QuickCreatePopover", () => {
       start_time: "14:00",
       end_time: "14:30",
     });
+  });
+
+  // C17: a range dragged out on the grid keeps its own length through All day and back, never the
+  // account's (Work's half hour here).
+  it("a dragged range keeps its length through All day and back", () => {
+    const { onDraft } = open({ placement: "beside", timeTouched: true, calendarId: WORK_CAL });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(onDraft.mock.lastCall![0].time.kind).toBe("all_day");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({
+      kind: "timed",
+      start_date: "2026-10-12",
+      start_time: "09:00",
+      end_date: "2026-10-12",
+      end_time: "10:00",
+    });
+  });
+
+  // C17: a range dragged out on the grid is the user's choice, so another calendar never re-seeds
+  // it; a slot clicked takes the new calendar's length, as the button's does (above).
+  it("a dragged range isn't re-seeded on a calendar change; a click's is", () => {
+    for (const timeTouched of [true, false]) {
+      const { onDraft, unmount } = open({ placement: "beside", timeTouched });
+      fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+      fireEvent.click(screen.getByRole("radio", { name: "Work" }), { detail: 1 });
+      expect(onDraft).toHaveBeenLastCalledWith(
+        timeTouched ? seed : { ...seed, time: { ...seed.time, end_time: "09:30" } },
+        WORK_CAL,
+        "unsaved",
+      );
+      unmount();
+    }
+  });
+
+  // C17: from a slot on the grid, the box opens beside it, level with its top: to its right, or to
+  // its left when the window has no room there, as Google's does.
+  it("opens beside a slot: to its right, else its left, level with its top", () => {
+    const at = (left: number, right: number) => {
+      const { unmount } = open({ anchor: rect(left, 200, right, 240), placement: "beside" });
+      const placed = [box().style.left, box().style.top];
+      unmount();
+      return placed;
+    };
+    const width = 300;
+    const offset = vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(width);
+    try {
+      // Room on both sides: on the right.
+      expect(at(500, 600)).toEqual(["606px", "200px"]);
+      // No room on its left either: on its right, kept inside the window.
+      expect(at(100, 200)).toEqual(["206px", "200px"]);
+      // No room on the right of the window: on the slot's left.
+      const right = window.innerWidth - 50;
+      expect(at(right - 100, right)).toEqual([`${right - 100 - 6 - width}px`, "200px"]);
+    } finally {
+      offset.mockRestore();
+    }
+    // Under a button, as ever.
+    open();
+    expect([box().style.left, box().style.top]).toEqual(["40px", "44px"]);
   });
 
   it("an end on another day is words, and all day keeps the date", () => {

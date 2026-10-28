@@ -10,11 +10,20 @@
 // sit over the today-column tint, where a translucent fill goes muddy. An event given its own colour in
 // Google is filled with that instead, solid, in its own text colour, the stripe keeping its calendar's
 // colour, as Google draws it (`own`). Meta reveals with depth AND available height (a 20px sliver has
-// no room for a time line); a past event is greyed via isPast.
+// no room for a time line); a past event is greyed via isPast. On a grid that drags (C16b) it carries
+// its id and day for the drag's hit test, and an invisible strip with a resize cursor at each end
+// that may be dragged; the drag itself lives in the calendar's gesture, not here.
 
 import type { CSSProperties } from "react";
 import { cn } from "../../ui";
-import { DRAFT_EVENT_CLASS, PAST_EVENT_CLASS, spokenName } from "../../../lib/calendar-layout";
+import {
+  DRAFT_EVENT_CLASS,
+  DRAG_ORIGIN_CLASS,
+  PAST_EVENT_CLASS,
+  PENDING_EVENT_CLASS,
+  spokenName,
+} from "../../../lib/calendar-layout";
+import { handleSizes } from "../../../lib/calendarDrag";
 import { declinedName } from "../../../lib/calendarEdit/rsvp";
 import { eventFill, eventHover, inkOn, type EventColour } from "../../../theme/eventPalette";
 
@@ -52,6 +61,19 @@ interface Props {
   tabStop?: boolean;
   /** Open the event's detail popup, anchored at the card's on-screen rect. */
   onSelect?: (anchor: DOMRect) => void;
+  /** On a grid that drags (C16b): the event's id and this piece's day (`YYYY-MM-DD`), which the
+   *  drag reads to know what a press took. Absent elsewhere (Focus's read-only grid). */
+  drag?: {
+    eventId: string;
+    day: string;
+    /** Which ends may be dragged on this piece: the top on the event's first piece, the bottom on
+     *  its last, where moving is allowed. */
+    edges: { start: boolean; end: boolean };
+    /** It is being dragged: dimmed where it was. */
+    dimmed: boolean;
+    /** A move of it is being asked about or saved: drawn where it was dropped, dashed. */
+    pending: boolean;
+  };
 }
 
 // Height thresholds below which a line has no room — keep them out of the render so a squeezed card
@@ -78,6 +100,7 @@ export function EventCard({
   continuesAfter,
   tabStop = true,
   onSelect,
+  drag,
 }: Props) {
   const style: CSSProperties = {
     top: `${topPx}px`,
@@ -105,14 +128,26 @@ export function EventCard({
     declined,
   );
 
+  // The edges that may be dragged, sized as the drag's hit test sizes them (`handleSizes`).
+  const handles = handleSizes(heightPx);
+
   return (
     <div
       className={cn(
         "absolute overflow-hidden rounded-[var(--radius-sm)] border border-border border-l-[3px] px-1.5 py-0.5",
         onSelect && `cursor-pointer ${eventHover(own)}`,
-        ghost !== null ? DRAFT_EVENT_CLASS : isPast && PAST_EVENT_CLASS,
+        // One look, so only one opacity utility is ever on the card.
+        ghost !== null
+          ? DRAFT_EVENT_CLASS
+          : drag?.dimmed
+            ? DRAG_ORIGIN_CLASS
+            : drag?.pending
+              ? PENDING_EVENT_CLASS
+              : isPast && PAST_EVENT_CLASS,
       )}
       data-draft-event={ghost !== null ? "" : undefined}
+      data-event-id={drag?.eventId}
+      data-day={drag?.day}
       style={style}
       title={summary}
       aria-label={ariaLabel}
@@ -149,6 +184,22 @@ export function EventCard({
         <div className="truncate font-mono text-[0.5625rem] text-ink2" style={inkOn(own)}>
           {location}
         </div>
+      )}
+      {drag?.edges.start && handles.top > 0 && (
+        <div
+          aria-hidden="true"
+          data-edge="start"
+          className="absolute inset-x-0 top-0 cursor-ns-resize"
+          style={{ height: `${handles.top}px` }}
+        />
+      )}
+      {drag?.edges.end && handles.bottom > 0 && (
+        <div
+          aria-hidden="true"
+          data-edge="end"
+          className="absolute inset-x-0 bottom-0 cursor-ns-resize"
+          style={{ height: `${handles.bottom}px` }}
+        />
       )}
     </div>
   );
