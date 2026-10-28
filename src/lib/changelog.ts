@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.158.1-alpha",
+    date: "2026-10-28",
+    highlights: [
+      "Under-the-hood tidying, with a safety fix. On Windows, opening PM twice in quick succession could start a second copy alongside the first; now the second launch just brings the open window forward. PM's windows picked up fixes too: on a Mac, dropping files from some apps onto PM could close it. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.158.0-alpha",
     date: "2026-10-28",
     highlights: [

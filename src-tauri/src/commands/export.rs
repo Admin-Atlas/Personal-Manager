@@ -294,6 +294,54 @@ mod tests {
     }
 
     #[test]
+    fn every_entry_reads_back_byte_for_byte() {
+        // zip 9.1 reuses one DEFLATE compressor across entries (zip2 #1119). Were its state not
+        // reset between them, a later entry would carry back-references into the one before it, and
+        // that only shows when neighbouring entries share content. The folder walk's order is the
+        // filesystem's, so every note opens with the same compressible text, whichever comes first.
+        // Every entry is read back in full (zip checks each one's CRC as it goes) and compared with
+        // the file it came from.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Vault");
+        let note = "A line every note repeats, so DEFLATE finds matches.\n".repeat(1300);
+        write(&root.join(vault::META_FILENAME), "{}");
+        write(&root.join("vault").join("a.md"), &note);
+        write(&root.join("vault").join("b.md"), &note);
+        write(
+            &root.join("vault").join("chats").join("c.md"),
+            &format!("{note}{}", note.to_uppercase()),
+        );
+        let snapshot = dir.path().join("snap.sqlite");
+        write(&snapshot, &"db page ".repeat(8192));
+
+        let resolved = vault::ResolvedVault {
+            vault_root: root.clone(),
+            db_path: root.join(vault::DB_FILENAME),
+            markdown_dir: root.join("vault"),
+        };
+        let dest = dir.path().join("out.zip");
+        write_export_zip(&resolved, &snapshot, &dest).unwrap();
+
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&dest).unwrap()).unwrap();
+        assert_eq!(z.len(), 5);
+        for i in 0..z.len() {
+            let mut entry = z.by_index(i).unwrap();
+            let name = entry.name().unwrap().to_string();
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut got).unwrap();
+            let source = if name == vault::DB_FILENAME {
+                snapshot.clone()
+            } else {
+                root.join(&name)
+            };
+            assert!(
+                got == std::fs::read(&source).unwrap(),
+                "{name} doesn't match its source"
+            );
+        }
+    }
+
+    #[test]
     fn a_moved_vault_exports_its_own_markdown_not_the_profiles() {
         // The defect #712 names. The DB snapshot has always come from the live (possibly pointed)
         // store while the tree came from `<data_dir>/vault` — so a moved or shared vault paired the
