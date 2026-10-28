@@ -33,6 +33,9 @@ interface SegmentedControlBaseProps<T extends string> {
   "aria-describedby"?: string;
   /** Shown but not changeable (a value the user may see and not set). */
   disabled?: boolean;
+  /** A choice is on its way: every option says it's unavailable (`aria-disabled`) and a press does
+   *  nothing, but none is `disabled`, which would drop the focus of the one just pressed. */
+  busy?: boolean;
 }
 
 export type SegmentedControlProps<T extends string> = SegmentedControlBaseProps<T> &
@@ -52,6 +55,7 @@ export function SegmentedControl<T extends string>({
   "aria-labelledby": ariaLabelledBy,
   "aria-describedby": ariaDescribedBy,
   disabled,
+  busy,
 }: SegmentedControlProps<T>) {
   return (
     <div
@@ -73,10 +77,13 @@ export function SegmentedControl<T extends string>({
             type="button"
             title={opt.title}
             aria-pressed={active}
+            aria-disabled={busy || undefined}
             disabled={disabled}
-            onClick={() => onChange(opt.value)}
+            onClick={() => {
+              if (!busy) onChange(opt.value);
+            }}
             className={cn(
-              "inline-flex min-h-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-2.5 py-1 text-xs transition disabled:cursor-not-allowed",
+              "inline-flex min-h-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-2.5 py-1 text-xs transition disabled:cursor-not-allowed aria-disabled:cursor-not-allowed",
               // Disabled is a colour change, no alpha (as Button): the chosen value stays legible
               // on a neutral fill, the others step down a tier. Never `faint`: the options are
               // information (what it could be), not decoration (designGuards).

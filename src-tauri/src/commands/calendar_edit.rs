@@ -47,15 +47,16 @@ use crate::calendar_write::attendees::{self, Own};
 use crate::calendar_write::classify::{Method, Verdict};
 use crate::calendar_write::dto::{
     ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit, EventPatchDraft,
-    FieldPermissions, GuestForEdit, GuestNotice, HeldDeleteInfo, MilestoneMoves, MilestoneOffer,
-    NewEventDraft, Notify, ReadOnlyReason, RemindersDraft, RepeatDraft, ScopeRow, SeenSummary,
-    SeriesChoices, SeriesInfo, SeriesScope, SeriesWarningDto, ShowAs, SplitAction, TimeDraft,
-    Visibility, WriteOutcome, WriteWarning,
+    FieldPermissions, GuestForEdit, GuestNotice, HeldDeleteInfo, ListRights, MilestoneMoves,
+    MilestoneOffer, NewEventDraft, Notify, ReadOnlyReason, RemindersDraft, RepeatDraft, Rsvp,
+    RsvpScope, ScopeRow, SeenSummary, SeriesChoices, SeriesInfo, SeriesScope, SeriesWarningDto,
+    ShowAs, SplitAction, TimeDraft, Visibility, WriteOutcome, WriteWarning,
 };
 use crate::calendar_write::gate::{self, EditFacts};
 use crate::calendar_write::patch::{self, DeleteCheck, UpdateCheck};
 use crate::calendar_write::plan::{is_plain_segment, RequestPlan};
 use crate::calendar_write::reconcile::{RecentWrites, Stamp};
+use crate::calendar_write::rsvp;
 use crate::calendar_write::series::diff::{self, Expect, GoneRow, Refetch, Removes, SeriesDiff};
 use crate::calendar_write::series::journal::{self, Entry, Look, Orphan};
 use crate::calendar_write::series::plan::{
@@ -295,6 +296,7 @@ fn facts_from_fresh<'a>(
             .and_then(|o| o.get("self"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        guests_can_modify: patch::bool_of(fresh.get("guestsCanModify"), false),
         locked: fresh
             .get("locked")
             .and_then(Value::as_bool)
@@ -304,6 +306,7 @@ fn facts_from_fresh<'a>(
         html_description: text("description").is_some_and(patch::description_is_html),
         labelled: text("eventLabelId").is_some_and(|label| !label.is_empty()),
         reminders_readable: patch::reminders_of(fresh).is_some(),
+        invited: rsvp::invited(fresh),
     }
 }
 
@@ -324,6 +327,8 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         access_role: calendar.facts.access_role.as_deref(),
         event_type: row.event_type.as_deref(),
         organizer_self: row.organizer_self,
+        // Mirrored since v57, absent read as false as Google documents.
+        guests_can_modify: row.guests_can_modify,
         locked: row.locked,
         visibility: row.visibility.as_deref(),
         // The mirror never holds a series itself (`calendar::parse_event`). An occurrence is
@@ -333,6 +338,11 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         labelled: row.event_label_id.is_some(),
         // The mirror doesn't hold notifications; the editor's fresh copy says.
         reminders_readable: true,
+        // As `rsvp::invited` reads Google's copy: an entry marked as this calendar, with an address.
+        invited: row
+            .attendees
+            .iter()
+            .any(|a| a.is_self && a.email.as_deref().is_some_and(|e| !e.trim().is_empty())),
     }
 }
 
@@ -403,12 +413,9 @@ impl GuestAnswer {
     }
 }
 
-/// Each row's list-level edit block (see [`facts_from_row`]): the one reason nothing about it may
-/// change, or `None`.
-pub(super) fn edit_blocks(
-    conn: &Connection,
-    rows: &[CalendarEvent],
-) -> Result<Vec<Option<ReadOnlyReason>>> {
+/// What the list offers on each row (see [`facts_from_row`]): the one reason nothing in the editor
+/// may change, Delete, and the reply, each as the gate says.
+pub(super) fn list_rights(conn: &Connection, rows: &[CalendarEvent]) -> Result<Vec<ListRights>> {
     let calendars: HashMap<String, calendar::Calendar> = calendar::list_calendars(conn)?
         .into_iter()
         .map(|c| (c.id.clone(), c))
@@ -416,8 +423,11 @@ pub(super) fn edit_blocks(
     Ok(rows
         .iter()
         .map(|row| match calendars.get(&row.calendar_id) {
-            Some(cal) => gate::edit_block(&facts_from_row(row, cal)),
-            None => Some(ReadOnlyReason::NotGoogle),
+            Some(cal) => gate::list_rights(&facts_from_row(row, cal)),
+            None => ListRights {
+                edit_block: Some(ReadOnlyReason::NotGoogle),
+                ..Default::default()
+            },
         })
         .collect())
 }
@@ -498,6 +508,14 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
         }),
         color_id: Some(text("colorId")).filter(|id| !id.is_empty()),
         label_id: Some(text("eventLabelId")).filter(|id| !id.is_empty()),
+        // Whose entry is the user's depends on the calendar the copy is on, which only the caller
+        // knows ([`open_editor`]).
+        reply: None,
+        organizer_self: fresh
+            .get("organizer")
+            .and_then(|o| o.get("self"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -517,50 +535,39 @@ fn guest_for_edit(entry: &Value) -> Option<GuestForEdit> {
     })
 }
 
-/// The reason to give when a draft touches a field the gate closed: the first, or for a draft whose
-/// only closed fields are its notifications or colour, the one that closed them (a label holds the
-/// colour, a notification PM can't read holds the list; C13 critique C1-L1), never a lock or a
-/// formatted description that has nothing to do with them.
+/// The reason to give when a draft touches a field the gate closed: the first closed field's own
+/// ([`gate::reason_for`]). The guest list is looked at first, so under "modify" a guest change says
+/// the guest list is the organiser's (C14 §9.1); notifications and colour last, so their own
+/// reasons (a label, a notification PM can't read; C13 critique C1-L1) are given only when nothing
+/// else the draft touches is closed.
 fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<ReadOnlyReason> {
-    let touched_closed = (draft.summary.is_some() && !perms.summary)
-        || (draft.time.is_some() && !perms.time)
-        || (draft.location.is_some() && !perms.location)
-        || (draft.description.is_some() && !perms.description)
-        || (draft.show_as.is_some() && !perms.show_as)
-        || (draft.visibility.is_some() && !perms.visibility)
-        // How it repeats moves its times, so it takes the time's permission (C11).
-        || (draft.recurrence.is_some() && !perms.time)
+    use gate::Field;
+    [
         // The guest list and what guests may do (C12).
-        || (draft.touches_guests() && !perms.guests);
-    let first = || {
-        perms
-            .reasons
-            .first()
-            .copied()
-            .unwrap_or(ReadOnlyReason::CalendarReadOnly)
-    };
-    if touched_closed {
-        return Some(first());
-    }
-    let own = |closed: bool, reason: ReadOnlyReason| {
-        closed.then(|| {
-            if perms.reasons.contains(&reason) {
-                reason
-            } else {
-                first()
-            }
-        })
-    };
-    own(
-        draft.colour.is_some() && !perms.colour,
-        ReadOnlyReason::LabelReadOnly,
-    )
-    .or_else(|| {
-        own(
+        (draft.touches_guests() && !perms.guests, Field::Guests),
+        (draft.summary.is_some() && !perms.summary, Field::Summary),
+        (draft.time.is_some() && !perms.time, Field::Time),
+        // How it repeats: closed with the time, and on someone else's event (C14 critique C1-H2).
+        (draft.recurrence.is_some() && !perms.repeat, Field::Repeat),
+        (draft.location.is_some() && !perms.location, Field::Location),
+        (
+            draft.description.is_some() && !perms.description,
+            Field::Description,
+        ),
+        (draft.show_as.is_some() && !perms.show_as, Field::ShowAs),
+        (
+            draft.visibility.is_some() && !perms.visibility,
+            Field::Visibility,
+        ),
+        (draft.colour.is_some() && !perms.colour, Field::Colour),
+        (
             draft.reminders.is_some() && !perms.reminders,
-            ReadOnlyReason::RemindersUnreadable,
-        )
-    })
+            Field::Reminders,
+        ),
+    ]
+    .into_iter()
+    .find(|(closed, _)| *closed)
+    .map(|(_, field)| gate::reason_for(perms, field))
 }
 
 /// Move an editor's base onto Google's copy after a save, for the fields the save sent and no
@@ -687,7 +694,7 @@ async fn open_editor<W: Wire>(
         .map(Box::new);
     let permissions = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
     let fallback = shown_zone(&target.facts, device_zone);
-    let Some(event) = event_for_edit(&fresh, fallback.as_deref().unwrap_or("")) else {
+    let Some(mut event) = event_for_edit(&fresh, fallback.as_deref().unwrap_or("")) else {
         return Ok(EditLoad::Failed {
             message: match fallback {
                 Some(_) => "Google sent this event without a start or end PM can read.".into(),
@@ -695,6 +702,8 @@ async fn open_editor<W: Wire>(
             },
         });
     };
+    // The user's own reply, from the entry marked as the calendar this copy is on (C14).
+    event.reply = rsvp::reply_for_edit(&fresh, &target.remote_calendar);
     let seen = seen_of(&target.calendar_id, &fresh);
     let session = keep_session(edit, target, fresh, master, device_zone)?;
     Ok(EditLoad::Ready {
@@ -2291,11 +2300,7 @@ async fn send_delete<W: Wire, H: Host>(
         let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
         if !perms.delete {
             return WriteOutcome::ReadOnly {
-                reason: perms
-                    .reasons
-                    .first()
-                    .copied()
-                    .unwrap_or(ReadOnlyReason::CalendarReadOnly),
+                reason: gate::reason_for(&perms, gate::Field::Delete),
             };
         }
         // An occurrence of a repeating event: which occurrences is the user's choice, never a
@@ -2358,6 +2363,495 @@ async fn send_delete<W: Wire, H: Host>(
         }
     }
     WriteOutcome::Conflict { fields: Vec::new() }
+}
+
+// --- replying to an invitation (C14) ---
+
+/// Google answered a reply as if it were a change to the shared event: it didn't read
+/// `attendeesOmitted` as documented, so "someone else organises it" would be the wrong words.
+const REPLY_REFUSED: &str = "Google wouldn't take this reply from PM. Reply in Google Calendar.";
+/// "All events" with the repeating event unreadable: nothing to reply to.
+const SERIES_UNREAD: &str = "PM couldn't read this repeating event from Google, so your reply \
+                             wasn't sent. Reply to this occurrence, or try again.";
+const NO_STAMP_REPLY: &str =
+    "Google sent this event without a version stamp, so PM won't reply to it.";
+const LOST_REPLY: &str = "PM lost touch with Google, and your reply isn't there. Try again.";
+/// A reply changes only the user's own entry: a shorter guest list after it means Google read it as
+/// more (C14 critique C1-M7), or someone took a guest off meanwhile. Either way, never "Saved".
+const GUESTS_SHRANK: &str = "The event's guest list came back shorter after your reply. Check \
+                             its guests in Google Calendar.";
+
+/// What the user chose: the reply, their note as typed (`None` keeps the one Google holds, `""`
+/// removes it), and for an occurrence of a repeating event, which occurrences.
+#[derive(Debug, Clone, Copy)]
+struct ReplyChoice<'a> {
+    response: Rsvp,
+    note: Option<&'a str>,
+    scope: Option<RsvpScope>,
+}
+
+/// Reply to an invitation, or, as its organiser, to your own event with guests: Yes, No or Maybe,
+/// with a note (`comment`: `None` keeps the note Google holds, `""` removes it). Keyed by the mirror
+/// row, like a delete, so the popover can reply without opening the editor. For an occurrence of a
+/// repeating event `scope` says this one or all of them; on an event that doesn't repeat it's
+/// ignored. Google is told at once and tells the organiser (plan Q6, no question asked); the
+/// organiser's own reply tells nobody.
+#[tauri::command]
+pub async fn respond_to_calendar_event(
+    app: AppHandle,
+    window: tauri::Window,
+    event_id: String,
+    response: Rsvp,
+    comment: Option<String>,
+    scope: Option<RsvpScope>,
+) -> Result<WriteOutcome> {
+    require_main_window(&window)?;
+    require_owner(&app)?;
+    let state = app.state::<AppState>();
+    // One lock for the row's target, its account's choice and the repeating event it's an occurrence
+    // of (the DB mutex isn't re-entrant).
+    let (target, editing_choice, series) = {
+        let conn = state.conn()?;
+        match resolve_target(&conn, &event_id)? {
+            Ok(target) => {
+                let editing_choice = calendar_editing::choice(&conn, &target.email)?;
+                let series = row_series(&conn, &event_id)?;
+                (target, editing_choice, series)
+            }
+            Err(reason) => return Ok(WriteOutcome::ReadOnly { reason }),
+        }
+    };
+    // Said now rather than after a read; the rest of the gate needs Google's copy.
+    let editing = editing_status(editing_choice, &target.token_key);
+    if editing != EditingStatus::On {
+        return Ok(WriteOutcome::ReadOnly {
+            reason: ReadOnlyReason::EditingOff,
+        });
+    }
+    #[cfg(debug_assertions)]
+    {
+        // "All events" reaches every occurrence: series-wide, as every other write to all of them.
+        let series_wide = scope == Some(RsvpScope::All);
+        let allowed = dev_allow::check(&*state.conn()?, &target.remote_calendar, series_wide)?;
+        if let Err(message) = allowed {
+            return Ok(WriteOutcome::Failed {
+                message: message.into(),
+            });
+        }
+    }
+    let choice = ReplyChoice {
+        response,
+        note: comment.as_deref(),
+        scope,
+    };
+    let token_key = target.token_key.clone();
+    Ok(reply(
+        &GoogleWire(&token_key),
+        &app,
+        &target,
+        series.as_deref(),
+        choice,
+        editing,
+    )
+    .await)
+}
+
+/// The repeating event the mirror row `row_id` is an occurrence of (Google's id), or `None` for a
+/// one-off, or a row that's gone (the write's own read says so).
+fn row_series(conn: &Connection, row_id: &str) -> Result<Option<String>> {
+    Ok(calendar::event_by_id(conn, row_id)?
+        .and_then(|row| row.series_id)
+        .filter(|id| is_plain_segment(id)))
+}
+
+/// A reply on its way: the copy it went to (the event, or for "all events" the repeating event), by
+/// id and as it was replied to, the clicked occurrence for "all events", and what was sent.
+struct ReplySent<'a> {
+    copy_id: String,
+    before: &'a Value,
+    occurrence: Option<&'a Value>,
+    response: Rsvp,
+    note: Option<&'a str>,
+}
+
+impl ReplySent<'_> {
+    /// The copy is gone from Google: the row goes from the mirror. A repeating event's copy is no
+    /// version of the row, so it isn't recorded as the one removed.
+    fn gone(&self, host: &impl Host, target: &Target, copy: Option<&Value>) -> WriteOutcome {
+        land_gone(
+            host,
+            target,
+            if self.occurrence.is_some() {
+                None
+            } else {
+                copy
+            },
+        )
+    }
+}
+
+/// [`respond_to_calendar_event`] past its shell: the note tidied before anything is read (C14
+/// critique C1-L3), the row and the repeating event the mirror says it belongs to (`series`)
+/// claimed once (C1-M1), then at most two rounds of a fresh read and a PATCH of the user's own
+/// entry: a 412 gets one silent rebase onto Google's newer copy, with no compare, since a reply
+/// touches nothing anyone else changes (R2). Google through `wire`, the mirror and the claims
+/// through `host`.
+async fn reply<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    series: Option<&str>,
+    choice: ReplyChoice<'_>,
+    editing: EditingStatus,
+) -> WriteOutcome {
+    let note = match choice.note.map(rsvp::tidy_note).transpose() {
+        Ok(note) => note,
+        Err(e) => {
+            return WriteOutcome::Failed {
+                message: e.to_string(),
+            }
+        }
+    };
+    let note = note.as_deref();
+    let cal = target.remote_calendar.as_str();
+    // Before any read, and held to the end: a rebase meets no claim of its own, and "this event"
+    // waits while every occurrence is being written (C14 critique C1-M1).
+    let mut keys = vec![target.row_id.clone()];
+    keys.extend(series.map(|s| series_key(cal, s)));
+    let Some(_flight) = InFlight::claim_all(host.edit(), &keys) else {
+        return WriteOutcome::Busy;
+    };
+    // A repeating event the mirror didn't name (its row was a one-off then), claimed once found.
+    let mut late_claim: Option<InFlight<'_>> = None;
+    for round in 1..=2 {
+        let fresh = match get(wire, cal, &target.remote_event).await {
+            Fetched::Event(fresh) => fresh,
+            Fetched::Gone => return land_gone(host, target, None),
+            Fetched::Reauth => return WriteOutcome::Reauth,
+            Fetched::Busy => return WriteOutcome::Busy,
+            Fetched::Failed(message) => return WriteOutcome::Failed { message },
+        };
+        if patch::is_gone(&fresh) {
+            return land_gone(host, target, Some(&fresh));
+        }
+        if let Some(reason) = gate::reply_block(&facts_from_fresh(&fresh, &target.facts, editing)) {
+            return WriteOutcome::ReadOnly { reason };
+        }
+        // A one-off Google has since made repeating: a reply to it would answer every occurrence
+        // with no choice asked, as a save would change them all.
+        if turned_series(&fresh) {
+            return WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::BecameRepeating,
+            };
+        }
+        // Which copy. An occurrence names this one or all of them, never by default (R9; only a
+        // GET has gone out); a scope on an event that doesn't repeat is ignored, so a row read
+        // before Google made it a one-off can't loop (C14 critique C1-L2).
+        let master_id = fresh
+            .get("recurringEventId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (copy, occurrence) = match (master_id, choice.scope) {
+            (None, _) | (Some(_), Some(RsvpScope::This)) => (fresh, None),
+            (Some(_), None) => return WriteOutcome::needs_scope(),
+            (Some(master_id), Some(RsvpScope::All)) => {
+                if series != Some(master_id.as_str()) && late_claim.is_none() {
+                    match InFlight::claim(host.edit(), &series_key(cal, &master_id)) {
+                        Some(claim) => late_claim = Some(claim),
+                        None => return WriteOutcome::Busy,
+                    }
+                }
+                let Some(master) = open_master(wire, target, &fresh).await else {
+                    return WriteOutcome::Failed {
+                        message: SERIES_UNREAD.into(),
+                    };
+                };
+                // The user may be on one occurrence's guest list only.
+                let facts = facts_from_fresh(&master, &target.facts, editing);
+                if let Some(reason) = gate::reply_block(&facts) {
+                    return WriteOutcome::ReadOnly { reason };
+                }
+                (master, Some(fresh))
+            }
+        };
+        // Already so: for every occurrence, the repeating event and the occurrence clicked both
+        // hold it (C14 critiques C1-M3, C2-H1). Nothing is sent.
+        let holds = |copy: &Value, note| rsvp::rsvp_applied(copy, cal, choice.response, note);
+        if holds(&copy, note) && occurrence.as_ref().is_none_or(|o| holds(o, None)) {
+            return WriteOutcome::NoChange;
+        }
+        let body = match rsvp::rsvp_body(&copy, cal, choice.response, note) {
+            Ok(body) => body,
+            Err(rsvp::RsvpError::NotInvited) => {
+                return WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotInvited,
+                }
+            }
+            Err(e) => {
+                return WriteOutcome::Failed {
+                    message: e.to_string(),
+                }
+            }
+        };
+        let id = copy
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_plain_segment(id));
+        let (Some(id), Some(etag)) = (id, copy.get("etag").and_then(Value::as_str)) else {
+            return WriteOutcome::Failed {
+                message: NO_STAMP_REPLY.into(),
+            };
+        };
+        // Q6: a reply tells the organiser, with no question asked; the organiser's own reply, which
+        // would reach only themselves, tells nobody (R7).
+        let notify = if rsvp::organised_here(&copy) {
+            Notify::None
+        } else {
+            Notify::All
+        };
+        let request = plan::patch_event(
+            cal,
+            id,
+            etag,
+            Value::Object(body),
+            notify,
+            plan::VersionFlags::default(),
+        );
+        let sent = ReplySent {
+            copy_id: id.to_string(),
+            before: &copy,
+            occurrence: occurrence.as_ref(),
+            response: choice.response,
+            note,
+        };
+        let answer = match wire.send(&request).await {
+            Ok(answer) => answer,
+            Err(google_io::NoAnswer::Unsent { why, .. }) => return unsent_outcome(why),
+            // No answer, or a sign-in refused after a server error: look before saying either.
+            Err(google_io::NoAnswer::Lost { .. }) => {
+                return after_lost_reply(wire, host, target, &sent).await
+            }
+        };
+        // A server error on the way may have been applied, whatever the last answer says: look
+        // before reporting anything but success.
+        if answer.maybe_applied && answer.verdict != Verdict::Ok {
+            match get(wire, cal, &sent.copy_id).await {
+                Fetched::Event(now) if patch::is_gone(&now) => {
+                    return sent.gone(host, target, Some(&now))
+                }
+                Fetched::Event(now) if holds(&now, note) => {
+                    return land_reply(wire, host, target, &sent, Some(now)).await
+                }
+                Fetched::Event(_) => {}
+                Fetched::Gone => return sent.gone(host, target, None),
+                _ => return WriteOutcome::Unconfirmed,
+            }
+        }
+        match answer.verdict {
+            Verdict::Ok => return land_reply(wire, host, target, &sent, None).await,
+            Verdict::Conflict if round == 1 => continue,
+            Verdict::Gone => return sent.gone(host, target, None),
+            Verdict::NotOrganizer => {
+                return WriteOutcome::Failed {
+                    message: REPLY_REFUSED.into(),
+                }
+            }
+            verdict => return outcome_for(verdict, editing),
+        }
+    }
+    WriteOutcome::Conflict { fields: Vec::new() }
+}
+
+/// A reply whose answer never arrived: read the copy it went to and see whether it landed.
+async fn after_lost_reply<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    sent: &ReplySent<'_>,
+) -> WriteOutcome {
+    match get(wire, &target.remote_calendar, &sent.copy_id).await {
+        Fetched::Event(now) if patch::is_gone(&now) => sent.gone(host, target, Some(&now)),
+        Fetched::Event(now)
+            if rsvp::rsvp_applied(&now, &target.remote_calendar, sent.response, sent.note) =>
+        {
+            land_reply(wire, host, target, sent, Some(now)).await
+        }
+        Fetched::Event(_) => WriteOutcome::Failed {
+            message: LOST_REPLY.into(),
+        },
+        Fetched::Gone => sent.gone(host, target, None),
+        _ => WriteOutcome::Unconfirmed,
+    }
+}
+
+/// Whether someone on `before`'s guest list (the copy the reply went to) is missing from `now`'s.
+/// A reply changes only the user's own entry, so a shorter list means Google read it as more, or
+/// someone took a guest off meanwhile (C14 critique C1-M7). Replies and who is optional don't count.
+fn guests_lost(before: &Value, now: &Value) -> bool {
+    let after: HashSet<String> = attendees::guest_set(now.get("attendees"))
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect();
+    attendees::guest_set(before.get("attendees"))
+        .into_iter()
+        .any(|(address, _)| !after.contains(&address))
+}
+
+/// A reply landed: Google's copy now goes into the mirror, read again (`read`, when the caller has
+/// read it already) rather than taken from the PATCH's answer, which under `attendeesOmitted` may
+/// list only the user: a row parsed from it would lose every other guest until the next sync. Never
+/// "Saved" for a copy that doesn't hold the reply (C14 critiques C1-M2, C2-M2) or lost a guest
+/// (C1-M7).
+async fn land_reply<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    sent: &ReplySent<'_>,
+    read: Option<Value>,
+) -> WriteOutcome {
+    let cal = target.remote_calendar.as_str();
+    let now = match read {
+        Some(now) => now,
+        None => match get(wire, cal, &sent.copy_id).await {
+            Fetched::Event(now) if !patch::is_gone(&now) => now,
+            // Taken, but PM couldn't read it back: the next sync shows it.
+            _ => return saved_pending(host, target),
+        },
+    };
+    if guests_lost(sent.before, &now) {
+        let shrank = WriteOutcome::Failed {
+            message: GUESTS_SHRANK.into(),
+        };
+        // One event: its row shows the list as Google holds it now.
+        return match sent.occurrence {
+            None => land_fresh(host, target, &now, shrank),
+            Some(_) => shrank,
+        };
+    }
+    if !rsvp::rsvp_applied(&now, cal, sent.response, sent.note) {
+        return WriteOutcome::IgnoredByGoogle { split: false };
+    }
+    let Some(occurrence) = sent.occurrence else {
+        return match calendar::parse_event(&target.calendar_id, &now)
+            .map(|row| land(host, target, vec![row], Vec::new()))
+        {
+            Some(Ok(())) => WriteOutcome::Saved {
+                warnings: Vec::new(),
+                left_behind: Vec::new(),
+                milestone_moves: None,
+            },
+            _ => saved_pending(host, target),
+        };
+    };
+    land_every_reply(wire, host, target, sent, occurrence, &now).await
+}
+
+/// A reply to every occurrence, landed from a re-fetch of the occurrences over the mirror's window,
+/// read again (`REFETCH_AGAIN`) while it's short, lacks the occurrence clicked, or doesn't show the
+/// reply yet. The occurrence clicked shows it when it had the repeating event's reply before; one
+/// answered on its own may keep its answer, so then some occurrence updated no earlier than the
+/// repeating event's copy read after the reply (`now`) must be listed, as `land_series` floors a
+/// change to every occurrence (L-R14, INFERRED): a lagging listing would land the others with their
+/// old reply and say they kept an answer of their own (PR B review round 1). Still so, nothing is
+/// recorded and the next sync shows it (C14 critique C1-M2: never half landed). Every occurrence
+/// listed is upserted and none deleted: a reply removes nothing. Occurrences answered on their own
+/// that kept their answer are said, by day (`KeptOwnReply`), never hidden behind "all events"
+/// (C1-M3, C2-H1), even when the mirror can't take the listing (PR B review round 2).
+async fn land_every_reply<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    target: &Target,
+    sent: &ReplySent<'_>,
+    occurrence: &Value,
+    now: &Value,
+) -> WriteOutcome {
+    let cal = target.remote_calendar.as_str();
+    let Ok(mirror) = host.mirror(&target.calendar_id) else {
+        return saved_pending(host, target);
+    };
+    let clicked = occurrence.get("id").and_then(Value::as_str);
+    // It had the repeating event's reply before, so it takes the new one with it.
+    let follows = rsvp::own_response(occurrence, cal) == rsvp::own_response(sent.before, cal);
+    let moment = |copy: &Value| {
+        copy.get("updated")
+            .and_then(Value::as_str)
+            .and_then(|u| chrono::DateTime::parse_from_rfc3339(u).ok())
+    };
+    // Without an `updated` on the repeating event, a lagging listing can't be told from a current one.
+    let floor = moment(now);
+    let caught_up = |items: &[Value]| {
+        floor.is_some_and(|floor| {
+            items
+                .iter()
+                .any(|item| moment(item).is_some_and(|at| at >= floor))
+        })
+    };
+    let mut listing = Listing::default();
+    let mut stale = true;
+    for pause in [None, Some(REFETCH_AGAIN[0]), Some(REFETCH_AGAIN[1])] {
+        if let Some(pause) = pause {
+            wire.wait(pause).await;
+        }
+        listing = refetch(wire, cal, &sent.copy_id, &mirror.window, false).await;
+        let shown = listing
+            .items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == clicked);
+        stale = !listing.complete
+            || shown.is_none_or(|s| {
+                if follows {
+                    !rsvp::rsvp_applied(s, cal, sent.response, None)
+                } else {
+                    !caught_up(&listing.items)
+                }
+            });
+        if !stale {
+            break;
+        }
+    }
+    if stale {
+        return saved_pending(host, target);
+    }
+    let live: Vec<&Value> = listing
+        .items
+        .iter()
+        .filter(|item| !patch::is_gone(item))
+        .collect();
+    let rows: Vec<CalendarEvent> = live
+        .iter()
+        .filter_map(|item| calendar::parse_event(&target.calendar_id, item))
+        .collect();
+    // Days in the zone the repeating event is set in, else the calendar's.
+    let zone = sent
+        .before
+        .pointer("/start/timeZone")
+        .and_then(Value::as_str)
+        .or(target.facts.time_zone.as_deref())
+        .and_then(|z| z.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::UTC);
+    let kept: Vec<String> = live
+        .iter()
+        .filter(|item| {
+            rsvp::own_response(item, cal).is_some()
+                && !rsvp::rsvp_applied(item, cal, sent.response, None)
+        })
+        .filter_map(|item| start_day(item, zone))
+        .collect();
+    let mut warnings = match land(host, target, rows, Vec::new()) {
+        Ok(()) => Vec::new(),
+        Err(_) => {
+            drop_hash(host, &target.calendar_id);
+            vec![WriteWarning::MirrorRefreshPending]
+        }
+    };
+    if !kept.is_empty() {
+        warnings.push(WriteWarning::KeptOwnReply);
+    }
+    WriteOutcome::Saved {
+        warnings,
+        left_behind: kept,
+        milestone_moves: None,
+    }
 }
 
 // --- repeating events (C9) ---
@@ -3106,13 +3600,9 @@ async fn prepare_change<W: Wire>(
     let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, editing));
     let closed = match request {
         ChoiceRequest::Edit { draft, .. } => refused_field(&perms, draft),
-        ChoiceRequest::Delete { .. } => (!perms.delete).then(|| {
-            perms
-                .reasons
-                .first()
-                .copied()
-                .unwrap_or(ReadOnlyReason::CalendarReadOnly)
-        }),
+        ChoiceRequest::Delete { .. } => {
+            (!perms.delete).then(|| gate::reason_for(&perms, gate::Field::Delete))
+        }
     };
     if let Some(reason) = closed {
         return refused(WriteOutcome::ReadOnly { reason });
@@ -6649,8 +7139,19 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
             "This is a private event on a calendar shared with you, and you can't change private \
              events there."
         }
+        // Never promises a reply: the calendar may not be on the guest list (C14 critique C2-L1).
         ReadOnlyReason::NotOrganizer => {
-            "Someone else organises this event, so only they can change it."
+            "Someone else organises this event, so only they can change its title, time, place, \
+             description, visibility and guests. Your notifications, colour and busy or free are \
+             yours to change."
+        }
+        // A group invitation lists the group, not this calendar (C14 critique C2-M8).
+        ReadOnlyReason::NotInvited => {
+            "PM can only reply where this calendar is on the guest list itself (not through a \
+             group)."
+        }
+        ReadOnlyReason::OrganizerOnlyGuests => {
+            "In PM, only the organiser can change who's invited."
         }
         ReadOnlyReason::BecameRepeating => {
             "This became a repeating event in Google. Refresh, then open one of its occurrences."
@@ -7452,6 +7953,15 @@ mod tests {
         assert!(f.organizer_self && f.html_description && !f.series_master);
         // C13: no label and no notifications of its own read as unlabelled and readable.
         assert!(!f.labelled && f.reminders_readable);
+        // C14: the calendar is on its own guest list.
+        assert!(f.invited);
+        let mut unaddressed = mine.clone();
+        unaddressed["attendees"] = json!([{ "email": "a@x.org" }, { "self": true }]);
+        let f = facts_from_fresh(&unaddressed, &facts, EditingStatus::On);
+        assert!(
+            !f.invited,
+            "an entry marked as the calendar but with no address is no reply to give"
+        );
         let mut labelled = mine.clone();
         labelled["eventLabelId"] = json!("label-1");
         labelled["reminders"] =
@@ -7466,7 +7976,15 @@ mod tests {
         });
         let f = facts_from_fresh(&invite, &facts, EditingStatus::On);
         assert!(!f.organizer_self && !f.series_master);
-        assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::NotOrganizer));
+        assert!(f.invited);
+        // Absent, Google's `guestsCanModify` is false.
+        assert!(!f.guests_can_modify);
+        // C14c: an invitation's own settings are editable, so nothing blocks the editor.
+        assert_eq!(gate::list_rights(&f).edit_block, None);
+        assert!(gate::list_rights(&f).can_respond && !gate::list_rights(&f).can_delete);
+        let mut modifiable = invite.clone();
+        modifiable["guestsCanModify"] = json!(true);
+        assert!(facts_from_fresh(&modifiable, &facts, EditingStatus::On).guests_can_modify);
         // An occurrence, a one-off, and a one-off Google has since given a rule: only the last is a
         // series itself, with its own reason (C9 design critique 2 M6).
         let mine = || json!({ "organizer": { "self": true }, "eventType": "default" });
@@ -7480,7 +7998,10 @@ mod tests {
             .collect();
         assert_eq!(masters, [false, false, true]);
         let f = facts_from_fresh(&turned, &facts, EditingStatus::On);
-        assert_eq!(gate::edit_block(&f), Some(ReadOnlyReason::BecameRepeating));
+        assert_eq!(
+            gate::list_rights(&f).edit_block,
+            Some(ReadOnlyReason::BecameRepeating)
+        );
         // An occurrence you organise edits like a one-off: every field and the delete are open, so
         // nothing in the gate stands between it and the dialog; which occurrences is asked at the
         // write (R9; C9b-1 critiques 1 L5, 2 L11).
@@ -7488,6 +8009,7 @@ mod tests {
         let open = FieldPermissions {
             summary: true,
             time: true,
+            repeat: true,
             location: true,
             description: true,
             show_as: true,
@@ -7496,6 +8018,8 @@ mod tests {
             reminders: true,
             colour: true,
             delete: true,
+            // No guest list: nothing to reply to.
+            respond: false,
             reasons: Vec::new(),
         };
         assert!(
@@ -7635,12 +8159,14 @@ mod tests {
             access_role: Some("owner"),
             event_type: None,
             organizer_self: true,
+            guests_can_modify: false,
             locked: true,
             visibility: None,
             series_master: false,
             html_description: false,
             labelled: false,
             reminders_readable: true,
+            invited: false,
         });
         let title = EventPatchDraft {
             summary: Some("x".into()),
@@ -7652,14 +8178,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(refused_field(&locked, &busy), None);
-        // How it repeats moves its times: a locked time locks it too (C11).
+        // How it repeats moves its times: a locked time locks it too (C11). It has its own right
+        // since C14 (critique C1-H2), so an open time alone doesn't open it.
         let stop = EventPatchDraft {
             recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
             ..Default::default()
         };
         assert_eq!(refused_field(&locked, &stop), Some(ReadOnlyReason::Locked));
-        let open = FieldPermissions {
+        let time_only = FieldPermissions {
             time: true,
+            ..locked.clone()
+        };
+        assert_eq!(
+            refused_field(&time_only, &stop),
+            Some(ReadOnlyReason::Locked)
+        );
+        let open = FieldPermissions {
+            repeat: true,
             ..locked.clone()
         };
         assert_eq!(refused_field(&open, &stop), None);
@@ -7698,12 +8233,14 @@ mod tests {
                 access_role: Some("owner"),
                 event_type: None,
                 organizer_self: true,
+                guests_can_modify: false,
                 locked,
                 visibility: None,
                 series_master: false,
                 html_description: false,
                 labelled,
                 reminders_readable,
+                invited: false,
             })
         };
         let colour = EventPatchDraft {
@@ -8740,10 +9277,16 @@ mod tests {
             organizer_self: false,
             ..mine.clone()
         };
+        let blocks: Vec<(Option<ReadOnlyReason>, bool)> = list_rights(&conn, &[mine, invite])
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.edit_block, r.can_delete))
+            .collect();
+        // C14c: an invitation's own settings are editable too, but it is never deleted from PM.
         assert_eq!(
-            edit_blocks(&conn, &[mine, invite]).unwrap(),
-            vec![None, Some(ReadOnlyReason::NotOrganizer)],
-            "the list: editable when it's yours"
+            blocks,
+            vec![(None, true), (None, false)],
+            "the list: editable either way, Delete only when it's yours"
         );
         let facts = CalendarFacts {
             access_role: Some("owner".into()),
@@ -9004,8 +9547,10 @@ mod tests {
         ));
     }
 
+    /// The list's three rights per row, each as the gate gives them (C14): Edit, Delete (no longer
+    /// the webview's own rule), and the reply, which follows the guest list, not who organises.
     #[test]
-    fn the_list_marks_what_can_be_edited() {
+    fn the_list_marks_what_can_be_edited_deleted_and_answered() {
         let (_d, conn) = store();
         let cal = "gcal:me@x.com:me@x.com";
         add_calendar(&conn, "gcal:me@x.com", "google", cal, Some("me@x.com"));
@@ -9045,16 +9590,90 @@ mod tests {
         let facts = facts_from_row(&labelled, &calendars[0]);
         assert!(facts.labelled && facts.reminders_readable);
         assert!(!facts_from_row(&mine, &calendars[0]).labelled);
-        assert_eq!(
-            edit_blocks(&conn, &[mine, invite, orphan, occurrence, labelled]).unwrap(),
-            vec![
-                None,
-                Some(ReadOnlyReason::NotOrganizer),
-                Some(ReadOnlyReason::NotGoogle),
-                None,
-                None
-            ]
-        );
+        // C14: the calendar's own entry on the guest list, read from the mirror's guests.
+        let me = || calendar::Attendee {
+            email: Some("me@x.com".into()),
+            is_self: true,
+            ..Default::default()
+        };
+        let guest = calendar::Attendee {
+            email: Some("a@x.org".into()),
+            ..Default::default()
+        };
+        let mine_invited = CalendarEvent {
+            id: format!("{cal}:e"),
+            attendees: vec![me(), guest.clone()],
+            ..mine.clone()
+        };
+        let invited = CalendarEvent {
+            id: format!("{cal}:f"),
+            organizer_self: false,
+            attendees: vec![guest.clone(), me()],
+            ..mine.clone()
+        };
+        // An entry marked as the calendar with no address is no reply to give.
+        let no_address = CalendarEvent {
+            id: format!("{cal}:g"),
+            organizer_self: false,
+            attendees: vec![
+                guest,
+                calendar::Attendee {
+                    is_self: true,
+                    ..Default::default()
+                },
+            ],
+            ..mine.clone()
+        };
+        // Google locks its shared fields: no Delete offered, Edit and the reply still are.
+        let locked = CalendarEvent {
+            id: format!("{cal}:h"),
+            locked: true,
+            attendees: vec![me()],
+            ..mine.clone()
+        };
+        assert!(facts_from_row(&invited, &calendars[0]).invited);
+        // C14c: whether the organiser lets guests change it, from the mirror.
+        assert!(!facts_from_row(&invited, &calendars[0]).guests_can_modify);
+        let modifiable = CalendarEvent {
+            guests_can_modify: true,
+            ..invited.clone()
+        };
+        assert!(facts_from_row(&modifiable, &calendars[0]).guests_can_modify);
+        let rights = |edit_block, can_delete, can_respond| ListRights {
+            edit_block,
+            can_delete,
+            can_respond,
+        };
+        let rows = [
+            mine,
+            invite,
+            orphan,
+            occurrence,
+            labelled,
+            mine_invited,
+            invited,
+            no_address,
+            locked,
+        ];
+        // C14c: someone else's event opens in the editor for the user's own settings, and is never
+        // deleted from PM (Remove is a later layer's).
+        let want = vec![
+            rights(None, true, false),
+            rights(None, false, false),
+            rights(Some(ReadOnlyReason::NotGoogle), false, false),
+            rights(None, true, false),
+            rights(None, true, false),
+            // Yours, with your own entry: the organiser may reply too.
+            rights(None, true, true),
+            rights(None, false, true),
+            rights(None, false, false),
+            rights(None, false, true),
+        ];
+        let got = list_rights(&conn, &rows).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (i, (got, want)) in got.iter().zip(&want).enumerate() {
+            assert!(got == want, "row {i}: not the rights the gate gives");
+        }
     }
 
     /// scope-L8: a delete of an occurrence with no choice is refused before it's held. The test is
@@ -10584,6 +11203,8 @@ mod tests {
             .await,
             read_only(ReadOnlyReason::HtmlDescription)
         );
+        // Someone else's occurrence: its title is the organiser's, refused before any row; its
+        // busy or free is the user's own, so the gate lets it through to the rows (C14c).
         let invitation = with(
             instance.clone(),
             "organizer",
@@ -10596,6 +11217,46 @@ mod tests {
                 EditingStatus::On,
                 "owner",
                 edit(title("Retro"))
+            )
+            .await,
+            read_only(ReadOnlyReason::NotOrganizer)
+        );
+        let series = with(
+            weekly(),
+            "organizer",
+            json!({ "email": "boss@example.com" }),
+        );
+        let script = Script::new(reads(&invitation, &series, vec![series.clone()], october()));
+        let busy = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let (this, _, _) = ask(
+            &script,
+            &invitation,
+            edit(busy),
+            Some((&invitation, Some(&series))),
+            &["abc"],
+        )
+        .await;
+        assert!(
+            matches!(this, ScopeRow::Offered { .. }),
+            "busy or free is offered"
+        );
+        // A delete of someone else's occurrence whose organiser lets guests change it says the
+        // organiser's reason, never the guest list's (C14 critique C1-L1).
+        let modifiable = with(invitation.clone(), "guestsCanModify", json!(true));
+        let delete = ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(modifiable.clone())),
+        };
+        assert_eq!(
+            refused(
+                only(&modifiable),
+                &modifiable,
+                EditingStatus::On,
+                "owner",
+                delete
             )
             .await,
             read_only(ReadOnlyReason::NotOrganizer)
@@ -18292,6 +18953,9 @@ mod tests {
                 SeriesRefusal::Guest(attendees::GuestError::Omitted),
                 SeriesRefusal::GuestsDifferHere,
                 SeriesRefusal::GuestPermissionsAreSeriesWide,
+                // What a guest may not do to someone else's repeating event (C14).
+                SeriesRefusal::InvitationFollowing,
+                SeriesRefusal::InvitationRule,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -18318,6 +18982,8 @@ mod tests {
             ReadOnlyReason::CalendarReadOnly,
             ReadOnlyReason::PrivateEvent,
             ReadOnlyReason::NotOrganizer,
+            ReadOnlyReason::NotInvited,
+            ReadOnlyReason::OrganizerOnlyGuests,
             ReadOnlyReason::BecameRepeating,
             ReadOnlyReason::SpecialType,
             ReadOnlyReason::Locked,
@@ -18332,13 +18998,33 @@ mod tests {
                 RULE_UNSURE,
                 STOP_UNSURE,
                 REPEAT_STOP_NOT_YET,
+                // Replying to an invitation (C14).
+                REPLY_REFUSED,
+                SERIES_UNREAD,
+                NO_STAMP_REPLY,
+                LOST_REPLY,
+                GUESTS_SHRANK,
             ]
             .iter()
             .map(|l| l.to_string()),
         );
+        lines.extend(
+            [rsvp::RsvpError::NotInvited, rsvp::RsvpError::NoteTooLong]
+                .iter()
+                .map(ToString::to_string),
+        );
         for line in &lines {
             let lower = line.to_lowercase();
-            for word in ["series", "split", "instance", "exception", "master"] {
+            for word in [
+                "series",
+                "split",
+                "instance",
+                "exception",
+                "master",
+                "rsvp",
+                "attendee",
+                "organizer",
+            ] {
                 assert!(!lower.contains(word), "“{line}” says “{word}”");
             }
             // Straight quotes only around nothing: titles and labels take curly ones.
@@ -21682,5 +22368,1511 @@ mod tests {
         .await;
         script.asked_all();
         assert!(outcome == saved(), "all events: saved, nothing offered");
+    }
+
+    // --- replying to an invitation (C14) ---
+
+    /// An invitation's guest list as Google sends it to the test calendar: the organiser, the
+    /// calendar's own entry awaiting a reply, and another guest.
+    fn invited_list() -> Value {
+        json!([
+            { "email": "o@x.org", "organizer": true, "responseStatus": "accepted" },
+            { "email": CALENDAR, "self": true, "responseStatus": "needsAction" },
+            { "email": "a@x.org", "responseStatus": "accepted" }
+        ])
+    }
+
+    /// `event` as an invitation from o@x.org with the calendar on its guest list.
+    fn invitation_of(event: Value) -> Value {
+        with(
+            with(event, "organizer", json!({ "email": "o@x.org" })),
+            "attendees",
+            invited_list(),
+        )
+    }
+
+    /// The dentist one-off ("solo", at "s1") as an invitation.
+    fn invite() -> Value {
+        invitation_of(dentist())
+    }
+
+    /// The weekly series ("abc", at "m1") as an invitation, and its occurrence on 19-10.
+    fn weekly_invite() -> Value {
+        invitation_of(weekly())
+    }
+
+    fn monday_invite() -> Value {
+        invitation_of(monday_19())
+    }
+
+    /// `event` as Google holds it once the calendar's own entry says `response` (and `note`), at
+    /// `etag`. The list is built anew, never edited in place.
+    fn replied(event: &Value, response: &str, note: Option<&str>, etag: &str) -> Value {
+        let list: Vec<Value> = event["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if entry["self"] == true {
+                    entry["responseStatus"] = json!(response);
+                    if let Some(note) = note {
+                        entry["comment"] = json!(note);
+                    }
+                }
+                entry
+            })
+            .collect();
+        written(event, &[("attendees", Value::Array(list))], etag)
+    }
+
+    /// Google's answer to a reply under `attendeesOmitted`: the user's entry alone.
+    fn only_me(event: &Value) -> Value {
+        with(
+            event.clone(),
+            "attendees",
+            json!([{ "email": CALENDAR, "self": true, "responseStatus": "accepted" }]),
+        )
+    }
+
+    /// A reply from the row of `event` (its repeating event as the mirror names it), Google
+    /// answering as `script` says, editing on.
+    async fn reply_on(
+        host: &TestHost,
+        script: &Script,
+        event: &Value,
+        response: Rsvp,
+        note: Option<&str>,
+        scope: Option<RsvpScope>,
+    ) -> WriteOutcome {
+        let series = event.get("recurringEventId").and_then(Value::as_str);
+        let choice = ReplyChoice {
+            response,
+            note,
+            scope,
+        };
+        reply(
+            script,
+            host,
+            &target(event),
+            series,
+            choice,
+            EditingStatus::On,
+        )
+        .await
+    }
+
+    /// The PATCH of `path` on `etag` that tells the organiser (Q6).
+    fn reply_patch(path: &str, etag: &str, answer: Scripted) -> Step {
+        told(Method::Patch, path, etag, "sendUpdates=all", answer)
+    }
+
+    /// Every write the script was sent.
+    fn writes(script: &Script) -> Vec<RequestPlan> {
+        script
+            .sent()
+            .into_iter()
+            .filter(|r| r.method != Method::Get)
+            .collect()
+    }
+
+    /// The query of `request`'s URL.
+    fn query_of(request: &RequestPlan) -> String {
+        request
+            .url
+            .split_once('?')
+            .map(|(_, q)| q.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The user's own reply on the mirror row `event`.
+    fn row_reply(host: &TestHost, event: &str) -> Option<String> {
+        host.row(event)
+            .attendees
+            .iter()
+            .find(|a| a.is_self)
+            .and_then(|a| a.response.clone())
+    }
+
+    /// C14 §4.7: a reply goes on the fresh etag, telling the organiser and nothing else, its body
+    /// the user's own entry; the row lands from a read after it, never from the PATCH's answer,
+    /// which under `attendeesOmitted` lists the user alone.
+    #[tokio::test]
+    async fn a_reply_patches_only_the_users_entry_on_the_fresh_etag() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let now = replied(&event, "accepted", None, "\"s2\"");
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch("/events/solo", "\"s1\"", Scripted::Json(only_me(&now))),
+            Step::get("/events/solo", "", now.clone()),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.asked_all();
+        assert!(outcome == saved(), "replied");
+        let patch = first_write(&script);
+        assert!(
+            query_of(&patch) == "sendUpdates=all",
+            "who is told, and nothing else"
+        );
+        assert!(
+            patch.if_match.as_deref() == Some("\"s1\""),
+            "the fresh etag"
+        );
+        let want = Value::Object(rsvp::rsvp_body(&event, CALENDAR, Rsvp::Yes, None).unwrap());
+        assert!(
+            patch.body == Some(want),
+            "the user's own entry, as rsvp_body builds it"
+        );
+        let row = host.row("solo");
+        assert_eq!(row.attendees.len(), 3, "every guest kept in the mirror");
+        assert_eq!(row_reply(&host, "solo").as_deref(), Some("accepted"));
+        assert_eq!(host.told(), vec!["cal".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_a_note_sends_it_and_an_empty_one_removes_it() {
+        for (held, note, sent) in [(None, "late", "late"), (Some("late"), "", "")] {
+            let event = match held {
+                Some(held) => replied(&invite(), "tentative", Some(held), "\"s1\""),
+                None => invite(),
+            };
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let now = replied(&event, "tentative", Some(sent), "\"s2\"");
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", event.clone()),
+                reply_patch("/events/solo", "\"s1\"", Scripted::Json(only_me(&now))),
+                Step::get("/events/solo", "", now),
+            ]);
+            let outcome = reply_on(&host, &script, &event, Rsvp::Maybe, Some(note), None).await;
+            script.asked_all();
+            assert!(outcome == saved(), "the note “{note}” went");
+            let body = first_write(&script).body.unwrap();
+            assert_eq!(body["attendees"][0]["comment"], sent);
+            assert_eq!(body["attendees"][0]["responseStatus"], "tentative");
+        }
+    }
+
+    /// Google holds the reply already, and both copies of "all events" hold it: nothing is sent.
+    #[tokio::test]
+    async fn a_reply_google_already_holds_sends_nothing() {
+        // With a note Google holds and none given: the note is left as it is, so it's the same.
+        let event = replied(&invite(), "accepted", Some("x"), "\"s1\"");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.finished();
+        assert!(outcome == WriteOutcome::NoChange);
+        assert_eq!(script.sent().len(), 1);
+
+        let occurrence = replied(&monday_invite(), "accepted", None, "\"i1\"");
+        let series = replied(&weekly_invite(), "accepted", None, "\"m1\"");
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let script = Script::new(vec![
+            instance_read(&occurrence),
+            Step::get("/events/abc", "", series),
+        ]);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.finished();
+        assert!(outcome == WriteOutcome::NoChange, "both hold it");
+    }
+
+    /// R2: a 412 gets one fresh read and one more PATCH, on Google's new etag, with no compare: a
+    /// reply someone else gave meanwhile isn't the user's business, and isn't in either body.
+    #[tokio::test]
+    async fn a_412_rebases_once_in_silence() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let mut list = invited_list();
+        list[2]["responseStatus"] = json!("declined");
+        let moved = written(&event, &[("attendees", list)], "\"s2\"");
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch("/events/solo", "\"s1\"", Scripted::Status(412)),
+            Step::get("/events/solo", "", moved.clone()),
+            reply_patch("/events/solo", "\"s2\"", Scripted::Json(only_me(&moved))),
+            Step::get(
+                "/events/solo",
+                "",
+                replied(&moved, "accepted", None, "\"s3\""),
+            ),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.asked_all();
+        assert!(outcome == saved(), "rebased in silence");
+        let sent = writes(&script);
+        assert_eq!(sent.len(), 2);
+        for write in sent {
+            let body = write.body.unwrap();
+            let list = body["attendees"].as_array().unwrap();
+            assert!(
+                list.len() == 1 && list[0]["email"] == CALENDAR,
+                "the user's entry alone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_412_is_a_conflict() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let moved = written(&event, &[("summary", json!("Dentist (moved)"))], "\"s2\"");
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch("/events/solo", "\"s1\"", Scripted::Status(412)),
+            Step::get("/events/solo", "", moved),
+            reply_patch("/events/solo", "\"s2\"", Scripted::Status(412)),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::No, None, None).await;
+        script.asked_all();
+        assert!(outcome == WriteOutcome::Conflict { fields: Vec::new() });
+        assert_eq!(writes(&script).len(), 2);
+        assert_eq!(row_reply(&host, "solo").as_deref(), Some("needsAction"));
+    }
+
+    /// R9: an occurrence says which occurrences; without that, only a GET has gone out.
+    #[tokio::test]
+    async fn an_occurrence_without_a_scope_asks() {
+        let occurrence = monday_invite();
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let script = Script::new(vec![instance_read(&occurrence)]);
+        let outcome = reply_on(&host, &script, &occurrence, Rsvp::Yes, None, None).await;
+        script.finished();
+        assert!(outcome == WriteOutcome::needs_scope());
+        assert_eq!(script.sent().len(), 1);
+    }
+
+    /// C14 critique C1-L2: a scope on an event that doesn't repeat (a row read before Google made
+    /// it a one-off) is ignored, so the reply goes to the event and can't loop.
+    #[tokio::test]
+    async fn a_one_off_with_a_scope_replies_to_the_event() {
+        for scope in [RsvpScope::This, RsvpScope::All] {
+            let event = invite();
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let now = replied(&event, "accepted", None, "\"s2\"");
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", event.clone()),
+                reply_patch("/events/solo", "\"s1\"", Scripted::Json(only_me(&now))),
+                Step::get("/events/solo", "", now),
+            ]);
+            let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, Some(scope)).await;
+            script.asked_all();
+            assert!(outcome == saved(), "the one event");
+        }
+    }
+
+    #[tokio::test]
+    async fn this_event_replies_on_the_occurrence() {
+        let occurrence = monday_invite();
+        let id = occurrence["id"].as_str().unwrap().to_string();
+        let etag = occurrence["etag"].as_str().unwrap().to_string();
+        let path = format!("/events/{id}");
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let now = replied(&occurrence, "accepted", None, "\"i2\"");
+        let script = Script::new(vec![
+            instance_read(&occurrence),
+            reply_patch(&path, &etag, Scripted::Json(only_me(&now))),
+            Step::get(&path, "", now),
+        ]);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::This),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "this occurrence");
+        assert!(first_write(&script)
+            .url
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .ends_with(&id));
+        assert_eq!(row_reply(&host, &id).as_deref(), Some("accepted"));
+    }
+
+    /// The steps of "all events" from the occurrence `occurrence` of `series` up to the PATCH of the
+    /// series on `etag`, answered `answer`.
+    fn all_events_steps(
+        occurrence: &Value,
+        series: &Value,
+        etag: &str,
+        answer: Scripted,
+    ) -> Vec<Step> {
+        vec![
+            instance_read(occurrence),
+            Step::get("/events/abc", "", series.clone()),
+            reply_patch("/events/abc", etag, answer),
+        ]
+    }
+
+    #[tokio::test]
+    async fn all_events_replies_on_the_repeating_event_and_lands_its_occurrences() {
+        let (occurrence, series) = (monday_invite(), weekly_invite());
+        let later = invitation_of(plain("2026-10-26T09:00:00Z"));
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        let series_now = replied(&series, "accepted", None, "\"m2\"");
+        let listed = vec![
+            replied(&occurrence, "accepted", None, "\"i1\""),
+            replied(&later, "accepted", None, "\"i2\""),
+            cancelled("2026-11-02T09:00:00Z"),
+        ];
+        let mut steps = all_events_steps(
+            &occurrence,
+            &series,
+            "\"m1\"",
+            Scripted::Json(only_me(&series_now)),
+        );
+        steps.push(Step::get("/events/abc", "", series_now));
+        steps.push(refetch_read(Scripted::Json(page(listed, None))));
+        let script = Script::new(steps);
+        let before = host.ids();
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "every occurrence");
+        let patch = first_write(&script);
+        assert!(query_of(&patch) == "sendUpdates=all");
+        assert!(
+            patch.body
+                == Some(Value::Object(
+                    rsvp::rsvp_body(&series, CALENDAR, Rsvp::Yes, None).unwrap()
+                )),
+            "the repeating event's own entry"
+        );
+        // Every listed occurrence upserted, the cancelled one skipped, none deleted.
+        assert_eq!(host.ids(), before);
+        for row in host.rows() {
+            assert!(
+                row.attendees
+                    .iter()
+                    .any(|a| a.is_self && a.response.as_deref() == Some("accepted")),
+                "every occurrence shows the reply"
+            );
+        }
+        assert!(!host.nothing_recorded());
+    }
+
+    /// The user may be on one occurrence's guest list only: "all events" needs the repeating
+    /// event's own, and sends nothing without it.
+    #[tokio::test]
+    async fn all_events_needs_the_user_on_the_repeating_events_own_list() {
+        let occurrence = monday_invite();
+        let series = with(
+            weekly_invite(),
+            "attendees",
+            json!([{ "email": "o@x.org", "organizer": true }]),
+        );
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let script = Script::new(vec![
+            instance_read(&occurrence),
+            Step::get("/events/abc", "", series),
+        ]);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotInvited
+                }
+        );
+        // The repeating event's own copy is judged as a copy of its own: a private one on a calendar
+        // that can't change private events takes no reply from it, whatever the occurrence is.
+        let series = with(weekly_invite(), "visibility", json!("private"));
+        let script = Script::new(vec![
+            instance_read(&occurrence),
+            Step::get("/events/abc", "", series),
+        ]);
+        let mut shared = target(&occurrence);
+        shared.facts.access_role = Some("writerWithoutPrivateAccess".into());
+        let choice = ReplyChoice {
+            response: Rsvp::Yes,
+            note: None,
+            scope: Some(RsvpScope::All),
+        };
+        let outcome = reply(
+            &script,
+            &*host,
+            &shared,
+            Some("abc"),
+            choice,
+            EditingStatus::On,
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::PrivateEvent
+                }
+        );
+    }
+
+    /// C14 critique C1-M1: the row and its repeating event are claimed before any read, so a reply
+    /// to this occurrence or to all of them waits while the repeating event is being written, and
+    /// one whose row didn't name it claims it once found.
+    #[tokio::test]
+    async fn all_events_is_busy_while_the_repeating_event_is_being_written() {
+        let occurrence = monday_invite();
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let held = InFlight::claim(&host.edit, &series_key(CALENDAR, "abc")).unwrap();
+        for scope in [Some(RsvpScope::This), Some(RsvpScope::All), None] {
+            let script = Script::new(Vec::new());
+            let outcome = reply_on(&host, &script, &occurrence, Rsvp::Yes, None, scope).await;
+            script.asked_all();
+            assert!(outcome == WriteOutcome::Busy, "claimed before any read");
+        }
+        // A row the mirror holds as a one-off: the repeating event is claimed once Google names it.
+        let script = Script::new(vec![instance_read(&occurrence)]);
+        let choice = ReplyChoice {
+            response: Rsvp::Yes,
+            note: None,
+            scope: Some(RsvpScope::All),
+        };
+        let outcome = reply(
+            &script,
+            &*host,
+            &target(&occurrence),
+            None,
+            choice,
+            EditingStatus::On,
+        )
+        .await;
+        script.finished();
+        assert!(outcome == WriteOutcome::Busy, "claimed once found");
+        drop(held);
+        // Every claim is let go once the reply ends.
+        assert!(InFlight::claim_all(
+            &host.edit,
+            &[series_key(CALENDAR, "abc"), target(&occurrence).row_id]
+        )
+        .is_some());
+    }
+
+    /// C14 critique C1-M1: a 412 on "all events" rebases onto the repeating event's newer copy; its
+    /// own claim is never met again as Busy.
+    #[tokio::test]
+    async fn a_412_on_all_events_rebases_not_busy() {
+        let (occurrence, series) = (monday_invite(), weekly_invite());
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let mut list = invited_list();
+        list[2]["responseStatus"] = json!("declined");
+        let moved = written(&series, &[("attendees", list)], "\"m2\"");
+        let series_now = replied(&moved, "accepted", None, "\"m3\"");
+        let mut steps = all_events_steps(&occurrence, &series, "\"m1\"", Scripted::Status(412));
+        steps.extend(all_events_steps(
+            &occurrence,
+            &moved,
+            "\"m2\"",
+            Scripted::Json(only_me(&series_now)),
+        ));
+        steps.push(Step::get("/events/abc", "", series_now));
+        steps.push(refetch_read(Scripted::Json(page(
+            vec![replied(&occurrence, "accepted", None, "\"i1\"")],
+            None,
+        ))));
+        let script = Script::new(steps);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "rebased, not busy");
+        assert_eq!(writes(&script).len(), 2);
+    }
+
+    /// The plan's "no self entry → ReadOnly": nothing to reply from, said in the editor's words.
+    #[tokio::test]
+    async fn no_entry_on_the_list_is_read_only() {
+        let event = with(
+            invite(),
+            "attendees",
+            json!([{ "email": "o@x.org", "organizer": true }, { "email": "a@x.org" }]),
+        );
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotInvited
+                }
+        );
+        assert_eq!(script.sent().len(), 1);
+        assert_eq!(
+            read_only_message(ReadOnlyReason::NotInvited),
+            rsvp::RsvpError::NotInvited.to_string(),
+            "one sentence for one reason"
+        );
+    }
+
+    /// §0.4 item 1: the organiser's own reply sends the whole guest list as Google sent it, only
+    /// their entry changed, and emails nobody.
+    #[tokio::test]
+    async fn the_organisers_own_reply_sends_the_whole_list_and_tells_nobody() {
+        let me = json!({ "email": CALENDAR, "self": true, "organizer": true, "responseStatus": "accepted" });
+        let guest = json!({ "email": "a@x.org", "responseStatus": "needsAction", "comment": "x" });
+        let event = with(dentist(), "attendees", json!([me, guest]));
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let now = replied(&event, "declined", None, "\"s2\"");
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                "sendUpdates=none",
+                Scripted::Json(now.clone()),
+            ),
+            Step::get("/events/solo", "", now),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::No, None, None).await;
+        script.asked_all();
+        assert!(outcome == saved(), "the organiser replied");
+        let patch = first_write(&script);
+        assert!(query_of(&patch) == "sendUpdates=none", "nobody told");
+        let mut declined = me.clone();
+        declined["responseStatus"] = json!("declined");
+        assert!(
+            patch.body == Some(json!({ "attendees": [declined, guest] })),
+            "the whole list, only the organiser's own entry changed"
+        );
+    }
+
+    /// A reply whose answer never came is looked up: there, it landed (from that read); not there,
+    /// it didn't; unreadable, nobody can say.
+    #[tokio::test]
+    async fn a_lost_answer_is_looked_up() {
+        let event = invite();
+        let now = replied(&event, "accepted", None, "\"s2\"");
+        let cases = [
+            (Step::get("/events/solo", "", now.clone()), saved()),
+            (
+                Step::get("/events/solo", "", event.clone()),
+                WriteOutcome::Failed {
+                    message: LOST_REPLY.into(),
+                },
+            ),
+            (
+                Step::status("/events/solo", "", 500),
+                WriteOutcome::Unconfirmed,
+            ),
+        ];
+        for (look, expected) in cases {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", event.clone()),
+                reply_patch("/events/solo", "\"s1\"", Scripted::Lost { retried: false }),
+                look,
+            ]);
+            let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+            script.asked_all();
+            assert!(outcome == expected, "looked before saying");
+            let landed = outcome == saved();
+            assert_eq!(
+                row_reply(&host, "solo").as_deref(),
+                Some(if landed { "accepted" } else { "needsAction" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_error_that_may_have_landed_is_looked_up() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let now = replied(&event, "accepted", None, "\"s2\"");
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch(
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Reply {
+                    status: 503,
+                    body: None,
+                    date: None,
+                    maybe_applied: true,
+                },
+            ),
+            Step::get("/events/solo", "", now),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.asked_all();
+        assert!(outcome == saved(), "it had landed");
+        assert_eq!(row_reply(&host, "solo").as_deref(), Some("accepted"));
+    }
+
+    /// Google refusing a reply as a change to the shared event means it didn't read the guest
+    /// form as documented: never "someone else organises it".
+    #[tokio::test]
+    async fn google_refusing_a_reply_as_a_shared_change_says_so() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let refusal = json!({ "error": { "code": 403, "message": "Shared properties can only be changed by the organizer of the event.",
+            "errors": [{ "domain": "calendar", "reason": "forbiddenForNonOrganizer", "message": "Shared properties can only be changed by the organizer of the event." }] } });
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch(
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Reply {
+                    status: 403,
+                    body: Some(refusal),
+                    date: None,
+                    maybe_applied: false,
+                },
+            ),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: REPLY_REFUSED.into()
+                }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_from_a_special_event_or_a_read_only_calendar_is_refused() {
+        let birthday = with(invite(), "eventType", json!("birthday"));
+        let host = TestHost::holding(std::slice::from_ref(&birthday));
+        let script = Script::new(vec![Step::get("/events/solo", "", birthday.clone())]);
+        let outcome = reply_on(&host, &script, &birthday, Rsvp::Yes, None, None).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::SpecialType
+                }
+        );
+        let event = invite();
+        let mut reader = target(&event);
+        reader.facts.access_role = Some("reader".into());
+        let script = Script::new(vec![Step::get("/events/solo", "", event)]);
+        let choice = ReplyChoice {
+            response: Rsvp::Yes,
+            note: None,
+            scope: None,
+        };
+        let outcome = reply(&script, &*host, &reader, None, choice, EditingStatus::On).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::CalendarReadOnly
+                }
+        );
+    }
+
+    /// C14 critique C1-L3: a note past the limit is refused before anything is read or claimed.
+    #[tokio::test]
+    async fn a_note_too_long_is_refused_before_anything_is_read() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(Vec::new());
+        let long = "a".repeat(rsvp::NOTE_MAX + 1);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, Some(long.as_str()), None).await;
+        script.asked_all();
+        assert!(script.sent().is_empty());
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: rsvp::RsvpError::NoteTooLong.to_string()
+                }
+        );
+        assert!(InFlight::claim(&host.edit, &target(&event).row_id).is_some());
+    }
+
+    /// A one-off Google has since made repeating: a reply would answer every occurrence with no
+    /// choice asked, so it's refused with its own reason, only a GET sent.
+    #[tokio::test]
+    async fn a_reply_to_a_one_off_made_repeating_sends_nothing() {
+        let event = invite();
+        let turned = with(event.clone(), "recurrence", json!(["RRULE:FREQ=WEEKLY"]));
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![Step::get("/events/solo", "", turned)]);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &event,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::BecameRepeating
+                }
+        );
+    }
+
+    /// C14 critiques C1-M2, C2-M2: Google answering as if it took a reply its copy doesn't hold is
+    /// never "Saved", and nothing is landed.
+    #[tokio::test]
+    async fn a_reply_google_answered_but_didnt_take_is_never_saved() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch("/events/solo", "\"s1\"", Scripted::Json(only_me(&event))),
+            Step::get("/events/solo", "", written(&event, &[], "\"s2\"")),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.asked_all();
+        assert!(outcome == WriteOutcome::IgnoredByGoogle { split: false });
+        assert!(host.nothing_recorded());
+    }
+
+    /// C14 critique C1-M7: a guest list that comes back shorter is never "Saved": Google may have
+    /// read the reply as the whole list. The row shows the list as it is now.
+    #[tokio::test]
+    async fn a_reply_that_comes_back_with_fewer_guests_is_never_saved() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let now = replied(&event, "accepted", None, "\"s2\"");
+        let fewer = with(
+            now.clone(),
+            "attendees",
+            json!([
+                { "email": "o@x.org", "organizer": true, "responseStatus": "accepted" },
+                { "email": CALENDAR, "self": true, "responseStatus": "accepted" }
+            ]),
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            reply_patch("/events/solo", "\"s1\"", Scripted::Json(only_me(&now))),
+            Step::get("/events/solo", "", fewer),
+        ]);
+        let outcome = reply_on(&host, &script, &event, Rsvp::Yes, None, None).await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: GUESTS_SHRANK.into()
+                }
+        );
+        assert_eq!(
+            host.row("solo").attendees.len(),
+            2,
+            "the row shows Google's list"
+        );
+        // Replies and who is optional don't count as a shorter list.
+        let mut changed = invited_list();
+        changed[2]["responseStatus"] = json!("declined");
+        changed[2]["optional"] = json!(true);
+        assert!(!guests_lost(
+            &event,
+            &with(event.clone(), "attendees", changed)
+        ));
+    }
+
+    /// C14 critique C1-M2: "all events" lands only a listing that shows the reply on the
+    /// occurrence clicked (which had the repeating event's reply): a lagging first listing is read
+    /// again after a pause; one that never catches up records nothing.
+    #[tokio::test]
+    async fn all_events_waits_for_a_listing_that_shows_the_reply() {
+        let (occurrence, series) = (monday_invite(), weekly_invite());
+        let series_now = replied(&series, "accepted", None, "\"m2\"");
+        let lagging = || refetch_read(Scripted::Json(page(vec![occurrence.clone()], None)));
+        let caught_up = refetch_read(Scripted::Json(page(
+            vec![replied(&occurrence, "accepted", None, "\"i1\"")],
+            None,
+        )));
+        let steps = |listings: Vec<Step>| {
+            let mut steps = all_events_steps(
+                &occurrence,
+                &series,
+                "\"m1\"",
+                Scripted::Json(only_me(&series_now)),
+            );
+            steps.push(Step::get("/events/abc", "", series_now.clone()));
+            steps.extend(listings);
+            steps
+        };
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let script = Script::new(steps(vec![lagging(), caught_up]));
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved(), "landed from the second listing");
+        assert_eq!(script.waits(), vec![REFETCH_AGAIN[0]]);
+        assert_eq!(
+            row_reply(&host, occurrence["id"].as_str().unwrap()).as_deref(),
+            Some("accepted")
+        );
+
+        let host = TestHost::holding(std::slice::from_ref(&occurrence));
+        let script = Script::new(steps(vec![lagging(), lagging(), lagging()]));
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == pending(), "taken, shown after the next refresh");
+        assert!(host.nothing_recorded(), "never half landed");
+        assert_eq!(script.waits(), REFETCH_AGAIN.to_vec());
+    }
+
+    /// C14 critiques C1-M3, C2-H1: with the repeating event already answered and the occurrence
+    /// clicked answered otherwise on its own, "all events" still goes, and an occurrence that kept
+    /// its own answer afterwards is said, by day, never hidden behind "all events".
+    #[tokio::test]
+    async fn all_events_says_which_occurrences_kept_their_own_answer() {
+        let occurrence = replied(&monday_invite(), "declined", None, "\"i1\"");
+        let series = replied(&weekly_invite(), "accepted", None, "\"m1\"");
+        let later = invitation_of(plain("2026-10-26T09:00:00Z"));
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        let mut steps = all_events_steps(
+            &occurrence,
+            &series,
+            "\"m1\"",
+            Scripted::Json(only_me(&series)),
+        );
+        steps.push(Step::get("/events/abc", "", series.clone()));
+        steps.push(refetch_read(Scripted::Json(page(
+            vec![
+                occurrence.clone(),
+                replied(&later, "accepted", None, "\"i2\""),
+            ],
+            None,
+        ))));
+        let script = Script::new(steps);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::KeptOwnReply],
+                    left_behind: vec!["2026-10-19".into()],
+                    milestone_moves: None,
+                },
+            "saved, with the occurrence that kept its own answer"
+        );
+        assert_eq!(script.waits(), Vec::<Duration>::new(), "no lag to wait out");
+        assert_eq!(
+            row_reply(&host, occurrence["id"].as_str().unwrap()).as_deref(),
+            Some("declined")
+        );
+    }
+
+    /// PR B review round 2: a mirror that can't take the listing still has the occurrences that
+    /// kept their own answer said, by day, beside the calendar catching up.
+    #[tokio::test]
+    async fn all_events_says_which_kept_their_own_answer_when_the_mirror_cant_take_it() {
+        let occurrence = replied(&monday_invite(), "declined", None, "\"i1\"");
+        let series = replied(&weekly_invite(), "accepted", None, "\"m1\"");
+        let later = invitation_of(plain("2026-10-26T09:00:00Z"));
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        // The mirror refuses every row from now on, as a full disk would.
+        host.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER no_rows BEFORE INSERT ON calendar_events \
+                 BEGIN SELECT RAISE(ABORT, 'full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let mut steps = all_events_steps(
+            &occurrence,
+            &series,
+            "\"m1\"",
+            Scripted::Json(only_me(&series)),
+        );
+        steps.push(Step::get("/events/abc", "", series.clone()));
+        steps.push(refetch_read(Scripted::Json(page(
+            vec![
+                occurrence.clone(),
+                replied(&later, "accepted", None, "\"i2\""),
+            ],
+            None,
+        ))));
+        let script = Script::new(steps);
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![
+                        WriteWarning::MirrorRefreshPending,
+                        WriteWarning::KeptOwnReply
+                    ],
+                    left_behind: vec!["2026-10-19".into()],
+                    milestone_moves: None,
+                },
+            "saved, shown after the next refresh, with the occurrence that kept its own answer"
+        );
+        assert!(host.hash_dropped(), "the next sync rewrites the calendar");
+        assert!(host.nothing_recorded());
+    }
+
+    /// PR B review round 1: from an occurrence answered on its own, "all events" can't wait for the
+    /// occurrence clicked, so it waits for a listing no older than the repeating event's copy after
+    /// the reply. A lagging one, whose other occurrences still have the old reply, is read again,
+    /// never landed with them said to have kept an answer of their own; one that never catches up
+    /// records nothing.
+    #[tokio::test]
+    async fn all_events_from_an_occurrence_answered_on_its_own_waits_out_a_lagging_listing() {
+        // Answered No on its own before the reply, so its version is older than the reply's.
+        let occurrence = with(
+            replied(&monday_invite(), "declined", None, "\"i1\""),
+            "updated",
+            json!("2026-10-10T08:00:00.000Z"),
+        );
+        let series = weekly_invite();
+        let series_now = replied(&series, "accepted", None, "\"m2\"");
+        let later = invitation_of(plain("2026-10-26T09:00:00Z"));
+        let lagging = || {
+            refetch_read(Scripted::Json(page(
+                vec![occurrence.clone(), later.clone()],
+                None,
+            )))
+        };
+        let caught_up = refetch_read(Scripted::Json(page(
+            vec![
+                occurrence.clone(),
+                replied(&later, "accepted", None, "\"i2\""),
+            ],
+            None,
+        )));
+        let steps = |listings: Vec<Step>| {
+            let mut steps = all_events_steps(
+                &occurrence,
+                &series,
+                "\"m1\"",
+                Scripted::Json(only_me(&series_now)),
+            );
+            steps.push(Step::get("/events/abc", "", series_now.clone()));
+            steps.extend(listings);
+            steps
+        };
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        let script = Script::new(steps(vec![lagging(), caught_up]));
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Saved {
+                    warnings: vec![WriteWarning::KeptOwnReply],
+                    left_behind: vec!["2026-10-19".into()],
+                    milestone_moves: None,
+                },
+            "landed from the second listing, only the occurrence answered on its own said"
+        );
+        assert_eq!(script.waits(), vec![REFETCH_AGAIN[0]]);
+        assert_eq!(
+            row_reply(&host, later["id"].as_str().unwrap()).as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            row_reply(&host, occurrence["id"].as_str().unwrap()).as_deref(),
+            Some("declined")
+        );
+
+        let host = TestHost::holding(&[occurrence.clone(), later.clone()]);
+        let script = Script::new(steps(vec![lagging(), lagging(), lagging()]));
+        let outcome = reply_on(
+            &host,
+            &script,
+            &occurrence,
+            Rsvp::Yes,
+            None,
+            Some(RsvpScope::All),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == pending(), "taken, shown after the next refresh");
+        assert!(host.nothing_recorded(), "never half landed");
+        assert_eq!(script.waits(), REFETCH_AGAIN.to_vec());
+    }
+
+    /// C14 §4.6: the editor opens with the user's own reply and whether they organise it; on an
+    /// invitation the reply is open, and from C14c the user's own settings, never the shared fields
+    /// (the organiser hasn't let guests change them here).
+    #[tokio::test]
+    async fn the_editor_opens_with_the_users_reply() {
+        let event = replied(&invite(), "needsAction", None, "\"s1\"");
+        let edit_state = CalendarEditState::default();
+        let script = Script::new(Vec::new());
+        let load = open_editor(
+            &script,
+            &edit_state,
+            target(&event),
+            event,
+            EditingStatus::On,
+            None,
+        )
+        .await
+        .unwrap();
+        script.finished();
+        let EditLoad::Ready {
+            event, permissions, ..
+        } = load
+        else {
+            panic!("the editor didn't open");
+        };
+        assert!(
+            event.reply
+                == Some(crate::calendar_write::dto::ReplyForEdit {
+                    response: Some("needsAction".into()),
+                    note: String::new(),
+                }),
+            "the user's own entry, no note"
+        );
+        assert!(!event.organizer_self);
+        assert!(permissions.respond && permissions.show_as && permissions.colour);
+        assert!(!permissions.summary && !permissions.guests && !permissions.delete);
+        assert!(!permissions.repeat);
+        // The dentist you organise, with nobody invited: no reply to give.
+        let script = Script::new(Vec::new());
+        let load = open_editor(
+            &script,
+            &edit_state,
+            target(&dentist()),
+            dentist(),
+            EditingStatus::On,
+            None,
+        )
+        .await
+        .unwrap();
+        let EditLoad::Ready {
+            event, permissions, ..
+        } = load
+        else {
+            panic!("the editor didn't open");
+        };
+        assert!(event.reply.is_none() && event.organizer_self && !permissions.respond);
+    }
+
+    /// The reply command makes the window and owner checks every write makes before it reads
+    /// anything; it reads the row's repeating event in the same lock as its target; and "all
+    /// events" is series-wide to a dev build's allow-list, as every write to all occurrences is.
+    #[test]
+    fn the_reply_command_checks_first_and_all_events_is_series_wide() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let start = shipped
+            .find("pub async fn respond_to_calendar_event(")
+            .expect("the reply command");
+        let shell = &shipped[start..];
+        let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
+        let at = |needle: &str| shell.find(needle).unwrap_or(usize::MAX);
+        assert!(
+            at("require_main_window(&window)?;") < at("require_owner(&app)?;")
+                && at("require_owner(&app)?;") < at("state.conn()")
+                && at("let series = row_series(&conn, &event_id)?;") < at("editing_status(")
+                && at("editing_status(") < at("reply(\n"),
+            "the window and owner first, the row's facts in one lock, then the reply"
+        );
+        assert!(shell.contains("let series_wide = scope == Some(RsvpScope::All);"));
+        assert!(shell
+            .contains("dev_allow::check(&*state.conn()?, &target.remote_calendar, series_wide)"));
+        assert!(shell.contains("if editing != EditingStatus::On {"));
+        assert_eq!(
+            dev_allow::decide(None, None, "home@group", true),
+            Err(dev_allow::UNSET)
+        );
+    }
+
+    // --- your own settings on someone else's event (C14c) ---
+
+    /// The dentist invitation, its organiser letting guests change it.
+    fn modifiable_invite() -> Value {
+        with(invite(), "guestsCanModify", json!(true))
+    }
+
+    /// The organiser and the other guest, each told of an update.
+    fn two_updated() -> GuestNotice {
+        GuestNotice {
+            updated: 2,
+            people: 2,
+            emails: 2,
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// C14 §9.2: busy or free, a notification and a colour are the user's own on an invitation:
+    /// one PATCH of that key alone, emailing nobody, asked nothing.
+    #[tokio::test]
+    async fn an_invitations_own_settings_save_without_an_email_question() {
+        let busy = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        for event in [invite(), modifiable_invite()] {
+            for (draft, key, value) in [
+                (busy.clone(), "transparency", json!("transparent")),
+                (
+                    notifying(&[("popup", 10)]),
+                    "reminders",
+                    json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 10 }] }),
+                ),
+                (colouring("10"), "colorId", json!("10")),
+            ] {
+                let host = TestHost::holding(std::slice::from_ref(&event));
+                let landed = written(&event, &[(key, value.clone())], "\"s2\"");
+                let (outcome, script, _) = save_one_off(
+                    &host,
+                    &event,
+                    target(&event),
+                    &draft,
+                    vec![Step::write(
+                        Method::Patch,
+                        "/events/solo",
+                        "\"s1\"",
+                        Scripted::Json(landed),
+                    )],
+                )
+                .await;
+                script.asked_all();
+                assert!(outcome == saved(), "{key}: saved without asking");
+                let body = first_write(&script).body.unwrap();
+                assert!(body == json!({ key: value }), "{key} alone");
+            }
+        }
+    }
+
+    /// C14 §9.2, Q16: without "modify event", an invitation's title is the organiser's: refused
+    /// with their reason after the one GET.
+    #[tokio::test]
+    async fn an_invitations_title_is_read_only_without_modify() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &title("Retro"), Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer
+                }
+        );
+    }
+
+    /// C14 §9.2, A11: with "modify event", a title change on an invitation asks Send / Don't send
+    /// with the organiser counted among those Google would email, only the GET sent; each answer
+    /// goes to Google as given.
+    #[tokio::test]
+    async fn with_modify_a_title_change_asks_and_counts_the_organiser() {
+        let event = modifiable_invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &title("Retro"), Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(two_updated()),
+            "asked: the organiser and the other guest"
+        );
+        for (notify, query) in [
+            (Notify::All, "sendUpdates=all"),
+            (Notify::None, "sendUpdates=none"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off_told(
+                &host,
+                &event,
+                target(&event),
+                &title("Retro"),
+                vec![told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    query,
+                    Scripted::Json(retitled(&event, "\"s2\"")),
+                )],
+                answered(notify, two_updated()),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "saved, as chosen");
+        }
+    }
+
+    /// C14 §9.2, Q4: the guest list of someone else's event stays the organiser's, saying so with
+    /// "modify event" on and the organiser's reason without it. Nothing but the GET goes out.
+    #[tokio::test]
+    async fn an_invitations_guest_list_is_the_organisers() {
+        for (event, reason) in [
+            (modifiable_invite(), ReadOnlyReason::OrganizerOnlyGuests),
+            (invite(), ReadOnlyReason::NotOrganizer),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &adding_guest("b@x.org"),
+                Vec::new(),
+            )
+            .await;
+            script.finished();
+            assert!(outcome == WriteOutcome::ReadOnly { reason });
+        }
+    }
+
+    /// C14 critiques C1-H2, C2-H2: a guest can't give someone else's one-off a repeat, whatever
+    /// the organiser lets guests change: refused after the GET, nothing sent.
+    #[tokio::test]
+    async fn a_guest_cant_make_an_invitation_repeat() {
+        for event in [invite(), modifiable_invite()] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &weekly_on(&[DayCode::Mon]),
+                Vec::new(),
+            )
+            .await;
+            script.finished();
+            assert!(
+                outcome
+                    == WriteOutcome::ReadOnly {
+                        reason: ReadOnlyReason::NotOrganizer
+                    }
+            );
+        }
+    }
+
+    /// C14 §9.2, L-I3's backstop: Google refusing a guest's shared change (403
+    /// `forbiddenForNonOrganizer`) is the organiser's reason, not a failure.
+    #[tokio::test]
+    async fn google_refusing_a_guests_shared_change_is_read_only() {
+        let event = modifiable_invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let refusal = json!({ "error": { "code": 403, "message": "Shared properties can only be changed by the organizer of the event.",
+            "errors": [{ "domain": "calendar", "reason": "forbiddenForNonOrganizer", "message": "Shared properties can only be changed by the organizer of the event." }] } });
+        let (outcome, script, _) = save_one_off_told(
+            &host,
+            &event,
+            target(&event),
+            &title("Retro"),
+            vec![told(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                "sendUpdates=none",
+                Scripted::Reply {
+                    status: 403,
+                    body: Some(refusal),
+                    date: None,
+                    maybe_applied: false,
+                },
+            )],
+            answered(Notify::None, two_updated()),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer
+                }
+        );
+    }
+
+    /// C14 §9.2: an invitation isn't deleted from PM until Remove (a later layer): a delete that
+    /// reached its send is refused with the organiser's reason, never the guest list's (critique
+    /// C1-L1), and nothing is deleted.
+    #[tokio::test]
+    async fn an_invitation_cant_be_deleted_until_remove() {
+        for event in [invite(), modifiable_invite()] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &answered(Notify::All, two_updated()),
+            )
+            .await;
+            script.finished();
+            assert!(
+                outcome
+                    == WriteOutcome::ReadOnly {
+                        reason: ReadOnlyReason::NotOrganizer
+                    }
+            );
+        }
+    }
+
+    /// C14 §9.1: a refused draft names the refused field's own reason. With "modify event" and a
+    /// lock, a title says the lock and a guest says the guest list; without "modify event", both
+    /// say the organiser's; a label still names itself for the colour.
+    #[test]
+    fn refused_field_names_the_fields_own_reason() {
+        let rights = |organizer_self: bool, guests_can_modify: bool, locked: bool| {
+            gate::edit_rights(&EditFacts {
+                google: true,
+                editing: EditingStatus::On,
+                access_role: Some("owner"),
+                event_type: None,
+                organizer_self,
+                guests_can_modify,
+                locked,
+                visibility: None,
+                series_master: false,
+                html_description: false,
+                labelled: true,
+                reminders_readable: true,
+                invited: true,
+            })
+        };
+        let guest = adding_guest("b@x.org");
+        let both = EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..guest.clone()
+        };
+        let a5 = rights(false, true, true);
+        assert_eq!(
+            refused_field(&a5, &title("Retro")),
+            Some(ReadOnlyReason::Locked)
+        );
+        assert_eq!(
+            refused_field(&a5, &guest),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        // The guest list is looked at first, whatever else the draft touches.
+        assert_eq!(
+            refused_field(&a5, &both),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        let a3 = rights(false, true, false);
+        assert_eq!(refused_field(&a3, &title("Retro")), None);
+        assert_eq!(
+            refused_field(&a3, &guest),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        // The guest list is looked at first.
+        assert_eq!(
+            refused_field(&a3, &both),
+            Some(ReadOnlyReason::OrganizerOnlyGuests)
+        );
+        assert_eq!(
+            refused_field(&a3, &weekly_on(&[DayCode::Mon])),
+            Some(ReadOnlyReason::NotOrganizer)
+        );
+        assert_eq!(
+            refused_field(&a3, &colouring("3")),
+            Some(ReadOnlyReason::LabelReadOnly)
+        );
+        let a2 = rights(false, false, false);
+        for draft in [guest.clone(), title("Retro"), both] {
+            assert_eq!(
+                refused_field(&a2, &draft),
+                Some(ReadOnlyReason::NotOrganizer)
+            );
+        }
+        let mine_locked = rights(true, false, true);
+        assert_eq!(
+            refused_field(&mine_locked, &title("Retro")),
+            Some(ReadOnlyReason::Locked)
+        );
+    }
+
+    /// C14 §9.3: an occurrence of someone else's repeating event offers "this event" and "all
+    /// events" for the user's own settings, and refuses "this and following" in its own words.
+    #[tokio::test]
+    async fn an_invitations_rows_say_why_following_is_refused() {
+        let (series, instance) = (weekly_invite(), monday_invite());
+        let window: Vec<Value> = october().into_iter().map(invitation_of).collect();
+        let busy = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let script = Script::new(reads(&instance, &series, vec![series.clone()], window));
+        let opened = Some((&instance, Some(&series)));
+        let (this, following, all) = ask(&script, &instance, edit(busy), opened, &["abc"]).await;
+        assert!(
+            matches!(this, ScopeRow::Offered { guests: None, .. }),
+            "this event, asking nobody"
+        );
+        assert!(
+            matches!(all, ScopeRow::Offered { guests: None, .. }),
+            "all events, asking nobody"
+        );
+        assert!(
+            following
+                == ScopeRow::Refused {
+                    message: SeriesRefusal::InvitationFollowing.to_string()
+                },
+            "this and following, refused in words"
+        );
     }
 }

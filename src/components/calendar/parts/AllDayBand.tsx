@@ -22,6 +22,7 @@ import {
   spokenName,
   type BandInput,
 } from "../../../lib/calendar-layout";
+import { declinedName, isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
 
@@ -139,7 +140,7 @@ export function AllDayBand({
                 borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
               }}
               title={b.ev.summary}
-              aria-label={spokenName(ghost, b.ev.summary)}
+              aria-label={declinedName(spokenName(ghost, b.ev.summary), isDeclined(b.ev))}
               role={clickable ? "button" : undefined}
               tabIndex={clickable ? 0 : undefined}
               onClick={
@@ -158,7 +159,10 @@ export function AllDayBand({
                   : undefined
               }
             >
-              <span className="truncate font-head text-ink" style={inkOn(own)}>
+              <span
+                className={cn("truncate font-head text-ink", isDeclined(b.ev) && "line-through")}
+                style={inkOn(own)}
+              >
                 {b.continuesLeft ? "‹ " : ""}
                 {b.ev.summary}
               </span>

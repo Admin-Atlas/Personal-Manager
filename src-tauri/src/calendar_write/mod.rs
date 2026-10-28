@@ -14,6 +14,8 @@
 //! - [`classify`]: what Google's answer means, and whether one retry is safe.
 //! - [`plan`]: the requests themselves, ids percent-encoded and `sendUpdates` always explicit.
 //! - [`reconcile`]: keeping a just-saved event on screen until a sync shows it.
+//! - [`rsvp`]: replying to an invitation, by changing only the user's own entry on its guest list
+//!   (C14).
 //! - [`series`]: changing a repeating event, its occurrence, the rest of it from one on, or all of
 //!   it, as ordered writes with their checks and compensations.
 //!
@@ -28,5 +30,6 @@ pub mod gate;
 pub mod patch;
 pub mod plan;
 pub mod reconcile;
+pub mod rsvp;
 pub mod series;
 pub mod time;

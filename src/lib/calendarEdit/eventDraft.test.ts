@@ -71,6 +71,8 @@ const event: EventForEdit = {
   reminders: { use_default: true, overrides: [] },
   color_id: null,
   label_id: null,
+  reply: null,
+  organizer_self: true,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -111,6 +113,7 @@ describe("the event draft", () => {
     const perms: FieldPermissions = {
       summary: false,
       time: false,
+      repeat: false,
       location: false,
       description: false,
       show_as: true,
@@ -119,13 +122,16 @@ describe("the event draft", () => {
       reminders: true,
       colour: true,
       delete: false,
+      respond: false,
       reasons: ["locked"],
     };
     expect(canEdit(perms, "summary")).toBe(false);
     expect(canEdit(perms, "show_as")).toBe(true);
-    // How it repeats goes with the time: Google locks both together.
+    // How it repeats has its own right (C14 critiques C1-H2, C2-H2): the backend closes it with the
+    // time, and on someone else's event whatever its time may do.
     expect(canEdit(perms, "recurrence")).toBe(false);
-    expect(canEdit({ ...perms, time: true }, "recurrence")).toBe(true);
+    expect(canEdit({ ...perms, time: true }, "recurrence")).toBe(false);
+    expect(canEdit({ ...perms, repeat: true }, "recurrence")).toBe(true);
   });
 });
 
@@ -601,6 +607,7 @@ describe("guests in the draft", () => {
     const perms: FieldPermissions = {
       summary: true,
       time: true,
+      repeat: true,
       location: true,
       description: true,
       show_as: true,
@@ -609,6 +616,7 @@ describe("guests in the draft", () => {
       reminders: true,
       colour: true,
       delete: true,
+      respond: false,
       reasons: [],
     };
     expect(canEdit(perms, "guests")).toBe(false);
@@ -1109,6 +1117,7 @@ describe("notifications and colour in the draft", () => {
     const perms: FieldPermissions = {
       summary: false,
       time: false,
+      repeat: false,
       location: false,
       description: false,
       show_as: true,
@@ -1117,6 +1126,7 @@ describe("notifications and colour in the draft", () => {
       reminders: true,
       colour: false,
       delete: false,
+      respond: false,
       reasons: ["label_read_only"],
     };
     expect(canEdit(perms, "reminders")).toBe(true);

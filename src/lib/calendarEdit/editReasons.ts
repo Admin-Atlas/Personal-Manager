@@ -11,16 +11,40 @@ import type {
   EditLoad,
   MilestoneMove,
   ReadOnlyReason,
+  Rsvp,
+  RsvpScope,
   SeriesScope,
   SplitAction,
   WriteOutcome,
   WriteWarning,
 } from "../types";
 import type { DraftProblem, EditorField } from "./eventDraft";
+import { rsvpLabel } from "./rsvp";
 
 function unreachable(value: never): never {
   throw new Error(`unhandled calendar edit value: ${JSON.stringify(value)}`);
 }
+
+const NOT_ORGANISER = "Someone else organises this event.";
+
+/** What stays the organiser's on an event they haven't let guests change (C14c). */
+const THEIRS =
+  "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+
+/** What the user may change on someone else's event: their reply only where its calendar is on the
+ *  guest list (C14 critique C2-L1). */
+const ownSettings = (canReply: boolean) =>
+  canReply
+    ? "Your reply, notifications, colour and busy or free are yours to change."
+    : "Your notifications, colour and busy or free are yours to change.";
+
+/** Under an event someone else organises who lets guests change it (A11): a paraphrase of Google's
+ *  developer guide ("only reflected on their own copy and might be lost if the organizer makes a
+ *  change"). Live test L-I3 records whether Google keeps a guest's change on their copy alone, as
+ *  the guide says, or shows it to everyone, as Workspace help reads; the wording follows it (C14
+ *  critiques C1-L10, C2-M5). */
+export const A11_NOTE =
+  "The organiser lets guests change this event. Your changes show on your copy, and may be lost if the organiser changes the event.";
 
 /** Why PM won't change an event, or a part of it. */
 export function reasonText(reason: ReadOnlyReason): string {
@@ -33,8 +57,16 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This calendar is shared with you to view only, so its events can't be changed here.";
     case "private_event":
       return "This is a private event on a calendar shared with you, and you can't change private events there.";
+    // Never promises a reply: the calendar may not be on the guest list (C14 critiques C1-L10,
+    // C2-L1). Where PM knows it is, `notOrganizerText` says so.
     case "not_organizer":
-      return "Someone else organises this event, so only they can change it.";
+      return `${THEIRS} ${ownSettings(false)}`;
+    // Group invitations list the group, not the user, so there's no entry of theirs to answer from
+    // (C14 critique C2-M8).
+    case "not_invited":
+      return "PM can only reply where this calendar is on the guest list itself (not through a group).";
+    case "organizer_only_guests":
+      return "In PM, only the organiser can change who's invited.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
@@ -50,6 +82,26 @@ export function reasonText(reason: ReadOnlyReason): string {
     default:
       return unreachable(reason);
   }
+}
+
+/** The line under an event someone else organises, in the popover and the editor (C14 critiques
+ *  C1-L10, C2-L1, C2-L10): what the user may still do from this copy. `canReply`: its calendar is on
+ *  the guest list; `editingOn`: its account has editing on, without which nothing is sent, a reply
+ *  included. Where the organiser lets guests change the event, `A11_NOTE` says it instead. */
+export function notOrganizerText(canReply: boolean, editingOn: boolean): string {
+  if (!editingOn) {
+    const what = canReply ? "reply and change your own settings" : "change your own settings";
+    return `${NOT_ORGANISER} Turn on editing for this account to ${what} from PM.`;
+  }
+  return `${THEIRS} ${ownSettings(canReply)}`;
+}
+
+/** Under the Repeat row of an event someone else organises: how it repeats stays theirs, whatever
+ *  they let guests change (C14 critiques C1-H2, C2-H2; the backend's `InvitationRule`). */
+export function repeatTheirsText(repeating: boolean): string {
+  return repeating
+    ? "Someone else organises this repeating event, so only they can change how it repeats."
+    : "Someone else organises this event, so only they can make it repeat.";
 }
 
 /** A field's name in a sentence. */
@@ -204,9 +256,20 @@ export function writeWarningText(
     // "nothing changed", and never a plain "Saved".
     case "partly_applied":
       return "Google didn't keep all of your changes, so check the event.";
+    // Only a reply for every occurrence comes back with it (C14): the days are its `leftBehind`.
+    case "kept_own_reply":
+      return keptReplyText(leftBehind?.length ?? 0);
     default:
       return unreachable(warning);
   }
+}
+
+/** Occurrences answered on their own that kept their answer when the user replied for every
+ *  occurrence (C14 critiques C1-M3, C2-H1). */
+function keptReplyText(count: number): string {
+  if (count === 1) return "1 occurrence you answered on its own kept its answer.";
+  if (count > 1) return `${count} occurrences you answered on their own kept their answer.`;
+  return "Occurrences you answered on their own kept their answer.";
 }
 
 /** What settling a change that went with Send would email guests, before a button is pressed
@@ -463,6 +526,95 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     default:
       return unreachable(outcome);
   }
+}
+
+/** What a reply to an invitation came to (C14), for the reply control's line: Google's words for
+ *  the choice ("Yes", "No", "Maybe"), and "all events" as Google says it, never "every
+ *  occurrence", since an occurrence answered on its own may keep its answer (said when it did). */
+export function replyText(
+  outcome: WriteOutcome,
+  reply: Rsvp,
+  scope: RsvpScope | null,
+): { tone: Tone; text: string } {
+  switch (outcome.outcome) {
+    case "saved": {
+      const all = scope === "all" ? " for all events" : "";
+      return savedReplyText(outcome, `You replied ${rsvpLabel(reply)}${all}.`);
+    }
+    case "no_change":
+      return { tone: "ok", text: "That's already your reply." };
+    case "conflict":
+      return {
+        tone: "warn",
+        text: "This event kept changing in Google while PM sent your reply. Try again.",
+      };
+    case "needs_choice":
+      return { tone: "warn", text: "Choose this occurrence or all of them, then reply again." };
+    // Google answered as if it took the reply, and its copy doesn't hold it (C14 critiques C1-M2,
+    // C2-M2).
+    case "ignored_by_google":
+      return {
+        tone: "warn",
+        text: "Google didn't take the reply. Try again, or reply in Google Calendar.",
+      };
+    case "gone":
+      return { tone: "error", text: GONE };
+    case "read_only":
+      return { tone: "error", text: reasonText(outcome.reason) };
+    case "busy":
+      return { tone: "warn", text: "Google is busy right now. Reply again in a moment." };
+    case "reauth":
+      return { tone: "error", text: REAUTH };
+    case "unconfirmed":
+      return {
+        tone: "warn",
+        text: "PM lost touch with Google before it could confirm your reply. Refresh the calendar to see whether it went through.",
+      };
+    case "failed":
+      return { tone: "error", text: outcome.message };
+    // Never a reply's answer; the switch stays exhaustive.
+    case "partial_split":
+    case "split_removed":
+    case "ambiguous":
+      return { tone: "error", text: "Your reply wasn't sent." };
+    default:
+      return unreachable(outcome);
+  }
+}
+
+/** A saved reply's words: `head`, then what PM's calendar still owes and the occurrences that kept
+ *  their own answer. */
+function savedReplyText(
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  head: string,
+): { tone: Tone; text: string } {
+  const words = [head];
+  if (outcome.warnings.includes("mirror_refresh_pending")) {
+    words.push(writeWarningText("mirror_refresh_pending", "save"));
+  }
+  const kept = outcome.warnings.includes("kept_own_reply");
+  if (kept) words.push(writeWarningText("kept_own_reply", "save", outcome.left_behind));
+  return { tone: kept ? "warn" : "ok", text: words.join(" ") };
+}
+
+/** What a reply came to, as one of the calendar's notices, naming the event (C14 critique C2-M1):
+ *  for a reply whose control went before its answer came (the popover closed), and for any answer
+ *  that isn't a success, which mustn't go with the popover. */
+export function replyNoticeText(
+  outcome: WriteOutcome,
+  reply: Rsvp,
+  scope: RsvpScope | null,
+  title: string,
+): { tone: Tone; text: string } {
+  if (outcome.outcome === "saved") {
+    const all = scope === "all" ? "all events of " : "";
+    return savedReplyText(outcome, `You replied ${rsvpLabel(reply)} to ${all}${quote(title)}.`);
+  }
+  if (outcome.outcome === "no_change") {
+    return { tone: "ok", text: `That's already your reply to ${quote(title)}.` };
+  }
+  const said = replyText(outcome, reply, scope);
+  return { tone: said.tone, text: `Your reply to ${quote(title)}: ${said.text}` };
 }
 
 /** A delete of chosen occurrences that the plan changed under again, after the dialog reopened

@@ -171,6 +171,26 @@ describe("TimeGridView", () => {
     expect(band.className).not.toContain("opacity-60");
     expect(band.hasAttribute("data-draft-event")).toBe(true);
   });
+
+  // #884 C14b: an event the user declined (the calendar marks it, `markDeclined`) is struck
+  // through, as Google draws it, and its name says so; any other is drawn as ever.
+  it("strikes through an event the user declined, timed or all day, and says so", () => {
+    const declined = (e: CalendarEvent) => ({ ...e, declined: true }) as CalendarEvent;
+    grid([
+      declined(ev({ id: "t", summary: "Review", start: "2026-10-12T09:00:00", end: null })),
+      ev({ id: "p", summary: "Plain", start: "2026-10-12T11:00:00", end: null }),
+      declined(
+        ev({ id: "a", summary: "Away", start: "2026-10-12", end: "2026-10-13", all_day: true }),
+      ),
+    ]);
+    const card = screen.getByRole("button", { name: /^Review, .*, declined$/ });
+    expect(within(card).getByText("Review").className).toContain("line-through");
+    const plain = screen.getByRole("button", { name: /^Plain, / });
+    expect(plain.getAttribute("aria-label")).not.toMatch(/declined/);
+    expect(within(plain).getByText("Plain").className).not.toContain("line-through");
+    const band = screen.getByRole("button", { name: "Away, declined" });
+    expect(within(band).getByText("Away").className).toContain("line-through");
+  });
 });
 
 // A sideways swipe moves the window a day at a time, and every step used to snap the hours back to

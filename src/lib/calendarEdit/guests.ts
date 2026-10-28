@@ -27,8 +27,8 @@ const isSpace = (ch: string) => SPACE.has(ch.charCodeAt(0));
  *  two addresses or a name, typed together). */
 const BANNED = new Set(['"', ",", ";", ":", "<", ">"]);
 
-/** `text` with the backend's white space taken off both ends. */
-function trimmed(text: string): string {
+/** `text` with the backend's white space taken off both ends (Rust's `str::trim`). */
+export function trimmed(text: string): string {
   let start = 0;
   let end = text.length;
   while (start < end && isSpace(text[start])) start++;

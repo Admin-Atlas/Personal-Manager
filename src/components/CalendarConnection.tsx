@@ -626,7 +626,7 @@ const EDITING_COPY: Record<
     enable: true,
   },
   on: {
-    text: "Editing on: PM can create events, one-off or repeating, on this account’s calendars, and change and delete events you organise there, repeating ones and ones with guests included.",
+    text: "Editing on: PM can create events, one-off or repeating, on this account’s calendars, change and delete events you organise there, repeating ones and ones with guests included, and send your replies to invitations and change your own settings on them.",
     action: "Turn off editing",
     enable: false,
     paused: true,
