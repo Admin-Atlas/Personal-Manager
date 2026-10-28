@@ -16,11 +16,17 @@
 //! (Microsoft does), the second refresh would post an already-invalidated refresh token and wedge the
 //! account. Serializing refreshes per key — and reloading the token blob under the lock — closes that
 //! race for both providers.
+//!
+//! And it sends the browser to the sign-in page ([`open_sign_in`]), offering the page's link in PM's
+//! window too, for a sign-in that belongs in another browser. Proton's CLI sign-in uses that part.
 
 use base64::Engine;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::error::{Error, Result};
@@ -218,6 +224,64 @@ fn write_page(stream: &mut std::net::TcpStream, message: &str) -> std::io::Resul
         body
     );
     stream.write_all(response.as_bytes())
+}
+
+// --- the sign-in page, offered in PM's window too ---
+
+/// A browser sign-in PM is waiting on, as the main window shows it: the page's link, to copy into
+/// another browser on this computer or to open again. The default browser isn't always the one
+/// signed in to the right account. Proton's sign-in comes through here as well, though its loopback
+/// is the CLI's.
+#[derive(Clone, Serialize)]
+pub struct SignInPage {
+    /// Tells one sign-in from another, so the end of one never takes away another's link.
+    pub id: u64,
+    /// Whose page it is, as the window names it ("Google").
+    pub provider: &'static str,
+    /// The page. It carries the sign-in's one-time state, so it is only ever shown for copying and
+    /// opening, never written to a log or an error.
+    pub url: String,
+    /// Whether the default browser opened on it. When it didn't, the link is the only way in.
+    pub opened: bool,
+}
+
+/// Keeps a sign-in page's link in PM's window until it drops, which is when the wait for the browser
+/// ends, however it ends (the redirect, an error, the timeout).
+pub struct SignInShown {
+    app: AppHandle,
+    id: u64,
+}
+
+impl Drop for SignInShown {
+    fn drop(&mut self) {
+        let _ = self.app.emit("signin://closed", self.id);
+    }
+}
+
+/// Open the default browser on `url`, `provider`'s sign-in page, and offer the link in PM's window
+/// while PM waits. A browser that won't open no longer ends the sign-in: the window says so, and the
+/// link still works pasted into one, until the wait times out.
+pub fn open_sign_in(app: &AppHandle, provider: &'static str, url: &str) -> SignInShown {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let opened = match open::that(url) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("sign-in: couldn't open the browser for {provider}: {e}");
+            false
+        }
+    };
+    let page = SignInPage {
+        id,
+        provider,
+        url: url.to_string(),
+        opened,
+    };
+    let _ = app.emit("signin://open", page);
+    SignInShown {
+        app: app.clone(),
+        id,
+    }
 }
 
 // --- per-key refresh lock ---

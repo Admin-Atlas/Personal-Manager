@@ -18,6 +18,8 @@ export {
 // rather than writing a ratio anywhere else.
 export { TONE_TOKEN, TONE_TEXT_TOKEN, TONE_MIX, toneMix, toneSurface, type Tone } from "./tone";
 export { IconButton, type IconButtonProps, type IconButtonVariant } from "./IconButton";
+// "Copy link" beside anything that opens a page in the browser, for when it belongs in another one.
+export { CopyLinkButton, type CopyLinkButtonProps } from "./CopyLinkButton";
 export { Input } from "./Input";
 export { Textarea } from "./Textarea";
 export { Select } from "./Select";

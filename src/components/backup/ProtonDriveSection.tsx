@@ -13,7 +13,7 @@ import type { ReactNode } from "react";
 
 import type { BackupPhase } from "../../lib/types";
 import { openUrl } from "../../lib/ipc";
-import { Button, SectionInfo, SectionLabel } from "../ui";
+import { Button, CopyLinkButton, SectionInfo, SectionLabel } from "../ui";
 import { CloudDestinationPanel } from "./CloudDestinationPanel";
 import type { UseProtonBackup } from "./useProtonBackup";
 
@@ -82,6 +82,7 @@ export function ProtonDriveSection({
             >
               Get the Proton Drive CLI&hellip;
             </Button>
+            <CopyLinkButton url={proton.install_url} size="md" />
             <Button variant="secondary" onClick={() => void locateCli()} disabled={locating}>
               {locating ? "Locating…" : "Locate manually…"}
             </Button>

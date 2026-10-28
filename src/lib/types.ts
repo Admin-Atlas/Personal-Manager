@@ -1226,6 +1226,19 @@ export interface ProtonConnStatus {
   error: string | null;
 }
 
+/** A browser sign-in PM is waiting on (`signin://open`, oauth_loopback.rs `SignInPage`): Google's,
+ *  Microsoft's or Proton's page, offered in the window to copy into another browser or open again.
+ *  The link carries the sign-in's one-time state, so it is never logged or shown whole. */
+export interface SignInPage {
+  /** Tells one sign-in from another: `signin://closed` carries the id that ended. */
+  id: number;
+  /** Whose page it is: "Google", "Microsoft" or "Proton". */
+  provider: string;
+  url: string;
+  /** Whether PM opened the default browser on it. When it didn't, the link is the only way in. */
+  opened: boolean;
+}
+
 /** One of PM's encrypted archives already at a backup destination (Proton or Google Drive), for
  *  the restore picker. Both destinations use the same archive naming, so this shape is shared. */
 export interface BackupEntry {

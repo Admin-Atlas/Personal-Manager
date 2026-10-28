@@ -14,6 +14,7 @@ import { ProviderChip } from "./components/ProviderChip";
 import { ThinkingToggle } from "./components/ThinkingToggle";
 import { FallbackStrip } from "./components/FallbackStrip";
 import { PowerConsentStrip } from "./components/PowerConsentStrip";
+import { SignInStrip } from "./components/SignInStrip";
 import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
@@ -1128,6 +1129,9 @@ export default function App() {
             {/* The one-time On battery question (#432). App-wide, because the moment it matters is
                 whatever tab is open when the battery runs low; renders nothing until it is asked. */}
             <PowerConsentStrip status={localAi} />
+            {/* A browser sign-in in progress, with its link for another browser. App-wide, since
+                any of several Settings sections may have started it; renders nothing otherwise. */}
+            <SignInStrip />
             <div
               className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
             >

@@ -23,6 +23,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 use super::naming::{self, BackupEntry, ARCHIVE_EXT};
 use super::RetentionOutcome;
@@ -482,27 +483,26 @@ fn first_https_url(line: &str) -> Option<String> {
     (url.len() > "https://".len()).then(|| url.to_string())
 }
 
-/// Open the first sign-in URL seen across the CLI's streams, exactly once. `open::that` launches
-/// the user's default browser — the same approach the Google/Microsoft OAuth flows use.
-fn open_url_once(line: &str, opened: &std::sync::atomic::AtomicBool) {
-    use std::sync::atomic::Ordering;
-    if opened.load(Ordering::Relaxed) {
+/// The sign-in page, once opened: its link stays in PM's window until the last holder drops it.
+type Shown = std::sync::Mutex<Option<crate::oauth_loopback::SignInShown>>;
+
+/// Open the first sign-in URL seen across the CLI's streams, exactly once, the way the
+/// Google/Microsoft OAuth flows do: the user's default browser, and the link in PM's window for
+/// another browser ([`crate::oauth_loopback::open_sign_in`]).
+fn open_url_once(line: &str, app: &AppHandle, shown: &Shown) {
+    let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+    if shown.is_some() {
         return;
     }
     if let Some(url) = first_https_url(line) {
-        if opened
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let _ = open::that(&url); // best-effort; the browser is the user's own
-        }
+        *shown = Some(crate::oauth_loopback::open_sign_in(app, "Proton", &url));
     }
 }
 
 /// Drain a child stream line-by-line (lossy UTF-8, so odd bytes never stall it), opening the
 /// sign-in URL the instant it appears. Draining fully also stops a filled pipe from deadlocking
 /// the `wait()` in [`connect`].
-fn scan_for_url<R: std::io::Read>(reader: R, opened: &std::sync::atomic::AtomicBool) {
+fn scan_for_url<R: std::io::Read>(reader: R, app: &AppHandle, shown: &Shown) {
     use std::io::{BufRead, BufReader};
     let mut r = BufReader::new(reader);
     let mut buf = Vec::new();
@@ -510,7 +510,7 @@ fn scan_for_url<R: std::io::Read>(reader: R, opened: &std::sync::atomic::AtomicB
         buf.clear();
         match r.read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(_) => open_url_once(&String::from_utf8_lossy(&buf), opened),
+            Ok(_) => open_url_once(&String::from_utf8_lossy(&buf), app, shown),
         }
     }
 }
@@ -521,10 +521,10 @@ fn scan_for_url<R: std::io::Read>(reader: R, opened: &std::sync::atomic::AtomicB
 /// the URL off the stream and opens it, the same way the Google/Microsoft flows do. The session
 /// is stored by the OS secret store, owned by the CLI. On any failure we DISCARD the CLI's output
 /// and return a generic message: that output carries a one-time-token URL that must never land in
-/// a UI-visible error string.
-pub(crate) fn connect(cli: &Path) -> Result<()> {
+/// a UI-visible error string. The URL itself reaches `app`'s window only to be copied or opened,
+/// and goes when the sign-in ends.
+pub(crate) fn connect(cli: &Path, app: &AppHandle) -> Result<()> {
     use std::process::Stdio;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     let mut cmd = Command::new(cli);
@@ -537,19 +537,21 @@ pub(crate) fn connect(cli: &Path) -> Result<()> {
         .spawn()
         .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
 
-    let opened = Arc::new(AtomicBool::new(false));
+    let shown: Arc<Shown> = Arc::default();
 
     // The URL can surface on either stream; scan stderr on a side thread (also draining it so a
-    // full pipe can't deadlock the wait) and stdout here. Open-once is shared via the flag.
+    // full pipe can't deadlock the wait) and stdout here. Open-once is shared via `shown`, which
+    // takes the link away from PM's window once both scanners and this call have let go of it.
     let stderr = child.stderr.take();
-    let opened_err = Arc::clone(&opened);
+    let shown_err = Arc::clone(&shown);
+    let app_err = app.clone();
     let stderr_thread = std::thread::spawn(move || {
         if let Some(e) = stderr {
-            scan_for_url(e, &opened_err);
+            scan_for_url(e, &app_err, &shown_err);
         }
     });
     if let Some(out) = child.stdout.take() {
-        scan_for_url(out, &opened);
+        scan_for_url(out, app, &shown);
     }
 
     let status = child

@@ -703,12 +703,16 @@ pub fn forget_backup_passphrase(state: State<'_, AppState>) -> Result<()> {
     secrets::delete_backup_passphrase()
 }
 
-/// Sign in to Proton Drive — opens the browser and blocks until the flow completes. The
-/// session is stored and owned by the CLI (OS secret store); PM never sees Proton credentials.
+/// Sign in to Proton Drive — opens the browser and blocks until the flow completes, offering the
+/// sign-in link in PM's window meanwhile. The session is stored and owned by the CLI (OS secret
+/// store); PM never sees Proton credentials.
 #[tauri::command]
-pub async fn proton_connect(state: State<'_, AppState>) -> Result<()> {
+pub async fn proton_connect(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     let cli = require_proton_cli(&state)?;
-    spawn_blocking_result("connect", move || crate::backup::proton::connect(&cli)).await
+    spawn_blocking_result("connect", move || {
+        crate::backup::proton::connect(&cli, &app)
+    })
+    .await
 }
 
 /// Sign out of Proton Drive (`auth logout`).
@@ -1373,6 +1377,7 @@ pub async fn backup_gdrive_connect(
     let token = match email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
         Some(chosen) => {
             google::run_consent_for_key(
+                &app,
                 &crate::drive::account_token_key(chosen),
                 chosen,
                 google::DRIVE_FILE_SCOPE,
@@ -1380,7 +1385,7 @@ pub async fn backup_gdrive_connect(
             )
             .await?
         }
-        None => google::run_consent(google::DRIVE_FILE_SCOPE, "Google Drive backup").await?,
+        None => google::run_consent(&app, google::DRIVE_FILE_SCOPE, "Google Drive backup").await?,
     };
     let (learned_email, _name) = crate::drive::about_user(&token).await?;
     if let Some(expected) = &email {
