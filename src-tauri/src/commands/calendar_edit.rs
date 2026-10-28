@@ -25249,9 +25249,9 @@ mod tests {
         silent.asked_all();
     }
 
-    /// An all-day event dropped in the hours takes this computer's zone and sends `date` as null
-    /// (`events.patch` merges the node); a resize keeps the untouched start as Google holds it,
-    /// seconds and all.
+    /// An all-day event dropped in the hours takes its calendar's zone (it names none of its own)
+    /// and sends `date` as null (`events.patch` merges the node); a resize keeps the untouched start
+    /// as Google holds it, seconds and all.
     #[tokio::test]
     async fn all_day_to_timed_nulls_date_and_a_resize_keeps_the_start() {
         let day = written(
@@ -26327,6 +26327,80 @@ mod tests {
             first_write(&script).body
                 == Some(json!({ "start": instance["start"], "end": instance["end"] })),
             "Google's values from before"
+        );
+    }
+
+    /// The occurrence on `day` of a weekly all-day series (Mondays from 05-10), ending on `next`.
+    fn all_day_of_weekly(day: &str, next: &str) -> Value {
+        let stamp = day.replace('-', "");
+        let mut occurrence = monday_19();
+        occurrence["id"] = json!(format!("abc_{stamp}"));
+        occurrence["etag"] = json!(format!("\"d{stamp}\""));
+        occurrence["originalStartTime"] = json!({ "date": day });
+        occurrence["start"] = json!({ "date": day });
+        occurrence["end"] = json!({ "date": next });
+        occurrence
+    }
+
+    /// An all-day series names no zone (Google asks one only of a timed series), so an occurrence
+    /// dragged into the hours is said in its calendar's, as an Edit of it would be: on a New York
+    /// laptop, "This event" writes London's zone at the time dropped, never New York's (review 2 of
+    /// PR C).
+    #[tokio::test]
+    async fn an_all_day_occurrence_dropped_in_the_hours_takes_its_calendars_zone() {
+        let series = written(
+            &weekly(),
+            &[
+                ("start", json!({ "date": "2026-10-05" })),
+                ("end", json!({ "date": "2026-10-06" })),
+            ],
+            "\"m1\"",
+        );
+        let window = vec![
+            all_day_of_weekly("2026-10-12", "2026-10-13"),
+            all_day_of_weekly("2026-10-19", "2026-10-20"),
+            all_day_of_weekly("2026-10-26", "2026-10-27"),
+        ];
+        let instance = window[1].clone();
+        let host = TestHost::holding(&window);
+        // 05:00 in New York on 19-10 is 10:00 in London.
+        let request = MoveRequest {
+            device_zone: Some("America/New_York".into()),
+            ..drop_at(&instance, "2026-10-19", "05:00", "06:00")
+        };
+        let (ten, eleven) = (
+            london("2026-10-19T10:00:00+01:00"),
+            london("2026-10-19T11:00:00+01:00"),
+        );
+        let moved = written(
+            &instance,
+            &[("start", ten.clone()), ("end", eleven.clone())],
+            "\"i2\"",
+        );
+        let mut steps = reads(&instance, &series, vec![series.clone()], window.clone());
+        steps.push(Step::write(
+            Method::Patch,
+            "/events/abc_20261019",
+            instance["etag"].as_str().unwrap(),
+            Scripted::Json(moved),
+        ));
+        let script = Script::new(steps);
+        let on = target(&instance);
+        let outcome = move_series(
+            &writer(&script, &host, &on),
+            &request,
+            Scope::This,
+            None,
+            None,
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "moved, with an Undo");
+        // The day nodes' `date` sent as null: `events.patch` merges a node.
+        let timed = |node: Value| with(node, "date", Value::Null);
+        assert!(
+            first_write(&script).body == Some(json!({ "start": timed(ten), "end": timed(eleven) })),
+            "London's zone, at 10:00-11:00"
         );
     }
 

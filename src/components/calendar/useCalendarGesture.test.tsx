@@ -1060,18 +1060,57 @@ describe("useCalendarGesture: creating", () => {
   it("Month's days are the weeks' width, less a scrollbar that takes room", () => {
     const { onCreate } = mountMonth(creates);
     // A 14 px scrollbar: the seven days share 686 px, so Sunday starts at 588.
-    Object.defineProperty(screen.getByTestId("stream"), "clientWidth", { value: 686 });
-    press(screen.getByTestId("stream"), 590, 60);
+    const stream = screen.getByTestId("stream");
+    Object.defineProperty(stream, "clientWidth", { value: 686 });
+    press(stream, 590, 60);
     release(590, 60);
     expect(onCreate.mock.calls[0][0].timing).toEqual({
       kind: "all_day",
       first: "2026-10-18",
       last: "2026-10-18",
     });
-    // Over the scrollbar itself: still Sunday, never past it.
-    press(screen.getByTestId("stream"), 695, 60);
+    // A drag from Sunday that passes over the scrollbar stays on Sunday, never past it.
+    press(stream, 590, 60);
+    moveTo(695, 160);
+    release(695, 160);
+    expect(onCreate.mock.calls[1][0].timing).toEqual({
+      kind: "all_day",
+      first: "2026-10-18",
+      last: "2026-10-25",
+    });
+  });
+
+  it("a press on Month's scrollbar only scrolls", () => {
+    const { onCreate } = mountMonth(creates);
+    const stream = screen.getByTestId("stream");
+    // A 14 px scrollbar down the right, and another along the bottom.
+    Object.defineProperty(stream, "clientWidth", { value: 686 });
+    Object.defineProperty(stream, "clientHeight", { value: 286 });
+    // The right one's track clicked, then its thumb dragged down; the bottom one's track clicked.
+    press(stream, 695, 60);
     release(695, 60);
-    expect(onCreate.mock.calls[1][0].timing).toMatchObject({ first: "2026-10-18" });
+    press(stream, 695, 60);
+    moveTo(695, 200);
+    release(695, 200);
+    press(stream, 300, 330);
+    release(300, 330);
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    // The days beside them still create.
+    press(stream, 590, 60);
+    release(590, 60);
+    expect(onCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("only the scrolling element's own press can be on its scrollbar: the all-day row still creates", () => {
+    const { onCreate } = mount(creates);
+    // The hours scroll below the all-day row, a 14 px scrollbar down their right.
+    const body = screen.getByTestId("body");
+    Object.defineProperty(body, "clientWidth", { value: 786 });
+    Object.defineProperty(body, "clientHeight", { value: 500 });
+    press(screen.getByTestId("band"), 600, 70);
+    release(600, 70);
+    expect(onCreate.mock.calls[0][0].timing).toEqual({ kind: "all_day", first: D2, last: D2 });
   });
 });
 

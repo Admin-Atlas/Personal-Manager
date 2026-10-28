@@ -147,6 +147,17 @@ function streamBox(stream: HTMLElement): Box {
   return { ...box, left, right: Math.min(box.right, left + inner) };
 }
 
+/** Whether a press at (x, y) on the element that scrolls the grid, `scroller`, is on its scrollbar
+ *  rather than the days it scrolls: outside the box its content spans. Such a press scrolls, so it
+ *  never creates or drags (paging Month's weeks down isn't a click on Sunday). A side not laid out
+ *  reads as all content. */
+function onScrollbar(scroller: HTMLElement, x: number, y: number): boolean {
+  const across = streamBox(scroller);
+  if (x < across.left || x >= across.right) return true;
+  const top = scroller.getBoundingClientRect().top + scroller.clientTop;
+  return scroller.clientHeight > 0 && (y < top || y >= top + scroller.clientHeight);
+}
+
 /** An event's surface, from its `data-surface`: the hours, the all-day row or Month; anything else
  *  isn't the drag's. */
 const surfaceOf = (s: string | undefined): Surface | null =>
@@ -615,6 +626,11 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       // create) is that thing's, whatever box it sits in.
       if (!(t instanceof Element) || !wrapper.contains(t)) return null;
       const found = measure(wrapper);
+      // A scrollbar's press goes to the element it scrolls: Month's weeks carry their surface, so
+      // without this a click on its track would create on the week's last day.
+      if (found && t === found.scroller && onScrollbar(found.scroller, e.clientX, e.clientY)) {
+        return null;
+      }
       const at = found ? targetIn(found, e.clientX, e.clientY) : null;
       if (!at) return null;
       const base = {
