@@ -128,7 +128,7 @@ export function EventCard({
     declined,
   );
 
-  // The edges that may be dragged, sized as the drag's hit test sizes them (`handleSizes`).
+  // The edges that may be dragged (`handleSizes`): a press on one of these strips takes that edge.
   const handles = handleSizes(heightPx);
 
   return (

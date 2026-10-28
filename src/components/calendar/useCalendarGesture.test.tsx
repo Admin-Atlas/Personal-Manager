@@ -100,14 +100,16 @@ function Grid({
         +
       </button>
       <div data-surface="band" data-days={`${D1},${D2}`} data-testid="band">
-        <div data-event-id="a1" data-testid="bar" />
+        <div data-event-id="a1" data-testid="bar">
+          <div data-edge="right" data-testid="bar-end" />
+        </div>
       </div>
       <div data-time-body="" data-row-h="40" data-testid="body">
         <div data-testid="gutter" />
         <div data-surface="grid" data-day={D1} data-testid="col1">
           <div data-event-id="e1" data-day={D1} data-testid="card">
-            <div data-edge="start" />
-            <div data-edge="end" />
+            <div data-edge="start" data-testid="card-start" />
+            <div data-edge="end" data-testid="card-end" />
           </div>
         </div>
         <div data-surface="grid" data-day={D2} data-testid="col2" />
@@ -274,12 +276,12 @@ describe("useCalendarGesture: a drop", () => {
     expect(notPrevented).toBe(true);
   });
 
-  it("resizes from the bottom edge, in its own column", () => {
+  it("resizes from the bottom edge, in its own column, by how far it's dragged", () => {
     const { onCommit } = mount();
-    // The bottom 10 px of the 40 px card are its edge: a press 8 px up from it still takes it.
-    press(screen.getByTestId("card"), 200, 492);
-    moveTo(600, 540);
-    release(600, 540);
+    // Its strip taken 8 px up from the bottom (09:48), and dragged down an hour.
+    press(screen.getByTestId("card-end"), 200, 492);
+    moveTo(600, 532);
+    release(600, 532);
     const commit = onCommit.mock.calls[0][0];
     expect(commit.resize).toBe(true);
     expect(commit.to).toEqual({
@@ -287,6 +289,35 @@ describe("useCalendarGesture: a drop", () => {
       start: { day: D1, min: 540 },
       end: { day: D1, min: 660 },
     });
+  });
+
+  it("taking an edge changes nothing until it's dragged: a sideways slip lets go as it was", () => {
+    const { onCommit } = mount();
+    press(screen.getByTestId("card-end"), 200, 492);
+    moveTo(212, 494);
+    expect(screen.getByTestId("ghost").dataset.kind).toBe("resize");
+    expect(screen.getByTestId("ghost").textContent).toContain(`${clock(9)}–${clock(10)}`);
+    release(212, 494);
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("the card's top strip takes its start; the card itself, even by its ends, moves it", () => {
+    const { onCommit } = mount();
+    press(screen.getByTestId("card-start"), 200, 462);
+    moveTo(200, 422);
+    release(200, 422);
+    expect(onCommit.mock.calls[0][0].resize).toBe(true);
+    expect(onCommit.mock.calls[0][0].to).toEqual({
+      kind: "timed",
+      start: { day: D1, min: 480 },
+      end: { day: D1, min: 600 },
+    });
+    onCommit.mockClear();
+    // A press on the card's own box near its bottom (its border, say) is a move.
+    press(screen.getByTestId("card"), 200, 499);
+    moveTo(200, 539);
+    release(200, 539);
+    expect(onCommit.mock.calls[0][0].resize).toBe(false);
   });
 
   it("a row re-read mid-drag doesn't change what was seen", () => {
@@ -729,6 +760,15 @@ describe("sayAgain", () => {
 });
 
 describe("useCalendarGesture: the all-day row", () => {
+  it("its right end's strip changes its days", () => {
+    const { onCommit } = mount();
+    press(screen.getByTestId("bar-end"), 420, 70);
+    moveTo(600, 70);
+    release(600, 70);
+    expect(onCommit.mock.calls[0][0].resize).toBe(true);
+    expect(onCommit.mock.calls[0][0].to).toEqual({ kind: "all_day", first: D1, last: D2 });
+  });
+
   it("moves an all-day event along the row by its body", () => {
     const { onCommit } = mount();
     press(screen.getByTestId("bar"), 200, 70);

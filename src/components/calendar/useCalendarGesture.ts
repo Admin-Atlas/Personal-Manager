@@ -38,12 +38,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   autoScrollDelta,
-  bandHitZone,
-  cardHitZone,
   exceedsThreshold,
   gapText,
   ghostEvent,
   grabAllowed,
+  grabOf,
   inCancelZone,
   planClick,
   planGesture,
@@ -692,16 +691,14 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
         const row = h.rowById(card.dataset.eventId ?? "");
         const surface = surfaceOf(card.closest<HTMLElement>("[data-surface]")?.dataset.surface);
         if (!row || !surface) return null;
-        const r = card.getBoundingClientRect();
-        // The ends the card draws as draggable are the ones it may be dragged by; Month draws
-        // none.
-        const has = (edge: string) => card.querySelector(`[data-edge="${edge}"]`) !== null;
-        const grab: Grab =
-          surface === "grid"
-            ? cardHitZone(e.clientY - r.top, r.height, { start: has("start"), end: has("end") })
-            : surface === "band"
-              ? bandHitZone(e.clientX - r.left, r.width, { left: has("left"), right: has("right") })
-              : "body";
+        // An edge is taken by pressing the strip the card draws for it (Month draws none): the
+        // strip shows the resize cursor too, so what looks like an edge is one, to the pixel. Its
+        // own border, outside the strips, is the body's, as its cursor says.
+        const strip = t.closest<HTMLElement>("[data-edge]");
+        const grab: Grab = grabOf(
+          surface,
+          strip && card.contains(strip) ? strip.dataset.edge : undefined,
+        );
         return {
           ...base,
           on: {

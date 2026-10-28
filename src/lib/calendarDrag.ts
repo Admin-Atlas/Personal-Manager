@@ -164,12 +164,16 @@ export const AUTOSCROLL_EDGE_PX = 32;
 export const AUTOSCROLL_MAX_PX = 14;
 /** How far a press moves before it's a drag. Touch never drags (a tap may still create). */
 export const THRESHOLD_PX = { mouse: 4, pen: 6 } as const;
-/** How far into an event its draggable edge reaches, at most. 6 px proved too thin to hit: a press a
- *  little way up from the bottom moved the event instead of changing its length. */
-export const HANDLE_MAX_PX = 10;
-/** An edge takes at most one part in this many of its card or bar (a third), so a short one keeps a
- *  body to move it by. */
-export const HANDLE_PARTS = 3;
+/** How far into an event the edge that starts it reaches, at most (a card's top, an all-day bar's
+ *  left end). No further: the title sits there, and taking an event by its title moves it. */
+export const HANDLE_MAX_PX = 6;
+/** How far the edge that ends it reaches (a card's bottom, a bar's right end). 6 px proved too thin
+ *  to hit: a press a little way up from the bottom moved the event instead of changing its length. */
+export const END_HANDLE_MAX_PX = 10;
+/** An edge takes at most one part in this many of its card or bar, so a short one keeps a body to
+ *  move it by: a quarter for the start, a third for the end. */
+export const HANDLE_PARTS = 4;
+export const END_HANDLE_PARTS = 3;
 export const TOP_HANDLE_MIN_H = 24;
 export const BOTTOM_HANDLE_MIN_H = 10;
 
@@ -280,38 +284,24 @@ export function autoScrollDelta(y: number, top: number, bottom: number): number 
 
 // --- hitting an event ------------------------------------------------------------------------------
 
-/** How tall a card's edges are: the same numbers size the strips drawn on it, so what looks like an
- *  edge is one. A short card keeps its body, so it can always be moved. */
+/** How tall a card's edges are: the strips drawn on it, which show the resize cursor and are what a
+ *  press takes as the edge (`useCalendarGesture`'s `pressOf`). A short card keeps its body, so it can
+ *  always be moved. */
 export function handleSizes(heightPx: number): { top: number; bottom: number } {
-  const size = Math.min(HANDLE_MAX_PX, heightPx / HANDLE_PARTS);
   return {
-    top: heightPx >= TOP_HANDLE_MIN_H ? size : 0,
-    bottom: heightPx >= BOTTOM_HANDLE_MIN_H ? size : 0,
+    top: heightPx >= TOP_HANDLE_MIN_H ? Math.min(HANDLE_MAX_PX, heightPx / HANDLE_PARTS) : 0,
+    bottom:
+      heightPx >= BOTTOM_HANDLE_MIN_H
+        ? Math.min(END_HANDLE_MAX_PX, heightPx / END_HANDLE_PARTS)
+        : 0,
   };
 }
 
-/** Which part of a card a press `offsetY` down it took. `edges` are what may be resized on this
- *  piece: the capability, and only the event's true ends (a piece that continues has none there). */
-export function cardHitZone(
-  offsetY: number,
-  heightPx: number,
-  edges: { start: boolean; end: boolean },
-): Grab {
-  const h = handleSizes(heightPx);
-  if (edges.start && offsetY < h.top) return "start";
-  if (edges.end && offsetY >= heightPx - h.bottom) return "end";
-  return "body";
-}
-
-/** The same for an all-day bar, across it. */
-export function bandHitZone(
-  offsetX: number,
-  widthPx: number,
-  edges: { left: boolean; right: boolean },
-): Grab {
-  const size = Math.min(HANDLE_MAX_PX, widthPx / HANDLE_PARTS);
-  if (edges.left && offsetX < size) return "left";
-  if (edges.right && offsetX >= widthPx - size) return "right";
+/** What a press on an event's strip `edge` (its `data-edge`) took on `surface`: that edge, where
+ *  the surface has it, else the body. */
+export function grabOf(surface: Surface, edge: string | undefined): Grab {
+  if (surface === "grid" && (edge === "start" || edge === "end")) return edge;
+  if (surface === "band" && (edge === "left" || edge === "right")) return edge;
   return "body";
 }
 
@@ -461,19 +451,26 @@ export function planBandToTimed(
   return finish(origin, { kind: "timed", start, end: addWall(start, lengthOf(lengthMin)) }, zone);
 }
 
-/** An edge dragged in its own piece's column (`pieceDay`; the pointer's column is ignored): the end
- *  edge between a step after the start and that day's midnight, the start edge between that day's
- *  midnight and a step before the end. Wall minutes across days, so on an event of several days the
- *  end edge of its last piece can't pass the start. */
+/** An edge dragged in its own piece's column (`pieceDay`; the pointer's column is ignored), pressed
+ *  at `pressMinute` and now at `minute`: the edge goes as far as the pointer has, from wherever in
+ *  the edge it was taken, so taking it changes nothing, and nothing changes until the pointer has
+ *  gone half a step. It lands on the 15-minute grid: the end edge between a step after the start and
+ *  that day's midnight, the start edge between that day's midnight and a step before the end. Wall
+ *  minutes across days, so on an event of several days the end edge of its last piece can't pass
+ *  the start. */
 export function planResize(
   origin: TimedTiming,
   edge: "start" | "end",
   pieceDay: string,
+  pressMinute: number,
   minute: number,
   zone: string | null,
 ): Plan {
-  const m = snapMinutes(clamp(minute, 0, DAY_MIN));
+  const travel = minute - pressMinute;
+  if (Math.abs(travel) < SNAP_MIN / 2) return finish(origin, origin, zone);
   const midnight: WallPoint = { day: pieceDay, min: 0 };
+  const from = wallDiff(midnight, edge === "end" ? origin.end : origin.start);
+  const m = snapMinutes(clamp(from + travel, 0, DAY_MIN));
   if (edge === "end") {
     const earliest = addWall(origin.start, MIN_DURATION_MIN);
     const end = addWall(midnight, m);
@@ -595,7 +592,14 @@ export function planGesture(press: Press, target: Target | null, opts: PlanOpts)
     case "start":
     case "end":
       return origin.kind === "timed" && target.zone === "timed"
-        ? planResize(origin, on.grab, on.pieceDay, target.minute, opts.zone)
+        ? planResize(
+            origin,
+            on.grab,
+            on.pieceDay,
+            at.zone === "timed" ? at.minute : target.minute,
+            target.minute,
+            opts.zone,
+          )
         : null;
     case "left":
     case "right":
