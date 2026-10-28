@@ -1068,7 +1068,8 @@ describe("QuickCreatePopover", () => {
     // A token that ended unproven: it may still be in Google.
     fireEvent.click(screen.getByRole("button", { name: "Check again" }));
     await screen.findByRole("button", { name: "Save" });
-    expect(state()).toBe("unsure");
+    // As below: the ghost hears of it from an effect that may run after Save is on screen.
+    await waitFor(() => expect(state()).toBe("unsure"));
   });
 
   it("a fresh save that fails outright leaves the ghost unsaved", async () => {
