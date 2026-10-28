@@ -305,7 +305,7 @@ describe("useCalendarGesture: a drop", () => {
     expect(onCommit).not.toHaveBeenCalled();
   });
 
-  it("the card's top strip takes its start; the card itself, even by its ends, moves it", () => {
+  it("the card's top strip takes its start; the card's own box between its strips moves it", () => {
     const { onCommit } = mount();
     press(screen.getByTestId("card-start"), 200, 462);
     moveTo(200, 422);
