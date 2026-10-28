@@ -24,6 +24,7 @@ vi.mock("../../lib/useDialogLayer", async (importOriginal) => ({
 }));
 
 import {
+  overlayShown,
   sayAgain,
   useCalendarGesture,
   type CalendarGesture,
@@ -80,7 +81,7 @@ function Grid({
     surfaceOk: () => true,
     rowById: (id) => rows.get(id),
     capability: canMove,
-    canCreate: () => false,
+    createIn: () => null,
     overlayOpen: () => false,
     lengthFor: () => 60,
     zone: () => "Europe/London",
@@ -113,7 +114,15 @@ function Grid({
           {view.chip}
         </div>
       )}
-      {view.ghost && <div data-testid="ghost">{view.ghost.label}</div>}
+      {view.ghost && (
+        <div
+          data-testid="ghost"
+          data-kind={view.ghost.kind}
+          data-calendar={view.ghost.event.calendar_id}
+        >
+          {view.ghost.label}
+        </div>
+      )}
     </div>
   );
 }
@@ -745,7 +754,7 @@ function MonthGrid({
     surfaceOk: () => true,
     rowById: (id) => rows.get(id),
     capability: canMove,
-    canCreate: () => false,
+    createIn: () => null,
     overlayOpen: () => false,
     lengthFor: () => 60,
     zone: () => "Europe/London",
@@ -765,6 +774,9 @@ function MonthGrid({
         data-testid="stream"
       >
         <div data-day={D1} data-testid="mon">
+          <span data-no-create="" data-testid="number">
+            12
+          </span>
           <div data-event-id="e1" data-testid="chip" />
         </div>
         <div data-day={D2} data-testid="tue">
@@ -797,6 +809,7 @@ function mountMonth(host: Partial<GestureHost> = {}) {
   place(screen.getByTestId("tue"), 100, 40, 200, 140);
   place(screen.getByTestId("chip"), 2, 70, 98, 84);
   place(screen.getByTestId("more"), 104, 120, 160, 134);
+  place(screen.getByTestId("number"), 2, 42, 20, 60);
   place(screen.getByTestId("m-bar"), 0, 50, 100, 64);
   return { ...spies, rows };
 }
@@ -865,5 +878,140 @@ describe("useCalendarGesture: Month", () => {
     release(750, 177);
     expect(onCommit).not.toHaveBeenCalled();
     expect(announce).toHaveBeenLastCalledWith(PUT_BACK);
+  });
+});
+
+// C17: a click or drag on empty space opens quick create for that slot, through `onCreate`, with
+// where the slot is on screen; never while something was open at the press, nowhere marked as no
+// place to create, and nowhere when no calendar takes the new event.
+describe("useCalendarGesture: creating", () => {
+  const creates = { createIn: () => "c1", lengthFor: (ev: CalendarEvent | null) => (ev ? 60 : 30) };
+  const box = (r: DOMRect | null) => r && [r.left, r.top, r.right, r.bottom];
+
+  it("a click on empty time creates the slot with the default length", () => {
+    const { onCreate, announce } = mount(creates);
+    press(screen.getByTestId("col2"), 600, 300);
+    release(600, 300);
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    const [effect, anchor] = onCreate.mock.calls[0];
+    // 05:00, floored to its slot, and the create calendar's half hour.
+    expect(effect).toEqual({
+      effect: "create",
+      timing: { kind: "timed", start: { day: D2, min: 300 }, end: { day: D2, min: 330 } },
+      drag: false,
+    });
+    expect(box(anchor)).toEqual([427, 300, 800, 320]);
+    // Quick create takes focus and says what it is: nothing is announced, and nothing captured.
+    expect(announce).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("a drag down creates the stepped range, drawn as the new event, and hands over its rect", () => {
+    const { onCreate } = mount(creates);
+    press(screen.getByTestId("col2"), 600, 300);
+    moveTo(600, 400);
+    const ghost = screen.getByTestId("ghost");
+    expect(ghost.dataset.kind).toBe("create");
+    expect(ghost.dataset.calendar).toBe("c1");
+    expect(document.body.style.cursor).toBe("ns-resize");
+    release(600, 400);
+    const [effect, anchor] = onCreate.mock.calls[0];
+    expect(effect).toEqual({
+      effect: "create",
+      timing: { kind: "timed", start: { day: D2, min: 300 }, end: { day: D2, min: 450 } },
+      drag: true,
+    });
+    expect(box(anchor)).toEqual([427, 300, 800, 400]);
+    expect(screen.queryByTestId("ghost")).toBeNull();
+  });
+
+  it("a click while the event popover is open only closes it; a drag then creates nothing", () => {
+    const { onCreate } = mount({ ...creates, overlayOpen: () => true });
+    press(screen.getByTestId("col2"), 600, 300);
+    release(600, 300);
+    press(screen.getByTestId("col2"), 600, 300);
+    moveTo(600, 400);
+    release(600, 400);
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("no calendar to create in: nothing happens", () => {
+    const { onCreate } = mount({ ...creates, createIn: () => null });
+    press(screen.getByTestId("col2"), 600, 300);
+    release(600, 300);
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
+  it("a tap creates on touch; a touch on an event is left to it", () => {
+    const { onCreate, onCommit } = mount(creates);
+    press(screen.getByTestId("col2"), 600, 300, { pointerType: "touch" });
+    fireEvent.pointerUp(document.body, at(600, 300, { buttons: 0, pointerType: "touch" }));
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    expect(onCreate.mock.calls[0][0].drag).toBe(false);
+    // Touch never drags.
+    press(screen.getByTestId("card"), 200, 480, { pointerType: "touch" });
+    fireEvent.pointerMove(document.body, at(600, 520, { pointerType: "touch" }));
+    frame();
+    fireEvent.pointerUp(document.body, at(600, 520, { buttons: 0, pointerType: "touch" }));
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("the all-day row creates all day, on the day clicked", () => {
+    const { onCreate } = mount(creates);
+    press(screen.getByTestId("band"), 600, 70);
+    release(600, 70);
+    const [effect, anchor] = onCreate.mock.calls[0];
+    expect(effect.timing).toEqual({ kind: "all_day", first: D2, last: D2 });
+    expect(box(anchor)).toEqual([427, 60, 800, 80]);
+  });
+
+  it("Month's days create all day, a drag across them over several", () => {
+    const { onCreate } = mountMonth(creates);
+    press(screen.getByTestId("tue"), 150, 60);
+    release(150, 60);
+    expect(onCreate.mock.calls[0][0]).toEqual({
+      effect: "create",
+      timing: { kind: "all_day", first: D2, last: D2 },
+      drag: false,
+    });
+    press(screen.getByTestId("tue"), 150, 60);
+    moveTo(350, 160);
+    expect(screen.getByTestId("ghost").textContent).toMatch(/13-10/);
+    release(350, 160);
+    expect(onCreate.mock.calls[1][0]).toEqual({
+      effect: "create",
+      timing: { kind: "all_day", first: D2, last: "2026-10-22" },
+      drag: true,
+    });
+  });
+
+  it("the day number and more never create", () => {
+    const { onCreate } = mountMonth(creates);
+    for (const id of ["number", "more"]) {
+      press(screen.getByTestId(id), 120, 125);
+      release(120, 125);
+      press(screen.getByTestId(id), 120, 125);
+      moveTo(350, 160);
+      release(350, 160);
+    }
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+  });
+});
+
+describe("overlayShown", () => {
+  it("counts a dialog, the event's details and any other popover", () => {
+    expect(overlayShown(false)).toBe(false);
+    expect(overlayShown(true)).toBe(true);
+    const panel = document.createElement("div");
+    panel.dataset.popoverPanel = "";
+    document.body.appendChild(panel);
+    expect(overlayShown(false)).toBe(true);
+    panel.remove();
+    env.dialog = true;
+    expect(overlayShown(false)).toBe(true);
   });
 });

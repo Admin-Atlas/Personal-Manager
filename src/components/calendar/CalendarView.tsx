@@ -14,7 +14,8 @@
 // for a new one, on a calendar the user picks, and Shift+C a quick box under the button, whose
 // draft is drawn on the grid as it's typed (C10). In Day and Week an event can be dragged to a new
 // time, or by its edges to a new start or end, and in Month to another day, asking what a save would
-// ask (C16b-c, `useCalendarGesture` and `edit/MoveFlow`); everything else stays read-only. The two
+// ask (C16b-c, `useCalendarGesture` and `edit/MoveFlow`); a click or drag on empty time, the all-day
+// row or a day in Month opens quick create beside it (C17); everything else stays read-only. The two
 // first-party overlays — project milestones (click opens their project) and freeform pinboard
 // timeline entries (click opens the Pinboard) — are each an all-day event in its own hue, injected
 // here and never written back to any calendar.
@@ -45,6 +46,7 @@ import {
   lengthFor,
 } from "../../lib/calendarEdit/createTargets";
 import { newEventSeed, type EditorFields } from "../../lib/calendarEdit/eventDraft";
+import { slotSeed } from "../../lib/calendarEdit/slotSeed";
 import {
   clampDayCount,
   readCursorDay,
@@ -84,6 +86,7 @@ import {
   isPinboardEvent,
   MILESTONE_CALENDAR_ID,
   occurrenceKey,
+  parseLocal,
   PINBOARD_CALENDAR_ID,
   startOfDay,
   startOfWeek,
@@ -114,7 +117,7 @@ import { WriteNotices } from "./edit/WriteNotices";
 import { MoveFlow } from "./edit/MoveFlow";
 import { useMoveDrops } from "./edit/useMoveDrops";
 import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
-import { sayAgain, useCalendarGesture } from "./useCalendarGesture";
+import { overlayShown, sayAgain, useCalendarGesture } from "./useCalendarGesture";
 import { AgendaView } from "./views/AgendaView";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
@@ -503,7 +506,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // A new event being made (#884, C10): its starting fields and calendar, and where: the full editor,
   // or quick create under "+ New event" (`anchor`, the button's rect), which More options turns into
   // the full editor carrying its draft (`handover`), and which opens again on a draft that went with
-  // the tab (`resume`). Null = closed.
+  // the tab (`resume`). From a click or drag on the grid (C17), quick create opens beside the slot
+  // (`beside`), and a dragged range is the user's own time (`timeTouched`). Null = closed.
   const [creating, setCreating] = useState<{
     seed: EditorFields;
     calendarId: string;
@@ -511,6 +515,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     anchor: DOMRect | null;
     handover?: CreateHandover;
     resume?: LeftDraft;
+    beside?: boolean;
+    timeTouched?: boolean;
   } | null>(null);
   // The open surface's way to bring its title into focus: "+ New event" again, or a click on the
   // ghost, focuses it, never replaces it.
@@ -823,12 +829,36 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // covers the grid.
   const ghost = useMemo(() => {
     if (creating?.mode === "quick") {
-      return quickDraft
-        ? draftEvent(quickDraft.draft, quickDraft.calendarId, quickDraft.state)
-        : null;
+      // Until the box first says what it holds, what it opens on: a slot clicked or dragged on the
+      // grid goes from the drag's outline to the draft with no frame of neither (C17).
+      if (!quickDraft) {
+        return draftEvent(creating.resume?.draft ?? creating.seed, creating.calendarId);
+      }
+      return draftEvent(quickDraft.draft, quickDraft.calendarId, quickDraft.state);
     }
     return landed?.ev ?? null;
-  }, [creating?.mode, quickDraft, landed]);
+  }, [creating, quickDraft, landed]);
+
+  // A date typed in quick create that the view doesn't show: the view goes to it, as Google's does
+  // (C16 critique C2-M9), in Day, Week and Month. Only a change of the draft's day moves it, never
+  // the box opening (a slot clicked on Month's first row, from the month before, stays put).
+  const draftDay = quickDraft
+    ? quickDraft.draft.time.kind === "timed"
+      ? quickDraft.draft.time.start_date
+      : quickDraft.draft.time.first_day
+    : null;
+  const lastDraftDay = useRef<string | null>(null);
+  useEffect(() => {
+    const was = lastDraftDay.current;
+    lastDraftDay.current = draftDay;
+    if (draftDay === null || was === null || draftDay === was) return;
+    if (view !== "day" && view !== "week" && view !== "month") return;
+    const day = parseLocal(draftDay, true);
+    if (!day) return;
+    const { start, end } = visibleRange(view, cursor, dayCount);
+    if (day.getTime() >= start.getTime() && day.getTime() < end.getTime()) return;
+    setCursor(view === "week" ? startOfWeek(day) : day);
+  }, [draftDay, view, cursor, dayCount]);
   const shownEvents = useMemo(
     () => (ghost ? [...visibleEvents, ghost] : visibleEvents),
     [visibleEvents, ghost],
@@ -982,27 +1012,47 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   });
   const moveAsk = drops.ask;
 
+  // Where a click or drag on empty space creates (C17): the calendar "+ New event" would start on,
+  // and only with this computer's zone, since the slot is its wall time (C16 critique C1-L17).
+  const createTarget = () => {
+    if (!targets || deviceTimeZoneOrNull() === null) return null;
+    return defaultTarget(targets, readLastCreate());
+  };
+
   const gesture = useCalendarGesture({
     wrapper: () => gridWrapperRef.current,
     surfaceOk: () => interactive,
     rowById: (id) => shownById.get(id),
     capability,
-    // Creating by clicking or dragging on the grid comes with C17.
-    canCreate: () => false,
+    createIn: () => createTarget()?.calendar.id ?? null,
     // The details aren't a dialog, nor is any other popover (the add-zone list, the range menu).
-    overlayOpen: () =>
-      isAnyDialogOpen() ||
-      popoverOpenRef.current ||
-      document.querySelector("[data-popover-panel]") !== null,
+    overlayOpen: () => overlayShown(popoverOpenRef.current),
+    // A new event's: its calendar's account's default length, as "+ New event" gives it.
     lengthFor: (ev) => {
-      const cal = ev ? overview?.calendars.find((c) => c.id === ev.calendar_id) : undefined;
-      return overview
-        ? accountLength(overview, cal?.source_id ?? null) / 60_000
-        : DEFAULT_LENGTH_MIN;
+      if (!overview) return DEFAULT_LENGTH_MIN;
+      if (!ev) return lengthFor(overview, createTarget()) / 60_000;
+      const cal = overview.calendars.find((c) => c.id === ev.calendar_id);
+      return accountLength(overview, cal?.source_id ?? null) / 60_000;
     },
     zone: deviceTimeZoneOrNull,
     onCommit: drops.drop,
-    onCreate: () => {},
+    // Quick create beside the slot, or under "+ New event" when the slot isn't on screen; the
+    // draft it draws takes over from the drag's outline in the same render.
+    onCreate: ({ timing, drag }, anchor) => {
+      const target = createTarget();
+      const zone = deviceTimeZoneOrNull();
+      if (!target || zone === null) return;
+      const under = anchor ? null : (createButtonRef.current?.getBoundingClientRect() ?? null);
+      setLanded(null);
+      setCreating({
+        seed: slotSeed(timing, new Date(), zone),
+        calendarId: target.calendar.id,
+        mode: anchor || under ? "quick" : "full",
+        anchor: anchor ?? under,
+        beside: anchor !== null,
+        timeTouched: drag,
+      });
+    },
     announce,
   });
 
@@ -1363,6 +1413,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           returnFocusTo={createButtonRef}
           focusRef={focusCreateRef}
           resume={creating.resume}
+          placement={creating.beside ? "beside" : "below"}
+          timeTouched={creating.timeTouched}
           onDraft={onQuickDraft}
           onMore={onQuickMore}
           onClose={onQuickClose}

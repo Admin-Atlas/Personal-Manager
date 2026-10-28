@@ -24,8 +24,9 @@ import type {
   Milestone,
   WriteOutcome,
 } from "../../lib/types";
-import { dayKey, startOfDay } from "../../lib/calendar-layout";
+import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-layout";
 import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
+import { formatDateLocal, pad2 } from "../../lib/format";
 
 const ipc = vi.hoisted(() => ({
   calendarOverview: vi.fn(),
@@ -347,6 +348,29 @@ describe("CalendarView: dragging in Week", () => {
 });
 
 describe("CalendarView: a new event", () => {
+  // C16 critique C2-M9: a date typed in quick create that the view doesn't show moves the view to
+  // it, as Google's does; the box opening on a day already shown moves nothing.
+  it("a date typed in quick create off screen moves the week to it", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    await mount();
+    const week = (d: Date) => `${formatDateLocal(d)} – ${formatDateLocal(addDays(d, 6))}`;
+    const now = startOfWeek(new Date());
+    quickCreate("Dentist");
+    expect(screen.getByText(week(now))).toBeTruthy();
+    const later = addDays(now, 21);
+    const date = within(quick()).getByLabelText<HTMLInputElement>("Date");
+    date.focus();
+    fireEvent.change(date, {
+      target: {
+        value: `${pad2(later.getDate())}-${pad2(later.getMonth() + 1)}-${later.getFullYear()}`,
+      },
+    });
+    fireEvent.blur(date);
+    await act(async () => {});
+    expect(screen.getByText(week(later))).toBeTruthy();
+    expect(quick()).toBeTruthy();
+  });
+
   it("Shift+C opens quick create, non-modal, under + New event; c the full editor", async () => {
     await mount();
     press("C", true);

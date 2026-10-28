@@ -3,7 +3,8 @@
 
 // Dragging on the calendar grid (#884, C16b): moving an event in Day and Week, changing when it starts
 // or ends by its top or bottom edge, an all-day event's days by its ends, and between the all-day row
-// and the hours; in Month, moving it to another day, keeping its times (C16c). The pure half is
+// and the hours; in Month, moving it to another day, keeping its times (C16c); and creating an event
+// by clicking or dragging over empty time, the all-day row or Month's days (C17). The pure half is
 // `calendarDrag` (where a drop lands) and `calendarGesture` (what each press, frame, release or
 // cancel does); this is the half that touches the page.
 //
@@ -25,7 +26,10 @@
 // Letting go on a valid place that changes something is the only way a drop happens. Escape, the
 // window losing focus or being hidden, the pointer being cancelled or captured away, a dialog
 // opening, or the calendar going all put it back. It imports no write and names no command: a drop is
-// handed to the calendar (`onCommit`), which asks and moves through the write hook.
+// handed to the calendar (`onCommit`), which asks and moves through the write hook, and a new event's
+// slot to quick create (`onCreate`), which saves nothing until its own Save.
+//
+// Touch never drags (Q14): a touch press is taken only on empty space, where a tap creates.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -62,6 +66,7 @@ import {
   type GestureEffect,
   type GesturePhase,
 } from "../../lib/calendarGesture";
+import { DRAFT_EVENT_ID } from "../../lib/calendar-layout";
 import type { CalendarEvent } from "../../lib/types";
 import { isAnyDialogOpen } from "../../lib/useDialogLayer";
 import type { GhostView } from "./parts/DragGhost";
@@ -80,12 +85,14 @@ export interface GestureHost {
   /** The event as drawn, by id, read at the press: the drop is made from it. */
   rowById: (id: string) => CalendarEvent | undefined;
   capability: (ev: CalendarEvent) => DragCapability;
-  /** A press on empty space may create an event (C17); until then nothing is taken there. */
-  canCreate: () => boolean;
+  /** The calendar a press on empty space creates in (PM's id), read at the press; null where
+   *  nothing may be created there (no calendar takes events, or this computer's zone is unknown),
+   *  and then nothing is taken (C17). */
+  createIn: () => string | null;
   /** The event's details or another popover is open now, read before the press closes it. */
   overlayOpen: () => boolean;
   /** How long `ev` becomes when dragged from the all-day row into the hours (its account's default
-   *  length), or a new event (null), in minutes. */
+   *  length), or a new event clicked into the hours (null: the create calendar's), in minutes. */
   lengthFor: (ev: CalendarEvent | null) => number;
   /** This computer's time zone, or null when it can't be told. */
   zone: () => string | null;
@@ -137,6 +144,32 @@ const NBSP = String.fromCharCode(0xa0);
  *  "Put back.") differ by a no-break space, so a screen reader says them again. */
 export function sayAgain(was: string, text: string): string {
   return was === text ? `${text}${NBSP}` : text;
+}
+
+/** Whether something a press on the grid should only close is open: a dialog, the event's details
+ *  (`detailsOpen`, which aren't a dialog), or any other popover (the add-zone list, the range menu,
+ *  C16 critique C1-M8). The calendar's `overlayOpen`. */
+export function overlayShown(detailsOpen: boolean): boolean {
+  return (
+    isAnyDialogOpen() || detailsOpen || document.querySelector("[data-popover-panel]") !== null
+  );
+}
+
+/** The new event a press on empty space would make, on `calendarId`, before it has times: drawn as
+ *  C10c's draft, which quick create's own takes over from (C17). */
+function newRow(calendarId: string): CalendarEvent {
+  return {
+    id: DRAFT_EVENT_ID,
+    calendar_id: calendarId,
+    summary: "",
+    description: null,
+    location: null,
+    start: "",
+    end: null,
+    all_day: false,
+    html_link: null,
+    uid: null,
+  };
 }
 
 /** The grid inside `wrapper` as laid out now, with the element that scrolls it: the time grid's
@@ -202,24 +235,43 @@ function acting(press: Press): boolean {
 /** The pointer's look while dragging: what's being changed, or that nothing may be. */
 function cursorFor(press: Press): string {
   if (!acting(press)) return "not-allowed";
-  const grab: Grab = press.on.kind === "event" ? press.on.grab : "end";
+  // A new event's range: down the hours, across the all-day row, over Month's days.
+  if (press.on.kind === "empty") {
+    return press.on.surface === "grid"
+      ? "ns-resize"
+      : press.on.surface === "band"
+        ? "ew-resize"
+        : "crosshair";
+  }
+  const grab: Grab = press.on.grab;
   if (grab === "start" || grab === "end") return "ns-resize";
   if (grab === "left" || grab === "right") return "ew-resize";
   return "grabbing";
 }
 
-/** What the grid draws for `phase`. */
-function viewOf(phase: GesturePhase): GestureView {
+/** What the grid draws for `phase`; `createIn` is the calendar a press on empty space creates in. */
+function viewOf(phase: GesturePhase, createIn: string | null): GestureView {
   if (phase.phase !== "dragging") return NONE;
   const on = phase.press.on;
-  // A drag over empty space draws the new event's outline from C17.
-  if (on.kind === "empty") return { ...NONE, live: true };
-  if (!acting(phase.press)) return { ...NONE, live: true, chip: on.cap.reason };
+  if (on.kind === "event" && !acting(phase.press)) {
+    return { ...NONE, live: true, chip: on.cap.reason };
+  }
   const plan = phase.plan;
   const timing: Timing | null =
     plan === null ? null : plan.ok ? plan.timing : plan.why === "gap" ? plan.timing : null;
   // Nowhere to drop (the cancel zone): it shows where it is, as letting go would leave it.
   if (timing === null) return { ...NONE, live: true };
+  const invalid = plan !== null && !plan.ok && plan.why === "gap" ? gapText(plan.at) : null;
+  if (on.kind === "empty") {
+    // The new event's outline over the range, in the draft's look and its calendar's colour.
+    if (createIn === null) return { ...NONE, live: true };
+    const event = ghostEvent(newRow(createIn), timing);
+    return {
+      ...NONE,
+      live: true,
+      ghost: { event, kind: "create", invalid, label: whenText(event) },
+    };
+  }
   const event = ghostEvent(on.row, timing);
   return {
     live: true,
@@ -227,7 +279,7 @@ function viewOf(phase: GesturePhase): GestureView {
     ghost: {
       event,
       kind: on.grab === "body" ? "move" : "resize",
-      invalid: plan !== null && !plan.ok && plan.why === "gap" ? gapText(plan.at) : null,
+      invalid,
       label: whenText(event),
     },
     chip: null,
@@ -242,6 +294,8 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
   const [phase, setPhase] = useState<GesturePhase>(IDLE);
   const pos = useRef({ x: 0, y: 0 });
   const chipEl = useRef<HTMLElement | null>(null);
+  // The calendar the press on empty space creates in, set at that press, for its outline's colour.
+  const createCal = useRef<string | null>(null);
 
   useEffect(() => {
     let state: GesturePhase = IDLE;
@@ -560,7 +614,12 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
           },
         };
       }
-      if (t.closest(CONTROLS) || !t.closest("[data-surface]") || !h.canCreate()) return null;
+      // Empty space: never a control or something marked as no place to create (a day number), and
+      // only where a calendar can take the new event.
+      if (t.closest(CONTROLS) || !t.closest("[data-surface]")) return null;
+      const calendar = h.createIn();
+      if (calendar === null) return null;
+      createCal.current = calendar;
       const surface: Surface = at.zone === "timed" ? "grid" : at.zone;
       return {
         ...base,
@@ -582,12 +641,15 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       const h = hostRef.current;
       const wrapper = h.wrapper();
       if (!wrapper || !h.surfaceOk()) return;
-      // The main button, unmodified (a Mac's Ctrl-click is a right-click), never touch (Q14), and
-      // never under a dialog, which owns the press.
+      // The main button, unmodified (a Mac's Ctrl-click is a right-click), and never under a
+      // dialog, which owns the press.
       if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
-      if (e.pointerType === "touch" || isAnyDialogOpen()) return;
+      if (isAnyDialogOpen()) return;
       const press = pressOf(e, wrapper);
       if (!press) return;
+      // Touch never drags (Q14): an event's tap opens it as ever, and a tap on empty space creates
+      // (it never passes the threshold, so it is always a click).
+      if (e.pointerType === "touch" && press.on.kind !== "empty") return;
       pos.current = { x: e.clientX, y: e.clientY };
       dispatch({ type: "press", press });
       attach(press, wrapper);
@@ -612,5 +674,6 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     }
   }, []);
 
-  return useMemo(() => ({ ...viewOf(phase), chipRef }), [phase, chipRef]);
+  // `createCal` is set at the press, before the phase it draws for.
+  return useMemo(() => ({ ...viewOf(phase, createCal.current), chipRef }), [phase, chipRef]);
 }

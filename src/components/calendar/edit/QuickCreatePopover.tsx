@@ -89,8 +89,14 @@ import { createEvent, noteCreateResult, noteHeldCreate, type CreateSent } from "
 import { useRepeatView } from "./useRepeat";
 
 interface Props {
-  /** The "+ New event" button's rect: the box opens under it. */
+  /** The "+ New event" button's rect: the box opens under it. Or the slot clicked or dragged on the
+   *  grid (C17, `placement` "beside"): the box opens beside it, as Google's does. */
   anchor: DOMRect;
+  /** Under the anchor (the header button's), or beside it (a slot on the grid). */
+  placement?: "below" | "beside";
+  /** The time is the user's from the start (a range dragged on the grid): another calendar keeps it,
+   *  rather than giving the event its own default length (C17). */
+  timeTouched?: boolean;
   /** The fields it starts with (`newEventSeed`). */
   seed: EditorFields;
   targets: CreateTargets;
@@ -145,6 +151,8 @@ type AllDay = Extract<TimeDraft, { kind: "all_day" }>;
 
 /** Room kept between the box and the window's edge. */
 const MARGIN = 8;
+/** Room between the box and what it opens from. */
+const GAP = 6;
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -160,6 +168,8 @@ function moveAllDay(t: AllDay, first_day: string): AllDay {
 
 export function QuickCreatePopover({
   anchor,
+  placement = "below",
+  timeTouched: timeChosen = false,
   seed,
   targets,
   calendarId: firstCalendar,
@@ -198,8 +208,9 @@ export function QuickCreatePopover({
   const refusedLineId = `${dateId}-refused`;
   // The event's length, kept while its start moves: the account's default to begin with.
   const lengthRef = useRef(lengthFor(overview, targetById(targets, firstCalendar)));
-  // Whether the user has changed the time: until then, another calendar brings its own length.
-  const timeTouched = useRef(resume?.timeTouched ?? false);
+  // Whether the user has changed the time (or dragged it out on the grid): until then, another
+  // calendar brings its own length.
+  const timeTouched = useRef(resume?.timeTouched ?? timeChosen);
   const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(null);
   // The one guard every way to save passes, set before the request goes.
   const savingRef = useRef(false);
@@ -264,19 +275,32 @@ export function QuickCreatePopover({
   const refocusSave = () => setTimeout(() => saveButton.current?.focus(), 0);
   const whereOf = (id: string) => createdWhere(overviewRef.current, hiddenRef.current, id);
 
-  // Under the button, clamped to the window, above it only when there's no room below; hidden until
-  // placed so it never flashes at the corner. Placed again as it grows (a problem line, the banner).
+  // Under the button, clamped to the window, above it only when there's no room below; beside a
+  // slot on the grid (C17), to its right, or its left when there's no room, level with its top.
+  // Hidden until placed so it never flashes at the corner. Placed again as it grows (a problem
+  // line, the banner).
   useLayoutEffect(() => {
     const el = panelRef.current;
     if (!el) return;
     const place = () => {
       const w = el.offsetWidth;
       const h = el.offsetHeight;
-      const left = Math.max(MARGIN, Math.min(anchor.left, window.innerWidth - w - MARGIN));
-      let top = anchor.bottom + 6;
-      if (top + h + MARGIN > window.innerHeight) {
-        const above = anchor.top - 6 - h;
-        top = above >= MARGIN ? above : Math.max(MARGIN, window.innerHeight - h - MARGIN);
+      const inX = (x: number) => Math.max(MARGIN, Math.min(x, window.innerWidth - w - MARGIN));
+      let left: number;
+      let top: number;
+      if (placement === "beside") {
+        const after = anchor.right + GAP;
+        const before = anchor.left - GAP - w;
+        left =
+          after + w + MARGIN <= window.innerWidth ? after : before >= MARGIN ? before : inX(after);
+        top = Math.max(MARGIN, Math.min(anchor.top, window.innerHeight - h - MARGIN));
+      } else {
+        left = inX(anchor.left);
+        top = anchor.bottom + GAP;
+        if (top + h + MARGIN > window.innerHeight) {
+          const above = anchor.top - GAP - h;
+          top = above >= MARGIN ? above : Math.max(MARGIN, window.innerHeight - h - MARGIN);
+        }
       }
       setPos((p) => (p && p.left === left && p.top === top ? p : { left, top }));
     };
@@ -288,7 +312,7 @@ export function QuickCreatePopover({
       ro?.disconnect();
       window.removeEventListener("resize", place);
     };
-  }, [anchor]);
+  }, [anchor, placement]);
 
   // The title takes focus once the box is placed (a hidden element can't), and only then: placing
   // it again as it grows must not pull focus back from wherever the user went.
