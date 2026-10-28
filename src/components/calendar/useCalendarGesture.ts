@@ -166,18 +166,22 @@ const surfaceOf = (s: string | undefined): Surface | null =>
 
 /** The edge a press at `y` on `t` inside `card` took (its strip's `data-edge`), or undefined for the
  *  body. A press on a strip takes that edge: the strip shows the resize cursor, so what looks like an
- *  edge is one (Month draws none). So does a press on the card's own top or bottom border beside a
- *  strip: the card clips its strips inside its border, and that line is what's drawn as the event's
- *  edge. */
+ *  edge is one (Month draws none). So does a press on the card's own box level with a strip: the
+ *  card clips its strips inside its border and rounded corners, and that border (the line drawn as
+ *  the event's top or bottom, the calendar's stripe down its side, the corners) is the edge too. */
 function edgeTaken(card: HTMLElement, t: Element, y: number): string | undefined {
   const strip = t.closest<HTMLElement>("[data-edge]");
   if (strip && card.contains(strip)) return strip.dataset.edge;
   if (t !== card) return undefined;
-  const r = card.getBoundingClientRect();
-  const css = getComputedStyle(card);
-  const has = (edge: string) => card.querySelector(`[data-edge="${edge}"]`) !== null;
-  if (y < r.top + (Number.parseFloat(css.borderTopWidth) || 0) && has("start")) return "start";
-  if (y >= r.bottom - (Number.parseFloat(css.borderBottomWidth) || 0) && has("end")) return "end";
+  // A strip not laid out (no height) is no band to be level with.
+  const band = (edge: string) => {
+    const r = card.querySelector<HTMLElement>(`[data-edge="${edge}"]`)?.getBoundingClientRect();
+    return r && r.height > 0 ? r : null;
+  };
+  const start = band("start");
+  if (start && y < start.bottom) return "start";
+  const end = band("end");
+  if (end && y >= end.top) return "end";
   return undefined;
 }
 

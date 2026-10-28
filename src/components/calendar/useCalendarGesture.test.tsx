@@ -157,6 +157,10 @@ function layOut() {
   place(screen.getByTestId("col1"), 54, 100, 427, 600);
   place(screen.getByTestId("col2"), 427, 100, 800, 600);
   place(screen.getByTestId("card"), 55, 460, 426, 500);
+  // Its strips, as EventCard draws them inside its 1 px border, its stripe and its corners: the
+  // top 6 px and the bottom 10 px of the padding box.
+  place(screen.getByTestId("card-start"), 58, 461, 425, 467);
+  place(screen.getByTestId("card-end"), 58, 489, 425, 499);
 }
 
 function mount(host: Partial<GestureHost> = {}, opts: { strict?: boolean } = {}) {
@@ -313,18 +317,17 @@ describe("useCalendarGesture: a drop", () => {
       end: { day: D1, min: 600 },
     });
     onCommit.mockClear();
-    // A press on the card's own box, off its strips, is a move.
-    press(screen.getByTestId("card"), 200, 495);
-    moveTo(200, 535);
-    release(200, 535);
+    // A press on the card's own box between its strips is a move.
+    press(screen.getByTestId("card"), 200, 480);
+    moveTo(200, 520);
+    release(200, 520);
     expect(onCommit.mock.calls[0][0].resize).toBe(false);
   });
 
-  it("the line drawn as the card's bottom (its border, which clips the strip) takes the end", () => {
+  it("the card's own border level with a strip (the line drawn as its edge) takes that edge", () => {
     const { onCommit } = mount();
     const card = screen.getByTestId("card");
-    // As EventCard draws it (`border`): 1 px all round.
-    card.style.border = "1px solid";
+    // On the line drawn as its bottom, below the strip the card clips inside its border.
     press(card, 200, 499.5);
     moveTo(200, 539.5);
     release(200, 539.5);
@@ -345,6 +348,18 @@ describe("useCalendarGesture: a drop", () => {
       end: { day: D1, min: 600 },
     });
     onCommit.mockClear();
+    // On the calendar's stripe down its left side, level with the end's strip, and in its
+    // bottom-left corner, outside the strip's rounded clip.
+    for (const [x, y] of [
+      [56, 494],
+      [59, 497],
+    ]) {
+      press(card, x, y);
+      moveTo(x, y + 40);
+      release(x, y + 40);
+      expect(onCommit.mock.calls[0][0].resize).toBe(true);
+      onCommit.mockClear();
+    }
     // A border with no strip beside it (an end that may not move) is the body's.
     card.querySelector('[data-edge="end"]')?.remove();
     press(card, 200, 499.5);
