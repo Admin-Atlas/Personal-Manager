@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import type { CalendarEvent } from "../../lib/types";
 import { dragCapability, NO_END, type DragCapability } from "../../lib/calendarDrag";
 import { PUT_BACK } from "../../lib/calendarGesture";
+import { formatClock } from "../../lib/format";
 
 const env = vi.hoisted(() => ({ dialog: false }));
 vi.mock("../../lib/useDialogLayer", async (importOriginal) => ({
@@ -33,6 +34,8 @@ import {
 
 const D1 = "2026-10-12";
 const D2 = "2026-10-13";
+// The ghost's times follow the machine's locale (CI's is 12-hour), so they're built the same way.
+const clock = (h: number) => formatClock(new Date(2026, 9, 13, h));
 
 const row = (over: Partial<CalendarEvent>): CalendarEvent => ({
   id: "e1",
@@ -235,7 +238,7 @@ describe("useCalendarGesture: a drop", () => {
     const { onCommit, announce } = mount();
     dragGymOver();
     expect(announce).toHaveBeenCalledWith("Moving “Gym”.");
-    expect(screen.getByTestId("ghost").textContent).toMatch(/10:00.11:00/);
+    expect(screen.getByTestId("ghost").textContent).toContain(`${clock(10)}–${clock(11)}`);
     release(600, 520);
     expect(onCommit).toHaveBeenCalledTimes(1);
     const commit = onCommit.mock.calls[0][0];
