@@ -42,6 +42,13 @@ const ALLOWED = [
     why: "Reads MoE expert counts out of a binary GGUF header over HTTP range requests. A maintained format library prevents a correctness bug we cannot cheaply verify by hand; dev-only, never shipped, and the generator is deliberately not part of `just check`.",
   },
   {
+    file: "scripts/bundle-rpm.test.mjs",
+    specifier: "vitest",
+    why: "The repo's existing test runner, on the same terms as the entries below. The rpm's version label is otherwise exercised only by the Linux bundle dry-run and a release, so its rule is pinned where `just frontend-test` (which has node_modules) collects it through the vitest include glob; no dependency is added.",
+    pinExempt:
+      "Same reason as the other vitest entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
+  },
+  {
     file: "scripts/check-action-pins.test.mjs",
     specifier: "vitest",
     why: "The repo's existing test runner, reached exactly as the catalog generator's test below reaches it. Adds no new dependency — `just frontend-test` already collects this file through a vitest include glob.",

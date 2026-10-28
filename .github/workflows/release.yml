@@ -244,6 +244,15 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
 
+      # The rpm gets its own bundling pass, labelled 3.155.1+alpha rather than 3.155.1-alpha:
+      # rpm's Version tag can't hold a "-" (tauri.linux.conf.json leaves the rpm out of the
+      # build above for that reason). The file keeps the usual PM-<version>-1.x86_64.rpm name,
+      # and the pass skips the updater signature, so it needs no secret. See the script.
+      - name: Bundle the rpm (Linux)
+        if: startsWith(matrix.os, 'ubuntu-')
+        shell: bash
+        run: node scripts/bundle-rpm.mjs
+
       # Clean-profile guard: exercise the *bundled* interpreter exactly as the
       # bundler laid it down. A packaging regression that flattens the Python tree
       # (losing Lib/encodings) makes the document engine dead on first ingest;

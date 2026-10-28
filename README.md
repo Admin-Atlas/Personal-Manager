@@ -203,7 +203,7 @@ Three formats ship per release, all x86_64 — pick one:
   `sudo apt install libfuse2` (Debian/Ubuntu) or run with `--appimage-extract-and-run`.
 - **rpm** (Fedora/RHEL/openSUSE): `sudo dnf install ./PM-*.rpm` — adds a menu entry and
   icon; the downloaded file is disposable afterwards.
-- **deb** (Debian/Ubuntu/Mint): `sudo apt install ./pm_*.deb` — same as the rpm.
+- **deb** (Debian/Ubuntu/Mint): `sudo apt install ./PM_*.deb` — same as the rpm.
 
 A **package** install (rpm/deb) can't self-update: the in-app updater only replaces an
 AppImage in place, so PM detects a package install and, rather than a doomed auto-update,
