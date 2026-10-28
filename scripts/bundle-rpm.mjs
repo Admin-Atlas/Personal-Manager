@@ -79,26 +79,37 @@ export function movingArg(args) {
 }
 
 /**
- * From the rpm folder's files ({name, mtimeMs}), the renames to make and the one rpm this run
- * built. Only files written since `started` count, so an rpm Tauri wrote somewhere else (a
- * --target, CARGO_BUILD_TARGET or a cargo [build] target moves it) fails here instead of a
- * leftover from an earlier run passing as the new build.
+ * The renames to make and the one rpm this run built, from the rpm folder's files before and after
+ * the pass ({name, sig}, sig standing for inode, size and mtime). Only a file the pass created or
+ * rewrote counts, and only under the name Tauri gives it (the label), so neither a leftover from an
+ * earlier run nor the clock can pass for the new build. An rpm Tauri wrote somewhere else (a
+ * --target, CARGO_BUILD_TARGET or a cargo [build] target moves it) fails here.
  */
-export function pickBuilt(entries, version, label, started) {
-  // Two seconds' slack for filesystems that keep coarse timestamps.
-  const fresh = entries.filter((e) => e.mtimeMs >= started - 2000).map((e) => e.name);
-  const renames = renamesFor(fresh, version, label);
-  const after = fresh.map((name) => renames.find(([from]) => from === name)?.[1] ?? name);
-  const built = after.filter((name) => name.endsWith(".rpm") && name.includes(`-${version}-`));
-  if (built.length !== 1) {
+export function pickBuilt(before, after, version, label) {
+  const was = new Map(before.map((e) => [e.name, e.sig]));
+  const written = after
+    .filter((e) => was.get(e.name) !== e.sig)
+    .map((e) => e.name)
+    .filter((name) => name.endsWith(".rpm") && name.includes(`-${label}-`));
+  if (written.length !== 1) {
     throw new Error(
-      `expected one newly built rpm for ${version}, found ${built.length}` +
-        (built.length ? `: ${built.join(", ")}` : "") +
+      `expected the pass to write one rpm for ${label}, found ${written.length}` +
+        (written.length ? `: ${written.join(", ")}` : "") +
         ". This script makes the host's release rpm only; --target, --debug, CARGO_BUILD_TARGET " +
         "or a cargo [build] target puts it somewhere else.",
     );
   }
-  return { renames, built: built[0] };
+  const renames = renamesFor(written, version, label);
+  return { renames, built: renames.length ? renames[0][1] : written[0] };
+}
+
+/** The rpm folder's files as {name, sig}, or none if it doesn't exist yet. */
+function snapshot(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .map((name) => ({ name, stat: statSync(join(dir, name)) }))
+    .filter((e) => e.stat.isFile())
+    .map((e) => ({ name: e.name, sig: `${e.stat.ino}:${e.stat.size}:${e.stat.mtimeMs}` }));
 }
 
 /** Where cargo, and so Tauri, puts the target dir: Tauri asks `cargo metadata` from src-tauri. */
@@ -132,18 +143,12 @@ function main() {
   ];
   const dir = join(cargoTargetDir(), "release", "bundle", "rpm");
   console.log(`bundle-rpm: labelling the rpm ${label} (PM ${version})`);
-  const started = Date.now();
+  const before = snapshot(dir);
   const run = spawnSync(tauri, args, { cwd: repoRoot, stdio: "inherit" });
   if (run.error) throw run.error;
   if (run.status !== 0) process.exit(run.status ?? 1);
 
-  const entries = existsSync(dir)
-    ? readdirSync(dir)
-        .map((name) => ({ name, stat: statSync(join(dir, name)) }))
-        .filter((e) => e.stat.isFile())
-        .map((e) => ({ name: e.name, mtimeMs: e.stat.mtimeMs }))
-    : [];
-  const { renames, built } = pickBuilt(entries, version, label, started);
+  const { renames, built } = pickBuilt(before, snapshot(dir), version, label);
   for (const [from, to] of renames) {
     renameSync(join(dir, from), join(dir, to));
     console.log(`bundle-rpm: ${from} -> ${to}`);

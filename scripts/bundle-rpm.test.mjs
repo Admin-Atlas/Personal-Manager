@@ -112,43 +112,51 @@ describe("movingArg", () => {
 });
 
 describe("pickBuilt", () => {
-  const started = 1_000_000;
-  const now = started + 30_000;
-  const old = started - 60_000;
+  const V = "3.155.1-alpha";
+  const L = "3.155.1+alpha";
+  const labelled = "PM-3.155.1+alpha-1.x86_64.rpm";
+  const named = "PM-3.155.1-alpha-1.x86_64.rpm";
 
   it("renames the rpm this run wrote under its label", () => {
-    expect(
-      pickBuilt(
-        [
-          { name: "PM-3.155.1+alpha-1.x86_64.rpm", mtimeMs: now },
-          { name: "PM-3.155.0-alpha-1.x86_64.rpm", mtimeMs: old },
-        ],
-        "3.155.1-alpha",
-        "3.155.1+alpha",
-        started,
-      ),
-    ).toEqual({
-      renames: [["PM-3.155.1+alpha-1.x86_64.rpm", "PM-3.155.1-alpha-1.x86_64.rpm"]],
-      built: "PM-3.155.1-alpha-1.x86_64.rpm",
+    const before = [{ name: "PM-3.155.0-alpha-1.x86_64.rpm", sig: "1:10:5" }];
+    const after = [...before, { name: labelled, sig: "2:20:9" }];
+    expect(pickBuilt(before, after, V, L)).toEqual({
+      renames: [[labelled, named]],
+      built: named,
     });
   });
 
-  it("refuses a leftover rpm from an earlier run when this run wrote none here", () => {
-    const leftover = [{ name: "PM-3.155.1-alpha-1.x86_64.rpm", mtimeMs: old }];
-    expect(() => pickBuilt(leftover, "3.155.1-alpha", "3.155.1+alpha", started)).toThrow(
-      /expected one newly built rpm for 3\.155\.1-alpha, found 0/,
-    );
-    expect(() => pickBuilt([], "3.155.1-alpha", "3.155.1+alpha", started)).toThrow(/found 0/);
+  it("takes the new rpm, not the last run's renamed one beside it", () => {
+    // Two runs back to back: the first's rpm is already under the release name.
+    const before = [{ name: named, sig: "3:30:9" }];
+    const after = [...before, { name: labelled, sig: "4:30:10" }];
+    expect(pickBuilt(before, after, V, L)).toEqual({ renames: [[labelled, named]], built: named });
+  });
+
+  it("counts a labelled rpm the pass rewrote in place", () => {
+    const before = [{ name: labelled, sig: "5:30:9" }];
+    expect(pickBuilt(before, [{ name: labelled, sig: "5:31:12" }], V, L).built).toBe(named);
+  });
+
+  it("refuses when the pass wrote nothing here, whatever is lying around", () => {
+    for (const files of [
+      [],
+      [{ name: named, sig: "6:30:99999" }],
+      [{ name: labelled, sig: "7:1:1" }],
+    ]) {
+      expect(() => pickBuilt(files, files, V, L)).toThrow(
+        /expected the pass to write one rpm for 3\.155\.1\+alpha, found 0/,
+      );
+    }
   });
 
   it("takes a release version's rpm as it is, if this run wrote it", () => {
     const rpm = "PM-4.0.0-1.x86_64.rpm";
-    expect(pickBuilt([{ name: rpm, mtimeMs: now }], "4.0.0", "4.0.0", started)).toEqual({
+    expect(pickBuilt([], [{ name: rpm, sig: "8:1:1" }], "4.0.0", "4.0.0")).toEqual({
       renames: [],
       built: rpm,
     });
-    expect(() => pickBuilt([{ name: rpm, mtimeMs: old }], "4.0.0", "4.0.0", started)).toThrow(
-      /found 0/,
-    );
+    const old = [{ name: rpm, sig: "8:1:1" }];
+    expect(() => pickBuilt(old, old, "4.0.0", "4.0.0")).toThrow(/found 0/);
   });
 });
