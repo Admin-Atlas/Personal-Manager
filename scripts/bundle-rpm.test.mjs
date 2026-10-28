@@ -9,10 +9,12 @@
 //
 // Importing the module does not run the bundler (entry-point guard at the bottom of it).
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { movingArg, pickBuilt, renamesFor, rpmVersion } from "./bundle-rpm.mjs";
+import { movingArg, pickBuilt, renamesFor, rpmVersion, snapshot } from "./bundle-rpm.mjs";
 
 // The characters rpm-rs 0.30 allows in a Version tag, quoted from its error message.
 const RPM_LEGAL = /^[A-Za-z0-9._+%{}~^]+$/;
@@ -135,7 +137,25 @@ describe("pickBuilt", () => {
 
   it("counts a labelled rpm the pass rewrote in place", () => {
     const before = [{ name: labelled, sig: "5:30:9" }];
-    expect(pickBuilt(before, [{ name: labelled, sig: "5:31:12" }], V, L).built).toBe(named);
+    expect(pickBuilt(before, [{ name: labelled, sig: "5:30:12" }], V, L).built).toBe(named);
+  });
+
+  it("goes by the label's name, even when something else in the folder changed too", () => {
+    const before = [{ name: named, sig: "3:30:9" }];
+    const after = [
+      { name: named, sig: "3:30:11" },
+      { name: labelled, sig: "4:30:10" },
+      { name: "PM-3.155.1+alpha-1.x86_64.rpm.sig", sig: "9:1:10" },
+    ];
+    expect(pickBuilt(before, after, V, L)).toEqual({ renames: [[labelled, named]], built: named });
+  });
+
+  it("refuses two new labelled rpms rather than pick one", () => {
+    const after = [
+      { name: labelled, sig: "4:30:10" },
+      { name: "PM-3.155.1+alpha-1.aarch64.rpm", sig: "5:30:10" },
+    ];
+    expect(() => pickBuilt([], after, V, L)).toThrow(/found 2/);
   });
 
   it("refuses when the pass wrote nothing here, whatever is lying around", () => {
@@ -158,5 +178,42 @@ describe("pickBuilt", () => {
     });
     const old = [{ name: rpm, sig: "8:1:1" }];
     expect(() => pickBuilt(old, old, "4.0.0", "4.0.0")).toThrow(/found 0/);
+  });
+});
+
+describe("snapshot", () => {
+  const scratch = () => mkdtempSync(join(tmpdir(), "bundle-rpm-test-"));
+
+  it("is empty for a folder that doesn't exist yet", () => {
+    const dir = scratch();
+    try {
+      expect(snapshot(join(dir, "rpm"))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lists files only, and tells an in-place rewrite of the same bytes apart", () => {
+    const dir = scratch();
+    try {
+      const rpm = join(dir, "PM-3.155.1+alpha-1.x86_64.rpm");
+      writeFileSync(rpm, "same bytes");
+      // As if written a minute ago, so the rewrite below can't share its mtime.
+      const earlier = new Date(Date.now() - 60_000);
+      utimesSync(rpm, earlier, earlier);
+      mkdirSync(join(dir, "PM-3.155.1+alpha-1.x86_64"));
+      const before = snapshot(dir);
+      expect(before.map((e) => e.name)).toEqual(["PM-3.155.1+alpha-1.x86_64.rpm"]);
+
+      // Tauri's File::create: the same inode, truncated and written again.
+      writeFileSync(rpm, "same bytes");
+      const after = snapshot(dir);
+      expect(after[0].sig).not.toBe(before[0].sig);
+      expect(pickBuilt(before, after, "3.155.1-alpha", "3.155.1+alpha").built).toBe(
+        "PM-3.155.1-alpha-1.x86_64.rpm",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

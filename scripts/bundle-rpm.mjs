@@ -103,8 +103,12 @@ export function pickBuilt(before, after, version, label) {
   return { renames, built: renames.length ? renames[0][1] : written[0] };
 }
 
-/** The rpm folder's files as {name, sig}, or none if it doesn't exist yet. */
-function snapshot(dir) {
+/**
+ * The rpm folder's files as {name, sig}, or none if it doesn't exist yet. Tauri rewrites an rpm
+ * that's already there in place (File::create keeps the inode, and the same build keeps the
+ * size), so the mtime is what tells a rewrite apart.
+ */
+export function snapshot(dir) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .map((name) => ({ name, stat: statSync(join(dir, name)) }))
