@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.155.1-alpha",
+    date: "2026-10-28",
+    highlights: [
+      "Under-the-hood tidying, with a few security fixes. The pieces PM uses to check for and install updates, open file dialogs and stop a second copy of PM from starting all picked up fixes. On Linux, an update now installs even when your computer keeps its temporary files on a separate drive, and an update in the wrong format is refused before it can touch the installed app.",
+      "This week's security fixes are in too: in the library PM uses to zip up your data when you export it, in the code that hashes your passphrase, and in two helpers inside PM's document engine. PM updates its document engine by itself the next time it starts. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.155.0-alpha",
     date: "2026-10-21",
     highlights: [
@@ -2369,7 +2377,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     version: "3.45.0-alpha",
     date: "2026-07-23",
     highlights: [
-      "Linux gets a Debian/Ubuntu installer. Alongside the AppImage and the Fedora .rpm, PM now ships a .deb — so Debian, Ubuntu, Mint and friends can install it with a single `sudo apt install ./pm_*.deb` and get PM in their app menu, no fuss. And if you installed PM from a package (rpm or deb), the update banner now points you to reinstall the new package instead of quietly trying — and failing — to update itself the way only the AppImage can. Not on Linux, or on the AppImage? Nothing changes.",
+      "Linux gets a Debian/Ubuntu installer. Alongside the AppImage and the Fedora .rpm, PM now ships a .deb — so Debian, Ubuntu, Mint and friends can install it with a single `sudo apt install ./PM_*.deb` and get PM in their app menu, no fuss. And if you installed PM from a package (rpm or deb), the update banner now points you to reinstall the new package instead of quietly trying — and failing — to update itself the way only the AppImage can. Not on Linux, or on the AppImage? Nothing changes.",
     ],
   },
   {

@@ -193,9 +193,9 @@
       }
     },
     "filelock": {
-      "versions": ["3.32.4"],
+      "versions": ["4.2.4"],
       "licence": "MIT",
-      "stamp": "9c56bfa25dc071882642146334d01f44",
+      "stamp": "daf7175405150de37013c36162ce6602",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -661,9 +661,9 @@
       "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
     },
     "setuptools": {
-      "versions": ["84.0.0"],
+      "versions": ["84.2.1"],
       "licence": "MIT",
-      "stamp": "9e4ef2fba3931c6d557a480047d5165c",
+      "stamp": "c8b738d8329822d796948cbf7c4457ed",
       "evidence": {
         "expression": "MIT",
         "license": null,

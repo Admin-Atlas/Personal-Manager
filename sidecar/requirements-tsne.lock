@@ -22,7 +22,7 @@
 # pm-lock: 1
 # pm-python-floor: 3.11
 # pm-input: sidecar/requirements-optional.txt@sha256:bbfc9c5804fc0d4f7c282c010593a6968eec9738d2847a9deb41fc6a9d84486c
-# pm-constraint: sidecar/requirements.lock@sha256:5c7a00de93e84c336c436ca72a2bde9e536f858ced0df80821a03f86908e1e94
+# pm-constraint: sidecar/requirements.lock@sha256:2cf1d3390e6ae556647f39daa398d8a6f0075b1087adeea23fdc0dfe94d31ba6
 # pm-pins: openTSNE==1.0.4
 joblib==1.5.3 \
     --hash=sha256:5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713 \

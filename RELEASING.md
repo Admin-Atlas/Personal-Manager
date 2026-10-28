@@ -219,8 +219,10 @@ reinstalling the next release's package), `SHA256SUMS`, and `THIRD-PARTY-NOTICES
 > AppImage + rpm + deb and smoke-tests the bundled interpreter **without a tag and without
 > secrets** (it signs with a throwaway key). It runs automatically on PRs touching the
 > Linux packaging surface and via manual dispatch — use it before a release whenever
-> the Linux lane changed, and to answer version-format questions (rpm rejects a raw
-> `-alpha`; the bundler owns the label conversion, and this proves it).
+> the Linux lane changed, and to answer version-format questions. rpm rejects the `-` in
+> `-alpha`, so `scripts/bundle-rpm.mjs` builds the rpm in its own pass labelled `+alpha`
+> (`rpm -q pm` shows `pm-3.155.1+alpha-1`) under the usual `PM-<version>-1.x86_64.rpm`
+> file name; the dry-run reads that label back out of the package.
 
 What a healthy update looks like: the app checks the feed **once, at launch** (there
 is no mid-session poll — a copy that was already running won't notice until it's

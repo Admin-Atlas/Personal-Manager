@@ -152,7 +152,8 @@ describe("usePull", () => {
       () => expect(onError).toHaveBeenCalledWith("couldn't download the model (disk full)", null),
       { timeout: 3000 },
     );
-    expect(result.current.pulling).toBeNull();
+    // onError is a plain call made before React re-renders the cleared state, so wait for that too.
+    await waitFor(() => expect(result.current.pulling).toBeNull());
     expect(result.current.lastPulledTag).toBeNull();
   });
 });

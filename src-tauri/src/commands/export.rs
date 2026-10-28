@@ -249,7 +249,7 @@ mod tests {
         let f = std::fs::File::open(zip_path).unwrap();
         let mut z = zip::ZipArchive::new(f).unwrap();
         let mut names: Vec<String> = (0..z.len())
-            .map(|i| z.by_index(i).unwrap().name().to_string())
+            .map(|i| z.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         names.sort();
         names
