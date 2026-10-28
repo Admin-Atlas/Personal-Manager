@@ -807,8 +807,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // dialogs (the editor among them) itself; the popover isn't one.
   const deleteDialog = useDeleteDialog(popoverOpen);
   const confirmDelete = deleteDialog.asked?.event ?? null;
-  // People already in the user's Google and Outlook calendars, for the editor's guest box: worked out
-  // here, over the rows this view holds, so no contacts are read (C12; never a subscription's).
+  // People already in the user's Google and Outlook calendars, for the editors' guest box (an event's
+  // and a new one's): worked out here, over the rows this view holds, so no contacts are read (C12;
+  // never a subscription's).
   const suggestions = useMemo(
     () => guestSuggestions(events, overview?.calendars ?? [], null),
     [events, overview],
@@ -1168,6 +1169,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               ? (milestones.find((m) => m.event_uid && m.event_uid === editing.uid) ?? null)
               : null
           }
+          colorOf={colorOf}
           onDelete={(row) => {
             // Close the editor first so its focus goes back to the event's chip, and the delete
             // dialog that opens next returns it there too.
@@ -1184,6 +1186,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           calendarId={creating.calendarId}
           overview={overview}
           hidden={hidden}
+          suggestions={suggestions}
           colorOf={colorOf}
           shapeOf={shapeOf}
           focusRef={focusCreateRef}

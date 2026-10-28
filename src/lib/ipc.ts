@@ -1132,12 +1132,16 @@ export const updateCalendarEvent = (
 /** Create an event on one of PM's Google calendars (`calendarId`, PM's own id). Outcomes come back as
  *  data. `retryToken` (from an `ambiguous` outcome) looks for the earlier attempt and sends it again,
  *  under the same id, only if Google still doesn't show it, so a retry is very unlikely to make a
- *  second copy. Nobody is emailed: new events have no guests. */
+ *  second copy. `notify` and `asked` as for a save: a new event with guests and no answer is
+ *  answered `needs_choice` with nothing sent. A retry sends the answer first sent. */
 export const createCalendarEvent = (
   calendarId: string,
   draft: NewEventDraft,
   retryToken: string | null = null,
-) => invoke<WriteOutcome>("create_calendar_event", { calendarId, draft, retryToken });
+  notify: Notify | null = null,
+  asked: GuestNotice | null = null,
+) =>
+  invoke<WriteOutcome>("create_calendar_event", { calendarId, draft, retryToken, notify, asked });
 
 /** Delete a mirrored event after an Undo window held by the backend. It goes to Google when the
  *  window ends, only if Google still holds what the user saw (`seen`); `onCalendarDeleteSettled`

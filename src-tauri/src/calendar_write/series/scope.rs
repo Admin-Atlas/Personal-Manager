@@ -14,8 +14,8 @@ use crate::calendar_recur::lines::TextOnly;
 use crate::calendar_recur::{Point, RecurError};
 
 use super::super::dto::{EventPatchDraft, SeriesScope, TimeDraft};
-use super::super::patch::build_patch;
-use super::super::time::{self, TimeError};
+use super::super::patch::{build_patch, PatchError};
+use super::super::time;
 use super::rule::rule_change;
 use super::{original_of, point_of, FreshEvent, Length, Master, SeriesRefusal};
 
@@ -40,7 +40,7 @@ impl From<SeriesScope> for Scope {
 /// What a change does to the occurrence, as far as the choice cares.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Change {
-    /// Title, place, description, busy/free, or guests (C12).
+    /// Title, place, description, busy/free, guests (C12), notifications or colour (C13).
     pub fields: bool,
     pub visibility: bool,
     /// What guests may do, which is the whole series', like visibility (C12).
@@ -83,7 +83,7 @@ impl Change {
         draft: &EventPatchDraft,
         instance: &FreshEvent,
         master: &Master,
-    ) -> Result<Change, TimeError> {
+    ) -> Result<Change, PatchError> {
         let it = instance.json();
         let body = build_patch(it, draft)?;
         let permissions = [
@@ -98,6 +98,9 @@ impl Change {
                 "description",
                 "transparency",
                 "attendees",
+                // Per occurrence in Google, so every row is offered, as for a title (C13).
+                "reminders",
+                "colorId",
             ]
             .iter()
             .chain(&permissions)
@@ -603,5 +606,53 @@ mod tests {
         assert_eq!(same.rule, None);
         assert!(same.fields);
         assert_eq!(scope_options(&same, false, None).this, Row::Offered);
+    }
+
+    /// C13: a colour or notifications are per occurrence in Google, so all three rows are offered,
+    /// as for a title; a value the occurrence already holds changes nothing, and one Google
+    /// wouldn't take is said before any row.
+    #[test]
+    fn a_colour_or_notification_change_offers_all_three_rows() {
+        use crate::calendar_write::dto::{ColourDraft, RemindersDraft};
+        let colour = change(EventPatchDraft {
+            colour: Some(ColourDraft::Colour { id: "3".into() }),
+            ..Default::default()
+        });
+        let notifications = change(EventPatchDraft {
+            reminders: Some(RemindersDraft {
+                use_default: false,
+                overrides: Vec::new(),
+            }),
+            ..Default::default()
+        });
+        for c in [colour, notifications] {
+            assert_eq!(
+                c,
+                Change {
+                    fields: true,
+                    ..Default::default()
+                }
+            );
+            let o = scope_options(&c, false, None);
+            assert_eq!(
+                (o.this, o.following, o.all),
+                (Row::Offered, Row::Offered, Row::Offered)
+            );
+        }
+        // The occurrence uses the defaults already.
+        let same = change(EventPatchDraft {
+            reminders: Some(RemindersDraft {
+                use_default: true,
+                overrides: Vec::new(),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(same, Change::default());
+        let m = Master::read(&fresh(master(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]))).unwrap();
+        let unknown = EventPatchDraft {
+            colour: Some(ColourDraft::Colour { id: "12".into() }),
+            ..Default::default()
+        };
+        assert!(Change::of(&unknown, &fresh(plain("2026-10-12T09:00:00+01:00")), &m).is_err());
     }
 }

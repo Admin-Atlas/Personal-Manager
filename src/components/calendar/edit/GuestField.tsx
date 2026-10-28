@@ -53,6 +53,9 @@ interface Props {
   disabled: boolean;
   /** Google cut the list short: shown, not changeable. */
   omitted: boolean;
+  /** A line the editor has about the list (a guest it took off), said under the box where this
+   *  field's own notes are, while none of those is showing. */
+  notice?: string | null;
   onChange: (guests: GuestDraft[]) => void;
   onPerms: (perms: GuestPerms) => void;
   /** Text left in the box on blur that isn't an address, or null once it's cleared or added: the
@@ -76,6 +79,7 @@ export function GuestField({
   organizer,
   disabled,
   omitted,
+  notice = null,
   onChange,
   onPerms,
   onReject,
@@ -366,9 +370,10 @@ export function GuestField({
           {problemText({ kind: "bad_guest", email: rejected })}
         </p>
       )}
-      {/* Always mounted, so "Already on the list." is heard as it appears. */}
+      {/* Always mounted, so "Already on the list." (or the editor's own line) is heard as it
+          appears. */}
       <div role="status" className="text-xs text-ink4">
-        {note}
+        {note ?? notice}
       </div>
       {guests.length > 0 && (
         <ul ref={listRef} aria-label="Guests" className="flex flex-col gap-1">

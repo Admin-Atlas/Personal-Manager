@@ -22,6 +22,7 @@ import {
   halfInstant,
   newEventSeed,
   rebaseDraft,
+  remindersAfterKindSwitch,
   repeatSeed,
   sameField,
   seedDraft,
@@ -67,6 +68,9 @@ const event: EventForEdit = {
   guests_can_see_other_guests: true,
   guests_omitted: false,
   organizer_email: "me@x.org",
+  reminders: { use_default: true, overrides: [] },
+  color_id: null,
+  label_id: null,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -112,6 +116,8 @@ describe("the event draft", () => {
       show_as: true,
       visibility: true,
       guests: false,
+      reminders: true,
+      colour: true,
       delete: false,
       reasons: ["locked"],
     };
@@ -600,6 +606,8 @@ describe("guests in the draft", () => {
       show_as: true,
       visibility: true,
       guests: false,
+      reminders: true,
+      colour: true,
       delete: true,
       reasons: [],
     };
@@ -621,14 +629,46 @@ describe("guests in the draft", () => {
     expect(seed.guest_perms).toEqual({ modify: false, invite_others: true, see_others: true });
     expect(NEW_EVENT_BASE.guest_perms).toEqual(seed.guest_perms);
     expect(changedFields(NEW_EVENT_BASE, seed)).not.toContain("guest_perms");
-    // A create doesn't send guests yet (C12d).
-    expect(Object.keys(toNewEvent(seed))).not.toContain("guests");
+    // A create sends its guest list, empty, and none of Google's own permissions (C12d).
+    const sent = toNewEvent(seed);
+    expect(sent.guests).toEqual([]);
+    expect(Object.keys(sent).filter((k) => k.startsWith("guests_"))).toEqual([]);
+  });
+
+  it("toNewEvent sends guests and only permissions Google doesn't default", () => {
+    const B = guest("B@x.org", { optional: true });
+    const draft: EditorFields = {
+      ...NEW_EVENT_BASE,
+      time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
+      // An entry Google marks as the organiser's or the calendar's own is only Google's to write.
+      guests: [A, ME, B],
+      guest_perms: { modify: true, invite_others: true, see_others: false },
+    };
+    const sent = toNewEvent(draft);
+    expect(sent.guests).toEqual([
+      { email: "A@x.org", optional: false },
+      { email: "B@x.org", optional: true },
+    ]);
+    expect(sent.guests_can_modify).toBe(true);
+    expect(sent.guests_can_see_other_guests).toBe(false);
+    expect("guests_can_invite_others" in sent).toBe(false);
+    // Who and whether optional only: never a name or a reply, which only Google writes.
+    expect(Object.keys(sent.guests[0]).sort()).toEqual(["email", "optional"]);
   });
 
   it("asks before a round trip only when the save would email someone", () => {
     const b = withGuests([ME, A]);
     expect(guestNotice(b, { ...b, show_as: "free" }, false)).toBeNull();
     expect(guestNotice(b, { ...b, summary: "Retro" }, false)).toMatchObject({ updated: 1 });
+    // Notifications and colour are the user's own too (C13, the backend's `PERSONAL`).
+    const mine = {
+      ...b,
+      reminders: { use_default: false, overrides: [{ method: "popup", minutes: 5 }] },
+      colour: { kind: "colour" as const, id: "2" },
+    };
+    expect(guestNotice(b, mine, false)).toBeNull();
+    // With a shared field beside them, everyone hears.
+    expect(guestNotice(b, { ...mine, location: "Room 2" }, false)).toMatchObject({ updated: 1 });
   });
 });
 
@@ -854,6 +894,8 @@ describe("a new event's starting fields", () => {
       recurrence: { kind: "once" },
       guests: [],
       guest_perms: { modify: false, invite_others: true, see_others: true },
+      reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
+      colour: { kind: "colour", id: "3" },
       show_as: "free",
       visibility: "private",
     };
@@ -866,9 +908,33 @@ describe("a new event's starting fields", () => {
       show_as: "free",
       visibility: "private",
       recurrence: null,
+      guests: [],
+      reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
+      colour: { kind: "colour", id: "3" },
     });
     // A copy: a later edit to the draft can't change what was sent.
     expect(sent.time).not.toBe(draft.time);
+    expect(sent.guests).not.toBe(draft.guests);
+    draft.reminders.overrides[0].minutes = 5;
+    expect(sent.reminders?.overrides[0].minutes).toBe(60);
+    expect(sent.colour).not.toBe(draft.colour);
+  });
+
+  it("a new event on the calendar's notifications and colour sends null for both (C13)", () => {
+    const seed = newEventSeed("2026-10-13", new Date(), "Europe/London", HOUR);
+    expect(seed.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(seed.colour).toEqual({ kind: "calendar" });
+    expect(changedFields(NEW_EVENT_BASE, seed)).not.toContain("reminders");
+    expect(changedFields(NEW_EVENT_BASE, seed)).not.toContain("colour");
+    const sent = toNewEvent(seed);
+    expect(sent.reminders).toBeNull();
+    expect(sent.colour).toBeNull();
+    // Each seed its own: a list made in one never shows up in the next.
+    expect(newEventSeed("2026-10-13", new Date(), null, HOUR).reminders).not.toBe(seed.reminders);
+    // An event's own empty list is a choice ("No notifications"), not the defaults.
+    expect(
+      toNewEvent({ ...seed, reminders: { use_default: false, overrides: [] } }).reminders,
+    ).toEqual({ use_default: false, overrides: [] });
   });
 
   // --- repeating (C11) ---
@@ -974,5 +1040,191 @@ describe("a new event's starting fields", () => {
       first_day: "2026-10-12",
       last_day: "2026-10-13",
     });
+  });
+});
+
+// Notifications and colour (C13): read from Google's copy, compared in any order, sent whole or as
+// one choice, carried through a rebase like any field, and fitted to a switch between timed and
+// all-day.
+describe("notifications and colour in the draft", () => {
+  const own = (...list: [string, number][]) => ({
+    use_default: false,
+    overrides: list.map(([method, minutes]) => ({ method, minutes })),
+  });
+  const google: EventForEdit = {
+    ...event,
+    reminders: own(["popup", 10], ["email", 60]),
+    color_id: "5",
+  };
+  const listed = seedDraft(google);
+
+  it("seedDraft takes Google's list and colour, and a label leaves the colour as colorId has it", () => {
+    expect(listed.reminders).toEqual(own(["popup", 10], ["email", 60]));
+    expect(listed.colour).toEqual({ kind: "colour", id: "5" });
+    expect(base().colour).toEqual({ kind: "calendar" });
+    expect(base().reminders).toEqual({ use_default: true, overrides: [] });
+    // A label isn't PM's to set: the field holds the colorId under it, read-only (the gate's).
+    expect(seedDraft({ ...event, label_id: "lbl", color_id: null }).colour).toEqual({
+      kind: "calendar",
+    });
+    // A copy: the editor's changes never reach the copy it opened on.
+    expect(listed.reminders.overrides).not.toBe(google.reminders.overrides);
+    expect(listed.reminders.overrides[0]).not.toBe(google.reminders.overrides[0]);
+  });
+
+  it("an untouched colour and notification list send nothing, and a reordered list is unchanged", () => {
+    expect(toChanges(listed, { ...listed })).toEqual({});
+    const reordered = { ...listed, reminders: own(["email", 60], ["popup", 10]) };
+    expect(changedFields(listed, reordered)).toEqual([]);
+    expect(sameField("colour", listed, { ...listed, colour: { kind: "colour", id: "5" } })).toBe(
+      true,
+    );
+    expect(sameField("colour", listed, { ...listed, colour: { kind: "colour", id: "6" } })).toBe(
+      false,
+    );
+    expect(sameField("colour", listed, { ...listed, colour: { kind: "calendar" } })).toBe(false);
+  });
+
+  it("sends the whole list, or the defaults, and the colour as one choice", () => {
+    const draft = {
+      ...listed,
+      reminders: own(["popup", 10], ["email", 60], ["popup", 1440]),
+      colour: { kind: "calendar" as const },
+    };
+    expect(changedFields(listed, draft)).toEqual(["reminders", "colour"]);
+    const sent = toChanges(listed, draft);
+    expect(sent).toEqual({
+      reminders: own(["popup", 10], ["email", 60], ["popup", 1440]),
+      colour: { kind: "calendar" },
+    });
+    // A copy: what was sent can't change with the draft.
+    draft.reminders.overrides[0].minutes = 1;
+    expect(sent.reminders?.overrides[0].minutes).toBe(10);
+    expect(
+      toChanges(listed, { ...listed, reminders: { use_default: true, overrides: [] } }),
+    ).toEqual({ reminders: { use_default: true, overrides: [] } });
+  });
+
+  it("maps notifications and colour to their own permissions", () => {
+    const perms: FieldPermissions = {
+      summary: false,
+      time: false,
+      location: false,
+      description: false,
+      show_as: true,
+      visibility: true,
+      guests: false,
+      reminders: true,
+      colour: false,
+      delete: false,
+      reasons: ["label_read_only"],
+    };
+    expect(canEdit(perms, "reminders")).toBe(true);
+    expect(canEdit(perms, "colour")).toBe(false);
+    expect(canEdit({ ...perms, reminders: false, colour: true }, "reminders")).toBe(false);
+    expect(canEdit({ ...perms, reminders: false, colour: true }, "colour")).toBe(true);
+  });
+
+  it("rebase keeps my colour and list when Google changed only the title", () => {
+    const newBase = { ...listed, summary: "Dentist (Google)" };
+    const draft = {
+      ...listed,
+      reminders: own(["popup", 30]),
+      colour: { kind: "colour" as const, id: "9" },
+    };
+    const r = rebaseDraft(listed, newBase, draft);
+    expect(r.overwritten).toEqual([]);
+    expect(r.draft.summary).toBe("Dentist (Google)");
+    expect(r.draft.reminders).toEqual(own(["popup", 30]));
+    expect(r.draft.colour).toEqual({ kind: "colour", id: "9" });
+    expect(r.draft.reminders).not.toBe(draft.reminders);
+    // Google changed the colour too: Google's stands, and is named.
+    const theirs = rebaseDraft(listed, { ...listed, colour: { kind: "colour", id: "3" } }, draft);
+    expect(theirs.overwritten).toEqual(["colour"]);
+    expect(theirs.draft.colour).toEqual({ kind: "colour", id: "3" });
+    // Untouched by the user, they're Google's, as copies: the draft never shares the base's list.
+    const kept = rebaseDraft(listed, newBase, { ...listed, location: "Room 2" });
+    expect(kept.draft.reminders).toEqual(newBase.reminders);
+    expect(kept.draft.reminders).not.toBe(newBase.reminders);
+    expect(kept.draft.colour).not.toBe(newBase.colour);
+  });
+
+  it("a kind switch puts my own notifications back to the defaults and says so, and back again restores them", () => {
+    const allDay = { kind: "all_day" as const, first_day: "2026-10-12", last_day: "2026-10-12" };
+    const switched = remindersAfterKindSwitch(listed, { ...listed, time: allDay }, true, false);
+    expect(switched.note).toBe("defaults");
+    expect(switched.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(switched.reset).toBe(true);
+    // Back on the kind Google holds: Google's list again, nothing to say (C13 critique C2-L5).
+    const back = remindersAfterKindSwitch(
+      listed,
+      { ...switched.draft, time: listed.time },
+      true,
+      switched.reset,
+    );
+    expect(back.note).toBeNull();
+    expect(back.draft.reminders).toEqual(own(["popup", 10], ["email", 60]));
+    expect(back.reset).toBe(false);
+    expect(changedFields(listed, back.draft)).toEqual([]);
+    // Already on the defaults: nothing to put back, nothing said.
+    const onDefaults = remindersAfterKindSwitch(base(), { ...base(), time: allDay }, true, false);
+    expect(onDefaults.note).toBeNull();
+    expect(onDefaults.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(onDefaults.reset).toBe(false);
+    // Notifications the user can't change are never touched (C1-L14).
+    const locked = remindersAfterKindSwitch(listed, { ...listed, time: allDay }, false, false);
+    expect(locked.note).toBeNull();
+    expect(locked.draft.reminders).toEqual(listed.reminders);
+    expect(locked.reset).toBe(false);
+  });
+
+  // C13 review round 2: defaults the user picked over the event's own list are their choice on
+  // either kind. The switch put nothing there, so there's nothing for a switch back to undo.
+  it("a switch there and back keeps the defaults I picked", () => {
+    const allDay = { kind: "all_day" as const, first_day: "2026-10-12", last_day: "2026-10-12" };
+    const picked = { ...listed, reminders: { use_default: true, overrides: [] } };
+    const away = remindersAfterKindSwitch(listed, { ...picked, time: allDay }, true, false);
+    expect(away.note).toBeNull();
+    expect(away.reset).toBe(false);
+    const back = remindersAfterKindSwitch(
+      listed,
+      { ...away.draft, time: listed.time },
+      true,
+      away.reset,
+    );
+    expect(back.note).toBeNull();
+    expect(back.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    expect(changedFields(listed, back.draft)).toEqual(["reminders"]);
+  });
+
+  // C13 review round 1: back on the kind Google holds, a list the user made on the other kind is
+  // replaced by the event's (C2-L5), and that is said, as the switch away says its own.
+  it("a switch back that replaces a list I made says so", () => {
+    const allDay = { kind: "all_day" as const, first_day: "2026-10-12", last_day: "2026-10-12" };
+    // On the defaults in Google: a list made on the other kind goes back to the defaults.
+    const made = { ...base(), time: allDay, reminders: own(["popup", 900], ["popup", 2340]) };
+    const toDefaults = remindersAfterKindSwitch(
+      base(),
+      { ...made, time: base().time },
+      true,
+      false,
+    );
+    expect(toDefaults.note).toBe("defaults");
+    expect(toDefaults.draft.reminders).toEqual({ use_default: true, overrides: [] });
+    // A list of its own in Google: that list comes back over the one made.
+    const madeOver = { ...listed, time: allDay, reminders: own(["email", 900]) };
+    const toEvent = remindersAfterKindSwitch(
+      listed,
+      { ...madeOver, time: listed.time },
+      true,
+      false,
+    );
+    expect(toEvent.note).toBe("event");
+    expect(toEvent.draft.reminders).toEqual(listed.reminders);
+    // The same list as Google's replaces nothing, and says nothing.
+    const same = { ...listed, time: allDay, reminders: own(["email", 60], ["popup", 10]) };
+    expect(
+      remindersAfterKindSwitch(listed, { ...same, time: listed.time }, true, false).note,
+    ).toBeNull();
   });
 });

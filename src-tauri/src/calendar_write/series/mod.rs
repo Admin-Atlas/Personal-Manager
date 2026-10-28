@@ -46,6 +46,7 @@ use crate::calendar_recur::{Point, RecurError, SeriesStart};
 
 use super::attendees::{guest_set, GuestError};
 use super::dto::ReadOnlyReason;
+use super::patch::PatchError;
 use super::time::TimeError;
 
 /// A copy of an event as Google just returned it. Planners take only this, never a mirror row: the
@@ -232,16 +233,15 @@ impl Master {
     /// Why nothing about the series may change, from its own facts. The calendar's role and the
     /// account's editing switch are the command layer's (gate.rs); a master can also be an invitation
     /// or a special kind of event, which the gate reads from the occurrence. Its guests are the
-    /// planners' to count, for the Send / Don't send choice (C12).
+    /// planners' to count, for the Send / Don't send choice (C12). A lock isn't here: it closes only
+    /// some fields, so the planners refuse what it closes (`plan::locks`), and a locked series'
+    /// notifications and colour still change (C13 critique C1-M1).
     pub fn read_only(&self) -> Option<ReadOnlyReason> {
         if !matches!(self.event_type.as_deref(), None | Some("default")) {
             return Some(ReadOnlyReason::SpecialType);
         }
         if !self.organizer_self {
             return Some(ReadOnlyReason::NotOrganizer);
-        }
-        if self.locked {
-            return Some(ReadOnlyReason::Locked);
         }
         None
     }
@@ -326,10 +326,8 @@ fn same_field(key: &str, instance: Option<&Value>, master: Option<&Value>) -> bo
     match key {
         "transparency" => default(instance, "opaque".into()) == default(master, "opaque".into()),
         "visibility" => default(instance, "default".into()) == default(master, "default".into()),
-        "reminders" => {
-            let d = serde_json::json!({ "useDefault": true });
-            default(instance, d.clone()) == default(master, d)
-        }
+        // In any order, the defaults however Google writes them (C13).
+        "reminders" => super::patch::reminders_eq(instance, master),
         "summary" | "description" | "location" | "colorId" | "eventLabelId" => {
             default(instance, "".into()) == default(master, "".into())
         }
@@ -643,6 +641,8 @@ pub enum SeriesRefusal {
     /// What guests may do applies to the whole series: like visibility, never one occurrence's
     /// until a probe shows Google applies it to one (C12 critiques C1-M7, C2-L11).
     GuestPermissionsAreSeriesWide,
+    /// The draft's notifications or colour can't go onto the copy they're for (C13).
+    Draft(PatchError),
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -773,7 +773,7 @@ impl fmt::Display for SeriesRefusal {
             ),
             SeriesRefusal::KeptHasOwn(day) => write!(
                 f,
-                "The occurrence on {}, the one that would stay, has its own colour, reminders, \
+                "The occurrence on {}, the one that would stay, has its own colour, notifications, \
                  attachments, video call, label or who can see it, which PM can't keep when it \
                  stops repeating.",
                 day.format("%d-%m-%Y")
@@ -796,6 +796,7 @@ impl fmt::Display for SeriesRefusal {
                 "What guests may do applies to every occurrence of a repeating event, so it can't \
                  change for this one only."
             ),
+            SeriesRefusal::Draft(e) => e.fmt(f),
         }
     }
 }
@@ -1388,8 +1389,11 @@ mod tests {
             json!("focusTime"),
         ));
         assert_eq!(focus.read_only(), Some(ReadOnlyReason::SpecialType));
+        // A lock closes only some fields, which the planners refuse (C13 critique C1-M1): not the
+        // whole series.
         let locked = read(with(master(&["RRULE:FREQ=DAILY"]), "locked", json!(true)));
-        assert_eq!(locked.read_only(), Some(ReadOnlyReason::Locked));
+        assert!(locked.locked);
+        assert_eq!(locked.read_only(), None);
     }
 
     /// T13.

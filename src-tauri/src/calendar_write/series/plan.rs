@@ -70,11 +70,12 @@ use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
 use super::super::attendees::{self, GuestError, Own, Reach};
 use super::super::dto::{
-    EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason, SeenSummary,
+    ColourDraft, EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason, SeenSummary,
 };
 use super::super::patch::{
-    bool_of, build_patch, delete_still_matches, description_is_html, drop_other_kind, is_gone,
-    update_check, when_eq, CREATABLE,
+    bool_of, build_patch, check_draft_extras, delete_still_matches, description_is_html,
+    drop_other_kind, is_gone, reminders_eq, reminders_value, series_patch, update_check, watched,
+    when_eq, PatchError, CREATABLE,
 };
 use super::super::patch::{DeleteCheck, UpdateCheck};
 use super::super::plan::{
@@ -159,6 +160,15 @@ impl From<RetimeError> for NotPlanned {
 impl From<time::TimeError> for NotPlanned {
     fn from(e: time::TimeError) -> Self {
         NotPlanned::Refused(e.into())
+    }
+}
+
+impl From<PatchError> for NotPlanned {
+    fn from(e: PatchError) -> Self {
+        match e {
+            PatchError::Time(e) => e.into(),
+            e => NotPlanned::Refused(SeriesRefusal::Draft(e)),
+        }
     }
 }
 
@@ -354,6 +364,9 @@ impl Op {
                 "guestsCanModify",
                 "guestsCanInviteOthers",
                 "guestsCanSeeOtherGuests",
+                // C13: never a label, which PM doesn't set.
+                "reminders",
+                "colorId",
             ],
             Op::Carry { .. } => &[
                 "summary",
@@ -1037,22 +1050,26 @@ impl SeriesPlan {
             "guestsCanInviteOthers" | "guestsCanSeeOtherGuests" => {
                 bool_of(a, true) == bool_of(b, true)
             }
-            "summary" | "description" | "location" | "colorId" => or(a, "") == or(b, ""),
+            // A label is text too, absent read as none: a colour's conflict check watches it (C13).
+            "summary" | "description" | "location" | "colorId" | "eventLabelId" => {
+                or(a, "") == or(b, "")
+            }
             // PM's own notes (a fence, a split's) are bookkeeping, not a change anyone made (C9
             // design review M9).
             "extendedProperties" => super::without_pm_notes(a) == super::without_pm_notes(b),
-            "reminders" => {
-                let d = json!({ "useDefault": true });
-                a.filter(|v| !v.is_null()).unwrap_or(&d) == b.filter(|v| !v.is_null()).unwrap_or(&d)
-            }
+            // In any order, the defaults however Google writes them (C13).
+            "reminders" => reminders_eq(a, b),
             _ => a.filter(|v| !v.is_null()) == b.filter(|v| !v.is_null()),
         }
     }
 }
 
 /// The checks every series plan starts with: both copies there, the series' own facts, the
-/// occurrence one of its own.
-fn prepare(input: &SeriesInput) -> Result<(Master, Point), NotPlanned> {
+/// occurrence one of its own. `draft` is the change, `None` for a delete.
+fn prepare(
+    input: &SeriesInput,
+    draft: Option<&EventPatchDraft>,
+) -> Result<(Master, Point), NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     if is_gone(instance) || is_gone(master_json) {
         return Err(NotPlanned::Gone);
@@ -1060,6 +1077,9 @@ fn prepare(input: &SeriesInput) -> Result<(Master, Point), NotPlanned> {
     let master = Master::read(input.fresh.master)?;
     if let Some(reason) = master.read_only() {
         return Err(NotPlanned::ReadOnly(reason));
+    }
+    if master.locked && locks(draft) {
+        return Err(NotPlanned::ReadOnly(ReadOnlyReason::Locked));
     }
     if instance.get("recurringEventId").and_then(Value::as_str) != Some(master.id.as_str()) {
         return Err(SeriesRefusal::NotInSeries.into());
@@ -1075,6 +1095,21 @@ fn prepare(input: &SeriesInput) -> Result<(Master, Point), NotPlanned> {
     }
     let original = original_of(instance).ok_or(SeriesRefusal::Unreadable)?;
     Ok((master, original))
+}
+
+/// Whether a lock stops `draft` (`None`: a delete), as the gate closes a locked copy's fields
+/// (gate.rs): Google refuses changes to its title, description, place, times and repeat, and its
+/// deletion and guests are undocumented, so closed. Its notifications, colour, busy or free and who
+/// can see it still change (C13 critique C1-M1), so a lock is no reason to refuse those.
+fn locks(draft: Option<&EventPatchDraft>) -> bool {
+    draft.is_none_or(|d| {
+        d.summary.is_some()
+            || d.description.is_some()
+            || d.location.is_some()
+            || d.time.is_some()
+            || d.recurrence.is_some()
+            || d.touches_guests()
+    })
 }
 
 fn text(v: &Value, key: &str) -> String {
@@ -1346,7 +1381,7 @@ fn delete_plan(
     seen: &SeenSummary,
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
-    let (master, original) = prepare(input)?;
+    let (master, original) = prepare(input, None)?;
     let instance = input.fresh.instance.json();
     match delete_still_matches(seen, instance) {
         DeleteCheck::Matches => {}
@@ -1594,8 +1629,10 @@ fn with_cancelled(
 }
 
 /// The draft's touched fields, as Google names them: its text and choices, its guest changes as the
-/// series' own list (`master_json`'s, Google's entries kept) with them (C12), and what guests may do.
-/// A new part takes the guests through [`tail_body`], which leaves their replies behind.
+/// series' own list (`master_json`'s, Google's entries kept) with them (C12), what guests may do, and
+/// its notifications, whole, and colour, the calendar's own as an empty one (C13: without them a
+/// "this and following" change would drop them unsaid). A new part takes the guests through
+/// [`tail_body`], which leaves their replies behind, and has no empty colour to clear.
 pub(super) fn draft_fields(
     draft: &EventPatchDraft,
     master_json: &Value,
@@ -1630,6 +1667,14 @@ pub(super) fn draft_fields(
             out.push((key, Value::Bool(v)));
         }
     }
+    if let Some(reminders) = &draft.reminders {
+        out.push(("reminders", reminders_value(reminders)));
+    }
+    match &draft.colour {
+        Some(ColourDraft::Calendar) => out.push(("colorId", Value::from(""))),
+        Some(ColourDraft::Colour { id }) => out.push(("colorId", Value::from(id.clone()))),
+        None => {}
+    }
     out
 }
 
@@ -1639,11 +1684,28 @@ impl SeriesPlan {
     /// (look, wait, look, post again once under the same id; a 409 means look). `None` when the body
     /// holds a key a create may not send (G5), the id isn't one path segment, or the body has no
     /// start PM can read (never an invented one).
-    pub fn create(calendar: &str, id: &str, body: Map<String, Value>) -> Option<SeriesPlan> {
+    ///
+    /// Its guests (C12d) are each invited ([`Reach::of_insert`]: never one of `own`, the calendar's
+    /// own addresses, nor a room). The plan says how many, and its step sends `chosen`, the user's
+    /// Send or Don't send, or `none` when it invites nobody, whatever was chosen (R7). With guests
+    /// and no answer it never runs (R9, [`SeriesPlan::needs_notify`]). A held create keeps the plan,
+    /// so a retry sends the very answer first sent.
+    pub fn create(
+        calendar: &str,
+        id: &str,
+        body: Map<String, Value>,
+        own: &Own,
+        chosen: Option<Notify>,
+    ) -> Option<SeriesPlan> {
         if body.keys().any(|k| !CREATABLE.contains(&k.as_str())) || !is_plain_segment(id) {
             return None;
         }
         let start = body.get("start").and_then(start_of)?;
+        let guests = Reach::of_insert(&body, own).notice();
+        let notify = match guests {
+            Some(_) => chosen.unwrap_or(Notify::None),
+            None => Notify::None,
+        };
         Some(SeriesPlan {
             scope: Scope::All,
             steps: vec![Step {
@@ -1652,8 +1714,8 @@ impl SeriesPlan {
                     id: id.into(),
                     body,
                 },
-                // R7: a new event has no guests until C12d, so nobody is emailed.
-                notify: Notify::None,
+                // R7/R9: the user's answer, or none where nobody would be invited.
+                notify,
                 stage: Stage::Commit,
                 requires: None,
                 conflict: Recheck::Never,
@@ -1668,9 +1730,9 @@ impl SeriesPlan {
             removes: Removes::Nothing,
             start,
             rule_start: start,
-            guests: None,
-            chosen: None,
-            own: Own::default(),
+            guests,
+            chosen,
+            own: own.clone(),
         })
     }
 }
@@ -1731,7 +1793,7 @@ fn edit_plan(
     tail_id: &str,
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
-    let (master, original) = prepare(input)?;
+    let (master, original) = prepare(input, Some(draft))?;
     guests_ready(scope, input, draft)?;
     match scope {
         Scope::This => plan_this(input, &master, draft, notify),
@@ -1742,6 +1804,11 @@ fn edit_plan(
         Scope::Following => match cut_at(&master, input, original)? {
             None => plan_all(input, &master, original, draft, notify),
             Some(cut) => {
+                // Cutting the series rewrites its repeat, which Google locks whatever the draft
+                // changes (C13: a lock no longer refuses every change, `locks`).
+                if master.locked {
+                    return Err(NotPlanned::ReadOnly(ReadOnlyReason::Locked));
+                }
                 // The new part copies the series' guest list, which Google cut short would copy part
                 // of (C12 critique C1): refused, whatever the draft changes.
                 if attendees::omitted(input.fresh.master.json()) {
@@ -1941,8 +2008,12 @@ fn plan_this(
         UpdateCheck::Gone => return Err(NotPlanned::Gone),
         UpdateCheck::Conflict(fields) => return Err(NotPlanned::Conflict(fields)),
     }
-    let keys: Vec<&str> = body.keys().map(String::as_str).collect();
+    // A 412 re-sends only while these are as planned: a colour watches the label beside it (C13).
+    let watching = watched(&body);
+    let keys: Vec<&str> = watching.iter().map(String::as_str).collect();
     let before = snapshot(instance, &keys);
+    let sent_keys: Vec<&str> = body.keys().map(String::as_str).collect();
+    let old = snapshot(instance, &sent_keys);
     Ok(SeriesPlan {
         scope: Scope::This,
         steps: vec![Step {
@@ -1955,11 +2026,8 @@ fn plan_this(
             notify,
             stage: Stage::Commit,
             requires: None,
-            conflict: Recheck::Unchanged(before.clone()),
-            shows: Shows::Fields {
-                sent: body,
-                old: before,
-            },
+            conflict: Recheck::Unchanged(before),
+            shows: Shows::Fields { sent: body, old },
             gone_is_done: false,
             undo: None,
             guest_ops: Vec::new(),
@@ -2008,7 +2076,7 @@ fn plan_all(
         time: None,
         ..draft.clone()
     };
-    let mut body = build_patch(master_json, &text_only)?;
+    let mut body = series_patch(master_json, instance, &text_only)?;
     let mut warnings = Vec::new();
     let mut undo = None;
     let zone = master.start.zone();
@@ -2115,8 +2183,9 @@ pub(super) fn all_plan(
 ) -> Result<SeriesPlan, NotPlanned> {
     let master_json = input.fresh.master.json();
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    // A new end is measured from the series' start, so it watches the start and rule too.
-    let mut watched: Vec<String> = body.keys().cloned().collect();
+    // A new end is measured from the series' start, so it watches the start and rule too; a colour
+    // watches the label beside it (C13).
+    let mut watched: Vec<String> = watched(&body);
     if ["start", "end", "recurrence"]
         .iter()
         .any(|k| body.contains_key(*k))
@@ -2239,6 +2308,9 @@ fn plan_split(
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
     keeps_formatting(master_json, draft)?;
+    // The new part takes the series' notifications and colour where the draft leaves them: the
+    // draft's are checked against the series, as a save onto it is (C13).
+    check_draft_extras(master_json, Some(instance), draft)?;
     // An id PM minted for this plan, never the series' own (C8b review ADV-5).
     if !is_plain_segment(tail_id) || tail_id == master.id {
         return Err(SeriesRefusal::Unreadable.into());
@@ -2510,6 +2582,10 @@ pub(super) fn tail_body(
     body.insert("extendedProperties".into(), properties);
     for (k, v) in fields.iter().filter(|(k, _)| *k != "attendees") {
         body.insert((*k).to_string(), v.clone());
+    }
+    // The calendar's colour on a new event is no colour at all (C13).
+    if body.get("colorId").and_then(Value::as_str) == Some("") {
+        body.remove("colorId");
     }
     body.insert("start".into(), start);
     body.insert("end".into(), end);
@@ -5035,13 +5111,25 @@ mod tests {
             show_as: Some(ShowAs::Busy),
             visibility: None,
             recurrence: None,
+            guests: Vec::new(),
+            guests_can_modify: None,
+            guests_can_invite_others: None,
+            guests_can_see_other_guests: None,
+            reminders: None,
+            colour: None,
         })
         .unwrap()
     }
 
+    /// The create plan for `body` under [`NEW`], counting guests without nobody's own address and
+    /// with nobody's answer.
+    fn create_plan(id: &str, body: Map<String, Value>) -> Option<SeriesPlan> {
+        SeriesPlan::create(CALENDAR, id, body, &Own::default(), None)
+    }
+
     #[test]
     fn a_create_plan_is_one_commit_step_under_pms_id_with_no_one_notified() {
-        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        let plan = create_plan(NEW, new_body()).unwrap();
         assert_eq!(plan.steps.len(), 1);
         let step = &plan.steps[0];
         assert!(matches!(&step.op, Op::Insert { calendar, id, body }
@@ -5060,33 +5148,100 @@ mod tests {
         assert_eq!(request.body.unwrap()["id"], NEW);
         assert!(plan.expect.is_empty() && plan.warnings.is_empty());
         assert_eq!(plan.removes, Removes::Nothing);
+        assert!(
+            plan.guests.is_none() && !plan.needs_notify(),
+            "nobody to invite, nobody asked"
+        );
     }
 
     /// G5: a key a create may not send, a body with no start PM can read, or an id that isn't one
-    /// path segment builds no plan at all. The repeat rule is one a create sends since C11.
+    /// path segment builds no plan at all. The repeat rule is one a create sends since C11, the
+    /// guests and what they may do since C12d, and the notifications and colour since C13; a label
+    /// never is.
     #[test]
     fn a_create_plan_refuses_a_key_a_create_may_not_send() {
-        for key in [
-            "attendees",
-            "extendedProperties",
-            "reminders",
-            "conferenceData",
-            "colorId",
-            "id",
-        ] {
+        for key in ["extendedProperties", "conferenceData", "eventLabelId", "id"] {
             let mut body = new_body();
             body.insert(key.into(), json!([]));
-            assert!(SeriesPlan::create(CALENDAR, NEW, body).is_none(), "{key}");
+            assert!(create_plan(NEW, body).is_none(), "{key}");
         }
+        let mut invited = new_body();
+        invited.insert("attendees".into(), json!([{ "email": A }]));
+        invited.insert("guestsCanModify".into(), json!(true));
+        invited.insert("guestsCanInviteOthers".into(), json!(false));
+        invited.insert("guestsCanSeeOtherGuests".into(), json!(false));
+        assert!(create_plan(NEW, invited).is_some(), "guests are a create's");
+        let mut coloured = new_body();
+        coloured.insert(
+            "reminders".into(),
+            json!({ "useDefault": false, "overrides": [] }),
+        );
+        coloured.insert("colorId".into(), json!("4"));
+        let plan = create_plan(NEW, coloured).unwrap();
+        assert!(
+            plan.steps[0].op.fits(),
+            "notifications and colour are a create's"
+        );
         let mut no_start = new_body();
         no_start.insert("start".into(), json!({ "dateTime": "soon" }));
-        assert!(SeriesPlan::create(CALENDAR, NEW, no_start).is_none());
+        assert!(create_plan(NEW, no_start).is_none());
         for id in ["", "..", "a\nb"] {
+            assert!(create_plan(id, new_body()).is_none(), "{id:?}");
+        }
+    }
+
+    /// C12d: a new event's guests are each invited, never the calendar's own address or a room; its
+    /// one step sends the user's answer, and with nobody's it never runs (R9). Inviting nobody, it
+    /// sends `none` whatever was chosen (R7).
+    #[test]
+    fn a_create_plan_invites_its_guests_with_the_users_answer() {
+        let mut body = new_body();
+        body.insert(
+            "attendees".into(),
+            json!([
+                { "email": A },
+                { "email": "Me@Example.com" },
+                { "email": "room1@resource.calendar.google.com" },
+                { "email": B, "optional": true }
+            ]),
+        );
+        let own = Own::of(&["me@example.com"], &[]);
+        let invites = |chosen| SeriesPlan::create(CALENDAR, NEW, body.clone(), &own, chosen);
+        let unanswered = invites(None).unwrap();
+        assert!(
+            unanswered.guests
+                == Some(GuestNotice {
+                    invited: 2,
+                    people: 2,
+                    emails: 2,
+                    complete: true,
+                    ..Default::default()
+                }),
+            "A and B are invited; not you, not the room"
+        );
+        assert!(unanswered.needs_notify(), "asked before it runs");
+        for (chosen, sent) in [(Notify::All, "all"), (Notify::None, "none")] {
+            let plan = invites(Some(chosen)).unwrap();
+            assert!(!plan.needs_notify());
+            assert_eq!(plan.steps[0].notify, chosen);
+            let request = plan.steps[0].op.request(plan.steps[0].notify).unwrap();
+            assert!(request.url.ends_with(&format!(
+                "/events?sendUpdates={sent}&conferenceDataVersion=1"
+            )));
             assert!(
-                SeriesPlan::create(CALENDAR, id, new_body()).is_none(),
-                "{id:?}"
+                request.body.unwrap()["attendees"] == body["attendees"],
+                "every guest as sent"
             );
         }
+        // Only you and a room: nobody to invite, so nobody is asked, and Send sends `none`.
+        let mut only_you = new_body();
+        only_you.insert(
+            "attendees".into(),
+            json!([{ "email": "me@example.com" }, { "email": "room1@resource.calendar.google.com" }]),
+        );
+        let plan = SeriesPlan::create(CALENDAR, NEW, only_you, &own, Some(Notify::All)).unwrap();
+        assert!(plan.guests.is_none() && !plan.needs_notify());
+        assert_eq!(plan.steps[0].notify, Notify::None);
     }
 
     /// C11: a repeating event's body (its one rule line, its zone on both nodes) builds the same
@@ -5109,9 +5264,15 @@ mod tests {
                 description: String::new(),
                 show_as: None,
                 visibility: None,
+                guests: Vec::new(),
+                guests_can_modify: None,
+                guests_can_invite_others: None,
+                guests_can_see_other_guests: None,
+                reminders: None,
+                colour: None,
             })
             .unwrap();
-        let plan = SeriesPlan::create(CALENDAR, NEW, body).unwrap();
+        let plan = create_plan(NEW, body).unwrap();
         let step = &plan.steps[0];
         assert!(step.op.fits());
         assert_eq!(step.notify, Notify::None);
@@ -5125,7 +5286,7 @@ mod tests {
     /// deleted since; none proves nothing.
     #[test]
     fn created_reads_a_live_copy_as_landed_a_cancelled_one_as_not_and_none_as_unknown() {
-        let plan = SeriesPlan::create(CALENDAR, NEW, new_body()).unwrap();
+        let plan = create_plan(NEW, new_body()).unwrap();
         let mut copy = Value::Object(new_body());
         copy["id"] = json!(NEW);
         copy["status"] = json!("confirmed");
@@ -5722,5 +5883,367 @@ mod tests {
             short.edit(Scope::Following, title("Retro")),
             SeriesRefusal::Guest(GuestError::Omitted)
         ));
+    }
+
+    // --- C13: notifications and colour ---
+
+    use crate::calendar_write::patch::{ColourError, ReminderError};
+
+    fn notifications(list: &[(&str, i64)]) -> crate::calendar_write::dto::RemindersDraft {
+        crate::calendar_write::dto::RemindersDraft {
+            use_default: false,
+            overrides: list
+                .iter()
+                .map(|(method, minutes)| crate::calendar::Reminder {
+                    method: (*method).into(),
+                    minutes: *minutes,
+                })
+                .collect(),
+        }
+    }
+
+    fn notified(list: &[(&str, i64)]) -> EventPatchDraft {
+        EventPatchDraft {
+            reminders: Some(notifications(list)),
+            ..Default::default()
+        }
+    }
+
+    fn coloured(colour: ColourDraft) -> EventPatchDraft {
+        EventPatchDraft {
+            colour: Some(colour),
+            ..Default::default()
+        }
+    }
+
+    fn colour(id: &str) -> ColourDraft {
+        ColourDraft::Colour { id: id.into() }
+    }
+
+    fn refused_draft(e: PatchError) -> Result<SeriesPlan, NotPlanned> {
+        Err(NotPlanned::Refused(SeriesRefusal::Draft(e)))
+    }
+
+    /// "This event" patches the occurrence's own colour or notifications, a write that fits; a
+    /// colour watches the label beside it, so one added in Google before a resend stops it.
+    #[test]
+    fn a_this_colour_or_notification_change_patches_the_occurrence() {
+        let case = Case::new(weekly(), monday_19());
+        for (draft, key) in [
+            (coloured(colour("3")), "colorId"),
+            (notified(&[("popup", 10)]), "reminders"),
+        ] {
+            let plan = case.edit(Scope::This, draft).unwrap();
+            let step = &plan.steps[0];
+            assert!(step.op.fits(), "{key}");
+            assert!(matches!(&step.op, Op::Patch { event, .. } if event == "abc_20261019T080000Z"));
+            let keys: Vec<&String> = body(step).keys().collect();
+            assert_eq!(keys, [key]);
+            let request = step.op.request(step.notify).unwrap();
+            assert!(!request.url.contains("eventLabelVersion"), "{key}");
+        }
+        let plan = case.edit(Scope::This, coloured(colour("3"))).unwrap();
+        let labelled = with(monday_19(), "eventLabelId", json!("label-1"));
+        assert_eq!(
+            plan.resend(0, &labelled),
+            Resend::Conflict(vec!["eventLabelId".into()])
+        );
+        assert_eq!(plan.resend(0, &monday_19()), Resend::Proceed);
+        // And a lost answer is read on what was sent, the label aside.
+        assert_eq!(
+            plan.verdict(0, Some(&with(monday_19(), "colorId", json!("3")))),
+            Applied::Yes
+        );
+        assert_eq!(plan.verdict(0, Some(&monday_19())), Applied::No);
+    }
+
+    /// "All events" is one PATCH of the series; an occurrence with notifications of its own may
+    /// have them reset, and the row says so.
+    #[test]
+    fn an_all_notification_change_patches_the_master_and_warns_on_reset() {
+        let own = with(
+            plain("2026-10-26T09:00:00+00:00"),
+            "reminders",
+            json!({ "useDefault": false, "overrides": [{ "method": "email", "minutes": 30 }] }),
+        );
+        let case = Case::new(weekly(), monday_19()).exceptions(vec![own]);
+        let plan = case.edit(Scope::All, notified(&[("popup", 10)])).unwrap();
+        let step = &plan.steps[0];
+        assert!(matches!(&step.op, Op::Patch { event, .. } if event == "abc"));
+        assert!(step.op.fits());
+        assert!(
+            body(step)["reminders"]
+                == json!({ "useDefault": false, "overrides": [{ "method": "popup", "minutes": 10 }] })
+        );
+        assert!(plan.warnings.contains(&SeriesWarning::ExceptionsMayReset {
+            count: 1,
+            complete: true
+        }));
+        // A colour on All is the series' too.
+        let plan = case.edit(Scope::All, coloured(colour("8"))).unwrap();
+        assert_eq!(body(&plan.steps[0])["colorId"], "8");
+        assert!(matches!(&plan.steps[0].conflict,
+            Recheck::Unchanged(watching) if watching.contains_key("eventLabelId")));
+    }
+
+    /// C13 critiques C1-M6 and C1-H1: what the series itself can't take is refused on the series'
+    /// own copy, though the occurrence the editor showed could: a list it holds that PM can't read
+    /// takes no new one, and a series with a label takes no colour, on All and on a split alike.
+    #[test]
+    fn the_series_refuses_what_its_own_copy_cant_take() {
+        let unreadable = with(
+            weekly(),
+            "reminders",
+            json!({ "useDefault": false, "overrides": [{ "method": "popup" }] }),
+        );
+        let case = Case::new(unreadable, monday_19());
+        for scope in [Scope::All, Scope::Following] {
+            assert_eq!(
+                case.edit(scope, notified(&[("popup", 10)])),
+                refused_draft(PatchError::Reminders(ReminderError::Unreadable))
+            );
+        }
+        let labelled = with(weekly(), "eventLabelId", json!("label-1"));
+        let case = Case::new(labelled, monday_19());
+        for scope in [Scope::All, Scope::Following] {
+            for pick in [ColourDraft::Calendar, colour("2")] {
+                assert_eq!(
+                    case.edit(scope, coloured(pick)),
+                    refused_draft(PatchError::Colour(ColourError::Labelled))
+                );
+            }
+        }
+        // Its notifications still go.
+        assert!(case.edit(Scope::All, notified(&[("popup", 10)])).is_ok());
+        // The words say what to do.
+        assert_eq!(
+            SeriesRefusal::Draft(PatchError::Colour(ColourError::Labelled)).to_string(),
+            "This event has a Google Calendar label, which sets its colour. Change it in Google \
+             Calendar."
+        );
+    }
+
+    /// C13 critique C2-L6: "All events" from an occurrence holding a notification the series
+    /// doesn't keeps it as Google holds it; a new one is still checked.
+    #[test]
+    fn all_events_keeps_a_notification_only_the_occurrence_holds() {
+        let sms = json!({ "useDefault": false, "overrides": [{ "method": "sms", "minutes": 30 }] });
+        let case = Case::new(weekly(), with(monday_19(), "reminders", sms));
+        let plan = case
+            .edit(Scope::All, notified(&[("sms", 30), ("popup", 10)]))
+            .unwrap();
+        assert_eq!(
+            body(&plan.steps[0])["reminders"]["overrides"][0]["method"],
+            "sms"
+        );
+        assert_eq!(
+            case.edit(Scope::All, notified(&[("sms", 15)])),
+            refused_draft(PatchError::Reminders(ReminderError::UnknownMethod))
+        );
+    }
+
+    /// "This and following": the new part takes the draft's colour and notifications (until C13 a
+    /// split dropped them unsaid); the calendar's own colour leaves the series' off it, and without
+    /// either it copies the series'.
+    #[test]
+    fn a_following_colour_or_notification_change_goes_on_the_new_part() {
+        let series = with(weekly(), "colorId", json!("5"));
+        let case = Case::new(series, with(monday_19(), "colorId", json!("5")));
+        let plan = case
+            .edit(
+                Scope::Following,
+                EventPatchDraft {
+                    colour: Some(colour("2")),
+                    reminders: Some(notifications(&[("email", 60)])),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.scope, Scope::Following);
+        let insert = &plan.steps[0];
+        assert!(insert.op.fits());
+        assert_eq!(body(insert)["colorId"], "2");
+        assert!(
+            body(insert)["reminders"]
+                == json!({ "useDefault": false, "overrides": [{ "method": "email", "minutes": 60 }] })
+        );
+        assert!(!insert
+            .op
+            .request(Notify::None)
+            .unwrap()
+            .url
+            .contains("eventLabelVersion"));
+        let calendar = case
+            .edit(Scope::Following, coloured(ColourDraft::Calendar))
+            .unwrap();
+        assert!(!body(&calendar.steps[0]).contains_key("colorId"));
+        // Read back as inserted, Google holding no colour.
+        let mut landed = Value::Object(body(&calendar.steps[0]).clone());
+        landed["id"] = json!(TAIL);
+        assert!(calendar.tail_as_inserted(0, &landed));
+        let titled = case.edit(Scope::Following, title("Retro")).unwrap();
+        assert_eq!(body(&titled.steps[0])["colorId"], "5");
+        // The series' own colour already: nothing to split for.
+        assert_eq!(
+            case.edit(Scope::Following, coloured(colour("5"))),
+            Err(NotPlanned::NoChange)
+        );
+    }
+
+    /// C13 critique C1-M1: a locked series' notifications and colour still change on the
+    /// occurrence and on every occurrence; its title doesn't, nor is it deleted, and a split, whose
+    /// cut rewrites the repeat Google locks, is refused whatever it changes.
+    #[test]
+    fn a_locked_series_saves_notifications_and_colour() {
+        let locked = with(weekly(), "locked", json!(true));
+        let case = Case::new(locked.clone(), with(monday_19(), "locked", json!(true)));
+        for scope in [Scope::This, Scope::All] {
+            for draft in [
+                coloured(colour("3")),
+                notified(&[("popup", 10)]),
+                EventPatchDraft {
+                    show_as: Some(ShowAs::Free),
+                    ..Default::default()
+                },
+            ] {
+                assert!(case.edit(scope, draft).is_ok(), "{scope:?}");
+            }
+        }
+        let guest = EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: "b@x.org".into(),
+                to: crate::calendar_write::dto::GuestState::Required,
+            }]),
+            ..Default::default()
+        };
+        let modify = EventPatchDraft {
+            guests_can_modify: Some(true),
+            ..Default::default()
+        };
+        let text = |f: fn(&mut EventPatchDraft)| {
+            let mut draft = EventPatchDraft::default();
+            f(&mut draft);
+            draft
+        };
+        let closed = [
+            title("Retro"),
+            text(|d| d.description = Some("x".into())),
+            text(|d| d.location = Some("x".into())),
+            at("10:00", "2026-10-19"),
+            text(|d| d.recurrence = Some(crate::calendar_write::dto::RepeatDraft::Once)),
+            guest,
+            modify,
+        ];
+        for scope in [Scope::This, Scope::Following, Scope::All] {
+            for (i, draft) in closed.iter().enumerate() {
+                assert_eq!(
+                    case.edit(scope, draft.clone()),
+                    Err(NotPlanned::ReadOnly(ReadOnlyReason::Locked)),
+                    "{scope:?} {i}"
+                );
+            }
+            assert_eq!(
+                case.delete(scope),
+                Err(NotPlanned::ReadOnly(ReadOnlyReason::Locked)),
+                "{scope:?}"
+            );
+        }
+        assert_eq!(
+            case.edit(Scope::Following, coloured(colour("3"))),
+            Err(NotPlanned::ReadOnly(ReadOnlyReason::Locked))
+        );
+        // From its first occurrence "this and following" is every occurrence: no cut, so it goes.
+        let first = Case::new(
+            locked,
+            with(plain("2026-10-05T09:00:00+01:00"), "locked", json!(true)),
+        );
+        let plan = first
+            .edit(Scope::Following, notified(&[("popup", 10)]))
+            .unwrap();
+        assert_eq!(plan.scope, Scope::All);
+    }
+
+    /// Notifications compare as a set across a series too: an occurrence holding the series' list in
+    /// another order is plain, and saving that list on All is no change.
+    #[test]
+    fn notifications_in_any_order_are_the_same_series_value() {
+        let list = |order: Value| json!({ "useDefault": false, "overrides": order });
+        let ab =
+            json!([{ "method": "popup", "minutes": 10 }, { "method": "email", "minutes": 60 }]);
+        let ba =
+            json!([{ "method": "email", "minutes": 60 }, { "method": "popup", "minutes": 10 }]);
+        let series = with(weekly(), "reminders", list(ab.clone()));
+        let occurrence = with(monday_19(), "reminders", list(ba.clone()));
+        let master = Master::read(&fresh(series.clone())).unwrap();
+        assert_eq!(
+            classify_instance(&series, &master, &occurrence),
+            InstanceKind::Plain
+        );
+        let compare = probe(&master.start);
+        assert!(compare.same("reminders", Some(&list(ab)), Some(&list(ba.clone()))));
+        assert!(!compare.same(
+            "reminders",
+            Some(&list(ba)),
+            Some(&json!({ "useDefault": true }))
+        ));
+        assert!(compare.same("reminders", Some(&json!({ "useDefault": true })), None));
+        // A label left empty is none, as a colour is.
+        assert!(compare.same("eventLabelId", Some(&json!("")), None));
+        assert!(!compare.same("eventLabelId", Some(&json!("label-1")), None));
+        let case = Case::new(series, occurrence);
+        assert_eq!(
+            case.edit(Scope::All, notified(&[("email", 60), ("popup", 10)])),
+            Err(NotPlanned::NoChange)
+        );
+    }
+
+    /// Since a save's body can be refused for its notifications or colour (C13), a time Google can't
+    /// hold is still refused as a time, as before.
+    #[test]
+    fn a_bad_time_stays_a_time_refusal() {
+        let case = Case::new(weekly(), monday_19());
+        let gap = EventPatchDraft {
+            time: Some(TimeDraft::Timed {
+                start_date: "2026-03-29".into(),
+                start_time: "01:30".into(),
+                start_zone: "Europe/London".into(),
+                end_date: "2026-03-29".into(),
+                end_time: "03:00".into(),
+                end_zone: "Europe/London".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            case.edit(Scope::This, gap),
+            Err(NotPlanned::Refused(SeriesRefusal::Time(
+                time::TimeError::Gap { .. }
+            )))
+        ));
+    }
+
+    /// A label is never a series write's to send, inserted or patched; a colour and notifications
+    /// are (C13).
+    #[test]
+    fn a_body_with_a_label_never_fits() {
+        let body_of = |key: &str| -> Map<String, Value> {
+            [(key.to_string(), json!("x"))].into_iter().collect()
+        };
+        let patch = |body| Op::Patch {
+            calendar: CALENDAR.into(),
+            event: "abc".into(),
+            etag: "\"m1\"".into(),
+            body,
+        };
+        let insert = |body| Op::Insert {
+            calendar: CALENDAR.into(),
+            id: TAIL.into(),
+            body,
+        };
+        assert!(!patch(body_of("eventLabelId")).fits());
+        assert!(!insert(body_of("eventLabelId")).fits());
+        for key in ["colorId", "reminders"] {
+            assert!(patch(body_of(key)).fits(), "{key}");
+            assert!(insert(body_of(key)).fits(), "{key}");
+        }
     }
 }

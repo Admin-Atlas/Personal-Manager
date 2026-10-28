@@ -83,6 +83,8 @@ const REASONS: ReadOnlyReason[] = [
   "special_type",
   "locked",
   "html_description",
+  "label_read_only",
+  "reminders_unreadable",
 ];
 
 describe("edit reasons", () => {
@@ -92,13 +94,32 @@ describe("edit reasons", () => {
     expect(new Set(lines).size).toBe(REASONS.length);
   });
 
+  it("words a label and unreadable notifications plainly, as the backend does (C13)", () => {
+    expect(reasonText("label_read_only")).toBe(
+      "This event has a Google Calendar label, which sets its colour. Change it in Google Calendar.",
+    );
+    expect(reasonText("reminders_unreadable")).toBe(
+      "PM can't read one of this event's notifications, so it leaves them as they are.",
+    );
+    for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/reminder/i);
+  });
+
   it("names conflicting fields in the editor's words", () => {
-    // A key the editor has no field for (the colour, say) names nothing.
-    expect(conflictFields(["start", "end", "summary", "transparency", "colorId"])).toEqual([
+    // A key the editor has no field for names nothing.
+    expect(conflictFields(["start", "end", "summary", "transparency", "conferenceData"])).toEqual([
       "time",
       "summary",
       "show_as",
     ]);
+    // Notifications and colour (C13): a colour's check watches the label too, and both are the
+    // colour, said once.
+    expect(conflictFields(["eventLabelId"])).toEqual(["colour"]);
+    expect(conflictFields(["colorId"])).toEqual(["colour"]);
+    expect(conflictFields(["colorId", "eventLabelId", "reminders"])).toEqual([
+      "colour",
+      "reminders",
+    ]);
+    expect(listFields(["reminders", "colour"])).toBe("notifications and colour");
     // The guest list and its three permissions (C12), each said once.
     expect(
       conflictFields([
@@ -325,6 +346,7 @@ describe("a write's warnings", () => {
       "left_on_old_series",
       "outside_mirror",
       "milestone_not_offered",
+      "partly_applied",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
@@ -395,6 +417,26 @@ describe("a repeating event's save, said once the editor has closed", () => {
     );
     expect(savedNotice("Gym", saved(["mirror_refresh_pending"]), "all").text).toBe(
       "Saved “Gym” for every occurrence. PM's calendar will show it after the next refresh. To change it back, edit it again.",
+    );
+  });
+
+  // C13 review round 1: a save Google applied without keeping all of it (a colour it wouldn't clear
+  // beside a new title) is saved, never "nothing changed", and never a plain "Saved": it says to look.
+  it("says when Google didn't keep all of a save", () => {
+    expect(savedNotice("Gym", saved(["partly_applied"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym”. Google didn't keep all of your changes, so check the event.",
+    });
+    expect(savedNotice("Gym", saved(["mirror_refresh_pending", "partly_applied"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” to Google. Google didn't keep all of your changes, so check the event. PM's calendar will show it after the next refresh.",
+    });
+    expect(outcomeText(saved(["partly_applied"]))).toEqual({
+      tone: "warn",
+      text: "Saved to Google. Google didn't keep all of your changes, so check the event.",
+    });
+    expect(outcomeText(saved(["partly_applied", "mirror_refresh_pending"])).text).toBe(
+      "Saved to Google. Google didn't keep all of your changes, so check the event. PM's calendar will show it after the next refresh.",
     );
   });
 
@@ -776,6 +818,37 @@ describe("creating an event", () => {
     expect(createText(changed, "Dentist", false).text).toMatch(
       /^“Dentist” wasn't sent again: .* so it isn't made twice\.$/,
     );
+  });
+
+  // C12d: whether Google sends the invitations, said only where it can't be asked again; nothing
+  // was sent, and the words never say "guests" emailed or name a command.
+  it("says a create waiting on the invitations question wasn't created", () => {
+    const one = {
+      updated: 0,
+      invited: 1,
+      removed: 0,
+      told_cancelled: 0,
+      cancelled: false,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    expect(
+      createText({ outcome: "needs_choice", scope: false, guests: one }, "Dentist", false),
+    ).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't created: Choose whether Google sends the invitations, then save it again.",
+    });
+    expect(
+      createText(
+        { outcome: "needs_choice", scope: false, guests: one, again: true },
+        "Dentist",
+        false,
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't created: PM's count of who Google would invite differs from the one you answered. Save it again to choose whether Google sends the invitations.",
+    });
   });
 });
 

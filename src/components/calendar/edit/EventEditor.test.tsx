@@ -11,6 +11,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  Calendar,
   CalendarEvent,
   EditLoad,
   EventForEdit,
@@ -118,6 +119,8 @@ const ALL: FieldPermissions = {
   show_as: true,
   visibility: true,
   guests: true,
+  reminders: true,
+  colour: true,
   delete: true,
   reasons: [],
 };
@@ -149,6 +152,9 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     guests_can_see_other_guests: true,
     guests_omitted: false,
     organizer_email: "me@x.com",
+    reminders: { use_default: true, overrides: [] },
+    color_id: null,
+    label_id: null,
     ...over,
   };
 }
@@ -172,14 +178,16 @@ async function open(
   onClose = vi.fn(),
   onDelete?: (r: CalendarEvent) => void,
   clicked: CalendarEvent = row,
+  calendar: Calendar | null = null,
 ) {
   render(
     <EventEditor
       row={clicked}
-      calendar={null}
+      calendar={calendar}
       account="me@x.com"
       suggestions={NO_SUGGESTIONS}
       milestone={null}
+      colorOf={colourOf}
       onClose={onClose}
       onDelete={onDelete}
     />,
@@ -190,6 +198,9 @@ async function open(
 
 /** No one to suggest as a guest. */
 const NO_SUGGESTIONS: readonly GuestSuggestion[] = [];
+
+/** Every calendar in one colour: the colour list's "Calendar colour" swatch. */
+const colourOf = () => "var(--ink4)";
 
 /** A one-off's save: no scope, the draft's title for its notices, and nobody to email (no answer,
  *  no numbers). */
@@ -399,6 +410,39 @@ describe("EventEditor", () => {
     expect(screen.getByText(/Google has locked this event's title/)).toBeTruthy();
     // Delete is wired (onDelete given), and still not offered.
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    // Notifications and colour are the user's own, which Google leaves open on a locked event (C13).
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Add notification" }).disabled,
+    ).toBe(false);
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Colour: Calendar colour" }).disabled,
+    ).toBe(false);
+  });
+
+  it("a labelled event's colour and unreadable notifications stay as they are, saying why (C13)", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ label_id: "label-1", color_id: "5" }), {
+        ...ALL,
+        reminders: false,
+        colour: false,
+        reasons: ["label_read_only", "reminders_unreadable", "html_description"],
+      }),
+    );
+    await open(vi.fn(), vi.fn());
+    expect(screen.getByText(/This description has formatting/)).toBeTruthy();
+    // Each reason shows now that its row does (C1-M10).
+    expect(screen.getByText(/This event has a Google Calendar label/)).toBeTruthy();
+    expect(screen.getByText(/PM can't read one of this event's notifications/)).toBeTruthy();
+    // The colour names the label that sets it, never the colour hidden under it, and is off.
+    const colour = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Colour: Set by its Google Calendar label",
+    });
+    expect(colour.disabled).toBe(true);
+    // No list is shown as the event's when PM can't read it: no defaults, no rows, no Add.
+    const list = screen.getByRole("group", { name: "Notifications" });
+    expect(within(list).queryByRole("button", { name: "Add notification" })).toBeNull();
+    expect(within(list).queryByText(/default notifications/)).toBeNull();
+    expect(within(list).getByText("Google Calendar sends these, not PM.")).toBeTruthy();
   });
 
   it("deletes what the editor showed, asking first when there are unsaved changes", async () => {
@@ -827,6 +871,7 @@ describe("EventEditor", () => {
         account={null}
         suggestions={NO_SUGGESTIONS}
         milestone={null}
+        colorOf={colourOf}
         onClose={() => {}}
       />,
     );
@@ -1834,6 +1879,7 @@ describe("EventEditor, a linked milestone", () => {
       account="me@x.com"
       suggestions={NO_SUGGESTIONS}
       milestone={launch}
+      colorOf={colourOf}
       onClose={() => {}}
     />
   );
@@ -1977,6 +2023,28 @@ describe("EventEditor, guests", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(question()).toBeNull();
     expect(saveEdit).toHaveBeenCalledWith("s1", { show_as: "free" }, ...UNSCOPED);
+  });
+
+  // Notifications and colour are the user's own (C13): Google emails no guest about them, so PM
+  // never asks, as the backend's `PERSONAL` has it.
+  it("a notification and colour change with guests saves without asking", async () => {
+    openForEdit.mockResolvedValue(ready(withAnn()));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Add notification" }));
+    fireEvent.click(screen.getByRole("button", { name: "Colour: Calendar colour" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Basil" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(question()).toBeNull();
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      {
+        reminders: { use_default: false, overrides: [{ method: "popup", minutes: 30 }] },
+        colour: { kind: "colour", id: "10" },
+      },
+      ...UNSCOPED,
+    );
   });
 
   it("the backend's guests question opens the prompt with its numbers and the again line", async () => {
@@ -2192,5 +2260,340 @@ describe("EventEditor, guests", () => {
         self: false,
       },
     ]);
+  });
+});
+
+// Notifications and colour (#884, C13): the whole list goes when it changed, never an untouched one;
+// a colour is one choice; a row that can't be committed stops the save, and one typed but not
+// committed is sent; the kind switch puts an own list back to the defaults and says so.
+describe("EventEditor, notifications and colour", () => {
+  const work: Calendar = {
+    id: row.calendar_id,
+    source_id: "gcal:me@x.com",
+    provider: "google",
+    remote_id: "me@x.com",
+    name: "Work",
+    color: null,
+    selected: true,
+    is_primary: true,
+    quiet: false,
+    kind: null,
+    access_role: "owner",
+    time_zone: "Europe/London",
+    default_reminders: [{ method: "popup", minutes: 30 }],
+    conference_types: [],
+    data_owner: null,
+  };
+  const own = (...list: [string, number][]) => ({
+    use_default: false,
+    overrides: list.map(([method, minutes]) => ({ method, minutes })),
+  });
+  const saved: SaveAnswer = { outcome: "saved", warnings: [] };
+  const count = (words: string) =>
+    screen.getByRole<HTMLInputElement>("textbox", { name: `How many: ${words}` });
+
+  it("saves a notification change as the whole list", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10], ["email", 60]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    const ten = count("10 minutes before");
+    fireEvent.change(ten, { target: { value: "15" } });
+    fireEvent.blur(ten);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { reminders: own(["popup", 15], ["email", 60]) },
+      ...UNSCOPED,
+    );
+  });
+
+  it("sends a number typed but not yet committed when Save is pressed (C13 critique C2-M5)", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    const ten = count("10 minutes before");
+    ten.focus();
+    fireEvent.change(ten, { target: { value: "45" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { reminders: own(["popup", 45]) }, ...UNSCOPED);
+  });
+
+  it("shows a timed event's defaults as rows that send nothing until one changes", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    // Retitled only: nothing about notifications goes.
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { summary: "Gym" }, null, "Gym", null, null);
+    cleanup();
+    // The first change to a default row makes the list the event's own, the rest as they were.
+    const again = await open(vi.fn(), undefined, row, work);
+    fireEvent.change(screen.getByRole("combobox", { name: "How: 30 minutes before" }), {
+      target: { value: "email" },
+    });
+    expect(screen.queryByText("Work's default notifications:")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(again).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { reminders: own(["email", 30]) }, ...UNSCOPED);
+  });
+
+  it("a row it can't commit stops the save and asks before closing", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    const ten = count("10 minutes before");
+    fireEvent.change(ten, { target: { value: "ten" } });
+    fireEvent.blur(ten);
+    expect(screen.getByText("Use a whole number.")).toBeTruthy();
+    expect(ten.getAttribute("aria-invalid")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {});
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    // The draft never took the text, so only the refusal says something would be lost.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    // Fixed, it saves.
+    fireEvent.change(ten, { target: { value: "20" } });
+    fireEvent.blur(ten);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { reminders: own(["popup", 20]) }, ...UNSCOPED);
+  });
+
+  it("saves a colour as one choice, and the calendar's colour as the calendar's", async () => {
+    openForEdit.mockResolvedValue(ready(event({ color_id: "5" })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Colour: Banana" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Calendar colour" }));
+    expect(screen.getByRole("button", { name: "Colour: Calendar colour" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { colour: { kind: "calendar" } }, ...UNSCOPED);
+  });
+
+  it("a conflict on the colour, or a label Google added, names the colour", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ color_id: "5" })))
+      .mockResolvedValueOnce(ready(event({ color_id: "3" }), ALL, "s2"));
+    saveEdit.mockResolvedValue({ outcome: "conflict", fields: ["colorId", "eventLabelId"] });
+    await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Colour: Banana" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Sage" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Google's version of the colour is shown now/);
+    expect(screen.getByRole("button", { name: "Colour: Grape" })).toBeTruthy();
+  });
+
+  it("the colour list sits inside the editor, and Escape closes only it", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onClose = await open(vi.fn(), undefined, row, work);
+    const trigger = screen.getByRole("button", { name: "Colour: Calendar colour" });
+    fireEvent.click(trigger);
+    const list = screen.getByRole("listbox", { name: "Colour" });
+    // In the editor's dialog, so its focus trap and screen readers reach it.
+    expect(screen.getByRole("dialog", { name: "Edit event" }).contains(list)).toBe(true);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(list).getByRole("option", { name: "Calendar colour" }),
+      ),
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Edit event" })).toBeTruthy();
+    expect(screen.queryByText("Discard your changes?")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("switching to all day puts the event's own list back to the defaults and says so", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Work's defaults for all-day events."),
+    ).toBeTruthy();
+    expect(screen.getByText("Work's default notifications for all-day events.")).toBeTruthy();
+    // Back to timed, as Google holds it: the event's own list returns, and nothing says otherwise
+    // (C13 critique C2-L5).
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    expect(count("10 minutes before")).toBeTruthy();
+    // All day again; said until the list next changes.
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    // Back to timed over the list just made: the event's own replaces it, and that is said (C13
+    // review round 1).
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to the ones this event has in Google."),
+    ).toBeTruthy();
+    expect(count("10 minutes before")).toBeTruthy();
+    // All day again, and saved: the defaults go with the new time.
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit.mock.calls[0][1].reminders).toEqual({ use_default: true, overrides: [] });
+    expect(saveEdit.mock.calls[0][1].time?.kind).toBe("all_day");
+  });
+
+  // C13 review round 1: a conflict that puts Google's timed time back over the switch to all day
+  // puts back the notifications that switch replaced, as switching back would, and the switch's
+  // line goes; the next save sends none of them.
+  it("a conflict that undoes the switch to all day puts the event's own notifications back", async () => {
+    const list = own(["popup", 10], ["email", 60]);
+    const moved = event({
+      reminders: list,
+      time: {
+        kind: "timed",
+        start_date: "2026-10-12",
+        start_time: "15:00",
+        start_zone: "Europe/London",
+        end_date: "2026-10-12",
+        end_time: "16:00",
+        end_zone: "Europe/London",
+      },
+      start_at: "2026-10-12T14:00:00Z",
+      end_at: "2026-10-12T15:00:00Z",
+    });
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ reminders: list })))
+      .mockResolvedValueOnce(ready(moved, ALL, "s2"));
+    saveEdit
+      .mockResolvedValueOnce({ outcome: "conflict", fields: ["start", "end"] })
+      .mockResolvedValueOnce(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Work's defaults for all-day events."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/changed in Google while you were editing/);
+    expect(saveEdit.mock.calls[0][1].reminders).toEqual({ use_default: true, overrides: [] });
+    // Google's time, with the list that goes with it, as Google holds both.
+    expect(count("10 minutes before")).toBeTruthy();
+    expect(count("1 hour before, by email")).toBeTruthy();
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit.mock.calls[1][1]).toEqual({ summary: "Gym" });
+  });
+
+  // C13 review round 2: the defaults pressed for are the user's, on either kind; a switch there and
+  // back put nothing there, so it takes nothing away.
+  it("switching to all day and back keeps the defaults I picked", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Use Work's defaults" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { reminders: { use_default: true, overrides: [] } },
+      ...UNSCOPED,
+    );
+  });
+
+  // C13 review round 2: once the list has changed, the defaults on it are the user's, even if the
+  // switch had put them there first.
+  it("defaults picked again after the switch stay when switching back", async () => {
+    openForEdit.mockResolvedValue(ready(event({ reminders: own(["popup", 10]) })));
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use Work's defaults" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { reminders: { use_default: true, overrides: [] } },
+      ...UNSCOPED,
+    );
+  });
+
+  // C13 review round 2: a conflict that puts Google's timed time back over the switch keeps the
+  // defaults pressed for before it, since the switch never put them there.
+  it("a conflict that undoes the switch to all day keeps the defaults I picked", async () => {
+    const moved = event({
+      reminders: own(["popup", 10]),
+      time: {
+        kind: "timed",
+        start_date: "2026-10-12",
+        start_time: "15:00",
+        start_zone: "Europe/London",
+        end_date: "2026-10-12",
+        end_time: "16:00",
+        end_zone: "Europe/London",
+      },
+      start_at: "2026-10-12T14:00:00Z",
+      end_at: "2026-10-12T15:00:00Z",
+    });
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ reminders: own(["popup", 10]) })))
+      .mockResolvedValueOnce(ready(moved, ALL, "s2"));
+    saveEdit
+      .mockResolvedValueOnce({ outcome: "conflict", fields: ["start", "end"] })
+      .mockResolvedValueOnce(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("button", { name: "Use Work's defaults" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/changed in Google while you were editing/);
+    expect(screen.getByText("Work's default notifications:")).toBeTruthy();
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit.mock.calls[1][1]).toEqual({ reminders: { use_default: true, overrides: [] } });
+  });
+
+  // C13 review round 1: Google's list put in by a conflict is no longer the defaults the switch's
+  // line names, so the line goes.
+  it("a conflict that replaces the notifications drops the switch's line", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ reminders: own(["popup", 10]) })))
+      .mockResolvedValueOnce(ready(event({ reminders: own(["popup", 30]) }), ALL, "s2"));
+    saveEdit.mockResolvedValueOnce({ outcome: "conflict", fields: ["reminders"] });
+    await open(vi.fn(), undefined, row, work);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(
+      screen.getByText("Notifications went back to Work's defaults for all-day events."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/changed in Google while you were editing/);
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+  });
+
+  it("the kind switch leaves notifications it can't change as they are (C13 critique C1-L14)", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ reminders: own(["popup", 10]) }), { ...ALL, reminders: false }),
+    );
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await open(vi.fn(), undefined, row, work);
+    // Off, as the permission says.
+    expect(count("10 minutes before").disabled).toBe(true);
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(Object.keys(saveEdit.mock.calls[0][1])).toEqual(["time"]);
   });
 });
