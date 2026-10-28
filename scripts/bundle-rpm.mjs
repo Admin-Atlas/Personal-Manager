@@ -22,12 +22,13 @@
 // (TAURI_SIGNING_RPM_KEY) that PM doesn't set.
 //
 // Run from anywhere after a release `tauri build` on Linux: `node scripts/bundle-rpm.mjs
-// [extra tauri bundle args, e.g. --verbose]`. Shared by release.yml and linux-bundle-dryrun.yml
-// so the two can't drift.
+// [extra tauri bundle args, e.g. --verbose]`. It builds the host's release rpm only, so it refuses
+// --target and --debug, which would make Tauri write somewhere this script doesn't look. Shared by
+// release.yml and linux-bundle-dryrun.yml so the two can't drift.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -58,10 +59,29 @@ export function renamesFor(fileNames, version, label) {
     .map((name) => [name, name.replace(from, to)]);
 }
 
+/** The first passed-through argument that would move Tauri's output away from target/release, or null. */
+export function movingArg(args) {
+  return args.find((a) => /^(-t|--target|-d|--debug)(=.*)?$/.test(a)) ?? null;
+}
+
+/** Where cargo, and so Tauri, puts the target dir: Tauri asks `cargo metadata` from src-tauri. */
+function cargoTargetDir() {
+  const run = spawnSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+    cwd: join(repoRoot, "src-tauri"),
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (run.error) throw run.error;
+  if (run.status !== 0) throw new Error(`cargo metadata failed: ${run.stderr}`);
+  return JSON.parse(run.stdout).target_directory;
+}
+
 function main() {
   const conf = JSON.parse(readFileSync(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8"));
   const version = conf.version;
   const label = rpmVersion(version);
+  const moving = movingArg(process.argv.slice(2));
+  if (moving) throw new Error(`bundle-rpm builds the host's release rpm only; drop ${moving}`);
 
   const tauri = join(repoRoot, "node_modules", ".bin", "tauri");
   const args = [
@@ -78,11 +98,7 @@ function main() {
   if (run.error) throw run.error;
   if (run.status !== 0) process.exit(run.status ?? 1);
 
-  // Tauri writes bundles under the cargo target dir, which CARGO_TARGET_DIR moves.
-  const target = process.env.CARGO_TARGET_DIR
-    ? resolve(repoRoot, process.env.CARGO_TARGET_DIR)
-    : join(repoRoot, "src-tauri", "target");
-  const dir = join(target, "release", "bundle", "rpm");
+  const dir = join(cargoTargetDir(), "release", "bundle", "rpm");
   if (!existsSync(dir)) throw new Error(`tauri bundle left no rpm folder at ${dir}`);
   const files = readdirSync(dir).filter((name) => statSync(join(dir, name)).isFile());
   for (const [from, to] of renamesFor(files, version, label)) {

@@ -178,6 +178,10 @@ A local build (unsigned, for testing the bundle):
 npm run tauri build
 ```
 
+On Linux that makes the AppImage and the deb. The rpm takes a second step,
+`node scripts/bundle-rpm.mjs`, because rpm won't accept the `-` in `-alpha`: the rpm
+is labelled `+alpha` inside and keeps the usual `PM-<version>-1.x86_64.rpm` file name.
+
 Shipping a real auto-updatable release is tag-driven and handled by CI: bump the
 version, push a `vX.Y.Z` tag (a pre-release suffix like `-alpha`/`-beta` is allowed),
 and the installers + update feed publish to this repo's releases. Add a matching

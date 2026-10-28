@@ -126,9 +126,11 @@ jobs:
         # --verbose so a bundler failure prints linuxdeploy's own output instead
         # of the bare one-liner.
         run: npm run tauri build -- --verbose --bundles appimage,deb
-      # The rpm's own pass with its rpm-legal version label, exactly as release.yml runs it.
+      # The rpm's own pass with its rpm-legal version label, as release.yml runs it.
+      # Without the throwaway key from GITHUB_ENV, because release.yml's rpm step has no
+      # signing secret: if --no-sign ever stopped covering the rpm, this fails here first.
       - name: Bundle the rpm
-        run: node scripts/bundle-rpm.mjs --verbose
+        run: env -u TAURI_SIGNING_PRIVATE_KEY -u TAURI_SIGNING_PRIVATE_KEY_PASSWORD node scripts/bundle-rpm.mjs --verbose
 
       # The same script release.yml runs (single source — the two can't drift).
       - name: Smoke-test the bundled interpreter
@@ -152,4 +154,6 @@ jobs:
           label=$(rpm -qp --queryformat '%{VERSION}' "$rpm_file")
           echo "rpm Version tag: $label"
           test "$label" = "${version/-/+}"
+          # --no-sign really skipped the rpm's updater signature (nothing stages one).
+          test -z "$(find "$base"/rpm -name '*.rpm.sig' -print -quit)"
           echo "Linux bundle dry-run passed."

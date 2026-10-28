@@ -3,15 +3,16 @@
 
 // The rpm's version label. The release and the Linux dry-run are the only places the bundling
 // itself runs, so what's pinned here is the part they depend on: every label this produces is
-// legal for both Tauri (semver) and rpm, PM's real version labels cleanly today, and the renaming
-// back touches only the rpm that was just built.
+// legal for both Tauri (semver) and rpm, PM's real version labels cleanly today, the renaming
+// back touches only the rpm that was just built, and arguments that would make Tauri write the
+// rpm somewhere else are refused.
 //
 // Importing the module does not run the bundler (entry-point guard at the bottom of it).
 
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { renamesFor, rpmVersion } from "./bundle-rpm.mjs";
+import { movingArg, renamesFor, rpmVersion } from "./bundle-rpm.mjs";
 
 // The characters rpm-rs 0.30 allows in a Version tag, quoted from its error message.
 const RPM_LEGAL = /^[A-Za-z0-9._+%{}~^]+$/;
@@ -82,5 +83,22 @@ describe("renamesFor", () => {
 
   it("renames nothing when the label is the version", () => {
     expect(renamesFor(["PM-4.0.0-1.x86_64.rpm"], "4.0.0", "4.0.0")).toEqual([]);
+  });
+});
+
+describe("movingArg", () => {
+  it("lets output-neutral arguments through", () => {
+    expect(movingArg([])).toBeNull();
+    expect(movingArg(["--verbose", "-v"])).toBeNull();
+  });
+
+  it("names an argument that would move the rpm out of target/release", () => {
+    expect(movingArg(["--verbose", "--target", "aarch64-unknown-linux-gnu"])).toBe("--target");
+    expect(movingArg(["--target=aarch64-unknown-linux-gnu"])).toBe(
+      "--target=aarch64-unknown-linux-gnu",
+    );
+    expect(movingArg(["-t", "x"])).toBe("-t");
+    expect(movingArg(["--debug"])).toBe("--debug");
+    expect(movingArg(["-d"])).toBe("-d");
   });
 });

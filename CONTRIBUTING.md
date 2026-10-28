@@ -196,7 +196,8 @@ A green PR proves the code compiles, is well-formed, and passes unit tests; it d
   (see above).
 - **Release-bound change?** The PR gate *compiles* but never *packages*. Do a real
   `npm run tauri build` before a release relies on it — installer/signing/bundling
-  issues don't surface on the PR, only at release time.
+  issues don't surface on the PR, only at release time. On Linux, follow it with
+  `node scripts/bundle-rpm.mjs` for the rpm (see the README's "Build a release").
 - **Did you pick the right bump *type*?** CI proves the number *moved*, not that it
   moved correctly. That judgement is yours (next section).
 
