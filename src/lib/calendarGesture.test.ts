@@ -124,6 +124,7 @@ const CANCELS: CancelWhy[] = [
   "lostcapture",
   "unmount",
   "dialog",
+  "scrolled",
 ];
 
 describe("from idle", () => {

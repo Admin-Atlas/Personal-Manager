@@ -12,8 +12,9 @@
 // (`useHorizontalWheelShift`, #698): the day columns are keyed by date, so a swipe or ← mid-drag
 // unmounts the column a drag began over, and anything bound to it goes with it. So cards carry data
 // attributes and nothing else; one capture listener on the window reads what a press took from them,
-// and every frame measures the grid afresh (nothing is kept from the press but the row it took), so a
-// column re-keyed under the pointer just reads differently on the next frame. The press listener
+// and every frame measures the grid afresh (nothing is kept from the press but the row it took, and
+// how far the grid was scrolled, to tell a scrollbar's press), so a column re-keyed under the pointer
+// just reads differently on the next frame. The press listener
 // never prevents the default: the mousedown after it still closes the event's details and any other
 // popover, and whether one was open is read first, so that press only closes it.
 //
@@ -25,7 +26,8 @@
 //
 // Letting go on a valid place that changes something is the only way a drop happens. Escape, the
 // window losing focus or being hidden, the pointer being cancelled or captured away, a dialog
-// opening, or the calendar going all put it back. It imports no write and names no command: a drop is
+// opening, or the calendar going all put it back; a press the grid scrolls under before it becomes a
+// drag was a scrollbar's, and just ends. It imports no write and names no command: a drop is
 // handed to the calendar (`onCommit`), which asks and moves through the write hook, and a new event's
 // slot to quick create (`onCreate`), which saves nothing until its own Save.
 //
@@ -145,17 +147,6 @@ function streamBox(stream: HTMLElement): Box {
   if (inner <= 0) return box;
   const left = box.left + stream.clientLeft;
   return { ...box, left, right: Math.min(box.right, left + inner) };
-}
-
-/** Whether a press at (x, y) on the element that scrolls the grid, `scroller`, is on its scrollbar
- *  rather than the days it scrolls: outside the box its content spans. Such a press scrolls, so it
- *  never creates or drags (paging Month's weeks down isn't a click on Sunday). A side not laid out
- *  reads as all content. */
-function onScrollbar(scroller: HTMLElement, x: number, y: number): boolean {
-  const across = streamBox(scroller);
-  if (x < across.left || x >= across.right) return true;
-  const top = scroller.getBoundingClientRect().top + scroller.clientTop;
-  return scroller.clientHeight > 0 && (y < top || y >= top + scroller.clientHeight);
 }
 
 /** An event's surface, from its `data-surface`: the hours, the all-day row or Month; anything else
@@ -335,6 +326,16 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     let unarm: (() => void) | null = null;
     /** Takes off the eating of a touch tap's mouse events (`eatTapMouse`). */
     let untap: (() => void) | null = null;
+    /** What scrolls the grid, and where it stood at the press. */
+    let under: { el: HTMLElement; top: number } | null = null;
+
+    /** Whether the grid scrolled under a press that isn't a drag yet. A scrollbar that floats over
+     *  the days may let its press reach the day beneath (where it lands can't say which it was),
+     *  but it scrolls them, at once on its track or as its thumb is dragged, and a click on a day
+     *  never does. The drag's own scrolling starts only once it's a drag, so this one was the
+     *  scrollbar's (or a wheel's): the press just ends, creating or moving nothing. */
+    const scrolledUnder = () =>
+      now().phase === "pressed" && under !== null && under.el.scrollTop !== under.top;
 
     /** A tap that created: the browser follows a touch with a mousedown, mouseup and click at the
      *  same spot, which quick create (open by then) would read as a press outside it, and close.
@@ -483,6 +484,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     const end = () => {
       detach?.();
       detach = null;
+      under = null;
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
     };
@@ -534,6 +536,11 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
         cancel("dialog");
         return;
       }
+      // Before the frame that would pick it up: a thumb dragged moves the pointer too.
+      if (scrolledUnder()) {
+        cancel("scrolled");
+        return;
+      }
       const { x, y } = pos.current;
       const press = s.press;
       if (
@@ -563,6 +570,11 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
         pos.current = { x: e.clientX, y: e.clientY };
         const s = now();
         if (s.phase === "idle") return;
+        // A track clicked: let go before the next frame could see it scroll.
+        if (scrolledUnder()) {
+          cancel("scrolled");
+          return;
+        }
         // An event that left the calendar mid-drag (deleted, or moved, elsewhere) has nowhere to
         // go: it's put back, and the next read shows where it is.
         const on = s.press.on;
@@ -626,11 +638,12 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       // create) is that thing's, whatever box it sits in.
       if (!(t instanceof Element) || !wrapper.contains(t)) return null;
       const found = measure(wrapper);
-      // A scrollbar's press goes to the element it scrolls: Month's weeks carry their surface, so
-      // without this a click on its track would create on the week's last day.
-      if (found && t === found.scroller && onScrollbar(found.scroller, e.clientX, e.clientY)) {
-        return null;
-      }
+      // What scrolls the grid is covered edge to edge by what it scrolls (Month's week rows, the
+      // hours' gutter and columns), so a press on it itself is on its scrollbar: one that takes
+      // room, or one that floats over the days (GTK's default, and a Mac trackpad's), which takes
+      // none and so can't be told apart by where it lands. Such a press scrolls, never creates or
+      // drags: Month's weeks carry their surface, so it would otherwise create on the last day.
+      if (found && t === found.scroller) return null;
       const at = found ? targetIn(found, e.clientX, e.clientY) : null;
       if (!at) return null;
       const base = {
@@ -707,6 +720,8 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       // (it never passes the threshold, so it is always a click).
       if (e.pointerType === "touch" && press.on.kind !== "empty") return;
       pos.current = { x: e.clientX, y: e.clientY };
+      const scroller = measure(wrapper)?.scroller;
+      under = scroller ? { el: scroller, top: scroller.scrollTop } : null;
       dispatch({ type: "press", press });
       attach(press, wrapper);
       raf = requestAnimationFrame(tick);

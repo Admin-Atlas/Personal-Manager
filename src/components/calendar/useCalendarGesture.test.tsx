@@ -748,8 +748,9 @@ describe("useCalendarGesture: the all-day row", () => {
 });
 
 /** Month as the view marks it (C16c): the weekday row, then three weeks of 100 px from Monday
- *  12-10, seven 100 px days across, Gym's chip on Monday and the holiday's band on Monday, and a
- *  "+1 more" on Tuesday. */
+ *  12-10, seven 100 px days across, Gym's chip on Monday and the holiday's band on Monday, a
+ *  "+1 more" on Tuesday, and Sunday. Its days cover the stream, so a press on the stream itself is
+ *  on its scrollbar. */
 function MonthGrid({
   host,
   rows,
@@ -793,6 +794,7 @@ function MonthGrid({
             +1 more
           </span>
         </div>
+        <div data-day="2026-10-18" data-testid="sun" />
         <div data-event-id="a1" data-testid="m-bar" />
       </div>
       {view.ghost && <div data-testid="ghost">{view.ghost.label}</div>}
@@ -816,6 +818,7 @@ function mountMonth(host: Partial<GestureHost> = {}) {
   place(screen.getByTestId("stream"), 0, 40, 700, 340);
   place(screen.getByTestId("mon"), 0, 40, 100, 140);
   place(screen.getByTestId("tue"), 100, 40, 200, 140);
+  place(screen.getByTestId("sun"), 600, 40, 700, 140);
   place(screen.getByTestId("chip"), 2, 70, 98, 84);
   place(screen.getByTestId("more"), 104, 120, 160, 134);
   place(screen.getByTestId("number"), 2, 42, 20, 60);
@@ -1062,7 +1065,9 @@ describe("useCalendarGesture: creating", () => {
     // A 14 px scrollbar: the seven days share 686 px, so Sunday starts at 588.
     const stream = screen.getByTestId("stream");
     Object.defineProperty(stream, "clientWidth", { value: 686 });
-    press(stream, 590, 60);
+    const sun = screen.getByTestId("sun");
+    place(sun, 588, 40, 686, 140);
+    press(sun, 590, 60);
     release(590, 60);
     expect(onCreate.mock.calls[0][0].timing).toEqual({
       kind: "all_day",
@@ -1070,7 +1075,7 @@ describe("useCalendarGesture: creating", () => {
       last: "2026-10-18",
     });
     // A drag from Sunday that passes over the scrollbar stays on Sunday, never past it.
-    press(stream, 590, 60);
+    press(sun, 590, 60);
     moveTo(695, 160);
     release(695, 160);
     expect(onCreate.mock.calls[1][0].timing).toEqual({
@@ -1097,9 +1102,83 @@ describe("useCalendarGesture: creating", () => {
     expect(onCreate).not.toHaveBeenCalled();
     expect(capture).not.toHaveBeenCalled();
     // The days beside them still create.
-    press(stream, 590, 60);
+    press(screen.getByTestId("sun"), 590, 60);
     release(590, 60);
     expect(onCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("a press on a scrollbar that floats over Month's days only scrolls too", () => {
+    const { onCreate } = mountMonth(creates);
+    const stream = screen.getByTestId("stream");
+    // GTK's and a Mac trackpad's scrollbar takes no room: the days span the stream's whole width,
+    // and the bar floats over Sunday's right edge.
+    Object.defineProperty(stream, "clientWidth", { value: 700 });
+    Object.defineProperty(stream, "clientHeight", { value: 300 });
+    // Its track clicked, then its thumb dragged down.
+    press(stream, 695, 60);
+    release(695, 60);
+    press(stream, 695, 60);
+    moveTo(695, 200);
+    release(695, 200);
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    // Sunday under it, where the bar isn't, still creates.
+    press(screen.getByTestId("sun"), 695, 60);
+    release(695, 60);
+    expect(onCreate.mock.calls[0][0].timing).toEqual({
+      kind: "all_day",
+      first: "2026-10-18",
+      last: "2026-10-18",
+    });
+  });
+
+  it("a press the grid scrolls under before it's a drag was a scrollbar's: it creates nothing", () => {
+    const { onCreate } = mountMonth(creates);
+    const stream = screen.getByTestId("stream");
+    const sun = screen.getByTestId("sun");
+    // An engine that hands a floating bar's press to the day beneath it: the track clicked pages
+    // the weeks down, and the button is let go before the next frame.
+    press(sun, 695, 60);
+    stream.scrollTop = 100;
+    release(695, 60);
+    // The thumb dragged down: the weeks scroll as the pointer goes.
+    press(sun, 695, 60);
+    stream.scrollTop = 150;
+    moveTo(695, 200);
+    release(695, 200);
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    // With the weeks still, a click on Sunday creates, and a drag from it still scrolls them.
+    press(sun, 695, 60);
+    release(695, 60);
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    press(sun, 695, 60);
+    moveTo(695, 335);
+    frame();
+    expect(stream.scrollTop).toBeGreaterThan(150);
+    expect(capture).toHaveBeenCalledTimes(1);
+    release(695, 335);
+    expect(onCreate).toHaveBeenCalledTimes(2);
+  });
+
+  it("in the hours too, a press they scroll under creates or moves nothing", () => {
+    const { onCreate, onCommit, announce } = mount(creates);
+    const body = screen.getByTestId("body");
+    // The hours' floating thumb dragged down over the next day's column, which got the press.
+    press(screen.getByTestId("col2"), 790, 300);
+    body.scrollTop = 200;
+    moveTo(790, 400);
+    release(790, 400);
+    // Or over Gym's card.
+    press(screen.getByTestId("card"), 200, 480);
+    body.scrollTop = 400;
+    moveTo(200, 560);
+    release(200, 560);
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    // Quietly: nothing was picked up, so nothing is put back.
+    expect(announce).not.toHaveBeenCalled();
   });
 
   it("only the scrolling element's own press can be on its scrollbar: the all-day row still creates", () => {
