@@ -745,6 +745,16 @@ fn shown_zone(facts: &CalendarFacts, device_zone: Option<chrono_tz::Tz>) -> Opti
         .or_else(|| device_zone.map(|z| z.name().to_string()))
 }
 
+/// The zone a drop says a time in when Google's copy names none for either half: the calendar's, as
+/// [`shown_zone`] has the editor read it, so a drag writes the zone an Edit would (`None`: this
+/// computer's).
+fn unzoned_of(facts: &CalendarFacts) -> Option<chrono_tz::Tz> {
+    facts
+        .time_zone
+        .as_deref()
+        .and_then(|zone| time::parse_zone(zone).ok())
+}
+
 /// The series of the occurrence `fresh`, as Google holds it now, or `None` for a one-off or a series
 /// PM couldn't fetch.
 async fn open_master<W: Wire>(wire: &W, target: &Target, fresh: &Value) -> Option<Value> {
@@ -1473,7 +1483,8 @@ async fn ready_move<W: Wire, H: Host>(
     if let Some(held) = held_new_part(one.wire, host, target, fresh).await {
         return Err(held);
     }
-    let time = time::retime_draft(to, device, fresh).map_err(|e| failed(e.to_string()))?;
+    let time = time::retime_draft(to, device, unzoned_of(&target.facts), fresh)
+        .map_err(|e| failed(e.to_string()))?;
     let draft = EventPatchDraft {
         time: Some(time),
         ..Default::default()
@@ -2911,11 +2922,23 @@ impl CalendarEditState {
             .map(|u| u.target.clone())
     }
 
-    /// Take an Undo: once, whatever comes of it. Whether it is still in its window is
-    /// [`Self::undo_target`]'s to say, first.
+    /// Take an Undo: once, whatever comes of it, but Google being busy (see
+    /// [`Self::put_back_undo`]). Whether it is still in its window is [`Self::undo_target`]'s to
+    /// say, first.
     fn take_undo(&self, token: &str) -> Option<ChangeUndo> {
         let mut undos = self.undos.lock().ok()?;
         undos.remove(token)
+    }
+
+    /// An Undo taken and then answered Busy by Google (a rate limit), which landed nothing: it is
+    /// still there to press, under its own token, while its window lasts at `now`.
+    fn put_back_undo(&self, token: &str, record: ChangeUndo, now: Instant) {
+        if record.until <= now {
+            return;
+        }
+        if let Ok(mut undos) = self.undos.lock() {
+            undos.insert(token.to_owned(), record);
+        }
     }
 
     /// A landing wrote `rows` (PM's row ids): their Undos go, as Google's copy is no longer the one
@@ -2991,7 +3014,9 @@ pub async fn undo_calendar_change(
 
 /// [`undo_calendar_change`] past its shell: editing must still be on; the row is claimed before the
 /// record is taken, so a write on its way leaves the Undo where it was (C16 critique C1-L6); once
-/// taken it is gone, whatever comes of it.
+/// taken it is gone, whatever comes of it, but Busy: Google rate-limiting it sent nothing that
+/// landed (a write that may have was looked for first, and is Saved, Partly or Unconfirmed), so
+/// the record goes back and the Undo the webview shows again can still be pressed.
 async fn undo_change<W: Wire, H: Host>(wire: &W, host: &H, token: &str) -> WriteOutcome {
     let gone = || WriteOutcome::Failed {
         message: UNDO_GONE.into(),
@@ -3016,9 +3041,11 @@ async fn undo_change<W: Wire, H: Host>(wire: &W, host: &H, token: &str) -> Write
         target: &record.target,
         editing,
     };
-    send_one(&one, &Basis::Undo(&record), &GuestAnswer::default())
-        .await
-        .0
+    let (outcome, _) = send_one(&one, &Basis::Undo(&record), &GuestAnswer::default()).await;
+    if outcome == WriteOutcome::Busy {
+        edit.put_back_undo(token, record, Instant::now());
+    }
+    outcome
 }
 
 // --- replying to an invitation (C14) ---
@@ -4323,7 +4350,8 @@ async fn prepare_change<W: Wire>(
         // A drop is the editor's time draft for it, said in the event's own zone (C16a): what the
         // plan is built from, made on the occurrence Google holds now.
         ChoiceRequest::Move(m) => {
-            let time = match time::retime_draft(&m.to, device, instance.json()) {
+            let unzoned = unzoned_of(&target.facts);
+            let time = match time::retime_draft(&m.to, device, unzoned, instance.json()) {
                 Ok(time) => time,
                 Err(e) => return failed(e.to_string()),
             };
@@ -24799,6 +24827,61 @@ mod tests {
         }
     }
 
+    /// The dentist names no zone, so it is in its calendar's (London), as the editor reads it:
+    /// dragged on a New York laptop, it is written in London's zone, as an Edit would write it,
+    /// never given New York's.
+    #[tokio::test]
+    async fn a_drop_of_an_event_with_no_zone_writes_its_calendars() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        // 05:00 in New York on 12-10 is 10:00 in London.
+        let request = MoveRequest {
+            device_zone: Some("America/New_York".into()),
+            ..drop_at(&event, "2026-10-12", "05:00", "06:00")
+        };
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            Scripted::Json(dentist_at_ten()),
+        );
+        let (outcome, script) =
+            move_one(&host, &event, &request, vec![patch], GuestAnswer::default()).await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "saved, with its Undo");
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(body["start"], london("2026-10-12T10:00:00+01:00"));
+        assert_eq!(body["end"], london("2026-10-12T11:00:00+01:00"));
+    }
+
+    /// Google holds an event that ends as it starts (an import with no end, say): a drag moves it,
+    /// as Google's does, keeping its length, never refused for ending before it starts.
+    #[tokio::test]
+    async fn a_zero_length_event_moves() {
+        let at_nine = json!({ "dateTime": "2026-10-12T09:00:00+01:00" });
+        let event = with(dentist(), "end", at_nine);
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let request = drop_at(&event, "2026-10-12", "10:00", "10:00");
+        let at_ten = london("2026-10-12T10:00:00+01:00");
+        let moved = written(
+            &event,
+            &[("start", at_ten.clone()), ("end", at_ten.clone())],
+            "\"s2\"",
+        );
+        let patch = Step::write(
+            Method::Patch,
+            "/events/solo",
+            "\"s1\"",
+            Scripted::Json(moved),
+        );
+        let (outcome, script) =
+            move_one(&host, &event, &request, vec![patch], GuestAnswer::default()).await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "moved");
+        let body = first_write(&script).body.unwrap();
+        assert_eq!((&body["start"], &body["end"]), (&at_ten, &at_ten));
+    }
+
     /// `Saved` with an Undo for 8 s and nothing else to say (C16 critique C1-M5: compared without
     /// printing the outcome).
     fn saved_with_undo(outcome: &WriteOutcome) -> bool {
@@ -25729,6 +25812,96 @@ mod tests {
         assert!(undo_change(&silent, &*host, &token).await == gone, "once");
         silent.asked_all();
         assert!(silent.sent().is_empty());
+    }
+
+    /// An Undo pressed just as its button goes reaches the backend a moment after [`UNDO`]: its
+    /// grace keeps the record, and it goes through.
+    #[tokio::test]
+    async fn an_undo_pressed_as_its_button_goes_still_lands() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let offered_at = Instant::now()
+            .checked_sub(UNDO + Duration::from_secs(1))
+            .expect("a clock past that");
+        let token = host
+            .edit
+            .offer_undo(&target(&event), timing_landed(), offered_at)
+            .expect("offered")
+            .undo_token;
+        assert!(host.edit.undo_target(&token, Instant::now()).is_some());
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", dentist_at_ten()),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        assert!(undo_change(&script, &*host, &token).await == saved());
+        script.asked_all();
+    }
+
+    /// Google rate-limiting an Undo, on its read or on its write, landed nothing: Busy, and the
+    /// Undo is still there, so the button the webview shows again works the next time.
+    #[tokio::test]
+    async fn an_undo_google_was_too_busy_for_is_still_there() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let token = moved_to_ten(&host).await;
+        let read_busy = Script::new(vec![Step::status("/events/solo", "", 429)]);
+        assert!(undo_change(&read_busy, &*host, &token).await == WriteOutcome::Busy);
+        read_busy.asked_all();
+        assert!(host.edit.undo_target(&token, Instant::now()).is_some());
+        let write_busy = Script::new(vec![
+            Step::get("/events/solo", "", dentist_at_ten()),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Status(429),
+            ),
+        ]);
+        assert!(undo_change(&write_busy, &*host, &token).await == WriteOutcome::Busy);
+        write_busy.asked_all();
+        assert!(host.edit.undo_target(&token, Instant::now()).is_some());
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", dentist_at_ten()),
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s2\"",
+                Scripted::Json(written(&event, &[], "\"s3\"")),
+            ),
+        ]);
+        assert!(undo_change(&script, &*host, &token).await == saved());
+        script.asked_all();
+        assert!(host.edit.undo_target(&token, Instant::now()).is_none());
+    }
+
+    /// A record taken while its window lasts goes back; one whose window ended meanwhile doesn't.
+    #[test]
+    fn a_busy_undo_goes_back_only_inside_its_window() {
+        let event = dentist();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let now = Instant::now();
+        let token = host
+            .edit
+            .offer_undo(&target(&event), timing_landed(), now)
+            .expect("offered")
+            .undo_token;
+        let record = host.edit.take_undo(&token).expect("taken");
+        host.edit
+            .put_back_undo(&token, record, now + UNDO + UNDO_GRACE);
+        assert!(host.edit.undo_target(&token, now).is_none(), "lapsed");
+        let token = host
+            .edit
+            .offer_undo(&target(&event), timing_landed(), now)
+            .expect("offered")
+            .undo_token;
+        let record = host.edit.take_undo(&token).expect("taken");
+        host.edit.put_back_undo(&token, record, now);
+        assert!(host.edit.undo_target(&token, now).is_some());
     }
 
     /// A move's Undo as offered for the dentist: its times before and after.

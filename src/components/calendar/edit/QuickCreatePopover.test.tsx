@@ -593,6 +593,22 @@ describe("QuickCreatePopover", () => {
     });
   });
 
+  // C17: a range dragged out on the grid keeps its own length through All day and back, never the
+  // account's (Work's half hour here).
+  it("a dragged range keeps its length through All day and back", () => {
+    const { onDraft } = open({ placement: "beside", timeTouched: true, calendarId: WORK_CAL });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(onDraft.mock.lastCall![0].time.kind).toBe("all_day");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({
+      kind: "timed",
+      start_date: "2026-10-12",
+      start_time: "09:00",
+      end_date: "2026-10-12",
+      end_time: "10:00",
+    });
+  });
+
   // C17: a range dragged out on the grid is the user's choice, so another calendar never re-seeds
   // it; a slot clicked takes the new calendar's length, as the button's does (above).
   it("a dragged range isn't re-seeded on a calendar change; a click's is", () => {

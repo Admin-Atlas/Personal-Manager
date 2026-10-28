@@ -328,7 +328,9 @@ export function grabAllowed(grab: Grab, cap: DragCapability): boolean {
 // --- targets ---------------------------------------------------------------------------------------
 
 /** Where the pointer is over Week or Day: the all-day strip (the day headers above it count as the
- *  strip), or a time in a column. Null in the cancel zone, or with nothing measured. */
+ *  strip), or a time in a column, always one on screen (below the hours reads as their bottom edge,
+ *  which auto-scroll then moves, as Month's bottom row does). Null in the cancel zone, or with
+ *  nothing measured. */
 export function resolveTimeGridTarget(g: TimeGridGeom, x: number, y: number): Target | null {
   if (inCancelZone(g.wrapper, x, y)) return null;
   if (g.band && y < g.band.bottom) {
@@ -341,7 +343,8 @@ export function resolveTimeGridTarget(g: TimeGridGeom, x: number, y: number): Ta
   }
   const i = xToDayIndex(g.cols, x);
   if (i === null || !(g.rowH > 0)) return null;
-  const minute = clamp(pixelToMinute(y, g.body.top, g.scrollTop, g.rowH), 0, DAY_MIN);
+  const yIn = clamp(y, g.body.top, Math.max(g.body.top, g.body.bottom));
+  const minute = clamp(pixelToMinute(yIn, g.body.top, g.scrollTop, g.rowH), 0, DAY_MIN);
   return { zone: "timed", day: g.cols[i].day, minute };
 }
 

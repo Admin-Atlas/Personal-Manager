@@ -612,11 +612,50 @@ function withTwin(event: CalendarEvent): ReadonlyMap<string, Twin> {
   return twins;
 }
 
-/** `twins` without the one `eventId` set, for a drop taken back. */
+/** What a row had before a drop of it began, by row: an earlier move of it that landed (still drawn
+ *  where it went, as a landed move can be dragged again) and what was hidden at the occurrence the
+ *  new drop hides. One drop of a row at a time: one being asked about or saved can't be dragged. */
+const beforeDrop = new Map<
+  string,
+  { entry: PendingMove | null; key: string | null; twin: Twin | null }
+>();
+
+/** `eventId`'s drop taken back, or refused with Google's copy left as it was (`asBefore`): the row
+ *  as it was before the drop began, an earlier landed move and the copy it hid included, so another
+ *  account's copy never shows again at the old time (C16 critique C1-L10); only this drop's own
+ *  hiding goes. Otherwise (Google's copy is another now, or may be) none of it stays. */
+function undrop(eventId: string, asBefore: boolean): Pick<State, "moves" | "twins"> {
+  const before = beforeDrop.get(eventId);
+  beforeDrop.delete(eventId);
+  if (!asBefore || !before) {
+    return { moves: withMove(eventId, null), twins: withoutTwin(eventId) };
+  }
+  let twins = state.twins;
+  const key = before.key;
+  if (key !== null && twins.get(key)?.except === eventId) {
+    const next = new Map(twins);
+    if (before.twin) next.set(key, before.twin);
+    else next.delete(key);
+    twins = next;
+  }
+  return { moves: withMove(eventId, before.entry), twins };
+}
+
+/** `twins` without any `eventId` set. */
 function withoutTwin(eventId: string): ReadonlyMap<string, Twin> {
   const twins = new Map([...state.twins].filter(([, t]) => t.except !== eventId));
   return twins.size === state.twins.size ? state.twins : twins;
 }
+
+/** A move's answers that leave Google's copy as the drop found it: nothing reached it. */
+const LEFT_AS_IT_WAS: ReadonlySet<WriteOutcome["outcome"]> = new Set([
+  "no_change",
+  "ignored_by_google",
+  "read_only",
+  "busy",
+  "reauth",
+  "failed",
+]);
 
 /** Take the Undo off any notice about `rowId`: a later write of the row retires it in the backend,
  *  so pressing it would only say it can't be undone (C16 critique C1-L9). */
@@ -637,6 +676,13 @@ export function beginMove(drop: Drop): string {
   const flow = `move-${nextFlow++}`;
   flows.add(flow);
   const id = drop.event.id;
+  const key = occurrenceKey(drop.event);
+  const was = state.moves.get(id);
+  beforeDrop.set(id, {
+    entry: was?.phase === "landed" ? was : null,
+    key,
+    twin: key === null ? null : (state.twins.get(key) ?? null),
+  });
   update({
     moves: withMove(id, {
       eventId: id,
@@ -653,11 +699,11 @@ export function beginMove(drop: Drop): string {
 }
 
 /** The drop was taken back (Back, Escape, refused): it goes back where it was at once, and its
- *  other copies show again. */
+ *  other copies show again, unless an earlier move of it still hides them. */
 export function cancelMove(eventId: string) {
   const entry = state.moves.get(eventId);
   if (entry?.flow) flows.delete(entry.flow);
-  update({ moves: withMove(eventId, null), twins: withoutTwin(eventId) });
+  update(undrop(eventId, true));
 }
 
 /** The choices for moving an occurrence: asked with exactly what the move sends, since the token
@@ -763,7 +809,7 @@ function settleMove(
   }
   if (flow) flows.delete(flow);
   if (outcome.outcome !== "saved") {
-    update({ moves: withMove(id, null), twins: withoutTwin(id) });
+    update(undrop(id, LEFT_AS_IT_WAS.has(outcome.outcome)));
     if (outcome.outcome === "partial_split") notePartial(title, outcome);
     else if (outcome.outcome !== "no_change") {
       put({ id: nextNotice++, ...moveText(outcome, title, "", notify) });
@@ -809,6 +855,8 @@ function settleMove(
  *  copies stay hidden meanwhile. */
 function landMove(drop: Drop, outcome: Extract<WriteOutcome, { outcome: "saved" }>) {
   const id = drop.event.id;
+  // This landing is the row's now: nothing from before its drop is put back.
+  beforeDrop.delete(id);
   const mark = state.settles + 1;
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   update({
@@ -844,6 +892,8 @@ export async function undoChange(token: string): Promise<void> {
   const savedTitle = undoableSaves.get(token);
   put({ id: shown.id, tone: shown.tone, text: shown.text });
   const id = kept?.drop.event.id;
+  // The move's own entry, while no read has it yet: drawn again if nothing is sent.
+  const landed = id === undefined ? undefined : state.moves.get(id);
   if (kept && id) {
     update({
       moves: withMove(id, {
@@ -866,8 +916,8 @@ export async function undoChange(token: string): Promise<void> {
     undoingChanges.delete(token);
   }
   if (outcome.outcome === "busy") {
-    // Nothing was sent: it stays where the move put it, which PM's calendar shows.
-    if (id) update({ moves: withMove(id, null) });
+    // Nothing was sent: it stays where the move put it, drawn there until a read has it, as before.
+    if (id) update({ moves: withMove(id, landed ?? null) });
     put(shown);
     return;
   }

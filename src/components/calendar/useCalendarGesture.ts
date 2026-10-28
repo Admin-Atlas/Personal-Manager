@@ -29,7 +29,8 @@
 // handed to the calendar (`onCommit`), which asks and moves through the write hook, and a new event's
 // slot to quick create (`onCreate`), which saves nothing until its own Save.
 //
-// Touch never drags (Q14): a touch press is taken only on empty space, where a tap creates.
+// Touch never drags (Q14): a touch press is taken only on empty space, where a tap creates; the mouse
+// events the browser follows that tap with are eaten, so they can't close the quick create it opened.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -127,10 +128,24 @@ const OUTSIDE: Plan = { ok: false, why: "outside" };
 /** How far right of and below the pointer the reason sits, in px. */
 const CHIP_OFFSET = 12;
 
+/** How long after a tap that created its mouse events may still come, in ms: browsers send them
+ *  straight after the touch ends, or up to about 300 ms later where a double tap could zoom. */
+const TAP_MOUSE_MS = 800;
+
 /** What a press elsewhere on the grid leaves alone: controls (the add-zone button among them). */
 const CONTROLS = "button, a, input, select, textarea, [data-no-create]";
 
 const boxOf = (r: DOMRect): Box => ({ left: r.left, top: r.top, right: r.right, bottom: r.bottom });
+
+/** Month's weeks as laid out: the stream's box less a scrollbar that takes room (a mouse on macOS,
+ *  say), which the seven day columns don't span. A stream not laid out reads its whole box. */
+function streamBox(stream: HTMLElement): Box {
+  const box = boxOf(stream.getBoundingClientRect());
+  const inner = stream.clientWidth;
+  if (inner <= 0) return box;
+  const left = box.left + stream.clientLeft;
+  return { ...box, left, right: Math.min(box.right, left + inner) };
+}
 
 /** An event's surface, from its `data-surface`: the hours, the all-day row or Month; anything else
  *  isn't the drag's. */
@@ -212,7 +227,7 @@ function measure(wrapper: HTMLElement): Measured | null {
     scroller: stream,
     geom: {
       wrapper: outer,
-      stream: boxOf(stream.getBoundingClientRect()),
+      stream: streamBox(stream),
       scrollTop: stream.scrollTop,
       weekH: Number(stream.dataset.weekH),
       gridStart: stream.dataset.gridStart ?? "",
@@ -307,6 +322,30 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
     let detach: (() => void) | null = null;
     /** Takes off a click swallow still waiting for its pointerup. */
     let unarm: (() => void) | null = null;
+    /** Takes off the eating of a touch tap's mouse events (`eatTapMouse`). */
+    let untap: (() => void) | null = null;
+
+    /** A tap that created: the browser follows a touch with a mousedown, mouseup and click at the
+     *  same spot, which quick create (open by then) would read as a press outside it, and close.
+     *  They're the tap's, already done, so they're eaten, until the next press or a moment on. */
+    const eatTapMouse = () => {
+      untap?.();
+      const eat = (e: Event) => {
+        e.stopPropagation();
+        e.preventDefault();
+      };
+      const kinds = ["mousedown", "mouseup", "click"] as const;
+      const off = () => {
+        for (const kind of kinds) window.removeEventListener(kind, eat, true);
+        window.removeEventListener("pointerdown", off, true);
+        clearTimeout(timer);
+        untap = null;
+      };
+      for (const kind of kinds) window.addEventListener(kind, eat, true);
+      window.addEventListener("pointerdown", off, true);
+      const timer = setTimeout(off, TAP_MOUSE_MS);
+      untap = off;
+    };
 
     const placeChip = () => {
       const el = chipEl.current;
@@ -461,6 +500,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
             break;
           case "create":
             h.onCreate(fx, anchorFor(fx.timing));
+            if (before.phase !== "idle" && before.press.pointerType === "touch") eatTapMouse();
             break;
           case "announce":
             h.announce(fx.text);
@@ -663,6 +703,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
       cancel("unmount");
       end();
       unarm?.();
+      untap?.();
     };
   }, []);
 

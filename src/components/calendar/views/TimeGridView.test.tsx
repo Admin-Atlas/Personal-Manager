@@ -287,6 +287,20 @@ describe("TimeGridView — on a grid that drags", () => {
     ).toEqual(["right"]);
   });
 
+  it("an all-day bar's stripe takes no room, so its left end starts at its very edge", () => {
+    const { container } = draw(
+      [ev({ id: "a", summary: "Away", start: "2026-10-12", end: "2026-10-14", all_day: true })],
+      interaction(),
+    );
+    const bar = container.querySelector<HTMLElement>('[data-event-id="a"]');
+    // The drag measures a press from the bar's outer edge, and the end's strip sits inside any
+    // border: with no border, a press on the strip is a press on the end.
+    expect(bar?.querySelector('[data-edge="left"]')).not.toBeNull();
+    expect(bar?.style.borderLeftWidth).toBe("");
+    // The calendar's stripe is still drawn there, inside the bar.
+    expect(bar?.style.boxShadow).toMatch(/inset 3px 0/);
+  });
+
   it("the ghost's pieces sit at startMin/60 × rowH in their columns", () => {
     const moved = ev({ start: "2026-10-12T23:00:00", end: "2026-10-13T01:30:00" });
     const { container } = draw(

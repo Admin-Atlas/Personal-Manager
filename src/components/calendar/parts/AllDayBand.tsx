@@ -183,7 +183,12 @@ export function AllDayBand({
                 width: `${widthPct}%`,
                 height: `${LANE_H - 2}px`,
                 background: eventFill(own, color, 22),
-                borderLeft: b.continuesLeft ? undefined : `3px solid ${color}`,
+                // The calendar's stripe at its true start, drawn inside the bar rather than as a
+                // border: a border would push the left end's strip 3 px in from the edge the drag
+                // measures from, so what looks like the end wouldn't be (#884, C16b review). The
+                // text keeps its place beside it.
+                boxShadow: b.continuesLeft ? undefined : `inset 3px 0 0 ${color}`,
+                paddingLeft: b.continuesLeft ? undefined : "calc(0.375rem + 3px)",
                 borderTopLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
                 borderBottomLeftRadius: b.continuesLeft ? 0 : "var(--radius-sm)",
                 borderTopRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",

@@ -16,6 +16,8 @@ import { describe, expect, it } from "vitest";
 import { TUNING_TITLE } from "../components/localai/locate";
 import { LOCALAI_SECTIONS } from "../components/localai/sections";
 import { STATUS_LABEL } from "../components/ui/StatusBadge";
+import { inCancelZone } from "./calendarDrag";
+import { CHANGELOG } from "./changelog";
 import { HELP } from "./help";
 
 const LABELS = Object.values(STATUS_LABEL);
@@ -127,5 +129,34 @@ describe("the Local AI tab's help", () => {
     const body = HELP["settings-localai-lifecycle"].body;
     expect(body).not.toMatch(/Only Ollama can unload/);
     expect(body).toMatch(/PM can only ask Ollama to unload a model/);
+  });
+});
+
+// The calendar's drag (#884, PR C): help and What's New say what it does, not more.
+describe("calendar help agrees with the drag and its Undo", () => {
+  const said = [HELP["calendar-view"].body, ...CHANGELOG.flatMap((e) => e.highlights)];
+
+  it("puts an event back only where letting go does", () => {
+    // Beside or above the calendar puts it back; below scrolls and drops, so "outside" says more.
+    const box = { left: 0, top: 0, right: 100, bottom: 100 };
+    expect([
+      inCancelZone(box, -1, 50),
+      inCancelZone(box, 100, 50),
+      inCancelZone(box, 50, -1),
+    ]).toEqual([true, true, true]);
+    expect(inCancelZone(box, 50, 150)).toBe(false);
+    for (const text of said) expect(text).not.toMatch(/let(ting)? go outside the calendar/);
+    expect(HELP["calendar-view"].body).toMatch(/letting go beside or above the calendar/);
+  });
+
+  it("offers Undo after a save only where the backend does", () => {
+    // One event or one occurrence, and never after a change to the guests, what they may do (the
+    // backend's Undo leaves the permissions out) or the repeat.
+    const saves = said.filter((t) => /After a save|works after saving/.test(t));
+    expect(saves.length).toBeGreaterThan(0);
+    for (const text of saves) {
+      expect(text).toMatch(/one event,? or (of )?one occurrence/);
+      expect(text).toMatch(/guests, what they may do, or how (it|the event) repeats/);
+    }
   });
 });

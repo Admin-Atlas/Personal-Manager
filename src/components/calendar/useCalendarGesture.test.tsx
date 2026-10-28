@@ -493,8 +493,10 @@ describe("useCalendarGesture: putting it back", () => {
     expect(onCommit).not.toHaveBeenCalled();
   });
 
-  it("letting go above the calendar puts it back; below it doesn't", () => {
+  it("letting go above the calendar puts it back; below it drops at the hours' bottom edge", () => {
     const { onCommit } = mount();
+    // The hours don't scroll here, so their bottom edge (y 600) stays 12:30.
+    Object.defineProperty(screen.getByTestId("body"), "scrollTop", { get: () => 0, set: () => {} });
     dragGymOver();
     release(600, -5);
     expect(onCommit).not.toHaveBeenCalled();
@@ -502,6 +504,13 @@ describe("useCalendarGesture: putting it back", () => {
     moveTo(600, 640);
     release(600, 640);
     expect(onCommit).toHaveBeenCalledTimes(1);
+    // Pressed at 09:30, let go 40 px below the hours: the pressed point lands on the edge on screen
+    // (12:30), never on the 13:30 out of sight under the pointer.
+    expect(onCommit.mock.calls[0][0].to).toEqual({
+      kind: "timed",
+      start: { day: D2, min: 720 },
+      end: { day: D2, min: 780 },
+    });
   });
 
   it("every listener goes on unmount mid-drag", () => {
@@ -959,6 +968,53 @@ describe("useCalendarGesture: creating", () => {
     expect(capture).not.toHaveBeenCalled();
   });
 
+  it("the mouse events a tap that created is followed by never reach quick create", () => {
+    const { onCreate } = mount(creates);
+    const col = screen.getByTestId("col2");
+    // Quick create, open once a tap has created: a mousedown outside it closes it while untitled.
+    const outside = vi.fn();
+    const clicked = vi.fn();
+    col.addEventListener("click", clicked);
+    const tap = () => {
+      press(col, 600, 300, { pointerType: "touch" });
+      fireEvent.pointerUp(document.body, at(600, 300, { buttons: 0, pointerType: "touch" }));
+      window.addEventListener("mousedown", outside);
+    };
+    // The browser's mouse events for the tap, at the same spot.
+    const followUp = () => {
+      fireEvent.mouseDown(col, { clientX: 600, clientY: 300 });
+      fireEvent.mouseUp(col, { clientX: 600, clientY: 300 });
+      fireEvent.click(col, { clientX: 600, clientY: 300 });
+    };
+    try {
+      tap();
+      expect(onCreate).toHaveBeenCalledTimes(1);
+      followUp();
+      expect(outside).not.toHaveBeenCalled();
+      expect(clicked).not.toHaveBeenCalled();
+      // The next press is the user's own, and its mousedown closes it as ever.
+      press(screen.getByTestId("col1"), 200, 300);
+      fireEvent.mouseDown(screen.getByTestId("col1"), { clientX: 200, clientY: 300 });
+      expect(outside).toHaveBeenCalledTimes(1);
+      release(200, 300);
+      // So does any mousedown a moment after a tap.
+      tap();
+      act(() => {
+        vi.advanceTimersByTime(800);
+      });
+      fireEvent.mouseDown(col, { clientX: 600, clientY: 300 });
+      expect(outside).toHaveBeenCalledTimes(2);
+      // A mouse click that creates eats nothing.
+      press(col, 600, 300);
+      release(600, 300);
+      followUp();
+      expect(outside).toHaveBeenCalledTimes(3);
+      expect(clicked).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener("mousedown", outside);
+    }
+  });
+
   it("the all-day row creates all day, on the day clicked", () => {
     const { onCreate } = mount(creates);
     press(screen.getByTestId("band"), 600, 70);
@@ -999,6 +1055,23 @@ describe("useCalendarGesture: creating", () => {
     }
     expect(onCreate).not.toHaveBeenCalled();
     expect(capture).not.toHaveBeenCalled();
+  });
+
+  it("Month's days are the weeks' width, less a scrollbar that takes room", () => {
+    const { onCreate } = mountMonth(creates);
+    // A 14 px scrollbar: the seven days share 686 px, so Sunday starts at 588.
+    Object.defineProperty(screen.getByTestId("stream"), "clientWidth", { value: 686 });
+    press(screen.getByTestId("stream"), 590, 60);
+    release(590, 60);
+    expect(onCreate.mock.calls[0][0].timing).toEqual({
+      kind: "all_day",
+      first: "2026-10-18",
+      last: "2026-10-18",
+    });
+    // Over the scrollbar itself: still Sunday, never past it.
+    press(screen.getByTestId("stream"), 695, 60);
+    release(695, 60);
+    expect(onCreate.mock.calls[1][0].timing).toMatchObject({ first: "2026-10-18" });
   });
 });
 

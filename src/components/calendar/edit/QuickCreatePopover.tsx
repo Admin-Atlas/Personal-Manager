@@ -55,6 +55,7 @@ import {
   endTimeChoices,
   followStart,
   halfInstant,
+  newEventLength,
   switchNewKind,
   toNewEvent,
   type EditorFields,
@@ -206,8 +207,13 @@ export function QuickCreatePopover({
   // what's wrong with it.
   const dateId = dateFieldId(useId(), "start");
   const refusedLineId = `${dateId}-refused`;
-  // The event's length, kept while its start moves: the account's default to begin with.
-  const lengthRef = useRef(lengthFor(overview, targetById(targets, firstCalendar)));
+  // The event's length, kept while its start moves or it goes all day and back: its own to begin
+  // with (a range dragged on the grid is the user's, C17), else the account's default.
+  const lengthRef = useRef(
+    newEventLength(startDraft) ??
+      newEventLength(seed) ??
+      lengthFor(overview, targetById(targets, firstCalendar)),
+  );
   // Whether the user has changed the time (or dragged it out on the grid): until then, another
   // calendar brings its own length.
   const timeTouched = useRef(resume?.timeTouched ?? timeChosen);

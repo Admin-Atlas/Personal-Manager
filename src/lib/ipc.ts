@@ -1145,8 +1145,8 @@ export const rescheduleCalendarEvent = (
   asked: GuestNotice | null = null,
 ) => invoke<WriteOutcome>("reschedule_calendar_event", { request, scope, choice, notify, asked });
 
-/** Put back what a move just changed, by the token its Undo offer named: only while Google still
- *  holds what the move left, emailing whom the move did. Outcomes come back as data. */
+/** Put back what a move or an editor's save just changed, by the token its Undo offer named: only
+ *  while Google still holds what that write left, emailing whom it did. Outcomes come back as data. */
 export const undoCalendarChange = (undoToken: string) =>
   invoke<WriteOutcome>("undo_calendar_change", { undoToken });
 

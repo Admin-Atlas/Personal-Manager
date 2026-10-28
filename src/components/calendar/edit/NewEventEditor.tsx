@@ -67,6 +67,7 @@ import {
   guestNotice,
   halfInstant,
   hasBadDate,
+  newEventLength,
   refusedDateId,
   remindersAfterKindSwitch,
   switchNewKind,
@@ -229,8 +230,14 @@ export function NewEventEditor({
   };
   // The When fields' own, so a save a refusal stops can find the date field it names.
   const whenId = useId();
-  // The event's length, kept while its start moves: the account's default to begin with.
-  const lengthRef = useRef(lengthFor(overview, targetById(targets, startCalendar)));
+  // The event's length, kept while its start moves or it goes all day and back: its own to begin
+  // with (a range dragged on the grid, or quick create's, is the user's, C17), else the account's
+  // default.
+  const lengthRef = useRef(
+    newEventLength(startDraft) ??
+      newEventLength(seed) ??
+      lengthFor(overview, targetById(targets, startCalendar)),
+  );
   // Whether the user has changed the time: until then, another calendar brings its own length.
   const timeTouched = useRef(handover?.timeTouched ?? false);
   // Whether the user has picked Show as: until then, it follows the kind (all day free).

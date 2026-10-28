@@ -253,11 +253,20 @@ describe("targets", () => {
     // The day headers above the strip count as the strip.
     expect(resolveTimeGridTarget(GRID, 200, 30)).toEqual({ zone: "band", day: D });
     expect(resolveTimeGridTarget(GRID, 200, 140)).toEqual({ zone: "timed", day: D, minute: 540 });
-    // Below the body: past the viewport (auto-scroll shows it), never past the day.
-    expect(resolveTimeGridTarget(GRID, 200, 720)).toEqual({ zone: "timed", day: D, minute: 1410 });
-    expect(resolveTimeGridTarget(GRID, 200, 760)).toEqual({ zone: "timed", day: D, minute: 1440 });
+    // Below the body: its bottom edge on screen (23:00 here), never a time out of sight, however
+    // far below; auto-scroll moves that edge on.
+    expect(resolveTimeGridTarget(GRID, 200, 720)).toEqual({ zone: "timed", day: D, minute: 1380 });
+    expect(resolveTimeGridTarget(GRID, 200, 760)).toEqual({ zone: "timed", day: D, minute: 1380 });
     // Below the wrapper isn't the cancel zone, and still stays in the column's day.
     expect(resolveTimeGridTarget(GRID, 200, 2000)).toEqual({
+      zone: "timed",
+      day: D,
+      minute: 1380,
+    });
+    // Scrolled to the end, the bottom edge is the day's end, and never past it.
+    const end = { ...GRID, scrollTop: 360 };
+    expect(resolveTimeGridTarget(end, 200, 2000)).toEqual({ zone: "timed", day: D, minute: 1440 });
+    expect(resolveTimeGridTarget({ ...GRID, scrollTop: 400 }, 200, 2000)).toEqual({
       zone: "timed",
       day: D,
       minute: 1440,

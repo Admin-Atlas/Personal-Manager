@@ -636,6 +636,17 @@ describe("NewEventEditor", () => {
     expect(createEvent).not.toHaveBeenCalled();
   });
 
+  // C17: an hour dragged on the grid, handed over on Work (whose account makes half-hour events),
+  // keeps its hour through All day and back.
+  it("a handed-over range keeps its length through All day and back", () => {
+    open({ handover: handed(seed, { calendarId: WORK_CAL, timeTouched: true }) });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.queryByLabelText("End time")).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("10:00");
+  });
+
   it("a retry token handed over opens locked on Check again under the same token", async () => {
     createEvent.mockResolvedValue(saved);
     const sent = sentFor("Dentist");

@@ -752,6 +752,17 @@ export const NEW_EVENT_BASE: EditorFields = {
   visibility: "default",
 };
 
+/** How long a new event's draft lasts, in ms, for the creating boxes to keep while its start moves
+ *  or it switches to all day and back: its own length when timed and a minute or more (a range
+ *  dragged on the grid is the user's, C17), else `null`. */
+export function newEventLength(d: EditorFields): number | null {
+  const t = d.time;
+  if (t.kind !== "timed") return null;
+  const s = halfInstant(NEW_EVENT_BASE, t, "start");
+  const e = halfInstant(NEW_EVENT_BASE, t, "end");
+  return s !== null && e !== null && e - s >= 60_000 ? e - s : null;
+}
+
 const hhmm = (minutes: number) =>
   `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 

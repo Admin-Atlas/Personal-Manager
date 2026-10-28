@@ -2164,6 +2164,48 @@ describe("moving an event", () => {
     expect(rescheduleCalendarEvent).not.toHaveBeenCalled();
   });
 
+  // C1-L10: a second drag of a move that landed, taken back or refused with Google's copy left as
+  // the first move made it, leaves the first move as it was: still drawn where it went, and the other
+  // account's copy still hidden at the old time.
+  it("a second drag taken back or refused leaves the first move as it was", async () => {
+    rescheduleCalendarEvent
+      .mockResolvedValueOnce(saved("u1"))
+      .mockResolvedValueOnce({ outcome: "busy" })
+      .mockResolvedValueOnce({ outcome: "conflict", fields: ["start"] });
+    const { mod, hook, act, drop } = await loadMove();
+    act(() => void mod.beginMove(drop));
+    await act(() => mod.moveEvent(drop, null, null, null));
+    const writes = () => hook.result.current.writes;
+    const first = { moves: writes().moves, twins: writes().twins };
+    expect(first.moves.get(withUid.id)).toMatchObject({ timing: to, phase: "landed" });
+    expect(first.twins.size).toBe(1);
+    // Dragged again before any read: Back.
+    const again = mod.dropOf(withUid, to, later, false);
+    act(() => void mod.beginMove(again));
+    expect(writes().moves.get(withUid.id)?.phase).toBe("asking");
+    act(() => mod.cancelMove(withUid.id));
+    expect(writes().moves).toEqual(first.moves);
+    expect(writes().twins).toEqual(first.twins);
+    // Dragged again, and Google is busy: nothing reached it.
+    act(() => void mod.beginMove(again));
+    await act(() => mod.moveEvent(again, null, null, null));
+    expect(writes().moves).toEqual(first.moves);
+    expect(writes().twins).toEqual(first.twins);
+    // Once read at its new time, the row hides its new occurrence too; a second drag taken back
+    // leaves the first move's hiding alone and takes only its own off.
+    const atTen = { ...withUid, start: "2026-10-12T10:00:00Z", end: "2026-10-12T11:00:00Z" };
+    const fromTen = mod.dropOf(atTen, to, later, false);
+    act(() => void mod.beginMove(fromTen));
+    expect(writes().twins.size).toBe(2);
+    act(() => mod.cancelMove(withUid.id));
+    expect(writes().twins).toEqual(first.twins);
+    // Refused because Google's copy changed since: none of the first move's drawing stays.
+    act(() => void mod.beginMove(again));
+    await act(() => mod.moveEvent(again, null, null, null));
+    expect(writes().moves.size).toBe(0);
+    expect(writes().twins.size).toBe(0);
+  });
+
   it("needs_choice puts no notice, and the drop waits for its flow again", async () => {
     rescheduleCalendarEvent.mockResolvedValue({ outcome: "needs_choice", scope: true });
     const { mod, hook, act, reads, drop } = await loadMove();
@@ -2260,7 +2302,11 @@ describe("moving an event", () => {
     await act(() => mod.moveEvent(drop, null, null, null));
     await act(() => mod.undoChange("u1"));
     expect(hook.result.current.writes.notices[0].undoToken).toBe("u1");
-    expect(hook.result.current.writes.moves.size).toBe(0);
+    // Nothing was sent, and no read has the move yet: still drawn where the move put it.
+    expect(hook.result.current.writes.moves.get(withUid.id)).toMatchObject({
+      timing: to,
+      phase: "landed",
+    });
     await act(async () => {
       mod.undo("u1", "change");
     });
