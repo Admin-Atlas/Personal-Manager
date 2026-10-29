@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.159.1-alpha",
+    date: "2026-10-29",
+    highlights: [
+      "Open data folder no longer freezes PM. On some Linux desktops, PM used to stop responding until you closed the file manager it had opened; now it stays usable while the folder is open.",
+    ],
+  },
+  {
     version: "3.159.0-alpha",
     date: "2026-10-28",
     highlights: [
