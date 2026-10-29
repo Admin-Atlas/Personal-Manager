@@ -51,10 +51,17 @@ pub fn data_locations(app: AppHandle) -> Result<DataLocations> {
 /// Opens the RESOLVED vault root, not this profile's data dir (#712). It used to open the latter,
 /// which is the same folder for an ordinary install and the wrong one for every moved or joined
 /// vault — the case where a user most needs to be shown where their documents went.
+///
+/// On the blocking pool, as `open_url` is: a sync command runs on the main thread, and the launcher
+/// can wait until the file manager it started quits (xdg-open does on a desktop it doesn't know),
+/// which froze PM until then.
 #[tauri::command]
-pub fn open_data_folder(app: AppHandle) -> Result<()> {
-    let dir = vault::resolve(&app)?.vault_root;
-    open::that(dir).map_err(Error::from)
+pub async fn open_data_folder(app: AppHandle) -> Result<()> {
+    spawn_blocking_result("open data folder", move || {
+        let dir = vault::resolve(&app)?.vault_root;
+        open::that(dir).map_err(Error::from)
+    })
+    .await
 }
 
 /// Bundle the user's data into a single `.zip` at `dest_path`: the encrypted store
