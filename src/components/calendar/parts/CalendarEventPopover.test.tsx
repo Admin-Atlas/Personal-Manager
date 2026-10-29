@@ -493,7 +493,15 @@ describe("CalendarEventPopover", () => {
         color="#000"
         milestone={null}
         onClose={() => {}}
-        editing={{ canEdit: true, canDelete: true, reason: null, onEdit, onDelete }}
+        editing={{
+          canEdit: true,
+          canDelete: true,
+          canDuplicate: false,
+          reason: null,
+          onEdit,
+          onDelete,
+          onDuplicate: () => {},
+        }}
       />,
     );
     fireEvent.click(getByRole("button", { name: "Edit" }));
@@ -513,9 +521,11 @@ describe("CalendarEventPopover", () => {
         editing={{
           canEdit: true,
           canDelete: false,
+          canDuplicate: false,
           reason: "Google has locked this event's title, time, place and description.",
           onEdit,
           onDelete,
+          onDuplicate: () => {},
         }}
       />,
     );
@@ -533,15 +543,61 @@ describe("CalendarEventPopover", () => {
         editing={{
           canEdit: false,
           canDelete: false,
+          canDuplicate: false,
           reason: "Someone else organises this event.",
           onEdit,
           onDelete,
+          onDuplicate: () => {},
         }}
       />,
     );
     expect(queryByRole("button", { name: "Edit" })).toBeNull();
     expect(queryByRole("button", { name: "Delete" })).toBeNull();
     expect(getByText("Someone else organises this event.")).toBeTruthy();
+  });
+
+  // C18c: Duplicate sits before Edit, taking the push to the right from whichever came first.
+  it("Duplicate shows only when offered and calls onDuplicate", () => {
+    const onDuplicate = vi.fn();
+    const editing = (canDuplicate: boolean, canEdit: boolean): PopoverEditing => ({
+      canEdit,
+      canDelete: true,
+      canDuplicate,
+      reason: null,
+      onEdit: () => {},
+      onDelete: () => {},
+      onDuplicate,
+    });
+    const shown = (edit: PopoverEditing) => (
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+        editing={edit}
+      />
+    );
+    const { getByRole, queryByRole, rerender } = render(shown(editing(false, true)));
+    expect(queryByRole("button", { name: "Duplicate" })).toBeNull();
+    expect(getByRole("button", { name: "Edit" }).className).toContain("ml-auto");
+    rerender(shown(editing(true, true)));
+    const duplicate = getByRole("button", { name: "Duplicate" });
+    expect(duplicate.className).toContain("ml-auto");
+    expect(getByRole("button", { name: "Edit" }).className).not.toContain("ml-auto");
+    // Before Edit and Delete, in the row's order.
+    const names = Array.from(getByRole("dialog").querySelectorAll("button")).map(
+      (b) => b.textContent,
+    );
+    expect(names.indexOf("Duplicate")).toBeLessThan(names.indexOf("Edit"));
+    fireEvent.click(duplicate);
+    expect(onDuplicate).toHaveBeenCalledOnce();
+    // Nothing to edit: Delete follows Duplicate, which still pushes right.
+    rerender(shown(editing(true, false)));
+    expect(getByRole("button", { name: "Delete" }).className).not.toContain("ml-auto");
+    // Still a non-modal dialog, as the event's details are.
+    expect(getByRole("dialog").getAttribute("aria-modal")).toBeNull();
   });
 
   // A description is shown line by line: the wrapper's class is what index.css gives `pre-line`
@@ -652,9 +708,11 @@ describe("CalendarEventPopover", () => {
     const editing = (rsvp?: PopoverRsvp[]): PopoverEditing => ({
       canEdit: false,
       canDelete: false,
+      canDuplicate: false,
       reason: null,
       onEdit: () => {},
       onDelete: () => {},
+      onDuplicate: () => {},
       rsvp,
     });
     function popover(edit?: PopoverEditing, event = calendarEvent(), onClose = () => {}) {

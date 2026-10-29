@@ -15,6 +15,8 @@ import {
   createReasonFor,
   createTargets,
   defaultTarget,
+  duplicateTarget,
+  guestsOnto,
   lengthFor,
   meetDefault,
   meetOffered,
@@ -322,6 +324,30 @@ describe("createNotes", () => {
     expect(createNotes(day("2028-01-03"), true, o, new Set(), `${ME}:alpha`)).toEqual([
       `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
     ]);
+  });
+});
+
+// --- Duplicate (C18c) ---
+
+describe("duplicateTarget", () => {
+  it("starts a copy on the original's calendar when it takes events, else where a new one would", () => {
+    const t = createTargets(overview());
+    expect(duplicateTarget(t, `${ME}:alpha`, null)?.calendar.name).toBe("Alpha");
+    // Read-only, or another account with editing off: where a new event starts.
+    expect(duplicateTarget(t, `${ME}:holidays`, null)?.calendar.name).toBe("Me");
+    expect(duplicateTarget(t, `${OFF}:off@x.com`, `${ME}:team`)?.calendar.name).toBe("Team");
+    expect(
+      duplicateTarget(createTargets(overview({ calendars: [] })), `${ME}:alpha`, null),
+    ).toBeNull();
+  });
+
+  // Critique C1-L9: the calendar a copy starts on organises it, so its address isn't a guest.
+  it("guestsOnto drops the calendar's own address from a copy's guests", () => {
+    const t = createTargets(overview());
+    const team = targetById(t, `${ME}:team`)!;
+    const guests = [{ email: "a@y.org" }, { email: " Team " }, { email: "b@y.org" }];
+    expect(guestsOnto(guests, team)).toEqual([{ email: "a@y.org" }, { email: "b@y.org" }]);
+    expect(guestsOnto(guests, targetById(t, `${ME}:alpha`)!)).toEqual(guests);
   });
 });
 

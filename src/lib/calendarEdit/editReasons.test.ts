@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  Calendar,
   CalendarEvent,
   CalendarOverview,
   GuestNotice,
@@ -29,6 +30,7 @@ import {
   createReasonText,
   createText,
   deleteText,
+  duplicable,
   emailsGuests,
   endsRetry,
   eventRights,
@@ -1243,6 +1245,31 @@ describe("an event's rights in the calendar", () => {
     ...over,
   });
   const theirs = { organizer_self: false, can_delete: false, can_respond: true };
+
+  // C18c: any Google event of the ordinary kind whose details the account can read, editing on or
+  // not and whoever organises it.
+  it("duplicable: a Google event PM can read, of the ordinary kind", () => {
+    const calendar = (provider: string, access_role: string | null) =>
+      ({ id: CAL, provider, access_role }) as unknown as Calendar;
+    const rows: [string, CalendarEvent, Calendar | undefined, boolean][] = [
+      ["owner", row({}), calendar("google", "owner"), true],
+      ["writer", row({}), calendar("google", "writer"), true],
+      ["no private access", row({}), calendar("google", "writerWithoutPrivateAccess"), true],
+      ["reader", row({}), calendar("google", "reader"), true],
+      ["invitation", row(theirs), calendar("google", "owner"), true],
+      ["free/busy reader", row({}), calendar("google", "freeBusyReader"), false],
+      ["no role", row({}), calendar("google", null), false],
+      ["birthday", row({ event_type: "birthday" }), calendar("google", "owner"), false],
+      ["Gmail", row({ event_type: "fromGmail" }), calendar("google", "owner"), false],
+      ["kind unset", row({ event_type: null }), calendar("google", "owner"), true],
+      ["iCal", row({}), calendar("ical", "reader"), false],
+      ["Outlook", row({}), calendar("microsoft", "owner"), false],
+      ["no calendar", row({}), undefined, false],
+    ];
+    for (const [name, ev, cal, want] of rows) {
+      expect([name, duplicable(ev, cal)]).toEqual([name, want]);
+    }
+  });
 
   it("offers a drag exactly where the list says the time may change", () => {
     const on = overview("on");

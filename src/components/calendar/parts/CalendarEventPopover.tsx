@@ -77,10 +77,13 @@ export interface PopoverEditing {
   canEdit: boolean;
   /** Offer Delete. */
   canDelete: boolean;
+  /** Offer Duplicate (C18c): a copy the user can change before it's created, on any calendar. */
+  canDuplicate: boolean;
   /** Why the event can't be changed, or a part of it, when that's so; a line under the actions. */
   reason: string | null;
   onEdit: () => void;
   onDelete: () => void;
+  onDuplicate: () => void;
   /** Copies the user can reply from, the one shown first (C14b). Empty or absent: no reply strip. */
   rsvp?: readonly PopoverRsvp[];
 }
@@ -464,11 +467,27 @@ export function CalendarEventPopover({
             Open in Project
           </Button>
         )}
+        {/* Duplicate first of the event's own actions, taking the row's push to the right from
+            whichever comes first (critique C2-L6). */}
+        {editing?.canDuplicate && (
+          <Button
+            variant="tertiary"
+            size="sm"
+            className="ml-auto"
+            onClick={() => {
+              // As Edit below: focus back to the chip, for what opens next to return it there.
+              restoreFocus();
+              editing.onDuplicate();
+            }}
+          >
+            Duplicate
+          </Button>
+        )}
         {editing?.canEdit && (
           <Button
             variant="primary"
             size="sm"
-            className="ml-auto"
+            className={editing.canDuplicate ? undefined : "ml-auto"}
             onClick={() => {
               // As Delete below: focus back to the chip, for the editor to return it there.
               restoreFocus();
@@ -482,7 +501,7 @@ export function CalendarEventPopover({
           <Button
             variant="danger"
             size="sm"
-            className={editing.canEdit ? undefined : "ml-auto"}
+            className={editing.canEdit || editing.canDuplicate ? undefined : "ml-auto"}
             onClick={() => {
               // Back to the event's chip first, so the delete dialog that opens next returns
               // focus there when it closes, rather than to this button, which is about to go.

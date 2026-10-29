@@ -36,7 +36,11 @@ import type {
   WriteOutcome,
 } from "../../../lib/types";
 import { CREATE_LOST } from "../../../lib/calendarEdit/editReasons";
-import { toNewEvent, type EditorFields } from "../../../lib/calendarEdit/eventDraft";
+import {
+  COPY_CALL_NOTE,
+  toNewEvent,
+  type EditorFields,
+} from "../../../lib/calendarEdit/eventDraft";
 import { createTargets } from "../../../lib/calendarEdit/createTargets";
 import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import type { CreateAnswer } from "./useEventWrites";
@@ -81,7 +85,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
-import { NewEventEditor, type CreateHandover } from "./NewEventEditor";
+import { NewEventEditor, type CopyOf, type CreateHandover } from "./NewEventEditor";
 
 const ME = "gcal:me@x.com";
 const WORK = "gcal:work@x.com";
@@ -263,13 +267,15 @@ function open(
     strict?: boolean;
     suggestions?: GuestSuggestion[];
     overview?: CalendarOverview;
+    /** A copy to open on (Duplicate, C18c), its fields the seed. */
+    copy?: { fields: EditorFields; of: CopyOf };
   } = {},
 ) {
   const onClose = over.onClose ?? vi.fn();
   const shown = over.overview ?? overview;
   const editor = (
     <NewEventEditor
-      seed={seed}
+      seed={over.copy?.fields ?? seed}
       targets={createTargets(shown)}
       calendarId={over.calendarId ?? PERSONAL}
       overview={shown}
@@ -278,6 +284,7 @@ function open(
       colorOf={() => "var(--accent)"}
       shapeOf={() => undefined}
       handover={over.handover}
+      copyOf={over.copy?.of}
       onClose={onClose}
     />
   );
@@ -2281,5 +2288,117 @@ describe("NewEventEditor video call (C18b)", () => {
     expect(meetAsked()).toBe(false);
     addGuest("b@example.org");
     expect(meetAsked()).toBe(true);
+  });
+});
+
+// --- a copy of an event (Duplicate, C18c) ---
+
+/** A copy of "Retro" with `fields` over the seed's, and what it says. */
+const copyOf = (
+  fields: Partial<EditorFields> = {},
+  of: Partial<CopyOf> = {},
+): { fields: EditorFields; of: CopyOf } => ({
+  fields: { ...seed, summary: "Retro", location: "Room 2", ...fields },
+  of: { title: "Retro", notes: [], callNote: null, formatted: false, ...of },
+});
+
+const guestOf = (email: string): EditorFields["guests"][number] => ({
+  email,
+  name: null,
+  response: null,
+  optional: false,
+  organizer: false,
+  self: false,
+  room: false,
+});
+
+describe("NewEventEditor opened on a copy (C18c)", () => {
+  it("a copy says what it copies and what it doesn't", () => {
+    open({
+      copy: copyOf(
+        {},
+        {
+          notes: [
+            "The original repeats (Weekly on Monday); the copy doesn't. Choose Repeat to set it.",
+          ],
+        },
+      ),
+    });
+    const dialog = screen.getByRole("dialog", { name: "New event" });
+    expect(within(dialog).getByText("A copy of “Retro”.")).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        "The original repeats (Weekly on Monday); the copy doesn't. Choose Repeat to set it.",
+      ),
+    ).toBeTruthy();
+    expect(title().value).toBe("Retro");
+  });
+
+  // Google's Duplicate makes no video call whatever the setting (Workspace admin help 9898950).
+  it("a copy's call starts off even when the setting is on, and says why", () => {
+    open({
+      overview: meetOverview(),
+      copy: copyOf({ guests: [guestOf("b@example.org")] }, { callNote: COPY_CALL_NOTE }),
+    });
+    expect(meetAsked()).toBe(false);
+    expect(within(videoCall()).getByText(COPY_CALL_NOTE)).toBeTruthy();
+    addGuest("c@example.org");
+    pickCalendar("Personal", "Work");
+    pickCalendar("Work", "Personal");
+    expect(meetAsked(), "neither a guest nor a calendar turns it on").toBe(false);
+    fireEvent.click(addMeet());
+    expect(meetAsked()).toBe(true);
+    expect(within(videoCall()).queryByText(COPY_CALL_NOTE)).toBeNull();
+  });
+
+  it("closing an untouched copy asks nothing and sends nothing", () => {
+    const { onClose } = open({ copy: copyOf({ guests: [guestOf("b@example.org")] }) });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Discard this new event?" })).toBeNull();
+    expect(onClose).toHaveBeenCalled();
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  // C12d's question: Google invites the copy's guests only once the user says whether it emails.
+  it("a copy with guests asks Send / Don't send before creating", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ copy: copyOf({ guests: [guestOf("b@example.org")] }) });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send invitation emails to guests?" });
+    expect(createEvent).not.toHaveBeenCalled();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1]).toMatchObject({
+      summary: "Retro",
+      location: "Room 2",
+      guests: [{ email: "b@example.org", optional: false }],
+      meet: false,
+    });
+    expect(createEvent.mock.calls[0][3]).toEqual({ notify: "none", asked: ONE_INVITED });
+  });
+
+  // Q13: Duplicate is the way to another account's calendar.
+  it("a copy can go to another account's calendar", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ copy: copyOf() });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][0]).toBe(WORK_CAL);
+    expect(createEvent.mock.calls[0][1].summary).toBe("Retro");
+  });
+
+  // Critique C2-L12: a formatted description goes as Google holds it, shown as its text, read-only.
+  it("a formatted description is shown as text and sent unchanged", async () => {
+    createEvent.mockResolvedValue(saved);
+    const html = "<b>Bring</b> the form";
+    const { onClose } = open({ copy: copyOf({ description: html }, { formatted: true }) });
+    expect(screen.queryByLabelText("Description")).toBeNull();
+    expect(screen.getByText("Bring the form")).toBeTruthy();
+    expect(document.querySelector("b")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe(html);
   });
 });

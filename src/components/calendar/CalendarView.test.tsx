@@ -26,6 +26,7 @@ import type {
 } from "../../lib/types";
 import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-layout";
 import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
+import { COPY_CALL_NOTE } from "../../lib/calendarEdit/eventDraft";
 import { formatDateLocal, pad2 } from "../../lib/format";
 
 const ipc = vi.hoisted(() => ({
@@ -944,5 +945,121 @@ describe("CalendarView: invitations", () => {
         "Your reply to “Standup”: Google is busy right now. Reply again in a moment.",
       ),
     ).toBeTruthy();
+  });
+});
+
+// Duplicate (#884, C18c): from the details, the original is read from Google afresh and the full
+// editor opens on its copy; closing it puts focus back on the original's chip.
+describe("CalendarView: Duplicate", () => {
+  const chip = () => screen.getByRole("button", { name: /Standup/ });
+  const original: EventForEdit = {
+    summary: "Standup",
+    location: "Room 2",
+    description: "",
+    description_html: false,
+    time: {
+      kind: "timed",
+      start_date: today,
+      start_time: "07:00",
+      start_zone: "Europe/London",
+      end_date: today,
+      end_time: "07:30",
+      end_zone: "Europe/London",
+    },
+    start_at: `${today}T06:00:00Z`,
+    end_at: `${today}T06:30:00Z`,
+    show_as: "busy",
+    visibility: "default",
+    attachments: [],
+    html_link: null,
+    guests: [],
+    guests_can_modify: false,
+    guests_can_invite_others: true,
+    guests_can_see_other_guests: true,
+    guests_omitted: false,
+    organizer_email: "me@x.com",
+    reminders: { use_default: true, overrides: [] },
+    color_id: null,
+    label_id: null,
+    reply: null,
+    organizer_self: true,
+    call: { kind: "meet", name: "Google Meet", join: "https://meet.google.com/x", state: "ready" },
+    meet_offered: true,
+  };
+  const load: EditLoad = {
+    outcome: "ready",
+    session: "s1",
+    event: original,
+    permissions: {
+      summary: true,
+      time: true,
+      repeat: true,
+      location: true,
+      description: true,
+      show_as: true,
+      visibility: true,
+      guests: true,
+      reminders: true,
+      colour: true,
+      meet: true,
+      delete: true,
+      respond: false,
+      reasons: [],
+    },
+    seen: null,
+    series: null,
+  };
+
+  it("opens the full editor on a copy, which says what it leaves out, and focus goes back to the original", async () => {
+    // The original has a linked milestone, which stays with it.
+    ipc.listAllMilestones.mockResolvedValue([{ ...milestone, event_uid: "u1" }]);
+    ipc.getCalendarEventForEdit.mockResolvedValue(load);
+    await mount();
+    // A click focuses the chip, as the app's webviews do; the details hand focus back to it.
+    act(() => chip().focus());
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate" }));
+    const editor = await screen.findByRole("dialog", { name: "New event" });
+    expect(ipc.getCalendarEventForEdit).toHaveBeenCalledOnce();
+    expect(within(editor).getByText("A copy of “Standup”.")).toBeTruthy();
+    expect(
+      within(editor).getByText("The “Plant bulbs” milestone stays linked to the original."),
+    ).toBeTruthy();
+    expect(within(editor).getByText(COPY_CALL_NOTE)).toBeTruthy();
+    expect(within(editor).getByLabelText<HTMLInputElement>("Title").value).toBe("Standup");
+    // On the original's calendar, which takes new events.
+    expect(within(editor).getByRole("button", { name: "Calendar: Personal" })).toBeTruthy();
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "New event" })).toBeNull();
+    expect(ipc.createCalendarEvent).not.toHaveBeenCalled();
+    // Critique C2-M9: the copy's editor opened from the copying dialog, which is gone.
+    await waitFor(() => expect(document.activeElement).toBe(chip()));
+  });
+
+  it("is offered on a calendar that's only read, onto one that takes new events", async () => {
+    rows = [row({ calendar_id: `${ME}:holidays` })];
+    const withHolidays: CalendarOverview = {
+      ...overview,
+      calendars: [
+        ...overview.calendars,
+        calendar("holidays", { name: "Holidays", access_role: "reader" }),
+      ],
+    };
+    ipc.calendarOverview.mockResolvedValue(withHolidays);
+    ipc.getCalendarEventForEdit.mockResolvedValue(load);
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate" }));
+    const editor = await screen.findByRole("dialog", { name: "New event" });
+    // A reader calendar takes no new event: the copy starts where a new one would.
+    expect(within(editor).getByRole("button", { name: "Calendar: Personal" })).toBeTruthy();
+  });
+
+  it("isn't offered without a calendar to put the copy on", async () => {
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    await mount();
+    fireEvent.click(chip());
+    await screen.findByRole("dialog");
+    expect(screen.queryByRole("button", { name: "Duplicate" })).toBeNull();
   });
 });

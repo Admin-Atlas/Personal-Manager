@@ -8,6 +8,7 @@
 import type { Tone as CalloutTone } from "../../components/ui/tone";
 import { formatDateOnly } from "../format";
 import type {
+  Calendar,
   CalendarEvent,
   CalendarOverview,
   EditLoad,
@@ -160,6 +161,27 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
     canRetime: ev.can_retime === true,
     reason,
   };
+}
+
+/** The roles whose calendars show an event's details, which a copy is made from: a busy-only
+ *  calendar (`freeBusyReader`) shows none. */
+const READABLE_ROLES: readonly string[] = [
+  "owner",
+  "writer",
+  "writerWithoutPrivateAccess",
+  "reader",
+];
+
+/** Whether PM can copy `ev` (Duplicate, C18c): a Google event of the ordinary kind on a calendar
+ *  whose details the account can read, editing on or not, since the copy is read afresh and made on
+ *  a calendar of the user's choosing. Birthdays and Gmail events aren't copied (C20 makes their own
+ *  fields editable, not copyable). The view also needs a calendar to put the copy on. */
+export function duplicable(ev: CalendarEvent, calendar: Calendar | undefined | null): boolean {
+  return (
+    calendar?.provider === "google" &&
+    READABLE_ROLES.includes(calendar.access_role ?? "") &&
+    (ev.event_type ?? "default") === "default"
+  );
 }
 
 /** The calendar's dedup rank for one copy of an occurrence two accounts both show (C14 §9.5): the

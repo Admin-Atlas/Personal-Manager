@@ -47,6 +47,12 @@
 // guest when the account's "Automatically add Google Meet video conferences to events I create" is
 // on, off again when no guest is left (`meetDefault`), and another calendar decides it afresh.
 // Touched, it stays, except on a calendar without Meet, which turns it off and says so.
+//
+// It can open on a copy of an event (Duplicate, C18c, `copyOf`): the copy's fields are the seed, so
+// closing it unchanged asks nothing and sends nothing; a line under the bar says what it copies and
+// what it doesn't. Its call starts off and stays so until pressed, whatever the setting, as Google's
+// Duplicate makes none; a formatted description is copied unchanged and shown read-only, as the
+// editor of an existing event shows one.
 
 import {
   useCallback,
@@ -82,6 +88,7 @@ import {
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
 import { kindNoteText, type KindSwitchNote } from "../../../lib/calendarEdit/reminders";
+import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import {
   ambiguousText,
   CALLOUT_TONE,
@@ -150,7 +157,18 @@ interface Props {
    *  locked on Check again under the same token, the words of a token that ended unproven, and a
    *  date its field couldn't read, still refusing. */
   handover?: CreateHandover;
+  /** A copy of an event (Duplicate, C18c): `seed` holds its fields. */
+  copyOf?: CopyOf;
   onClose: () => void;
+}
+
+/** What the editor says of a copy it opens on (C18c): the original's title and what the copy leaves
+ *  out (`EventCopy`, the fields aside). */
+export interface CopyOf {
+  title: string;
+  notes: string[];
+  callNote: string | null;
+  formatted: boolean;
 }
 
 /** What quick create hands the full editor (C10c): nothing is sent on the way. */
@@ -220,6 +238,7 @@ export function NewEventEditor({
   shapeOf,
   focusRef,
   handover,
+  copyOf,
   onClose,
 }: Props) {
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
@@ -255,10 +274,13 @@ export function NewEventEditor({
   // Whether the user has picked Show as: until then, it follows the kind (all day free).
   const showAsTouched = useRef(handover?.showAsTouched ?? false);
   // Whether the user has pressed the video-call row (here or in quick create): until then, it
-  // follows Google's setting and the guest list (`meetDefault`).
-  const meetTouched = useRef(handover?.meetTouched ?? false);
+  // follows Google's setting and the guest list (`meetDefault`). A copy starts as pressed: Google's
+  // Duplicate ignores the setting (Workspace admin help 9898950).
+  const meetTouched = useRef(handover?.meetTouched ?? copyOf !== undefined);
   // Another calendar turned the call off, offering no Meet: said under the row until it next changes.
   const [meetNote, setMeetNote] = useState<string | null>(null);
+  // A copy's word that the original's call isn't copied: under the row until it's pressed.
+  const [copyCallNote, setCopyCallNote] = useState<string | null>(copyOf?.callNote ?? null);
   // Handed over while PM may already have made it: locked on what was sent, saying so; or after a
   // token ended unproven there, still saying that.
   const handedHeld: Held | null = handover?.held
@@ -731,6 +753,7 @@ export function NewEventEditor({
         onClose={requestClose}
         chrome="bar"
         title="New event"
+        subtitle={copyOf ? `A copy of “${copyOf.title.trim() || "(no title)"}”.` : undefined}
         closeLabel="Close"
         closeDisabled={saving}
         widthClassName="max-w-lg"
@@ -762,6 +785,13 @@ export function NewEventEditor({
               {banner.text}
             </Callout>
           )}
+
+          {/* What a copy leaves out of the original (C18c). */}
+          {copyOf?.notes.map((n) => (
+            <p key={n} className="text-xs text-ink3">
+              {n}
+            </p>
+          ))}
 
           <div className="flex flex-col items-start gap-1">
             <span className="text-sm text-ink2">Calendar</span>
@@ -883,10 +913,11 @@ export function NewEventEditor({
             value={draft.meet}
             offered={meetOffered(target)}
             disabled={locked}
-            note={meetNote}
+            note={meetNote ?? copyCallNote}
             onChange={(meet) => {
               meetTouched.current = true;
               setMeetNote(null);
+              setCopyCallNote(null);
               setDraft({ ...draftRef.current, meet });
             }}
           />
@@ -931,13 +962,25 @@ export function NewEventEditor({
             />
           </div>
 
-          <TextRow
-            label="Description"
-            multiline
-            value={draft.description}
-            disabled={locked}
-            onChange={(description) => setDraft({ ...draft, description })}
-          />
+          {copyOf?.formatted ? (
+            // A copy's formatted description goes as Google holds it, its formatting kept, and is
+            // shown as its text, read-only, as the editor of an existing event shows one (C18
+            // critique C2-L12).
+            <div className="flex flex-col gap-1">
+              <span className="text-sm text-ink2">Description</span>
+              <p className="whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
+                {descriptionText(draft.description)}
+              </p>
+            </div>
+          ) : (
+            <TextRow
+              label="Description"
+              multiline
+              value={draft.description}
+              disabled={locked}
+              onChange={(description) => setDraft({ ...draft, description })}
+            />
+          )}
 
           <div className="flex flex-wrap items-center gap-4">
             <ShowAsControl

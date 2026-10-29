@@ -9,8 +9,8 @@
 // whatever the backend says can't change and says why, and saves only the fields the user changed.
 // If the event changed in Google meanwhile on a field this save also sends, nothing is overwritten:
 // the editor reloads Google's copy, keeps the user's other changes, and names the fields where
-// Google's version now shows. A dirty draft asks before it is thrown away (closing, Escape, or
-// Delete).
+// Google's version now shows. A dirty draft asks before it is thrown away (closing, Escape, Delete,
+// or Duplicate, which closes it for a copy read from Google afresh, C18c).
 //
 // Guests (C12): the list, Optional, take off, and the three guest permissions, as Google Calendar
 // has them, with suggestions from people already in the user's calendars. Send or Don't send has no
@@ -179,6 +179,10 @@ interface Props {
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
    *  passed carries what the editor showed (Google's fresh copy), which the delete compares. */
   onDelete?: (row: CalendarEvent) => void;
+  /** Duplicate from the editor (C18c): it closes, and the calendar opens a copy of `row`, read from
+   *  Google afresh. Offered only with `canDuplicate`. */
+  onDuplicate?: (row: CalendarEvent) => void;
+  canDuplicate?: boolean;
   onClose: () => void;
 }
 
@@ -251,6 +255,8 @@ export function EventEditor({
   milestone,
   colorOf,
   onDelete,
+  onDuplicate,
+  canDuplicate = false,
   onClose,
 }: Props) {
   const { showPower } = useDepth();
@@ -279,7 +285,7 @@ export function EventEditor({
   const [saving, setSaving] = useState(false);
   // An earlier save's answer never came: it may be in Google already.
   const [uncertain, setUncertain] = useState(false);
-  const [askDiscard, setAskDiscard] = useState<"close" | "delete" | null>(null);
+  const [askDiscard, setAskDiscard] = useState<"close" | "delete" | "duplicate" | null>(null);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
   // The choices dialog for a repeating event (null = closed).
   const [asking, setAsking] = useState<Asking | null>(null);
@@ -435,6 +441,15 @@ export function EventEditor({
     commitFocused();
     if (isDirty()) setAskDiscard("delete");
     else onDelete(deleteRow());
+  };
+
+  /** Duplicate (C18c): the copy is read from Google afresh, so the row as clicked is enough. Changes
+   *  not saved here are asked about first, as Delete does. */
+  const requestDuplicate = () => {
+    if (!onDuplicate || saving || promptRef.current) return;
+    commitFocused();
+    if (isDirty()) setAskDiscard("duplicate");
+    else onDuplicate(row);
   };
 
   /** A reply from "Going?" (C14c), sent at once and apart from the draft. Once Google holds it the
@@ -885,6 +900,8 @@ export function EventEditor({
   const title = (draft?.summary ?? row.summary).trim() || "(no title)";
   const perms = loaded?.permissions;
   const may = (f: Parameters<typeof canEdit>[1]) => !!perms && canEdit(perms, f) && !saving;
+  // Once Google's copy has opened: an event that couldn't be read can't be copied either.
+  const showDuplicate = canDuplicate && !!onDuplicate && !!loaded;
   const timeOff = deviceZone === null;
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
   // Someone else's event says the reply is the user's only where this copy can send one (C14
@@ -943,9 +960,17 @@ export function EventEditor({
         footer={
           <>
             {perms?.delete && onDelete && (
-              <span className="mr-auto">
+              <span className={showDuplicate ? undefined : "mr-auto"}>
                 <Button variant="danger" onClick={requestDelete} disabled={saving}>
                   Delete
+                </Button>
+              </span>
+            )}
+            {/* After Delete, the left group's last; alone, it takes its place (critique C2-L6). */}
+            {showDuplicate && (
+              <span className="mr-auto">
+                <Button variant="tertiary" onClick={requestDuplicate} disabled={saving}>
+                  Duplicate
                 </Button>
               </span>
             )}
@@ -1266,9 +1291,19 @@ export function EventEditor({
       <ConfirmDialog
         open={askDiscard !== null}
         title={
-          askDiscard === "delete" ? "Discard your changes and delete?" : "Discard your changes?"
+          askDiscard === "delete"
+            ? "Discard your changes and delete?"
+            : askDiscard === "duplicate"
+              ? "Discard your changes and duplicate?"
+              : "Discard your changes?"
         }
-        confirmLabel={askDiscard === "delete" ? "Discard and delete" : "Discard"}
+        confirmLabel={
+          askDiscard === "delete"
+            ? "Discard and delete"
+            : askDiscard === "duplicate"
+              ? "Discard and duplicate"
+              : "Discard"
+        }
         cancelLabel="Keep editing"
         danger
         onClose={() => setAskDiscard(null)}
@@ -1276,6 +1311,7 @@ export function EventEditor({
           const next = askDiscard;
           setAskDiscard(null);
           if (next === "delete" && onDelete) onDelete(deleteRow());
+          else if (next === "duplicate" && onDuplicate) onDuplicate(row);
           else onClose();
         }}
       >

@@ -595,6 +595,71 @@ describe("EventEditor", () => {
     );
   });
 
+  // C18c: Duplicate in the footer's left group, after Delete; the copy is read afresh, so the row is
+  // handed on as clicked. Unsaved changes are asked about first.
+  it("Duplicate from a dirty editor asks first", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onDuplicate = vi.fn();
+    const onDelete = vi.fn();
+    render(
+      <EventEditor
+        row={row}
+        calendar={null}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        onClose={vi.fn()}
+        onDelete={onDelete}
+        onDuplicate={onDuplicate}
+        canDuplicate
+      />,
+    );
+    await screen.findByLabelText("Title");
+    const duplicate = screen.getByRole("button", { name: "Duplicate" });
+    // Delete keeps to the left of it; the last of the left group pushes the rest right.
+    expect(duplicate.parentElement?.className).toBe("mr-auto");
+    expect(screen.getByRole("button", { name: "Delete" }).parentElement?.className).toBe("");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(duplicate);
+    expect(await screen.findByText("Discard your changes and duplicate?")).toBeTruthy();
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard and duplicate" }));
+    expect(onDuplicate).toHaveBeenCalledWith(row);
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it("Duplicate goes at once from a clean editor, and only where offered", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onDuplicate = vi.fn();
+    const editor = (canDuplicate: boolean) => (
+      <EventEditor
+        row={row}
+        calendar={null}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        onClose={vi.fn()}
+        onDuplicate={onDuplicate}
+        canDuplicate={canDuplicate}
+      />
+    );
+    const { rerender } = render(editor(true));
+    await screen.findByLabelText("Title");
+    // No Delete: Duplicate alone takes the left.
+    expect(screen.getByRole("button", { name: "Duplicate" }).parentElement?.className).toBe(
+      "mr-auto",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    expect(onDuplicate).toHaveBeenCalledWith(row);
+    rerender(editor(false));
+    expect(screen.queryByRole("button", { name: "Duplicate" })).toBeNull();
+  });
+
   it("refuses to save a date it couldn't read, rather than dropping it", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     const onClose = await open();

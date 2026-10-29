@@ -969,6 +969,75 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
   return sent;
 }
 
+// --- duplicating an event (C18c) ---
+
+/** A copy of an event, as Duplicate opens it in the full editor's create mode. */
+export interface EventCopy {
+  /** The new event's fields: the original's, as Google's Duplicate copies them. The type is the
+   *  allow-list: nothing outside the editor's fields (PM's notes, a label, the ids) can reach the
+   *  create. */
+  fields: EditorFields;
+  /** What wasn't copied, said under the dialog's bar. */
+  notes: string[];
+  /** Said under the video-call row when the original had a call, which a copy never takes. */
+  callNote: string | null;
+  /** The description is Google's formatted text: copied unchanged and shown read-only, as the
+   *  editor shows one (C18 critique C2-L12). */
+  formatted: boolean;
+}
+
+/** Google's own Duplicate makes no video call ("no video conferencing by default", Workspace admin
+ *  help 9898950): one click adds a new one. */
+export const COPY_CALL_NOTE = "The video call isn't copied. Add a new one if you need it.";
+export const COPY_ATTACHMENTS_NOTE = "Attachments aren't copied: PM can't add attachments yet.";
+export const COPY_GUESTS_NOTE =
+  "The original's guests aren't copied. Add them if this is a meeting.";
+export const COPY_OMITTED_NOTE =
+  "Google didn't send the whole guest list, so the copy has only the guests PM could see.";
+
+/** Said of a copy of an occurrence, which starts as a one-off: `repeats` is how the original
+ *  repeats in Google Calendar's words, null when PM couldn't read it. */
+export const copyRepeatNote = (repeats: string | null): string =>
+  `The original repeats${repeats ? ` (${repeats})` : ""}; the copy doesn't. Choose Repeat to set it.`;
+
+/** Said when the original has a linked milestone, which stays with it (C18 critique C2-M5). */
+export const copyMilestoneNote = (label: string): string =>
+  `The “${label}” milestone stays linked to the original.`;
+
+/** A new event's fields copied from `event` (Google's fresh copy of the row the user chose) and, for
+ *  an occurrence, its repeating event's `series` (`repeating`: the row is one, though PM may not
+ *  have read its series), as Google's Duplicate makes a copy. The title, time, place, description
+ *  (unchanged, formatted or not), busy or free, visibility, notifications, colour and guest
+ *  permissions are the original's. A copy of an event the user organises keeps its guests, all but
+ *  the user's own entry, none of them the organiser, with no replies; a copy of an invitation starts
+ *  with none, since "Don't send" may still put it on their calendars (C18 critique C2-M7, probe
+ *  L-CP5). An occurrence's copy starts as a one-off at that occurrence's time (critiques C1-M4,
+ *  C2-M6: a copied rule's count would start again, and a moved occurrence's copy would jump to the
+ *  rule's day; probe L-CP3). Never a video call, never attachments. */
+export function seedDuplicate(
+  event: EventForEdit,
+  series: SeriesInfo | null,
+  repeating: boolean,
+): EventCopy {
+  const notes: string[] = [];
+  const others = event.guests.filter((g) => !g.self);
+  let guests: GuestDraft[] = [];
+  if (!event.organizer_self) {
+    if (others.length > 0) notes.push(COPY_GUESTS_NOTE);
+  } else {
+    guests = others.map((g) => ({ ...g, organizer: false, response: null }));
+    if (event.guests_omitted) notes.push(COPY_OMITTED_NOTE);
+  }
+  if (repeating || series !== null) notes.push(copyRepeatNote(series?.repeats ?? null));
+  if (event.attachments.length > 0) notes.push(COPY_ATTACHMENTS_NOTE);
+  return {
+    fields: { ...seedDraft(event), guests, meet: false, organizer_email: null },
+    notes,
+    callNote: event.call !== null ? COPY_CALL_NOTE : null,
+    formatted: event.description_html,
+  };
+}
+
 function setField(target: EditorFields, field: EditorField, from: EditorFields) {
   switch (field) {
     case "summary":

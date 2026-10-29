@@ -18,7 +18,7 @@ import { formatDateLocal } from "../format";
 import { wallInstant } from "../wallTime";
 import { DEFAULT_LENGTH_MS, type GuestDraft } from "./eventDraft";
 import type { CreatedWhere } from "./editReasons";
-import { changeNotice } from "./guests";
+import { changeNotice, sameAddress } from "./guests";
 
 /** A calendar a new event may go to, with its account. */
 export interface CreateTarget {
@@ -94,6 +94,28 @@ export function defaultTarget(t: CreateTargets, lastId: string | null): CreateTa
     all[0] ??
     null
   );
+}
+
+/** Where a copy starts (C18c): the original's calendar when a new event can go there, else where a
+ *  new event would (`defaultTarget`). Any account's calendar can be picked after, Duplicate being
+ *  the way to another account (Q13). */
+export function duplicateTarget(
+  t: CreateTargets,
+  calendarId: string,
+  lastId: string | null,
+): CreateTarget | null {
+  return targetById(t, calendarId) ?? defaultTarget(t, lastId);
+}
+
+/** A copy's guests on `target` (C18c): never the calendar's own address, which organises the event
+ *  there and can't be its guest (critique C1-L9). The picker drops it on a later pick too
+ *  (`NewEventEditor`). */
+export function guestsOnto<G extends { email: string }>(
+  guests: readonly G[],
+  target: CreateTarget,
+): G[] {
+  const own = target.calendar.remote_id;
+  return own ? guests.filter((g) => !sameAddress(g.email, own)) : [...guests];
 }
 
 /** The calendar `id` on offer, if it is. */
