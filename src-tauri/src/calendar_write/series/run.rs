@@ -1799,8 +1799,9 @@ mod tests {
         let (_, solo) = this_case();
         assert!(!solo.needs_notify() && Run::new(solo).is_ok());
         // A new event with a guest and nobody's answer, sent or sent again (C12d).
-        let Some(Op::Insert { calendar, id, body }) =
-            create_plan().steps.first().map(|s| s.op.clone())
+        let Some(Op::Insert {
+            calendar, id, body, ..
+        }) = create_plan().steps.first().map(|s| s.op.clone())
         else {
             panic!("a create plan inserts");
         };
@@ -2909,6 +2910,8 @@ mod tests {
                 guests_can_see_other_guests: None,
                 reminders: None,
                 colour: None,
+                meet: false,
+                meet_request: None,
             })
             .unwrap();
         let own = crate::calendar_write::attendees::Own::default();

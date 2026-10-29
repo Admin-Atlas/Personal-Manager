@@ -1019,6 +1019,28 @@ describe("creating an event", () => {
     });
   });
 
+  // C18b: a call the new event asked for that Google is still making is said, and one it didn't
+  // make is a warning that stays.
+  it("says what came of a new event's video call", () => {
+    const here = { name: "Work", hidden: false };
+    expect(createdText("Dentist", made(["call_pending"]), here)).toEqual({
+      tone: "ok",
+      text: "Created “Dentist”. Google is still making the video call; its link shows after a later refresh.",
+    });
+    expect(createdText("Dentist", made(["call_failed"]), here)).toEqual({
+      tone: "warn",
+      text: "Created “Dentist”. Google didn't make the video call. Add it again from Edit, or in Google Calendar.",
+    });
+    expect(createdText("Dentist", made(["mirror_refresh_pending", "call_pending"]), here)).toEqual({
+      tone: "ok",
+      text: "Created “Dentist” in Google. PM's calendar will show it after the next refresh. Google is still making the video call; its link shows after a later refresh.",
+    });
+    expect(createdText("Dentist", made(["call_pending"]), { name: "Work", hidden: true })).toEqual({
+      tone: "warn",
+      text: "Created “Dentist” in Work, which is hidden here. Google is still making the video call; its link shows after a later refresh.",
+    });
+  });
+
   it("never says a create PM may have made wasn't made", () => {
     const ambiguous = createText({ outcome: "ambiguous", retry_token: "ref-1" }, "Dentist", true);
     expect(ambiguous.tone).toBe("warn");

@@ -950,6 +950,10 @@ export interface CalendarOverview {
   /** Google's default length for a new event, in minutes, keyed by account id like `editing`. An
    *  account missing here has none stored yet: a new event then lasts an hour. */
   default_length: Record<string, number>;
+  /** Each Google account's "Automatically add Google Meet video conferences to events I create",
+   *  keyed by account id like `editing` (C18b). An account missing here has none stored yet: a new
+   *  event then starts with no call. */
+  auto_meet: Record<string, boolean>;
 }
 
 /** Calendar editing for one Google account (`calendar_editing::EditingStatus`). `paused` is the
@@ -1782,6 +1786,8 @@ export interface NewEventDraft {
   reminders: RemindersDraft | null;
   /** One of Google's eleven colours (C13): null on the calendar's, and it has none of its own. */
   colour: ColourChoice | null;
+  /** Ask Google for a new Google Meet call (C18b). The backend mints the request's id. */
+  meet: boolean;
 }
 
 // --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---

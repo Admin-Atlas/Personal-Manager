@@ -26,7 +26,8 @@
 // emails no guest.
 //
 // And the video call (C18): whether the event will have a Google Meet call after Save, sent as Add
-// or Remove; Google emails guests about it like any shared field.
+// or Remove; Google emails guests about it like any shared field. A new event sends whether it
+// asks for one (C18b).
 
 import type {
   ColourChoice,
@@ -811,7 +812,8 @@ export function newEventSeed(
     recurrence: ONCE,
     guests: [],
     guest_perms: { ...GOOGLE_PERMS },
-    // No video call until new events can ask for one.
+    // No video call: with the account's setting on, Meet starts with the first guest (C18b,
+    // `meetDefault`), and a new event starts with none.
     meet: false,
     reminders: calendarDefaults(),
     colour: { kind: "calendar" } as const,
@@ -937,7 +939,8 @@ export function followStart(was: EditorFields, next: EditorFields): EditorFields
  *  are who and whether optional, in the order added (never an organiser's or the calendar's own
  *  entry, which only Google writes), and each guest permission goes only where it isn't Google's
  *  own. Its notifications are null on the calendar's defaults, and its colour null on the
- *  calendar's: Google then gives it the calendar's own (INFERRED, E9). */
+ *  calendar's: Google then gives it the calendar's own (INFERRED, E9). Whether it asks for a Meet
+ *  call (C18b): the backend mints the request. */
 export function toNewEvent(draft: EditorFields): NewEventDraft {
   const sent: NewEventDraft = {
     summary: draft.summary,
@@ -953,6 +956,7 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
       .map((g) => ({ email: g.email, optional: g.optional })),
     reminders: draft.reminders.use_default ? null : copyReminders(draft.reminders),
     colour: draft.colour.kind === "calendar" ? null : copyColour(draft.colour),
+    meet: draft.meet,
   };
   const perms = draft.guest_perms;
   if (perms.modify !== GOOGLE_PERMS.modify) sent.guests_can_modify = perms.modify;

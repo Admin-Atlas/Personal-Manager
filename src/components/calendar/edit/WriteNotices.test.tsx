@@ -196,6 +196,7 @@ describe("WriteNotices", () => {
             guests: [],
             reminders: null,
             colour: null,
+            meet: false,
           },
         },
       },

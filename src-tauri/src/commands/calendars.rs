@@ -70,6 +70,26 @@ pub struct CalendarOverview {
     /// Google's default length for a new event, in minutes, keyed by account id (`gcal:<email>`)
     /// like `editing`. An account with none stored is missing: the editor then uses an hour.
     pub default_length: BTreeMap<String, u32>,
+    /// Each Google account's "Automatically add Google Meet video conferences to events I create",
+    /// keyed by account id like `editing` (C18b). An account with none stored is missing: a new
+    /// event then starts with no call.
+    pub auto_meet: BTreeMap<String, bool>,
+}
+
+/// `by_email`'s values (keyed by lowercased address) keyed by the id of each Google account in
+/// `accounts` instead, as the overview's maps are; an account with none stored is left out.
+fn by_account<T: Copy>(
+    accounts: &[calendar::CalendarAccount],
+    by_email: &BTreeMap<String, T>,
+) -> BTreeMap<String, T> {
+    accounts
+        .iter()
+        .filter(|a| a.provider == "google")
+        .filter_map(|a| {
+            let email = a.email.as_deref()?.trim().to_lowercase();
+            Some((a.id.clone(), *by_email.get(&email)?))
+        })
+        .collect()
 }
 
 /// The unified calendar state across every provider. Runs the one-time legacy Google migration first
@@ -78,7 +98,7 @@ pub struct CalendarOverview {
 pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     let _ = migrate_legacy_google_calendar(&app).await;
     let state = app.state::<AppState>();
-    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices, lengths) = {
+    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices, lengths, meets) = {
         let conn = state.conn()?;
         (
             calendar::list_sources(&conn, None)?,
@@ -87,16 +107,11 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
             calendar::time_window(&conn)?,
             calendar_editing::choices(&conn)?,
             calendar::default_lengths(&conn)?,
+            calendar::auto_meets(&conn)?,
         )
     };
-    let default_length = accounts
-        .iter()
-        .filter(|a| a.provider == "google")
-        .filter_map(|a| {
-            let email = a.email.as_deref()?.trim().to_lowercase();
-            Some((a.id.clone(), *lengths.get(&email)?))
-        })
-        .collect();
+    let default_length = by_account(&accounts, &lengths);
+    let auto_meet = by_account(&accounts, &meets);
     // Token scopes come from the keychain, read with the DB lock released. Only an account with a
     // stored choice needs one: without it, editing is off whatever the token holds.
     let editing = accounts
@@ -125,6 +140,7 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         mirror_end,
         editing,
         default_length,
+        auto_meet,
     })
 }
 
@@ -227,12 +243,15 @@ async fn do_connect_google_calendar(
     google::save_consented_token(&google_calendar_token_key(&email), &token).await?;
     // Google's default length for a new event, read now so a new account has it before its first
     // full sync (C10b); one that can't be read leaves any stored one, and the editor uses an hour.
+    // The same for its Meet setting (C18b): unread, a new event starts with no call.
     let default_length = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
+    let auto_meet = calendar::fetch_auto_meet(&google_calendar_token_key(&email)).await;
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
     // A nicety, so a store that can't take it never fails the connect. The same guarded store as a
     // sync's (the source was registered just above, under this lock).
     let _ = calendar::remember_default_length_if_connected(&conn, &account, &email, default_length);
+    let _ = calendar::remember_auto_meet_if_connected(&conn, &account, &email, auto_meet);
     // A read-only connect asked Google for reading only, so it turns editing off even when the
     // account had it: only the "Turn on editing" consent sets the choice.
     calendar_editing::set_choice(&conn, &email, None)?;
@@ -304,7 +323,7 @@ pub async fn disconnect_google_calendar_account(
     }
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
     calendar_editing::set_choice(&conn, &email, None)?;
-    calendar::set_default_length(&conn, &email, None)?;
+    calendar::forget_account_settings(&conn, &email)?;
     // A grant Google keeps still carries the write scope if editing was ever granted; a revoke ends it.
     let calendar_write = !plan.revoke && calendar_editing::write_granted(&conn, &email)?;
     if plan.revoke {
@@ -677,7 +696,7 @@ pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     calendar_editing::clear_all(&conn)?;
-    calendar::clear_default_lengths(&conn)?;
+    calendar::clear_account_settings(&conn)?;
     drive::forget_all_accounts(&conn)?;
     // A backup-only account has no Drive row, so the loop above never saw its sign-in. Clear it before
     // the destination below forgets which account it was.
@@ -864,15 +883,19 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
             );
         }
         if acc.provider == "google" {
-            // Google's default length for a new event (A28, C10b): one more GET per account beside
-            // the list's, read with no lock held. A failed read keeps the last good value.
-            let read = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
+            // Google's default length for a new event (A28, C10b) and its Meet setting (C18b): two
+            // more GETs per account beside the list's, read with no lock held. A failed read keeps
+            // the last good value.
+            let key = google_calendar_token_key(&email);
+            let read = calendar::fetch_default_length(&key).await;
+            let meet = calendar::fetch_auto_meet(&key).await;
             let state = app.state::<AppState>();
             let Ok(conn) = state.conn() else {
                 continue;
             };
-            // Disconnected during the read: its length went with it, and stays gone.
+            // Disconnected during the read: its settings went with it, and stay gone.
             let _ = calendar::remember_default_length_if_connected(&conn, &acc.id, &email, read);
+            let _ = calendar::remember_auto_meet_if_connected(&conn, &acc.id, &email, meet);
         }
     }
 }
@@ -1396,6 +1419,77 @@ mod tests {
         // An incomplete fetch only upserts, so the deleted row is removed explicitly.
         write_fetched_events(&conn, &edit, &cal, vec![a], false, before).unwrap();
         assert_eq!(titles(&conn), vec!["Gym"]);
+    }
+
+    /// C18b: the overview names each Google account's Meet setting by account id, as it does the
+    /// default length; an account with none stored, and one that isn't Google's, is missing.
+    #[test]
+    fn the_overview_says_each_accounts_meet_setting() {
+        let (_d, conn, _cal) = store();
+        calendar::upsert_source(
+            &conn,
+            "gcal:work@x.com",
+            "google",
+            Some("Work@X.com"),
+            "Work@X.com",
+        )
+        .unwrap();
+        calendar::upsert_source(&conn, "gcal:new@x.com", "google", Some("new@x.com"), "new")
+            .unwrap();
+        calendar::upsert_source(&conn, "ics:feed", "other", None, "Feed").unwrap();
+        // Another provider's account at an address Google's setting was read for: never named.
+        calendar::upsert_source(
+            &conn,
+            "outlook:work@x.com",
+            "microsoft",
+            Some("work@x.com"),
+            "work@x.com",
+        )
+        .unwrap();
+        calendar::set_auto_meet(&conn, "me@x.com", Some(true)).unwrap();
+        calendar::set_auto_meet(&conn, "work@x.com", Some(false)).unwrap();
+        // An address no account has: never in the overview.
+        calendar::set_auto_meet(&conn, "gone@x.com", Some(true)).unwrap();
+        let accounts = calendar::list_sources(&conn, None).unwrap();
+        let shown = by_account(&accounts, &calendar::auto_meets(&conn).unwrap());
+        let want: BTreeMap<String, bool> = [
+            ("gcal:me@x.com".to_string(), true),
+            ("gcal:work@x.com".to_string(), false),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(shown, want);
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["gcal:me@x.com"], true);
+    }
+
+    /// C18b: a disconnect forgets what PM read of the account's Meet setting, as it does its default
+    /// length, and clearing the Google client forgets every account's.
+    #[test]
+    fn a_disconnect_forgets_the_meet_setting() {
+        let (_d, conn, _cal) = store();
+        calendar::set_auto_meet(&conn, "me@x.com", Some(true)).unwrap();
+        calendar::set_default_length(&conn, "me@x.com", Some(30)).unwrap();
+        calendar::forget_account_settings(&conn, "Me@X.com").unwrap();
+        assert!(calendar::auto_meets(&conn).unwrap().is_empty());
+        assert!(calendar::default_lengths(&conn).unwrap().is_empty());
+        // The commands themselves (they need the app) forget through those two.
+        let source = include_str!("calendars.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body_of = |name: &str| {
+            let start = shipped.find(name).expect("the command is there");
+            let end = shipped[start..]
+                .find("\n}\n")
+                .map_or(shipped.len(), |e| start + e);
+            &shipped[start..end]
+        };
+        assert!(body_of("pub async fn disconnect_google_calendar_account(")
+            .contains("calendar::forget_account_settings(&conn, &email)?;"));
+        assert!(body_of("pub fn clear_google_client(")
+            .contains("calendar::clear_account_settings(&conn)?;"));
     }
 
     /// The calendar view reads what it may offer on a row beside the row's own fields (C14): one

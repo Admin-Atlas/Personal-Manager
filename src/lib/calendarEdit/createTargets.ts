@@ -16,8 +16,9 @@ import type {
 } from "../types";
 import { formatDateLocal } from "../format";
 import { wallInstant } from "../wallTime";
-import { DEFAULT_LENGTH_MS } from "./eventDraft";
+import { DEFAULT_LENGTH_MS, type GuestDraft } from "./eventDraft";
 import type { CreatedWhere } from "./editReasons";
+import { changeNotice } from "./guests";
 
 /** A calendar a new event may go to, with its account. */
 export interface CreateTarget {
@@ -118,6 +119,48 @@ export function accountLength(overview: CalendarOverview, accountId: string | nu
     ? minutes * 60_000
     : DEFAULT_LENGTH_MS;
 }
+
+/** The calendar offers Google Meet (its `allowedConferenceSolutionTypes`), so a new event there can
+ *  ask for a call (C18b). */
+export const meetOffered = (t: CreateTarget | null): boolean =>
+  t !== null && t.calendar.conference_types.includes("hangoutsMeet");
+
+/** Whether a new event on `t` inviting `guests` has a Meet call before the user touches the row
+ *  (C18b): its account's Google setting says to add one (`overview.auto_meet`), the calendar offers
+ *  Meet, and it invites someone other than the user, as Google adds Meet "when you add invitees"
+ *  (Help 72143) and "when users add the first guest" (admin help 9898950), critique C2-H2. An
+ *  account whose setting PM hasn't read is off: no call is made on a guess. Probe L-M6 records
+ *  whether a personal account adds one to a solo event too; if so, the guest clause goes. */
+export function meetDefault(
+  overview: CalendarOverview,
+  t: CreateTarget | null,
+  guests: readonly GuestDraft[],
+): boolean {
+  if (t === null || !meetOffered(t) || overview.auto_meet[t.account.id] !== true) return false;
+  // Who Google would invite, counted as the email question counts them: never the user, a room or
+  // the calendar's own address.
+  return changeNotice([], guests, true, false, t.account.email) !== null;
+}
+
+/** A new event's video call once the calendar picked is `t` (C18b): untouched (`touched` false),
+ *  what `meetDefault` says there; touched, as the user left it, unless `t` offers no Meet. `off`: a
+ *  call the draft had went off because `t` offers no Meet, which the editor says (`meetOffText`). */
+export function meetOnCalendar(
+  overview: CalendarOverview,
+  t: CreateTarget | null,
+  draft: { meet: boolean; guests: readonly GuestDraft[] },
+  touched: boolean,
+): { meet: boolean; off: boolean } {
+  const offered = meetOffered(t);
+  return {
+    meet: touched ? draft.meet && offered : meetDefault(overview, t, draft.guests),
+    off: draft.meet && !offered,
+  };
+}
+
+/** Said when another calendar turned a new event's video call off (C18b). */
+export const meetOffText = (calendar: string): string =>
+  `${calendar} doesn't offer Google Meet, so the video call is off.`;
 
 /** `date` (`YYYY-MM-DD`) at UTC midnight, moved by `days`, as ms. */
 const utcDay = (date: string, days = 0) => Date.parse(`${date}T00:00:00Z`) + days * 86_400_000;

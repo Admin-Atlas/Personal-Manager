@@ -123,6 +123,7 @@ const overview: CalendarOverview = {
   editing: { [ME]: "on", [WORK]: "on" },
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
+  auto_meet: {},
 };
 
 const seed: EditorFields = {
@@ -165,6 +166,7 @@ const sentFor = (summary: string) => ({
     guests: [],
     reminders: null,
     colour: null,
+    meet: false,
   } as NewEventDraft,
 });
 
@@ -255,8 +257,10 @@ function open(
     anchor?: DOMRect;
     placement?: "below" | "beside";
     timeTouched?: boolean;
+    overview?: CalendarOverview;
   } = {},
 ) {
+  const shown = over.overview ?? overview;
   const onClose = vi.fn();
   const onMore = vi.fn();
   const onDraft = vi.fn();
@@ -291,9 +295,9 @@ function open(
         placement={over.placement}
         timeTouched={over.timeTouched}
         seed={seed}
-        targets={createTargets(overview)}
+        targets={createTargets(shown)}
         calendarId={over.calendarId ?? PERSONAL}
-        overview={overview}
+        overview={shown}
         hidden={new Set()}
         colorOf={() => "var(--accent)"}
         shapeOf={() => undefined}
@@ -342,13 +346,14 @@ describe("QuickCreatePopover", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
     // The calendar, every field of the draft, and no token or answer: no repeat, and no guests, so
     // no one to notify (C12d: the guest list goes, empty); the calendar's notifications and colour,
-    // as null (C13: quick create has neither row).
+    // as null (C13: quick create has neither row); no video call asked for (C18b).
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
       "colour",
       "description",
       "guests",
       "location",
+      "meet",
       "recurrence",
       "reminders",
       "show_as",
@@ -394,6 +399,7 @@ describe("QuickCreatePopover", () => {
       unproven: null,
       showAsTouched: false,
       timeTouched: true,
+      meetTouched: false,
       badDate: null,
       openCustom: false,
     });
@@ -1001,6 +1007,7 @@ describe("QuickCreatePopover", () => {
           },
           calendarId: PERSONAL,
           timeTouched: true,
+          meetTouched: false,
           badDate: "31-02-2026",
         },
       ],
@@ -1016,7 +1023,14 @@ describe("QuickCreatePopover", () => {
     const draft: EditorFields = { ...seed, summary: "Dentist" };
     const { onLeave, unmount } = open({
       strict: true,
-      resume: { seed, draft, calendarId: PERSONAL, timeTouched: false, badDate: null },
+      resume: {
+        seed,
+        draft,
+        calendarId: PERSONAL,
+        timeTouched: false,
+        meetTouched: false,
+        badDate: null,
+      },
     });
     await act(async () => {});
     expect(onLeave).not.toHaveBeenCalled();
@@ -1082,7 +1096,14 @@ describe("QuickCreatePopover", () => {
       time: { ...seed.time, start_time: "11:00", end_time: "12:00" } as EditorFields["time"],
     };
     const { onDraft } = open({
-      resume: { seed, draft, calendarId: PERSONAL, timeTouched: true, badDate: "31-02-2026" },
+      resume: {
+        seed,
+        draft,
+        calendarId: PERSONAL,
+        timeTouched: true,
+        meetTouched: false,
+        badDate: "31-02-2026",
+      },
     });
     expect(title().value).toBe("Dentist");
     expect(document.activeElement).toBe(title());
@@ -1314,8 +1335,116 @@ describe("QuickCreatePopover", () => {
       unproven: null,
       showAsTouched: false,
       timeTouched: false,
+      meetTouched: false,
       badDate: null,
       openCustom: true,
     });
+  });
+});
+
+// --- a video call on new events (C18b) ---
+
+/** Personal offers Google Meet and its account adds Meet to the events it creates; Work offers
+ *  none. */
+const meetOverview: CalendarOverview = {
+  ...overview,
+  calendars: overview.calendars.map((c) =>
+    c.id === PERSONAL ? { ...c, conference_types: ["hangoutsMeet"] } : c,
+  ),
+  auto_meet: { [ME]: true },
+};
+
+const meetButton = () => screen.queryByRole("button", { name: "Google Meet" });
+
+describe("QuickCreatePopover video call (C18b)", () => {
+  // Quick create has no guests, so the setting alone turns nothing on (critique C2-H2).
+  it("the Meet button follows the setting and the calendar", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ overview: meetOverview });
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(meetButton()!, { detail: 1 });
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("true");
+    // Work offers no Meet: the button goes, the call is off, and the box says so.
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Work" }), { detail: 1 });
+    expect(meetButton()).toBeNull();
+    expect(
+      screen.getByText("Work doesn't offer Google Meet, so the video call is off."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Work" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Personal" }), { detail: 1 });
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByText(/doesn't offer Google Meet/)).toBeNull();
+    // Pressed again and saved: the create asks for the call.
+    fireEvent.click(meetButton()!, { detail: 1 });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Dentist").draft, meet: true }, null],
+    ]);
+  });
+
+  // Critique C2-M3: a click hands focus back to the title, so Enter saves as it does there; a key
+  // press leaves focus on the button, whose Enter presses it.
+  it("a click on Google Meet hands focus back to the title", () => {
+    open({ overview: meetOverview });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    meetButton()!.focus();
+    fireEvent.click(meetButton()!, { detail: 1 });
+    expect(document.activeElement).toBe(title());
+    meetButton()!.focus();
+    fireEvent.click(meetButton()!, { detail: 0 });
+    expect(document.activeElement).toBe(meetButton());
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("More options carries the call, and that it was pressed", () => {
+    const { onMore } = open({ overview: meetOverview });
+    fireEvent.click(meetButton()!, { detail: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    expect(onMore).toHaveBeenCalledWith(
+      expect.objectContaining({ draft: { ...seed, meet: true }, meetTouched: true }),
+    );
+  });
+
+  it("is absent where the calendar offers no Meet", () => {
+    open();
+    expect(meetButton()).toBeNull();
+  });
+
+  it("a draft that goes with the tab keeps the call, and whether it was pressed", async () => {
+    const { onLeave, unmount } = open({ overview: meetOverview });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(meetButton()!, { detail: 1 });
+    await leave(unmount);
+    expect(onLeave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        draft: expect.objectContaining({ meet: true }) as unknown,
+        meetTouched: true,
+      }),
+    );
+  });
+
+  // The view may open it again on another calendar than the one it left: one without Meet asks for
+  // no call, which the backend would refuse.
+  it("a draft back on a calendar without Meet asks for no call", async () => {
+    createEvent.mockResolvedValue(saved);
+    const draft: EditorFields = { ...seed, summary: "Dentist", meet: true };
+    const { onClose } = open({
+      overview: meetOverview,
+      calendarId: WORK_CAL,
+      resume: {
+        seed,
+        draft,
+        calendarId: WORK_CAL,
+        timeTouched: true,
+        meetTouched: true,
+        badDate: null,
+      },
+    });
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls[0][1].meet).toBe(false);
   });
 });

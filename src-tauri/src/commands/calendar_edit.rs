@@ -170,11 +170,18 @@ fn keep_session(
             master,
             device_zone,
             // Its own random id, never the session's: nothing named for a session feeds a body.
-            meet_request: uuid::Uuid::new_v4().simple().to_string(),
+            meet_request: new_meet_request(),
             opened: Instant::now(),
         },
     );
     Ok(session)
+}
+
+/// A fresh id for a request for a new Meet call (`createRequest.requestId`): 128 random bits, hex,
+/// minted by its own call, never through a session's (critique C1-L11). Google makes one call per
+/// id, and ignores a request whose id it has seen.
+fn new_meet_request() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// `draft` as the backend plans it: the session's request id beside a call change, never one from
@@ -341,6 +348,12 @@ fn offers_meet(facts: &CalendarFacts) -> bool {
 /// A call asked for where the calendar offers none: Google would refuse it, or make nothing (C18).
 const MEET_NOT_OFFERED: &str =
     "This calendar doesn't offer Google Meet, so PM can't add a video call to it.";
+
+/// A new event asking for a call on a calendar that offers none (C18b): nothing is created, since
+/// the user asked for an event with a call.
+const MEET_NOT_OFFERED_CREATE: &str = "This calendar doesn't offer Google Meet, so PM didn't \
+                                       create the event. Turn the video call off, or choose \
+                                       another calendar.";
 
 /// Whether `draft` asks for a call on a calendar whose `facts` offer none: checked before the
 /// gate's reasons, so such a calendar never gets a reason that isn't the call's (C18 critique C1-M1).
@@ -1774,6 +1787,8 @@ const RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// other numbers, is answered `NeedsChoice` with nothing sent; one inviting nobody sends `none`
 /// whatever it says (R7). A retry sends what was first sent, its answer included, whatever these
 /// say now.
+///
+/// `draft.meet` asks Google for a new Meet call, made once even if the create is sent again (C18b).
 #[tauri::command]
 pub async fn create_calendar_event(
     app: AppHandle,
@@ -1818,14 +1833,16 @@ pub async fn create_calendar_event(
         editing,
         new_id: plan::client_event_id,
         new_ref: new_create_ref,
+        new_request: new_meet_request,
     };
     let answer = GuestAnswer { notify, asked };
     Ok(create_event(&ctx, draft, retry_token.as_deref(), &answer).await)
 }
 
 /// What one create works with: Google through `wire`, the mirror and the held creates through
-/// `host`, the calendar, the account's editing status, and the two ids PM mints: the new event's
-/// ([`plan::client_event_id`]) and the retry token ([`new_create_ref`]), fixed ones in the tests.
+/// `host`, the calendar, the account's editing status, and the ids PM mints: the new event's
+/// ([`plan::client_event_id`]), the retry token ([`new_create_ref`]) and the request for a new Meet
+/// call ([`new_meet_request`], C18b), fixed ones in the tests.
 struct CreateWrite<'a, W, H> {
     wire: &'a W,
     host: &'a H,
@@ -1833,6 +1850,7 @@ struct CreateWrite<'a, W, H> {
     editing: EditingStatus,
     new_id: fn() -> String,
     new_ref: fn() -> String,
+    new_request: fn() -> String,
 }
 
 /// A retry token: PM's own random id, a separate one from the event's, so the webview never holds
@@ -1924,10 +1942,13 @@ impl Drop for TakenCreate<'_> {
 /// every other refusal and before anything is sent (R9); a retry never reads it.
 async fn create_event<W: Wire, H: Host>(
     ctx: &CreateWrite<'_, W, H>,
-    draft: NewEventDraft,
+    mut draft: NewEventDraft,
     retry_token: Option<&str>,
     answer: &GuestAnswer,
 ) -> WriteOutcome {
+    // A fresh id for every send, never the webview's (R5). A retry resends its first send's plan, so
+    // its own id only has to match the rest of the body (`call::same_insert`).
+    draft.meet_request = draft.meet.then(ctx.new_request);
     let body = match patch::insert_body(&draft) {
         Ok(body) => body,
         Err(e) => {
@@ -1943,6 +1964,13 @@ async fn create_event<W: Wire, H: Host>(
     if !ctx.target.selected {
         return WriteOutcome::Failed {
             message: NOT_SYNCED.into(),
+        };
+    }
+    // A first send only: a retry looks for the event first, so PM never says it didn't create one
+    // that may be there (critique C1-M2).
+    if draft.meet && !offers_meet(&ctx.target.facts) {
+        return WriteOutcome::Failed {
+            message: MEET_NOT_OFFERED_CREATE.into(),
         };
     }
     if let Some(reason) = create_blocked(ctx, &body) {
@@ -1979,8 +2007,9 @@ async fn create_event<W: Wire, H: Host>(
         };
     };
     let wire = Posts::new(ctx.wire);
+    let call = call_of_create(&body, &id);
     match drive(&wire, &mut run).await {
-        Ran::Done { ends } => landed_create(ctx.wire, ctx.host, ctx.target, &ends).await,
+        Ran::Done { ends } => landed_create(ctx.wire, ctx.host, ctx.target, &ends, call).await,
         // Gone: made, then deleted in Google before PM could look.
         Ran::NotDone { why, .. } => not_done_outcome(why, ctx.editing, false),
         Ran::Unknown { .. } => {
@@ -2115,7 +2144,9 @@ async fn retry_create<W: Wire, H: Host>(
             message: CREATE_LOST.into(),
         };
     };
-    if held.target.calendar_id != ctx.target.calendar_id || held.body != body {
+    // Its own request id aside (C18b): this send minted another, and the first send's is the one
+    // that goes again.
+    if held.target.calendar_id != ctx.target.calendar_id || !call::same_insert(&held.body, &body) {
         return WriteOutcome::Failed {
             message: CREATE_CHANGED.into(),
         };
@@ -2125,12 +2156,13 @@ async fn retry_create<W: Wire, H: Host>(
             message: UNFIT.into(),
         };
     };
+    let call = call_of_create(&held.body, id);
     let mut first = true;
     loop {
         match retry_next(RetryLook::of(get(ctx.wire, calendar, id).await), first) {
             RetryStep::Land(copy) => {
                 taken.consume();
-                return land_copy(ctx.wire, ctx.host, &held.target, &copy).await;
+                return land_copy(ctx.wire, ctx.host, &held.target, &copy, call).await;
             }
             RetryStep::Gone => {
                 taken.consume();
@@ -2170,7 +2202,7 @@ async fn retry_create<W: Wire, H: Host>(
     match ran {
         Ran::Done { ends } => {
             taken.consume();
-            landed_create(ctx.wire, ctx.host, &held.target, &ends).await
+            landed_create(ctx.wire, ctx.host, &held.target, &ends, call).await
         }
         Ran::NotDone { why: Why::Gone, .. } => {
             taken.consume();
@@ -2201,17 +2233,25 @@ async fn retry_create<W: Wire, H: Host>(
     }
 }
 
-/// A create's run proved it landed: Google's copy into the mirror, from the step's end.
+/// The id of the new event `body` makes, PM's own `id`, when the body asks Google for a new Meet call
+/// to wait for (C18b); `None` when it asks for none.
+fn call_of_create<'a>(body: &serde_json::Map<String, Value>, id: &'a str) -> Option<&'a str> {
+    call::asks_for_meet(body).then_some(id)
+}
+
+/// A create's run proved it landed: Google's copy into the mirror, from the step's end. `call`: the
+/// new event's id when it asked for a call ([`call_of_create`]).
 async fn landed_create<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &CalendarTarget,
     ends: &[End],
+    call: Option<&str>,
 ) -> WriteOutcome {
     match ends.first() {
         Some(End::Done {
             reply: Some(copy), ..
-        }) => land_copy(wire, host, target, copy).await,
+        }) => land_copy(wire, host, target, copy, call).await,
         // Proved without a copy to show: under `Shows::Created` every proof carries one, but the
         // next sync shows it anyway.
         _ => created_pending(host, target),
@@ -2220,17 +2260,32 @@ async fn landed_create<W: Wire, H: Host>(
 
 /// Google's copy of a new event into the mirror. A one-off's copy is its row; a repeating event's is
 /// its master, which never becomes a row (`calendar::parse_event`), so its occurrences are listed
-/// and landed instead (C11).
+/// and landed instead (C11). A new event that asked for a call (`call`, its id) is first looked at
+/// again while Google is still making it ([`wait_for_call`], C18b): the latest copy lands, and a
+/// call that isn't ready is said beside it. Here, rather than in the run's landing, so a retry that
+/// finds the event waits too (critique C1-L4). For a repeating one the copy is the master, and its
+/// occurrences are listed after the wait, so a ready link shows on them.
 async fn land_copy<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &CalendarTarget,
     copy: &Value,
+    call: Option<&str>,
 ) -> WriteOutcome {
-    if calendar::is_master(copy) {
-        return land_new_series(wire, host, &CalIds::of(target), copy, None).await;
-    }
-    land_created(host, target, copy)
+    let (copy, warning) = match call {
+        Some(id) => match wait_for_call(wire, &target.remote_calendar, id, copy.clone()).await {
+            Waited::Copy(copy, warning) => (copy, warning),
+            // Made, then deleted in Google while PM looked: nothing of it reached the mirror.
+            Waited::Gone(_) => return WriteOutcome::Gone,
+        },
+        None => (copy.clone(), None),
+    };
+    let landed = if calendar::is_master(&copy) {
+        land_new_series(wire, host, &CalIds::of(target), &copy, None).await
+    } else {
+        land_created(host, target, &copy)
+    };
+    with_warning(landed, warning)
 }
 
 /// PM's and Google's ids for one calendar, for landing what a write made there.
@@ -20095,8 +20150,9 @@ mod tests {
                 NOT_REPEATING_MOVE,
                 UNDO_GONE,
                 UNDO_GUESTS,
-                // A video call where the calendar offers none (C18).
+                // A video call where the calendar offers none (C18), on an event or a new one.
                 MEET_NOT_OFFERED,
+                MEET_NOT_OFFERED_CREATE,
             ]
             .iter()
             .map(|l| l.to_string()),
@@ -20418,6 +20474,8 @@ mod tests {
             guests_can_see_other_guests: None,
             reminders: None,
             colour: None,
+            meet: false,
+            meet_request: None,
         }
     }
 
@@ -20480,8 +20538,12 @@ mod tests {
             editing,
             new_id: || NEW.to_string(),
             new_ref: || "ref-1".to_string(),
+            new_request: || REQUEST.to_string(),
         }
     }
+
+    /// The request for a new Meet call every scripted create mints (C18b).
+    const REQUEST: &str = "0123456789abcdef0123456789abcdef";
 
     /// Google's copy of the new event `draft` makes, at `etag`.
     fn google_copy(draft: &NewEventDraft, etag: &str) -> Value {
@@ -20647,11 +20709,11 @@ mod tests {
         assert_eq!(held_creates(&host), 0);
     }
 
-    /// C10's tripwire, as C12d and C13 leave it: guests go only with a draft that has them, and
-    /// notifications and a colour only with one that sets its own (below); never a call, notes or a
-    /// label.
+    /// C10's tripwire, as C12d, C13 and C18b leave it: guests go only with a draft that has them,
+    /// notifications and a colour only with one that sets its own, and a call only with one that asks
+    /// for it (below); never notes or a label.
     #[tokio::test]
-    async fn a_create_sends_no_conference_or_notes_and_no_defaults() {
+    async fn a_create_sends_a_call_only_when_asked_and_never_notes() {
         let host = TestHost::holding(&[]);
         let draft = NewEventDraft {
             location: "High St".into(),
@@ -28088,5 +28150,423 @@ mod tests {
             first_write(&script).body,
             Some(json!({ "conferenceData": call::meet_request_body(&request_id) }))
         );
+    }
+
+    // --- a video call on new events (C18b) ---
+
+    /// [`new_target`] on a calendar that offers Google Meet.
+    fn meet_new_target() -> CalendarTarget {
+        let mut on = new_target();
+        on.facts.conference_types = vec!["hangoutsMeet".into()];
+        on
+    }
+
+    /// The dentist, asking for a Meet call.
+    fn dentist_with_meet() -> NewEventDraft {
+        NewEventDraft {
+            meet: true,
+            ..dentist_draft()
+        }
+    }
+
+    /// Google's copy of the new event `draft` makes, holding `call` (a ready Meet call has its link
+    /// too), at `etag`.
+    fn copy_calling(draft: &NewEventDraft, call: Value, etag: &str) -> Value {
+        let ready = call.get("conferenceId").is_some();
+        let mut v = google_copy(
+            &NewEventDraft {
+                meet: false,
+                ..draft.clone()
+            },
+            etag,
+        );
+        v["conferenceData"] = call;
+        if ready {
+            v["hangoutLink"] = json!(MEET_LINK);
+        }
+        v
+    }
+
+    /// [`create_on`], editing on, every request for a call minted by `request`: another send's own.
+    async fn create_minting(
+        host: &TestHost,
+        target: &CalendarTarget,
+        steps: Vec<Step>,
+        draft: NewEventDraft,
+        token: Option<&str>,
+        request: fn() -> String,
+    ) -> (WriteOutcome, Script) {
+        let script = Script::new(steps);
+        let ctx = CreateWrite {
+            new_request: request,
+            ..creator(&script, host, target, EditingStatus::On)
+        };
+        let outcome = create_event(&ctx, draft, token, &GuestAnswer::default()).await;
+        script.asked_all();
+        (outcome, script)
+    }
+
+    /// The dentist with Meet, created on a calendar with Meet, its answer lost and two looks not
+    /// finding it; posted again, lost again: held as "ref-1", two POSTs spent, both under
+    /// [`REQUEST`].
+    async fn lost_meet_create(host: &TestHost) -> Script {
+        let (outcome, script) = create_on(
+            host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(lost()),
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(lost()),
+                new_read(absent()),
+            ],
+            dentist_with_meet(),
+            None,
+        )
+        .await;
+        assert!(outcome == ambiguous("ref-1"), "held for Check again");
+        script
+    }
+
+    /// The request id a create's POST asked for its call under.
+    fn requested(insert: &RequestPlan) -> Option<String> {
+        insert
+            .body
+            .as_ref()?
+            .pointer("/conferenceData/createRequest/requestId")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// §5.2: Meet on a new event goes as a request under the id the command minted, at version 1
+    /// (every insert's), and a ready call lands with its link and nothing to say.
+    #[tokio::test]
+    async fn a_new_event_with_meet_asks_for_a_call_at_version_one() {
+        let host = TestHost::holding(&[]);
+        let draft = dentist_with_meet();
+        let copy = copy_calling(&draft, meet_call(), "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![insert_step(Scripted::Json(copy))],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "saved, with nothing to say");
+        let sent = &script.sent()[0];
+        assert!(sent
+            .url
+            .ends_with("/events?sendUpdates=none&conferenceDataVersion=1"));
+        assert_eq!(
+            sent.body.as_ref().unwrap()["conferenceData"],
+            call::meet_request_body(REQUEST)
+        );
+        assert!(
+            script.waits().is_empty(),
+            "a ready call needs no second look"
+        );
+        let row = new_row(&host).expect("the new event is in the mirror");
+        assert_eq!(row.conference_url.as_deref(), Some(MEET_LINK));
+    }
+
+    /// §5.2: a calendar that offers no Meet creates nothing when the draft asks for a call, and says
+    /// so; the same draft without the call goes.
+    #[tokio::test]
+    async fn meet_on_a_calendar_without_meet_creates_nothing() {
+        let host = TestHost::holding(&[]);
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            Vec::new(),
+            dentist_with_meet(),
+            None,
+        )
+        .await;
+        assert!(
+            outcome == failed(MEET_NOT_OFFERED_CREATE),
+            "refused in words"
+        );
+        assert!(script.sent().is_empty() && held_creates(&host) == 0);
+        let copy = google_copy(&dentist_draft(), "\"n1\"");
+        let (outcome, _) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![insert_step(Scripted::Json(copy))],
+            dentist_draft(),
+            None,
+        )
+        .await;
+        assert!(outcome == saved(), "the refusal was the call's");
+    }
+
+    /// §5.2, critique C1-M2: a retry mints its own request id yet isn't a changed draft, and the
+    /// POST it sends again carries the first send's id, so Google makes one call.
+    #[tokio::test]
+    async fn a_retried_create_with_meet_sends_its_first_request() {
+        let host = TestHost::holding(&[]);
+        let first = lost_meet_create(&host).await;
+        let posts = inserts(&first);
+        assert!(
+            posts.len() == 2
+                && posts
+                    .iter()
+                    .all(|p| requested(p).as_deref() == Some(REQUEST))
+        );
+        let draft = dentist_with_meet();
+        // Google answers the re-POST with the call still being made, and has it a second later.
+        let making = copy_calling(&draft, meet_making(REQUEST, "pending"), "\"n1\"");
+        let (outcome, script) = create_minting(
+            &host,
+            &meet_new_target(),
+            vec![
+                new_read(absent()),
+                new_read(absent()),
+                insert_step(Scripted::Json(making)),
+                new_read(Scripted::Json(copy_calling(&draft, meet_call(), "\"n2\""))),
+            ],
+            draft,
+            Some("ref-1"),
+            || "fedcba9876543210fedcba9876543210".to_string(),
+        )
+        .await;
+        assert!(outcome == saved(), "sent again and landed, not changed");
+        let again = inserts(&script);
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            requested(&again[0]).as_deref(),
+            Some(REQUEST),
+            "the first send's id"
+        );
+        assert_eq!(script.waits(), [RETRY_PAUSE, REFETCH_AGAIN[0]]);
+        assert_eq!(
+            new_row(&host).unwrap().conference_url.as_deref(),
+            Some(MEET_LINK),
+            "the call waited for"
+        );
+        assert_eq!(held_creates(&host), 0);
+    }
+
+    /// Critique C1-M2: the calendar's Meet is asked about only on a first send, so a retry still
+    /// looks for the event it may have made, and finds it.
+    #[tokio::test]
+    async fn a_retry_looks_first_where_meet_is_no_longer_offered() {
+        let host = TestHost::holding(&[]);
+        lost_meet_create(&host).await;
+        let copy = copy_calling(&dentist_with_meet(), meet_call(), "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &new_target(),
+            EditingStatus::On,
+            vec![new_read(Scripted::Json(copy))],
+            dentist_with_meet(),
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == saved(), "found and landed");
+        assert!(inserts(&script).is_empty());
+        assert_eq!(
+            new_row(&host).unwrap().conference_url.as_deref(),
+            Some(MEET_LINK)
+        );
+    }
+
+    /// C10's `CREATE_CHANGED`, with the call: a retry that turned Meet on, or off, is another new
+    /// event, refused with nothing sent and the create kept.
+    #[tokio::test]
+    async fn a_retry_that_turned_meet_on_is_changed() {
+        let host = TestHost::holding(&[]);
+        lost_create(&host).await;
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            Vec::new(),
+            dentist_with_meet(),
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == failed(CREATE_CHANGED), "turned on");
+        assert!(script.sent().is_empty());
+        assert_eq!(held_posts(&host, "ref-1"), Some(2));
+        let host = TestHost::holding(&[]);
+        lost_meet_create(&host).await;
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            Vec::new(),
+            dentist_draft(),
+            Some("ref-1"),
+        )
+        .await;
+        assert!(outcome == failed(CREATE_CHANGED), "turned off");
+        assert!(script.sent().is_empty());
+        assert_eq!(held_posts(&host, "ref-1"), Some(2));
+    }
+
+    /// §4.4 for a new event: a call Google is still making is looked at again after 1 s and 3 s,
+    /// then said; the latest copy read lands. A look that finds the event gone lands nothing.
+    #[tokio::test]
+    async fn a_pending_call_on_a_new_event_is_waited_for() {
+        let draft = dentist_with_meet();
+        let making = |etag| copy_calling(&draft, meet_making(REQUEST, "pending"), etag);
+        let host = TestHost::holding(&[]);
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(making("\"n1\""))),
+                new_read(Scripted::Json(making("\"n2\""))),
+                new_read(Scripted::Json(with(
+                    making("\"n3\""),
+                    "location",
+                    json!("Room 2"),
+                ))),
+            ],
+            draft.clone(),
+            None,
+        )
+        .await;
+        assert!(saved_saying(&outcome, &[WriteWarning::CallPending]));
+        assert_eq!(script.waits(), REFETCH_AGAIN);
+        let row = new_row(&host).expect("landed");
+        assert_eq!(
+            (row.location.as_deref(), row.etag.as_deref()),
+            (Some("Room 2"), Some("\"n3\"")),
+            "the last copy read"
+        );
+        assert!(row.conference_url.is_none(), "no link yet");
+        // Made at the first look: landed with its link, nothing to say.
+        let host = TestHost::holding(&[]);
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(making("\"n1\""))),
+                new_read(Scripted::Json(copy_calling(&draft, meet_call(), "\"n2\""))),
+            ],
+            draft.clone(),
+            None,
+        )
+        .await;
+        assert!(saved_saying(&outcome, &[]));
+        assert_eq!(script.waits(), [REFETCH_AGAIN[0]]);
+        assert_eq!(
+            new_row(&host).unwrap().conference_url.as_deref(),
+            Some(MEET_LINK)
+        );
+        // Google failed: said, landed all the same.
+        let host = TestHost::holding(&[]);
+        let (outcome, _) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![insert_step(Scripted::Json(copy_calling(
+                &draft,
+                meet_making(REQUEST, "failure"),
+                "\"n1\"",
+            )))],
+            draft.clone(),
+            None,
+        )
+        .await;
+        assert!(saved_saying(&outcome, &[WriteWarning::CallFailed]));
+        assert!(new_row(&host).is_some());
+        // Deleted in Google while PM looked: gone, and nothing in the mirror.
+        let host = TestHost::holding(&[]);
+        let (outcome, _) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(making("\"n1\""))),
+                new_read(absent()),
+            ],
+            draft,
+            None,
+        )
+        .await;
+        assert!(outcome == WriteOutcome::Gone, "gone");
+        assert!(new_row(&host).is_none());
+    }
+
+    /// Critique C1-L4: a retry that finds the new event waits for its call too.
+    #[tokio::test]
+    async fn a_retry_that_finds_the_event_waits_for_its_call() {
+        let host = TestHost::holding(&[]);
+        lost_meet_create(&host).await;
+        let draft = dentist_with_meet();
+        let making = copy_calling(&draft, meet_making(REQUEST, "pending"), "\"n1\"");
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![
+                new_read(Scripted::Json(making.clone())),
+                new_read(Scripted::Json(making)),
+                new_read(Scripted::Json(copy_calling(&draft, meet_call(), "\"n2\""))),
+            ],
+            draft,
+            Some("ref-1"),
+        )
+        .await;
+        assert!(saved_saying(&outcome, &[]), "landed with its call");
+        assert_eq!(script.waits(), REFETCH_AGAIN);
+        assert_eq!(
+            new_row(&host).unwrap().conference_url.as_deref(),
+            Some(MEET_LINK)
+        );
+    }
+
+    /// §5.2: a repeating new event's copy is its master: its call is waited for first, then its
+    /// occurrences are listed, so a ready link shows on them.
+    #[tokio::test]
+    async fn a_repeating_new_event_waits_for_its_call_before_listing() {
+        let host = TestHost::holding(&[]);
+        let draft = NewEventDraft {
+            meet: true,
+            ..weekly_dentist("2026-10-26", 3)
+        };
+        let calling_occurrences: Vec<Value> = three_mondays()
+            .into_iter()
+            .map(|o| {
+                let o = with(o, "conferenceData", meet_call());
+                with(o, "hangoutLink", json!(MEET_LINK))
+            })
+            .collect();
+        let (outcome, script) = create_on(
+            &host,
+            &meet_new_target(),
+            EditingStatus::On,
+            vec![
+                insert_step(Scripted::Json(copy_calling(
+                    &draft,
+                    meet_making(REQUEST, "pending"),
+                    "\"n1\"",
+                ))),
+                new_read(Scripted::Json(copy_calling(&draft, meet_call(), "\"n2\""))),
+                new_listing(listed(calling_occurrences)),
+            ],
+            draft,
+            None,
+        )
+        .await;
+        assert!(saved_saying(&outcome, &[]), "saved and landed");
+        assert_eq!(script.waits(), [REFETCH_AGAIN[0]]);
+        assert_eq!(new_rows(&host), three_ids());
+        let links: Vec<Option<String>> = host
+            .with_conn(|conn| calendar::series_rows(conn, "cal", &[NEW]))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.conference_url)
+            .collect();
+        assert!(links.iter().all(|l| l.as_deref() == Some(MEET_LINK)));
     }
 }

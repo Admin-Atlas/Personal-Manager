@@ -214,6 +214,44 @@ pub fn without_meet_request(body: &Map<String, Value>) -> Map<String, Value> {
         .collect()
 }
 
+/// Whether two create bodies are the same new event, the id of their request for a new call aside
+/// (C18b): each send of the create command mints its own, and a retry resends the first send's plan,
+/// so only what the user made has to match (C10's `CREATE_CHANGED` rule). A body with a call and one
+/// without are never the same.
+pub fn same_insert(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
+    request_id_aside(a) == request_id_aside(b)
+}
+
+/// A copy of PM's own create `body` with its call request's `requestId` left out, every other key
+/// and value as they are.
+fn request_id_aside(body: &Map<String, Value>) -> Map<String, Value> {
+    body.iter()
+        .map(|(key, value)| {
+            let value = match (key.as_str(), value.as_object()) {
+                ("conferenceData", Some(data)) => Value::Object(
+                    data.iter()
+                        .map(|(k, v)| match (k.as_str(), v.as_object()) {
+                            ("createRequest", Some(request)) => (
+                                k.clone(),
+                                Value::Object(
+                                    request
+                                        .iter()
+                                        .filter(|(field, _)| field.as_str() != "requestId")
+                                        .map(|(field, v)| (field.clone(), v.clone()))
+                                        .collect(),
+                                ),
+                            ),
+                            _ => (k.clone(), v.clone()),
+                        })
+                        .collect(),
+                ),
+                _ => value.clone(),
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +583,40 @@ mod tests {
             assert_eq!(has_meet(event), has, "{row}: has");
             assert_eq!(room_for_meet(event), room, "{row}: room");
         }
+    }
+
+    /// C18b: a retried create's own request id is no change; anything else the user made is, and so
+    /// is turning the call on or off.
+    #[test]
+    fn same_insert_ignores_only_the_request_id() {
+        let body = |summary: &str, request: Option<&str>| {
+            let mut body = Map::new();
+            body.insert("summary".into(), json!(summary));
+            if let Some(request) = request {
+                body.insert("conferenceData".into(), meet_request_body(request));
+            }
+            body
+        };
+        assert!(same_insert(
+            &body("Dentist", Some("r1")),
+            &body("Dentist", Some("r2"))
+        ));
+        assert!(same_insert(&body("Dentist", None), &body("Dentist", None)));
+        assert!(!same_insert(
+            &body("Dentist", Some("r1")),
+            &body("Gym", Some("r1"))
+        ));
+        assert!(!same_insert(
+            &body("Dentist", Some("r1")),
+            &body("Dentist", None)
+        ));
+        assert!(!same_insert(
+            &body("Dentist", None),
+            &body("Dentist", Some("r1"))
+        ));
+        // Only the id is set aside: another kind of call asked for is a change.
+        let mut other = body("Dentist", Some("r2"));
+        other["conferenceData"]["createRequest"]["conferenceSolutionKey"]["type"] = json!("addOn");
+        assert!(!same_insert(&body("Dentist", Some("r1")), &other));
     }
 }

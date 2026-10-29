@@ -139,6 +139,7 @@ const overview: CalendarOverview = {
   mirror_end: "2040-01-01T00:00:00Z",
   editing: { [ME]: "on" },
   default_length: {},
+  auto_meet: {},
 };
 
 const today = dayKey(startOfDay(new Date()));

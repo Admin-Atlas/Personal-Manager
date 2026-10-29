@@ -334,6 +334,14 @@ pub struct NewEventDraft {
     /// Its colour (C13). `None`, or the calendar's, sends nothing.
     #[serde(default)]
     pub colour: Option<ColourDraft>,
+    /// Ask Google for a new Google Meet call (C18b), made once even if the create is sent again.
+    #[serde(default)]
+    pub meet: bool,
+    /// The id of that request (`createRequest.requestId`): minted by the create command for each
+    /// send, never by the webview (R5). A retry resends its first send's plan, which holds the first
+    /// id, so Google makes one call however often the create goes.
+    #[serde(skip)]
+    pub meet_request: Option<String>,
 }
 
 /// What the user saw of an event when they chose to delete it, taken from the mirror row they
@@ -1551,6 +1559,23 @@ mod tests {
             "the webview named the request"
         );
         assert_eq!(named.meet, Some(MeetChange::Add));
+    }
+
+    /// C18b: a new event asks for no call unless the editor says so, and never names the request's
+    /// id: the webview can't set it (R5).
+    #[test]
+    fn a_new_event_reads_meet_off_by_default() {
+        let time = r#""time":{"kind":"all_day","first_day":"2026-10-26","last_day":"2026-10-26"}"#;
+        let plain: NewEventDraft = serde_json::from_str(&format!("{{{time}}}")).unwrap();
+        assert!(!plain.meet && plain.meet_request.is_none());
+        let asked: NewEventDraft =
+            serde_json::from_str(&format!(r#"{{{time},"meet":true,"meet_request":"abc"}}"#))
+                .unwrap();
+        assert!(asked.meet, "the editor asked for a call");
+        assert!(
+            asked.meet_request.is_none(),
+            "the webview named the request"
+        );
     }
 
     /// C18: the call as the editor names its kind and state.

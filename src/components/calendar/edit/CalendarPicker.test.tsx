@@ -80,6 +80,7 @@ const overview: CalendarOverview = {
     "gcal:consent@x.com": "needs_consent",
   },
   default_length: {},
+  auto_meet: {},
 };
 
 // jsdom ships no ResizeObserver, and the list's popover (escapeClipping) builds one to re-place

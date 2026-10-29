@@ -136,6 +136,7 @@ const overview: CalendarOverview = {
   editing: { [ME]: "on", [WORK]: "on" },
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
+  auto_meet: {},
 };
 
 const seed: EditorFields = {
@@ -177,6 +178,7 @@ const sentFor = (summary: string, calendarId = PERSONAL) => ({
     guests: [],
     reminders: null,
     colour: null,
+    meet: false,
   } as NewEventDraft,
 });
 
@@ -260,15 +262,17 @@ function open(
     /** Inside <StrictMode>, as the app's development build runs: every effect set up twice. */
     strict?: boolean;
     suggestions?: GuestSuggestion[];
+    overview?: CalendarOverview;
   } = {},
 ) {
   const onClose = over.onClose ?? vi.fn();
+  const shown = over.overview ?? overview;
   const editor = (
     <NewEventEditor
       seed={seed}
-      targets={createTargets(overview)}
+      targets={createTargets(shown)}
       calendarId={over.calendarId ?? PERSONAL}
-      overview={overview}
+      overview={shown}
       hidden={over.hidden ?? new Set()}
       suggestions={over.suggestions ?? []}
       colorOf={() => "var(--accent)"}
@@ -296,6 +300,7 @@ const handed = (draft: EditorFields, over: Partial<CreateHandover> = {}): Create
   unproven: null,
   showAsTouched: false,
   timeTouched: false,
+  meetTouched: false,
   badDate: null,
   openCustom: false,
   ...over,
@@ -354,13 +359,14 @@ describe("NewEventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     // The calendar, every field of the draft, and no token: nobody to notify, no repeat, no guests,
-    // the calendar's notifications and colour (C13).
+    // the calendar's notifications and colour (C13), and no video call asked for (C18b).
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
       "colour",
       "description",
       "guests",
       "location",
+      "meet",
       "recurrence",
       "reminders",
       "show_as",
@@ -2157,5 +2163,123 @@ describe("NewEventEditor, notifications and colour", () => {
       screen.getByText("Notifications went back to Family's defaults for timed events."),
     ).toBeTruthy();
     expect(screen.queryByText(/Personal's defaults/)).toBeNull();
+  });
+});
+
+// --- a video call on new events (C18b) ---
+
+/** Personal and Work offer Google Meet, Family doesn't; Personal's account adds Meet to the events
+ *  it creates (`auto`), Work's doesn't. */
+const meetOverview = (auto: Record<string, boolean> = { [ME]: true }): CalendarOverview => ({
+  ...overview,
+  calendars: overview.calendars.map((c) =>
+    c.id === FAMILY ? c : { ...c, conference_types: ["hangoutsMeet"] },
+  ),
+  auto_meet: auto,
+});
+
+const videoCall = () => screen.getByRole("group", { name: "Video call" });
+const addMeet = () =>
+  within(videoCall()).getByRole("button", { name: "Add Google Meet video conferencing" });
+const dontAdd = () => within(videoCall()).getByRole("button", { name: "Don't add the video call" });
+const meetAsked = () =>
+  within(videoCall()).queryByText(
+    "Google Meet video conferencing. Google makes the link when you save.",
+  ) !== null;
+
+describe("NewEventEditor video call (C18b)", () => {
+  // Critique C2-H2: Google adds Meet "when you add invitees", so the setting turns the row on with
+  // the first guest, and off again when none is left, while it's untouched.
+  it("the account's setting turns the row on with the first guest", () => {
+    open({ overview: meetOverview() });
+    expect(meetAsked()).toBe(false);
+    expect(addMeet()).toBeTruthy();
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Remove b@example.org" }));
+    expect(meetAsked()).toBe(false);
+    // The user's own address invites nobody, so no call.
+    addGuest("me@x.com");
+    expect(meetAsked()).toBe(false);
+    cleanup();
+    // Off in Google: a guest brings no call.
+    open({ overview: meetOverview({ [ME]: false }) });
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(false);
+  });
+
+  it("Save asks for the call", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ overview: meetOverview() });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(addMeet());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Dentist").draft, meet: true }, null, null],
+    ]);
+  });
+
+  it("the row is off while what was sent may be in Google", async () => {
+    createEvent.mockResolvedValue(ambiguous);
+    open({ overview: meetOverview() });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(addMeet());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("button", { name: "Check again" });
+    expect(dontAdd()).toHaveProperty("disabled", true);
+  });
+
+  it("a calendar change re-seeds an untouched row", () => {
+    open({ overview: meetOverview({ [ME]: true, [WORK]: false }) });
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+    pickCalendar("Personal", "Work");
+    expect(meetAsked(), "Work's account adds none").toBe(false);
+    pickCalendar("Work", "Personal");
+    expect(meetAsked()).toBe(true);
+  });
+
+  it("a touched row stays, except on a calendar without Meet, which says so", () => {
+    open({ overview: meetOverview({ [ME]: false, [WORK]: false }) });
+    fireEvent.click(addMeet());
+    pickCalendar("Personal", "Work");
+    expect(meetAsked(), "touched: kept where Meet is offered").toBe(true);
+    pickCalendar("Work", "Family");
+    expect(meetAsked()).toBe(false);
+    expect(
+      within(videoCall()).getByText("Family doesn't offer Google Meet, so the video call is off."),
+    ).toBeTruthy();
+    expect(within(videoCall()).queryByRole("button")).toBeNull();
+    pickCalendar("Family", "Personal");
+    expect(screen.queryByText(/doesn't offer Google Meet/)).toBeNull();
+    expect(meetAsked(), "the call isn't brought back").toBe(false);
+    // Turned off by hand, a guest doesn't bring it back either.
+    cleanup();
+    open({ overview: meetOverview() });
+    addGuest("b@example.org");
+    fireEvent.click(dontAdd());
+    addGuest("c@example.org");
+    expect(meetAsked()).toBe(false);
+  });
+
+  it("the hand-over carries the call, and whether it was pressed", () => {
+    // Pressed in quick create: no guest needed, and a guest added here doesn't change it.
+    open({
+      overview: meetOverview({ [ME]: false }),
+      handover: handed({ ...seed, summary: "Dentist", meet: true }, { meetTouched: true }),
+    });
+    expect(meetAsked()).toBe(true);
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+    cleanup();
+    // Untouched there: it follows the guests here.
+    open({
+      overview: meetOverview(),
+      handover: handed({ ...seed, summary: "Dentist" }),
+    });
+    expect(meetAsked()).toBe(false);
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
   });
 });

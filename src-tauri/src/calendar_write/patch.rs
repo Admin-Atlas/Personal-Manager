@@ -77,9 +77,8 @@ pub const REPEAT_PATCHABLE: &[&str] = &[
 ];
 
 /// What a create may send: a save's fields, the repeat rule (C11), the guests with what they may do
-/// (C12d), the notifications and colour (C13), and a request for a Meet call (C18; widened with
-/// [`PATCHABLE`], though nothing builds a create body with a call yet). Still no label or private
-/// notes. Widening it is a decision, never a slip:
+/// (C12d), the notifications and colour (C13), and a request for a new Meet call (C18b). Still no
+/// label or private notes. Widening it is a decision, never a slip:
 /// `creatable_is_the_c11_list_guests_notifications_and_colour` pins it to exactly this, and the
 /// create plan's own refusal test names what it still refuses (C10 critique 1 L10).
 pub const CREATABLE: &[&str] = &[
@@ -269,6 +268,10 @@ impl From<SpecError> for InsertError {
 /// Notifications (C13) go only as a list of the event's own, checked as any new ones are; the
 /// calendar's defaults send nothing, since Google gives a new event those (INFERRED, probe E9). A
 /// colour goes only when it's one of Google's eleven, never the calendar's own.
+///
+/// A Meet call (C18b) goes only when the draft asks for one, under the request id the create
+/// command put in; asked for without one, nothing is built ([`PatchError::MeetUnready`]), so a call
+/// is never asked for twice under two ids.
 pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertError> {
     let (time, rule) = match &draft.recurrence {
         None => (draft.time.clone(), None),
@@ -348,6 +351,13 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
             )));
         }
         body.insert("colorId".into(), Value::String(id.clone()));
+    }
+    if draft.meet {
+        let request = draft
+            .meet_request
+            .as_deref()
+            .ok_or(InsertError::Draft(PatchError::MeetUnready))?;
+        body.insert("conferenceData".into(), call::meet_request_body(request));
     }
     Ok(body)
 }
@@ -1830,6 +1840,8 @@ mod tests {
             guests_can_see_other_guests: None,
             reminders: None,
             colour: None,
+            meet: false,
+            meet_request: None,
         }
     }
 
@@ -1863,6 +1875,8 @@ mod tests {
             guests_can_modify: Some(true),
             reminders: Some(own(&[("popup", 10)])),
             colour: Some(ColourDraft::Colour { id: "3".into() }),
+            meet: true,
+            meet_request: Some("r1".into()),
             ..repeating(
                 timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
                 weekly_on(&[DayCode::Mon]),
@@ -1877,6 +1891,7 @@ mod tests {
             [
                 "attendees",
                 "colorId",
+                "conferenceData",
                 "description",
                 "end",
                 "guestsCanModify",
@@ -1917,9 +1932,44 @@ mod tests {
             "reminders",
             "colorId",
             "eventLabelId",
+            "conferenceData",
         ] {
             assert!(!once.contains_key(absent), "{absent}");
         }
+    }
+
+    /// C18b: a call is asked for exactly when the draft asks, under the request id the create
+    /// command put in; asked for without one, nothing is built.
+    #[test]
+    fn insert_body_asks_for_a_call_only_when_the_draft_does() {
+        let plain = new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"));
+        let body = insert_body(&NewEventDraft {
+            meet_request: Some("r1".into()),
+            ..plain.clone()
+        })
+        .unwrap();
+        assert!(
+            !body.contains_key("conferenceData"),
+            "an id without the ask"
+        );
+        let asked = NewEventDraft {
+            meet: true,
+            ..plain
+        };
+        let body = insert_body(&NewEventDraft {
+            meet_request: Some("r1".into()),
+            ..asked.clone()
+        })
+        .unwrap();
+        assert_eq!(body["conferenceData"], call::meet_request_body("r1"));
+        assert!(
+            insert_body(&asked) == Err(InsertError::Draft(PatchError::MeetUnready)),
+            "no id, no body"
+        );
+        assert_eq!(
+            InsertError::Draft(PatchError::MeetUnready).to_string(),
+            "PM couldn't get the video call ready, so nothing was sent. Try again."
+        );
     }
 
     /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4) and widened by C12d, C13 and

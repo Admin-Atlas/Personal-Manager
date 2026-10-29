@@ -1300,6 +1300,7 @@ const draft: NewEventDraft = {
   guests: [],
   reminders: null,
   colour: null,
+  meet: false,
 };
 const sent = { calendarId: CAL, draft };
 const shown = { name: "Me", hidden: false };

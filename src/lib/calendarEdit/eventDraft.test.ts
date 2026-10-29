@@ -906,7 +906,7 @@ describe("a new event's starting fields", () => {
       recurrence: { kind: "once" },
       guests: [],
       guest_perms: { modify: false, invite_others: true, see_others: true },
-      meet: false,
+      meet: true,
       reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
       colour: { kind: "colour", id: "3" },
       show_as: "free",
@@ -924,6 +924,7 @@ describe("a new event's starting fields", () => {
       guests: [],
       reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
       colour: { kind: "colour", id: "3" },
+      meet: true,
     });
     // A copy: a later edit to the draft can't change what was sent.
     expect(sent.time).not.toBe(draft.time);
@@ -1318,11 +1319,14 @@ describe("the video call in the draft", () => {
     expect(clash.draft.meet).toBe(false);
   });
 
-  it("a new event starts with no call, and sends none", () => {
+  // C18b: a seed has no guests, so no call (Meet starts with the first guest, `meetDefault`), and
+  // toNewEvent sends whether one is asked for.
+  it("a new event starts with no call, and toNewEvent sends meet", () => {
     expect(NEW_EVENT_BASE.meet).toBe(false);
     expect(
       newEventSeed("2026-10-12", new Date("2026-10-11T12:00:00Z"), "Europe/London", 3_600_000).meet,
     ).toBe(false);
-    expect(toNewEvent(base())).not.toHaveProperty("meet");
+    expect(toNewEvent(base()).meet).toBe(false);
+    expect(toNewEvent({ ...base(), meet: true }).meet).toBe(true);
   });
 });

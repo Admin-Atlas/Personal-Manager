@@ -41,6 +41,12 @@
 // all-day puts a list of the event's own back to the defaults, and says so. A notification row that
 // can't be committed stops every way to save, as a date a field couldn't read does. Quick create has
 // neither row, as Google's has none (INFERRED).
+//
+// It can have a Google Meet call (C18b): the video-call row sits after the guests, as when editing,
+// where the calendar offers Meet. Until the user touches it, it follows Google: on with the first
+// guest when the account's "Automatically add Google Meet video conferences to events I create" is
+// on, off again when no guest is left (`meetDefault`), and another calendar decides it afresh.
+// Touched, it stays, except on a calendar without Meet, which turns it off and says so.
 
 import {
   useCallback,
@@ -89,6 +95,10 @@ import {
   createdWhere,
   createNotes,
   lengthFor,
+  meetDefault,
+  meetOffered,
+  meetOffText,
+  meetOnCalendar,
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
@@ -101,6 +111,7 @@ import { CalendarPicker } from "./CalendarPicker";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
 import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
+import { MeetField } from "./MeetField";
 import { NotifyPrompt } from "./NotifyPrompt";
 import { ReminderList } from "./ReminderList";
 import {
@@ -150,9 +161,10 @@ export interface CreateHandover {
   held: { token: string; sent: CreateSent } | null;
   /** A token that ended there without Google showing the event made: its words carry on here. */
   unproven: Unproven | null;
-  /** Whether the user picked Show as, or changed the time, there. */
+  /** Whether the user picked Show as, or changed the time, or pressed Google Meet, there. */
   showAsTouched: boolean;
   timeTouched: boolean;
+  meetTouched: boolean;
   /** Text quick create's date field couldn't read: it stands here as the start's (Start date or
    *  First day), refusing a save until that field is given a date, as it did there. */
   badDate: string | null;
@@ -242,6 +254,11 @@ export function NewEventEditor({
   const timeTouched = useRef(handover?.timeTouched ?? false);
   // Whether the user has picked Show as: until then, it follows the kind (all day free).
   const showAsTouched = useRef(handover?.showAsTouched ?? false);
+  // Whether the user has pressed the video-call row (here or in quick create): until then, it
+  // follows Google's setting and the guest list (`meetDefault`).
+  const meetTouched = useRef(handover?.meetTouched ?? false);
+  // Another calendar turned the call off, offering no Meet: said under the row until it next changes.
+  const [meetNote, setMeetNote] = useState<string | null>(null);
   // Handed over while PM may already have made it: locked on what was sent, saying so; or after a
   // token ended unproven there, still saying that.
   const handedHeld: Held | null = handover?.held
@@ -478,7 +495,7 @@ export function NewEventEditor({
    *  (and back again), as Google's own length would. The calendar organises the event, so its own
    *  address typed as a guest on another one comes off the list, said under the box: GuestField
    *  refuses adding it, and the backend counts it as the event's own, never one Google invites (C13
-   *  review round 1). */
+   *  review round 1). The video call follows the new calendar (`meetOnCalendar`, C18b). */
   function pickCalendar(id: string) {
     setCalendarId(id);
     const target = targetById(targets, id);
@@ -496,7 +513,20 @@ export function NewEventEditor({
       const t = next.time;
       if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
     }
+    const call = meetOnCalendar(overviewRef.current, target, next, meetTouched.current);
+    if (call.meet !== next.meet) next = { ...next, meet: call.meet };
+    setMeetNote(call.off && target ? meetOffText(target.calendar.name) : null);
     if (next !== was) setDraft(next);
+  }
+
+  /** The guest list changed: an untouched video call follows it, on with the first guest where the
+   *  account's setting adds Meet, off when none is left (C18b). */
+  function changeGuests(guests: EditorFields["guests"]) {
+    const next = { ...draftRef.current, guests };
+    const meet = meetTouched.current
+      ? next.meet
+      : meetDefault(overviewRef.current, targetById(targets, calendarRef.current), guests);
+    setDraft(meet === next.meet ? next : { ...next, meet });
   }
 
   /** Whether the backend has said `fields`' repeat can be saved, for exactly its rule and start (a
@@ -841,10 +871,24 @@ export function NewEventEditor({
             notice={guestNote}
             onChange={(guests) => {
               setGuestNote(null);
-              setDraft({ ...draftRef.current, guests });
+              changeGuests(guests);
             }}
             onPerms={(guest_perms) => setDraft({ ...draftRef.current, guest_perms })}
             onReject={setBadGuest}
+          />
+
+          {/* A new event has no call yet: the row only asks for one (C18b). */}
+          <MeetField
+            call={null}
+            value={draft.meet}
+            offered={meetOffered(target)}
+            disabled={locked}
+            note={meetNote}
+            onChange={(meet) => {
+              meetTouched.current = true;
+              setMeetNote(null);
+              setDraft({ ...draftRef.current, meet });
+            }}
           />
 
           <TextRow

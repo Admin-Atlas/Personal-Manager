@@ -209,4 +209,80 @@ describe("MeetField", () => {
     expect(within(group()).getByText("<b>x</b>")).toBeTruthy();
     expect(group().querySelector("b")).toBeNull();
   });
+
+  // C18b: a new event's note that its calendar turned the call off shows even with nothing to press.
+  it("a note shows where the calendar offers no Meet", () => {
+    render(
+      <MeetField
+        call={null}
+        value={false}
+        offered={false}
+        onChange={() => {}}
+        note="Work doesn't offer Google Meet, so the video call is off."
+      />,
+    );
+    expect(
+      within(group()).getByText("Work doesn't offer Google Meet, so the video call is off."),
+    ).toBeTruthy();
+    expect(within(group()).queryByRole("button")).toBeNull();
+  });
+});
+
+// --- quick create's size (C18b) ---
+
+describe("MeetField compact", () => {
+  /** Quick create's button, its value following `onChange`. */
+  function Compact({
+    offered = true,
+    disabled,
+    onPointerPress,
+  }: {
+    offered?: boolean;
+    disabled?: boolean;
+    onPointerPress?: () => void;
+  }) {
+    const [on, setOn] = useState(false);
+    return (
+      <MeetField
+        compact
+        call={null}
+        value={on}
+        offered={offered}
+        disabled={disabled}
+        onChange={setOn}
+        onPointerPress={onPointerPress}
+        note="never shown here"
+      />
+    );
+  }
+  const meetButton = () => screen.getByRole("button", { name: "Google Meet" });
+
+  it("compact is one pressed-or-not button, hidden where Meet isn't offered", () => {
+    render(<Compact />);
+    expect(meetButton().getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(meetButton(), { detail: 1 });
+    expect(meetButton().getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(meetButton(), { detail: 1 });
+    expect(meetButton().getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByRole("group")).toBeNull();
+    expect(screen.queryByText("never shown here")).toBeNull();
+    cleanup();
+    const { container } = render(<Compact offered={false} />);
+    expect(container.textContent).toBe("");
+    cleanup();
+    render(<Compact disabled />);
+    expect(meetButton()).toHaveProperty("disabled", true);
+  });
+
+  // Critique C2-M3: a click hands focus back (quick create's title, where Enter saves); a key press
+  // on the button leaves it there.
+  it("says a pointer press, never a key press", () => {
+    const onPointerPress = vi.fn();
+    render(<Compact onPointerPress={onPointerPress} />);
+    fireEvent.click(meetButton(), { detail: 0 });
+    expect(onPointerPress).not.toHaveBeenCalled();
+    expect(meetButton().getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(meetButton(), { detail: 1 });
+    expect(onPointerPress).toHaveBeenCalledTimes(1);
+  });
 });

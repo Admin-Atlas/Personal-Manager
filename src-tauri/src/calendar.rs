@@ -298,65 +298,209 @@ pub fn parse_default_length(v: &serde_json::Value) -> Option<u32> {
 /// Store what a read of one account's default length found, under the caller's lock: a value Google
 /// gave replaces the last one; a read that failed (`None`) changes nothing, so the last good value
 /// stays rather than falling back to an hour.
+#[cfg(test)]
 fn remember_default_length(conn: &Connection, email: &str, read: Option<u32>) -> Result<()> {
-    match read {
-        Some(minutes) => set_default_length(conn, email, Some(minutes)),
-        None => Ok(()),
-    }
+    remember_by_email(conn, DEFAULT_LENGTH_KEY, email, read)
 }
 
-/// [`remember_default_length`] for a read made with no lock held, under the lock taken again after
-/// it: only while the Google source `source_id` is still connected. A disconnect during the read
-/// cleared the account's length, and a value read with the token it had before must not bring the
-/// length back for an account PM no longer holds.
+/// [`remember_by_email_if_connected`] for a default length.
 pub fn remember_default_length_if_connected(
     conn: &Connection,
     source_id: &str,
     email: &str,
     read: Option<u32>,
 ) -> Result<()> {
-    let connected = list_sources(conn, Some("google"))?
-        .iter()
-        .any(|s| s.id == source_id);
-    if connected {
-        remember_default_length(conn, email, read)
-    } else {
-        Ok(())
-    }
+    remember_by_email_if_connected(conn, DEFAULT_LENGTH_KEY, source_id, email, read)
 }
 
 /// Every account's stored default length. A value PM can't read is none at all: the editor then
 /// uses an hour, as it would before the first sync.
 pub fn default_lengths(conn: &Connection) -> Result<std::collections::BTreeMap<String, u32>> {
-    let Some(raw) = db::get_setting(conn, DEFAULT_LENGTH_KEY)? else {
+    values_by_email(conn, DEFAULT_LENGTH_KEY)
+}
+
+/// Store (or with `None`, forget) one account's default length, under the caller's lock.
+pub fn set_default_length(conn: &Connection, email: &str, minutes: Option<u32>) -> Result<()> {
+    set_value_by_email(conn, DEFAULT_LENGTH_KEY, email, minutes)
+}
+
+/// Forget every account's default length (every Google account went).
+pub fn clear_default_lengths(conn: &Connection) -> Result<()> {
+    clear_values_by_email(conn, DEFAULT_LENGTH_KEY)
+}
+
+// --- each Google account's "add Google Meet to events I create" (C18b) ---
+
+/// `settings` key: `{ "<lowercased account email>": true|false }`, each Google account's
+/// "Automatically add Google Meet video conferences to events I create" (`autoAddHangouts`). Read
+/// when an account connects and at each sync ([`fetch_auto_meet`]); a read that fails keeps the
+/// last value; a disconnect clears it. The default length's store, under its own key.
+pub const AUTO_MEET_KEY: &str = "calendar_auto_meet";
+
+/// The most pages of a settings list read for [`fetch_auto_meet`]: Google's list is a few dozen
+/// settings, one page; past this the read counts as failed.
+const SETTINGS_PAGES: usize = 3;
+
+/// Whether the account `token_key` signs in as adds a Meet call to the events it creates, from its
+/// settings list (`users/me/settings`, readable with the read-only calendar permission every account
+/// has). Google may leave a setting at its default out of the list, so a whole list without
+/// `autoAddHangouts` is `false` ([`parse_auto_meet`]). `None`: the list couldn't be read whole.
+/// Network only: callers hold no lock across it.
+pub async fn fetch_auto_meet(token_key: &str) -> Option<bool> {
+    let mut base = reqwest::Url::parse(&format!("{CALENDAR_API}/users/me/settings")).ok()?;
+    base.query_pairs_mut()
+        .append_pair("fields", "items(id,value),nextPageToken");
+    let (pages, _) = crate::connector_sync::paginate(SETTINGS_PAGES, |page_token| {
+        let mut url = base.clone();
+        async move {
+            if let Some(tok) = &page_token {
+                url.query_pairs_mut().append_pair("pageToken", tok);
+            }
+            let value = google::authorized_get(token_key, url.as_str()).await?;
+            let next = value
+                .get("nextPageToken")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok((vec![value], next))
+        }
+    })
+    .await
+    .ok()?;
+    parse_auto_meet(&pages)
+}
+
+/// The pages of a settings list, read: `Some(value == "true")` for `autoAddHangouts` (any other
+/// value is off, so no call is ever made on a guess), `Some(false)` when a list whose last page has
+/// no `nextPageToken` doesn't name it (Google: "if a setting has its default value, it might not be
+/// returned", and its default is `"false"`), and `None` when it ran past [`SETTINGS_PAGES`] or
+/// wasn't read at all.
+pub fn parse_auto_meet(pages: &[serde_json::Value]) -> Option<bool> {
+    let read = pages.get(..SETTINGS_PAGES).unwrap_or(pages);
+    let named = read
+        .iter()
+        .filter_map(|page| page.get("items")?.as_array())
+        .flatten()
+        .find(|item| item.get("id").and_then(|v| v.as_str()) == Some("autoAddHangouts"));
+    if let Some(item) = named {
+        return Some(item.get("value").and_then(|v| v.as_str()) == Some("true"));
+    }
+    let whole = pages.len() <= SETTINGS_PAGES
+        && read
+            .last()
+            .is_some_and(|page| page.get("nextPageToken").is_none());
+    whole.then_some(false)
+}
+
+/// [`remember_by_email_if_connected`] for the Meet setting.
+pub fn remember_auto_meet_if_connected(
+    conn: &Connection,
+    source_id: &str,
+    email: &str,
+    read: Option<bool>,
+) -> Result<()> {
+    remember_by_email_if_connected(conn, AUTO_MEET_KEY, source_id, email, read)
+}
+
+/// Every account's stored Meet setting. One PM can't read is none at all: a new event then starts
+/// with no call, as before the first sync.
+pub fn auto_meets(conn: &Connection) -> Result<std::collections::BTreeMap<String, bool>> {
+    values_by_email(conn, AUTO_MEET_KEY)
+}
+
+/// Store (or with `None`, forget) one account's Meet setting, under the caller's lock.
+pub fn set_auto_meet(conn: &Connection, email: &str, on: Option<bool>) -> Result<()> {
+    set_value_by_email(conn, AUTO_MEET_KEY, email, on)
+}
+
+/// Forget what PM read of one Google account's settings (it disconnected).
+pub fn forget_account_settings(conn: &Connection, email: &str) -> Result<()> {
+    set_default_length(conn, email, None)?;
+    set_auto_meet(conn, email, None)
+}
+
+/// Forget what PM read of every Google account's settings (every Google account went).
+pub fn clear_account_settings(conn: &Connection) -> Result<()> {
+    clear_default_lengths(conn)?;
+    clear_values_by_email(conn, AUTO_MEET_KEY)
+}
+
+// --- one value per Google account, under one `settings` key (C10, C18b) ---
+
+/// The values stored under `key`, by lowercased account address. The `calendar_editing` shape: one
+/// key for every account, so a change is one read-modify-write under the DB lock. A value PM can't
+/// read is none at all.
+fn values_by_email<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    key: &str,
+) -> Result<std::collections::BTreeMap<String, T>> {
+    let Some(raw) = db::get_setting(conn, key)? else {
         return Ok(Default::default());
     };
     Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
-/// Store (or with `None`, forget) one account's default length, under the caller's lock. Writes
+/// Store (or with `None`, forget) one account's value under `key`, under the caller's lock. Writes
 /// only on a change, so a sync that reads the same value writes nothing; forgetting the last one
 /// removes the key.
-pub fn set_default_length(conn: &Connection, email: &str, minutes: Option<u32>) -> Result<()> {
-    let mut all = default_lengths(conn)?;
-    let key = email.trim().to_lowercase();
-    let changed = match minutes {
-        Some(m) => all.insert(key, m) != Some(m),
-        None => all.remove(&key).is_some(),
+fn set_value_by_email<T>(conn: &Connection, key: &str, email: &str, value: Option<T>) -> Result<()>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + Copy,
+{
+    let mut all = values_by_email::<T>(conn, key)?;
+    let address = email.trim().to_lowercase();
+    let changed = match value {
+        Some(v) => all.insert(address, v) != Some(v),
+        None => all.remove(&address).is_some(),
     };
     if !changed {
         return Ok(());
     }
     if all.is_empty() {
-        return db::delete_setting(conn, DEFAULT_LENGTH_KEY);
+        return db::delete_setting(conn, key);
     }
     let json = serde_json::to_string(&all).map_err(|e| Error::Other(e.to_string()))?;
-    db::set_setting(conn, DEFAULT_LENGTH_KEY, &json)
+    db::set_setting(conn, key, &json)
 }
 
-/// Forget every account's default length (every Google account went).
-pub fn clear_default_lengths(conn: &Connection) -> Result<()> {
-    db::delete_setting(conn, DEFAULT_LENGTH_KEY)
+/// Forget every account's value under `key`.
+fn clear_values_by_email(conn: &Connection, key: &str) -> Result<()> {
+    db::delete_setting(conn, key)
+}
+
+/// Store what a read of one account's value found, under the caller's lock: a value Google gave
+/// replaces the last one; a read that failed (`None`) changes nothing, so the last good value stays.
+fn remember_by_email<T>(conn: &Connection, key: &str, email: &str, read: Option<T>) -> Result<()>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + Copy,
+{
+    match read {
+        Some(value) => set_value_by_email(conn, key, email, Some(value)),
+        None => Ok(()),
+    }
+}
+
+/// [`remember_by_email`] for a read made with no lock held, under the lock taken again after it:
+/// only while the Google source `source_id` is still connected. A disconnect during the read cleared
+/// the account's values, and one read with the token it had before must not bring a value back for
+/// an account PM no longer holds.
+fn remember_by_email_if_connected<T>(
+    conn: &Connection,
+    key: &str,
+    source_id: &str,
+    email: &str,
+    read: Option<T>,
+) -> Result<()>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + Copy,
+{
+    let connected = list_sources(conn, Some("google"))?
+        .iter()
+        .any(|s| s.id == source_id);
+    if connected {
+        remember_by_email(conn, key, email, read)
+    } else {
+        Ok(())
+    }
 }
 
 /// Fetch events from one Google calendar within `[time_min, time_max]` (RFC3339), with recurring
@@ -3848,5 +3992,145 @@ mod tests {
         upsert_source(&conn, &me, "other", None, "Feed").unwrap();
         remember_default_length_if_connected(&conn, &me, "me@example.com", Some(45)).unwrap();
         assert!(default_lengths(&conn).unwrap().is_empty());
+    }
+
+    // --- the Meet setting (C18b) ---
+
+    /// One settings page holding `items` (`[id, value]`), with `next` as its `nextPageToken`.
+    fn settings_page(items: &[(&str, &str)], next: Option<&str>) -> serde_json::Value {
+        let items: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(id, value)| serde_json::json!({ "id": id, "value": value }))
+            .collect();
+        let mut page = serde_json::json!({ "items": items });
+        if let Some(next) = next {
+            page["nextPageToken"] = serde_json::json!(next);
+        }
+        page
+    }
+
+    /// Google's own words: a setting at its default may be left out, and `autoAddHangouts`'s default
+    /// is "false". So a whole list without it is off, and one PM couldn't read whole is unknown.
+    #[test]
+    fn parse_auto_meet_reads_the_setting_and_its_default() {
+        let other = ("defaultEventLength", "30");
+        let on = ("autoAddHangouts", "true");
+        let off = ("autoAddHangouts", "false");
+        assert_eq!(
+            parse_auto_meet(&[settings_page(&[other, on], None)]),
+            Some(true)
+        );
+        assert_eq!(parse_auto_meet(&[settings_page(&[off], None)]), Some(false));
+        assert_eq!(
+            parse_auto_meet(&[settings_page(&[other], None)]),
+            Some(false),
+            "a whole list without it is Google's default"
+        );
+        assert_eq!(
+            parse_auto_meet(&[
+                settings_page(&[other], Some("p2")),
+                settings_page(&[on], None)
+            ]),
+            Some(true),
+            "named on the second page"
+        );
+        // A value that isn't "true" is off: no call is ever made on a guess.
+        assert_eq!(
+            parse_auto_meet(&[settings_page(&[("autoAddHangouts", "TRUE")], None)]),
+            Some(false)
+        );
+        let more = || settings_page(&[other], Some("next"));
+        assert_eq!(
+            parse_auto_meet(&[more(), more(), more()]),
+            None,
+            "three pages and still more: not read whole"
+        );
+        assert_eq!(
+            parse_auto_meet(&[more(), more(), more(), settings_page(&[on], None)]),
+            None,
+            "four pages"
+        );
+        assert_eq!(parse_auto_meet(&[]), None, "nothing read");
+        assert_eq!(
+            parse_auto_meet(&[serde_json::json!({ "kind": "calendar#settings" })]),
+            Some(false),
+            "a whole list with no items"
+        );
+    }
+
+    #[test]
+    fn auto_meets_round_trip_and_none_removes_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        assert!(auto_meets(&conn).unwrap().is_empty());
+        set_auto_meet(&conn, "Me@Example.com", Some(true)).unwrap();
+        set_auto_meet(&conn, "work@example.com", Some(false)).unwrap();
+        let all = auto_meets(&conn).unwrap();
+        assert_eq!(all.get("me@example.com"), Some(&true));
+        assert_eq!(all.get("work@example.com"), Some(&false));
+        set_auto_meet(&conn, "me@example.com", None).unwrap();
+        assert_eq!(auto_meets(&conn).unwrap().len(), 1);
+        set_auto_meet(&conn, "work@example.com", None).unwrap();
+        assert_eq!(db::get_setting(&conn, AUTO_MEET_KEY).unwrap(), None);
+        db::set_setting(&conn, AUTO_MEET_KEY, "not json").unwrap();
+        assert!(auto_meets(&conn).unwrap().is_empty());
+        // A read that failed keeps the last one; an account disconnected meanwhile gets none back.
+        let me = google_account_id("me@example.com");
+        upsert_source(
+            &conn,
+            &me,
+            "google",
+            Some("me@example.com"),
+            "me@example.com",
+        )
+        .unwrap();
+        remember_auto_meet_if_connected(&conn, &me, "me@example.com", Some(true)).unwrap();
+        remember_auto_meet_if_connected(&conn, &me, "me@example.com", None).unwrap();
+        assert_eq!(
+            auto_meets(&conn).unwrap().get("me@example.com"),
+            Some(&true)
+        );
+        remove_source(&conn, &me).unwrap();
+        forget_account_settings(&conn, "me@example.com").unwrap();
+        remember_auto_meet_if_connected(&conn, &me, "me@example.com", Some(true)).unwrap();
+        assert!(auto_meets(&conn).unwrap().is_empty());
+    }
+
+    /// The two settings share one store, each under its own key: writing or forgetting one never
+    /// touches the other, and a disconnect forgets both.
+    #[test]
+    fn the_store_is_one_for_both_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        set_default_length(&conn, "me@example.com", Some(30)).unwrap();
+        set_auto_meet(&conn, "me@example.com", Some(true)).unwrap();
+        set_auto_meet(&conn, "me@example.com", None).unwrap();
+        assert_eq!(
+            default_lengths(&conn).unwrap().get("me@example.com"),
+            Some(&30)
+        );
+        set_auto_meet(&conn, "me@example.com", Some(false)).unwrap();
+        set_default_length(&conn, "me@example.com", None).unwrap();
+        assert_eq!(
+            auto_meets(&conn).unwrap().get("me@example.com"),
+            Some(&false)
+        );
+        set_default_length(&conn, "me@example.com", Some(30)).unwrap();
+        set_default_length(&conn, "work@example.com", Some(45)).unwrap();
+        set_auto_meet(&conn, "work@example.com", Some(true)).unwrap();
+        forget_account_settings(&conn, "me@example.com").unwrap();
+        assert!(!default_lengths(&conn)
+            .unwrap()
+            .contains_key("me@example.com"));
+        assert!(!auto_meets(&conn).unwrap().contains_key("me@example.com"));
+        assert_eq!(
+            default_lengths(&conn).unwrap().len(),
+            1,
+            "the other account's stays"
+        );
+        assert_eq!(auto_meets(&conn).unwrap().len(), 1);
+        clear_account_settings(&conn).unwrap();
+        assert!(default_lengths(&conn).unwrap().is_empty());
+        assert!(auto_meets(&conn).unwrap().is_empty());
     }
 }

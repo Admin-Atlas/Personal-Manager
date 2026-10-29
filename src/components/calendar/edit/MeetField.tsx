@@ -6,6 +6,9 @@
 // `openUrl`, with Copy link beside it as wherever a button sends a page to the browser; the call's
 // name and link render as text. After Add, Don't add, Remove or Keep it, focus moves to the button
 // that took the pressed one's place, and the line saying what Save will do is read out.
+//
+// Quick create's size (`compact`, C18b) is one pressed-or-not button, "Google Meet", where the
+// calendar offers it: a new event has no call to show yet.
 
 import { useId, useLayoutEffect, useRef, type ReactNode } from "react";
 import type { CallForEdit } from "../../../lib/types";
@@ -13,7 +16,7 @@ import { openUrl } from "../../../lib/ipc";
 import { Button, CopyLinkButton } from "../../ui";
 
 interface Props {
-  /** The call Google holds now; null for none. */
+  /** The call Google holds now; null for none, and for a new event. */
   call: CallForEdit | null;
   /** Whether the event will have a Meet call after Save (the draft's `meet`). */
   value: boolean;
@@ -22,14 +25,60 @@ interface Props {
   /** Turns off Add, Remove, Don't add and Keep it; Join stays, so anyone can still join. */
   disabled?: boolean;
   onChange: (meet: boolean) => void;
-  /** Words to show under the row. */
+  /** Words to show under the row (not in `compact`: quick create says them with its notes). */
   note?: string | null;
+  /** Quick create's size: one pressed-or-not button, hidden where Meet isn't offered. */
+  compact?: boolean;
+  /** After a pointer press of the compact button, so quick create can hand focus back to its title
+   *  (Enter there saves); a keyboard press leaves focus on the button. */
+  onPointerPress?: () => void;
 }
 
 /** The link as it reads, without its scheme. */
 const shownLink = (link: string) => link.replace(/^https:\/\//, "");
 
-export function MeetField({ call, value, offered, disabled = false, onChange, note }: Props) {
+// The compact button's two looks, each its whole class string (`cn` is a plain joiner, so an
+// "on" class added to the "off" ones would leave the stylesheet to pick). The edge is `--ink4` in
+// both, a control's contrast floor; the dot marks "on" by shape, as the chat's Thinking button does.
+// Off while a save is out: the edge drops to `--border2` and the fill goes; the label stays at
+// `--ink4`, as the faint token is for decoration only (designGuards).
+const COMPACT_OFF =
+  "inline-flex shrink-0 items-center gap-1 rounded-[var(--radius-sm)] border border-ink4 px-2 py-1 text-xs text-ink3 transition-colors enabled:hover:text-ink disabled:cursor-not-allowed disabled:border-border2 disabled:text-ink4 motion-reduce:transition-none";
+const COMPACT_ON =
+  "inline-flex shrink-0 items-center gap-1 rounded-[var(--radius-sm)] border border-ink4 bg-accent px-2 py-1 text-xs text-accent-ink transition-colors disabled:cursor-not-allowed disabled:border-border2 disabled:bg-surface disabled:text-ink4 motion-reduce:transition-none";
+
+export function MeetField(props: Props) {
+  return props.compact ? <CompactMeet {...props} /> : <MeetRow {...props} />;
+}
+
+/** Quick create's button: pressed while the new event will ask for a call. */
+function CompactMeet({ value, offered, disabled = false, onChange, onPointerPress }: Props) {
+  if (!offered) return null;
+  return (
+    <button
+      type="button"
+      aria-pressed={value}
+      disabled={disabled}
+      onClick={(e) => {
+        onChange(!value);
+        // `detail` counts the clicks of a pointer press; a key press reports none.
+        if (e.detail > 0) onPointerPress?.();
+      }}
+      className={value ? COMPACT_ON : COMPACT_OFF}
+    >
+      {value && (
+        <span
+          aria-hidden
+          className="h-1.5 w-1.5 shrink-0 rounded-full"
+          style={{ background: "currentColor" }}
+        />
+      )}
+      Google Meet
+    </button>
+  );
+}
+
+function MeetRow({ call, value, offered, disabled = false, onChange, note }: Props) {
   const labelId = useId();
   const toggleRef = useRef<HTMLButtonElement>(null);
   // Set by a press, so focus follows to the button that replaced it; never on a value the editor
@@ -52,8 +101,9 @@ export function MeetField({ call, value, offered, disabled = false, onChange, no
   const pending = meet?.state === "pending";
   // A Meet call Google holds, made or being made: Remove takes it off.
   const held = meet !== null && !failed;
-  // Nothing to show and nothing to do: a calendar without Meet, and no call.
-  if (!other && !held && !value && !offered) return null;
+  // Nothing to show and nothing to do: a calendar without Meet, no call, and nothing to say (a new
+  // event's note that its calendar turned the call off stays).
+  if (!other && !held && !value && !offered && !note) return null;
 
   const join = (label: string, link: string) => (
     <span className="flex min-w-0 flex-wrap items-center gap-2">

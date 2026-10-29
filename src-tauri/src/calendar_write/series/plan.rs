@@ -241,11 +241,12 @@ pub enum Op {
     /// A new event under PM's own id, minted for this plan and kept for every retry of it:
     /// re-sending the same id normally can't make a second one (Google warns it can't always
     /// catch a repeated id, so the sends stay few), and a 409 means it's there (DS5). A new plan
-    /// gets a new id. A split's new series, or a new event ([`SeriesPlan::create`]).
+    /// gets a new id. A split's new series, or a new event ([`SeriesPlan::create`]); `of` says which.
     Insert {
         calendar: String,
         id: String,
         body: Map<String, Value>,
+        of: InsertOf,
     },
     Patch {
         calendar: String,
@@ -276,18 +277,30 @@ pub enum Op {
     },
 }
 
+/// What an insert makes, which decides what its body may carry ([`Op::fits`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOf {
+    /// A new event (C10): [`CREATABLE`], a request for a new Meet call included (C18b).
+    NewEvent,
+    /// A "this and following" change's new part: [`TAIL_FIELDS`], never a video call (DECISIONS
+    /// 17-10 #3).
+    SplitTail,
+}
+
 impl Op {
     /// The request, sent with `notify`. `None` for a carry, which needs its occurrence found first
     /// ([`Op::carry_request`]).
     pub fn request(&self, notify: Notify) -> Option<RequestPlan> {
         Some(match self {
-            Op::Insert { calendar, id, body } => insert_event(
+            Op::Insert {
+                calendar, id, body, ..
+            } => insert_event(
                 calendar,
                 id,
                 Value::Object(body.clone()),
                 notify,
-                // conferenceDataVersion=1 with no conference: Google adds no Meet of its own to the
-                // new series (AS16).
+                // conferenceDataVersion=1 on every insert: Google adds no Meet of its own (AS16), and
+                // makes the one a new event's body asks for (C18b).
                 VersionFlags {
                     conference: true,
                     labels: false,
@@ -352,7 +365,14 @@ impl Op {
 
     fn allowed(&self) -> &'static [&'static str] {
         match self {
-            Op::Insert { .. } => TAIL_FIELDS,
+            Op::Insert {
+                of: InsertOf::NewEvent,
+                ..
+            } => CREATABLE,
+            Op::Insert {
+                of: InsertOf::SplitTail,
+                ..
+            } => TAIL_FIELDS,
             Op::Patch { .. } => &[
                 "summary",
                 "location",
@@ -1736,6 +1756,7 @@ impl SeriesPlan {
                     calendar: calendar.into(),
                     id: id.into(),
                     body,
+                    of: InsertOf::NewEvent,
                 },
                 // R7/R9: the user's answer, or none where nobody would be invited.
                 notify,
@@ -2789,6 +2810,7 @@ pub(super) fn insert_step(
             calendar: input.calendar.to_string(),
             id: tail_id.to_string(),
             body,
+            of: InsertOf::SplitTail,
         },
         notify,
         stage: Stage::Commit,
@@ -5237,6 +5259,8 @@ mod tests {
             guests_can_see_other_guests: None,
             reminders: None,
             colour: None,
+            meet: false,
+            meet_request: None,
         })
         .unwrap()
     }
@@ -5252,8 +5276,10 @@ mod tests {
         let plan = create_plan(NEW, new_body()).unwrap();
         assert_eq!(plan.steps.len(), 1);
         let step = &plan.steps[0];
-        assert!(matches!(&step.op, Op::Insert { calendar, id, body }
-            if calendar == CALENDAR && id == NEW && *body == new_body()));
+        assert!(
+            matches!(&step.op, Op::Insert { calendar, id, body, of: InsertOf::NewEvent }
+            if calendar == CALENDAR && id == NEW && *body == new_body())
+        );
         assert_eq!(step.notify, Notify::None);
         assert_eq!(step.stage, Stage::Commit);
         assert!(step.requires.is_none() && step.undo.is_none() && !step.gone_is_done);
@@ -5287,16 +5313,20 @@ mod tests {
             body.insert(key.into(), json!([]));
             assert!(create_plan(NEW, body).is_none(), "{key}");
         }
+        // C18b: a new event may ask for a Meet call, and its run starts.
         let mut calling = new_body();
         calling.insert(
             "conferenceData".into(),
             crate::calendar_write::call::meet_request_body("r1"),
         );
         let plan = create_plan(NEW, calling).expect("a call is in the create's list");
-        assert!(!plan.steps[0].op.fits(), "an insert carries no call yet");
         assert!(
-            super::super::run::Run::new(plan).is_err(),
-            "so its run never starts"
+            plan.steps[0].op.fits(),
+            "a new event's insert carries a call"
+        );
+        assert!(
+            super::super::run::Run::new(plan).is_ok(),
+            "and its run starts"
         );
         let mut invited = new_body();
         invited.insert("attendees".into(), json!([{ "email": A }]));
@@ -5506,6 +5536,8 @@ mod tests {
                 guests_can_see_other_guests: None,
                 reminders: None,
                 colour: None,
+                meet: false,
+                meet_request: None,
             })
             .unwrap();
         let plan = create_plan(NEW, body).unwrap();
@@ -6470,17 +6502,44 @@ mod tests {
             etag: "\"m1\"".into(),
             body,
         };
-        let insert = |body| Op::Insert {
+        assert!(!patch(body_of("eventLabelId")).fits());
+        for of in [InsertOf::NewEvent, InsertOf::SplitTail] {
+            assert!(!inserting(body_of("eventLabelId"), of).fits(), "{of:?}");
+        }
+        for key in ["colorId", "reminders"] {
+            assert!(patch(body_of(key)).fits(), "{key}");
+            for of in [InsertOf::NewEvent, InsertOf::SplitTail] {
+                assert!(inserting(body_of(key), of).fits(), "{key} {of:?}");
+            }
+        }
+    }
+
+    /// An insert of `body` under [`TAIL`], making `of`.
+    fn inserting(body: Map<String, Value>, of: InsertOf) -> Op {
+        Op::Insert {
             calendar: CALENDAR.into(),
             id: TAIL.into(),
             body,
-        };
-        assert!(!patch(body_of("eventLabelId")).fits());
-        assert!(!insert(body_of("eventLabelId")).fits());
-        for key in ["colorId", "reminders"] {
-            assert!(patch(body_of(key)).fits(), "{key}");
-            assert!(insert(body_of(key)).fits(), "{key}");
+            of,
         }
+    }
+
+    /// C18b: a new event's insert may ask for a Meet call; a split's new part never carries one
+    /// (DECISIONS 17-10 #3), nor PM's own notes into a new event.
+    #[test]
+    fn a_create_step_may_carry_a_call_and_a_split_tail_never_does() {
+        let mut calling = Map::new();
+        calling.insert("summary".into(), json!("Dentist"));
+        calling.insert(
+            "conferenceData".into(),
+            crate::calendar_write::call::meet_request_body("r1"),
+        );
+        assert!(inserting(calling.clone(), InsertOf::NewEvent).fits());
+        assert!(!inserting(calling, InsertOf::SplitTail).fits());
+        let mut noted = Map::new();
+        noted.insert("extendedProperties".into(), json!({ "private": {} }));
+        assert!(inserting(noted.clone(), InsertOf::SplitTail).fits());
+        assert!(!inserting(noted, InsertOf::NewEvent).fits());
     }
 
     // --- C14: someone else's repeating event ---

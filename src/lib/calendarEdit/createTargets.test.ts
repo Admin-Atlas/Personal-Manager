@@ -6,7 +6,7 @@
 // two notices before a save (outside the mirror, hidden here).
 
 import { describe, expect, it } from "vitest";
-import type { Calendar, CalendarAccount, CalendarOverview } from "../types";
+import type { Calendar, CalendarAccount, CalendarOverview, GuestForEdit } from "../types";
 import { formatDateLocal } from "../format";
 import {
   accountLength,
@@ -16,6 +16,10 @@ import {
   createTargets,
   defaultTarget,
   lengthFor,
+  meetDefault,
+  meetOffered,
+  meetOffText,
+  meetOnCalendar,
   outsideMirror,
   targetById,
 } from "./createTargets";
@@ -84,6 +88,7 @@ function overview(over: Partial<CalendarOverview> = {}): CalendarOverview {
     mirror_end: "2027-11-01T00:00:00Z",
     editing: { [ME]: "on", [PAUSED]: "paused", [CONSENT]: "needs_consent" },
     default_length: {},
+    auto_meet: {},
     ...over,
   };
 }
@@ -317,5 +322,85 @@ describe("createNotes", () => {
     expect(createNotes(day("2028-01-03"), true, o, new Set(), `${ME}:alpha`)).toEqual([
       `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
     ]);
+  });
+});
+
+// --- a video call on new events (C18b) ---
+
+describe("the Meet default", () => {
+  const meetCal = calendar(ME, "me@x.com", {
+    name: "Me",
+    is_primary: true,
+    conference_types: ["addOn", "hangoutsMeet"],
+  });
+  const plainCal = calendar(ME, "alpha", { name: "Alpha", conference_types: ["addOn"] });
+  const o = (auto: Record<string, boolean>) =>
+    overview({ calendars: [meetCal, plainCal], auto_meet: auto });
+  const on = (cal: Calendar, auto: Record<string, boolean>) =>
+    targetById(createTargets(o(auto)), cal.id);
+  const guest = (email: string, over: Partial<GuestForEdit> = {}): GuestForEdit => ({
+    email,
+    name: null,
+    response: null,
+    optional: false,
+    organizer: false,
+    self: false,
+    room: false,
+    ...over,
+  });
+  const other = [guest("a@y.com")];
+
+  it("meetOffered reads the calendar's kinds of call", () => {
+    expect(meetOffered(on(meetCal, {}))).toBe(true);
+    expect(meetOffered(on(plainCal, {}))).toBe(false);
+    expect(meetOffered(null)).toBe(false);
+  });
+
+  // Critique C2-H2: Google adds Meet "when you add invitees", so the setting turns it on only with
+  // a guest who isn't the user.
+  it("is on only with the setting, a calendar with Meet and a guest", () => {
+    const auto = { [ME]: true };
+    expect(meetDefault(o(auto), on(meetCal, auto), other)).toBe(true);
+    expect(meetDefault(o(auto), on(meetCal, auto), []), "no guest").toBe(false);
+    expect(meetDefault(o(auto), on(plainCal, auto), other), "no Meet there").toBe(false);
+    expect(meetDefault(o({ [ME]: false }), on(meetCal, { [ME]: false }), other)).toBe(false);
+    expect(meetDefault(o({}), on(meetCal, {}), other), "never read").toBe(false);
+    expect(meetDefault(o(auto), null, other)).toBe(false);
+    // The user's own address, the calendar's own entry or a room is nobody Google invites.
+    for (const self of [
+      [guest("me@x.com")],
+      [guest("someone@x.com", { self: true })],
+      [guest("room@resource.calendar.google.com")],
+    ]) {
+      expect(meetDefault(o(auto), on(meetCal, auto), self), self[0].email).toBe(false);
+    }
+  });
+
+  it("another calendar decides an untouched call afresh, and turns a touched one off without Meet", () => {
+    const auto = { [ME]: true };
+    const ov = o(auto);
+    const draft = (meet: boolean) => ({ meet, guests: other });
+    expect(meetOnCalendar(ov, on(meetCal, auto), draft(false), false)).toEqual({
+      meet: true,
+      off: false,
+    });
+    expect(meetOnCalendar(ov, on(plainCal, auto), draft(true), false)).toEqual({
+      meet: false,
+      off: true,
+    });
+    // Touched: kept where Meet is offered, either way.
+    expect(meetOnCalendar(ov, on(meetCal, auto), draft(false), true)).toEqual({
+      meet: false,
+      off: false,
+    });
+    expect(meetOnCalendar(ov, on(meetCal, auto), draft(true), true)).toEqual({
+      meet: true,
+      off: false,
+    });
+    expect(meetOnCalendar(ov, on(plainCal, auto), draft(true), true)).toEqual({
+      meet: false,
+      off: true,
+    });
+    expect(meetOffText("Alpha")).toBe("Alpha doesn't offer Google Meet, so the video call is off.");
   });
 });

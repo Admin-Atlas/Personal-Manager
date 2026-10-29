@@ -1155,8 +1155,28 @@ export function createReasonText(reason: ReadOnlyReason): string {
 }
 
 /** A new event Google holds, once the editor has closed (C10 §15): created, and whether PM's
- *  calendar will show it. Ok when it will, a warning (which stays) when it won't. */
+ *  calendar will show it. Ok when it will, a warning (which stays) when it won't. A video call it
+ *  asked for that Google is still making, or didn't make, is said after (C18b); one it didn't make
+ *  is a warning too. */
 export function createdText(
+  title: string,
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  where: CreatedWhere,
+): { tone: Tone; text: string } {
+  const said = createdWords(title, outcome, where);
+  const calls = CALL_WARNINGS.filter((w) => outcome.warnings.includes(w));
+  if (calls.length === 0) return said;
+  return {
+    tone: outcome.warnings.includes("call_failed") ? "warn" : said.tone,
+    text: [said.text, ...calls.map((w) => writeWarningText(w, "save"))].join(" "),
+  };
+}
+
+/** The warnings about a video call a write asked for, in the order they're said. */
+const CALL_WARNINGS: readonly WriteWarning[] = ["call_pending", "call_failed"];
+
+/** `createdText` before what's said of the call. */
+function createdWords(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
   where: CreatedWhere,
