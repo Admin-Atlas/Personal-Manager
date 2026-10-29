@@ -101,6 +101,7 @@ import type {
   GdriveBackupStatus,
   ProtonCliStatus,
   ProtonConnStatus,
+  SignInPage,
   ReviewDecision,
   RetagEvent,
   RetagScope,
@@ -1569,6 +1570,15 @@ export const readDocumentImage = (docId: number) =>
 /** Open an arbitrary http(s) URL in the system browser. Used by the app-wide external-link handler
  *  (the webview can't open `target="_blank"` itself); the backend guards the scheme to http/https. */
 export const openUrl = (url: string) => invoke<void>("open_url", { url });
+
+/** A browser sign-in started (Google, Microsoft or Proton): PM opened, or couldn't open, the default
+ *  browser on its page, and offers the link while it waits. */
+export const onSignInOpened = (handler: (page: SignInPage) => void): Promise<UnlistenFn> =>
+  listen<SignInPage>("signin://open", (e) => handler(e.payload));
+
+/** A browser sign-in ended, however it ended: the id its `signin://open` carried. */
+export const onSignInClosed = (handler: (id: number) => void): Promise<UnlistenFn> =>
+  listen<number>("signin://closed", (e) => handler(e.payload));
 
 /** Bump the backend user-activity clock (F-08). Called throttled from App's interaction listener so
  *  idle-gated background jobs back off during real use (reading/triaging/editing), not only on chat

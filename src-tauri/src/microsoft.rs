@@ -16,6 +16,7 @@
 //! Scopes are **read-only** (`Files.Read`); PM never writes to OneDrive (spec non-goal #4).
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 use crate::error::{Error, Result};
 use crate::oauth_loopback;
@@ -79,8 +80,9 @@ fn http() -> Result<reqwest::Client> {
 /// Microsoft's consent screen for `scope`, catch the loopback redirect, and exchange the code. The
 /// caller chooses which keychain key to store it under — for a OneDrive account that key is derived
 /// from the account the token grants (known only after a follow-up `/me` call), so persisting is the
-/// caller's job. `success_label` names the connected product on the browser success page.
-pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
+/// caller's job. `success_label` names the connected product on the browser success page. While it
+/// waits, `app`'s window offers the page's link, for another browser ([`oauth_loopback::open_sign_in`]).
+pub async fn run_consent(app: &AppHandle, scope: &str, success_label: &str) -> Result<Token> {
     let client_id = client_id()?;
     let (verifier, challenge) = oauth_loopback::pkce()?;
     let state = oauth_loopback::random_token(16)?;
@@ -96,8 +98,7 @@ pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
     let auth_url = build_auth_url(&client_id, &redirect_uri, &challenge, &state, scope)?;
-    open::that(&auth_url)
-        .map_err(|e| Error::Other(format!("Couldn't open your browser to sign in: {e}")))?;
+    let shown = oauth_loopback::open_sign_in(app, "Microsoft", success_label, &auth_url);
 
     // Wait for Microsoft to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();
@@ -107,6 +108,8 @@ pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
     })
     .await
     .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
+    // The browser is back: its link has done its job.
+    drop(shown);
 
     let token = exchange_code(&client_id, &code, &redirect_uri, &verifier).await?;
     if token.refresh_token.is_none() {

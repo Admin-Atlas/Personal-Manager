@@ -71,13 +71,19 @@ pub async fn connect_drive(
     // shared client.
     let token = match (&own, &saved_account) {
         (Some((id, secret)), _) => {
-            google::run_consent_with_client(&scopes, "Google Drive", id.clone(), secret.clone())
-                .await?
+            google::run_consent_with_client(
+                &app,
+                &scopes,
+                "Google Drive",
+                id.clone(),
+                secret.clone(),
+            )
+            .await?
         }
         (None, Some(email)) => {
-            google::run_consent_with_saved_project(email, &scopes, "Google Drive").await?
+            google::run_consent_with_saved_project(&app, email, &scopes, "Google Drive").await?
         }
-        (None, None) => google::run_consent(&scopes, "Google Drive").await?,
+        (None, None) => google::run_consent(&app, &scopes, "Google Drive").await?,
     };
     let (email, name) = drive::about_user(&token).await?;
     if let Some(expected) = &saved_account {
@@ -890,7 +896,7 @@ pub fn clear_microsoft_client(app: AppHandle, state: State<'_, AppState>) -> Res
 #[tauri::command]
 pub async fn connect_onedrive(app: AppHandle) -> Result<onedrive::OneDriveAccount> {
     require_vault_owner(&app)?;
-    let token = microsoft::run_consent(microsoft::ONEDRIVE_SCOPE, "OneDrive").await?;
+    let token = microsoft::run_consent(&app, microsoft::ONEDRIVE_SCOPE, "OneDrive").await?;
     let (email, name) = onedrive::me_account(&token).await?;
     microsoft::save_token(&onedrive::account_token_key(&email), &token)?;
     let state = app.state::<AppState>();

@@ -43,7 +43,7 @@ import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
 import { eventColour } from "../../../theme/eventPalette";
-import { Button, IconButton } from "../../ui";
+import { Button, CopyLinkButton, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
 import { RsvpControl } from "../edit/RsvpControl";
 import { repeatsText, whenText } from "./whenText";
@@ -371,13 +371,22 @@ export function CalendarEventPopover({
 
         {event.conference_url && (
           <Field label="Call">
-            <button
-              type="button"
-              onClick={() => void openUrl(event.conference_url!)}
-              className="truncate text-left text-accent-text hover:brightness-110"
-            >
-              Join the call →
-            </button>
+            <span className="flex min-w-0 items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void openUrl(event.conference_url!)}
+                className="truncate text-left text-accent-text hover:brightness-110"
+              >
+                Join the call →
+              </button>
+              {/* For joining from another browser, or sending the link on. */}
+              <CopyLinkButton
+                url={event.conference_url}
+                to="the call"
+                size="xs"
+                className="shrink-0"
+              />
+            </span>
           </Field>
         )}
 
@@ -439,9 +448,12 @@ export function CalendarEventPopover({
       {/* Actions */}
       <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2.5">
         {event.html_link && (
-          <Button variant="secondary" size="sm" onClick={() => void openUrl(event.html_link!)}>
-            {sourceLabel(calendar?.provider)}
-          </Button>
+          <>
+            <Button variant="secondary" size="sm" onClick={() => void openUrl(event.html_link!)}>
+              {sourceLabel(calendar?.provider)}
+            </Button>
+            <CopyLinkButton url={event.html_link} to="this event" />
+          </>
         )}
         {milestone && onOpenProject && (
           <Button

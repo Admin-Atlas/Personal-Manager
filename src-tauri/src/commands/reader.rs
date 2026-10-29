@@ -8,6 +8,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
+use crate::blocking::spawn_blocking_result;
 use crate::error::{Error, Result};
 use crate::ingest;
 use crate::{pathguard, vault, AppState};
@@ -21,14 +22,19 @@ fn open_external_url(url: &str) -> Result<()> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(Error::Other("Only http(s) links can be opened.".into()));
     }
-    open::that(parsed.as_str()).map_err(|e| Error::Other(format!("Couldn't open the link: {e}")))
+    // By the error's kind only: a launcher's message repeats its command line, the link included,
+    // and a sign-in link carries one-time state.
+    open::that(parsed.as_str())
+        .map_err(|e| Error::Other(format!("Couldn't open the link ({:?}).", e.kind())))
 }
 
 /// Open an arbitrary http(s) URL in the system browser. The webview can't open `target="_blank"`
 /// links itself (no shell/opener plugin), so the frontend's app-wide link handler routes them here.
+/// On the blocking pool, not the main thread: a launcher can wait until the browser it started quits
+/// (xdg-open does on a desktop it doesn't know), and PM would be frozen until then.
 #[tauri::command]
-pub fn open_url(url: String) -> Result<()> {
-    open_external_url(&url)
+pub async fn open_url(url: String) -> Result<()> {
+    spawn_blocking_result("open link", move || open_external_url(&url)).await
 }
 
 // --- Document reader (Documents tab): read-only views onto already-indexed state ---
@@ -355,9 +361,10 @@ fn reveal_in_file_manager(path: &str) -> Result<()> {
 /// Open a document's source. An index-only web link (Drive/OneDrive `webViewLink`) opens in the system
 /// browser through the http(s) guard; a local-folder file path is revealed-and-selected in the OS file
 /// manager. Web links never reach the file-manager reveal and local paths never reach `open::that`.
-/// Supersedes the old `open_external_ref` (which was http(s)-only).
+/// Supersedes the old `open_external_ref` (which was http(s)-only). The opening itself runs on the
+/// blocking pool, as `open_url`'s does: a launcher can wait until what it started quits.
 #[tauri::command]
-pub fn open_source(app: AppHandle, state: State<'_, AppState>, doc_id: i64) -> Result<()> {
+pub async fn open_source(app: AppHandle, state: State<'_, AppState>, doc_id: i64) -> Result<()> {
     let external_ref: Option<String> = {
         let conn = state.conn()?;
         conn.query_row(
@@ -367,19 +374,20 @@ pub fn open_source(app: AppHandle, state: State<'_, AppState>, doc_id: i64) -> R
         )?
     };
     let refr = external_ref.ok_or_else(|| Error::Other("This item has no source link.".into()))?;
-    match classify_source_ref(&refr) {
-        SourceRefKind::Web => open_external_url(&refr),
-        SourceRefKind::LocalPath => {
-            // L-5 defense-in-depth: this path comes from the document row (populated by the
-            // now-guarded ingest / local-folder pipeline), but keep the reveal inside the folders
-            // PM tracks (or its own data dir) so it can never hand the OS shell an out-of-bounds
-            // location. Fails closed if the source has moved out of every tracked root.
-            let conn = state.conn()?;
-            pathguard::is_allowed(&app, &conn, &refr)?;
-            drop(conn);
-            reveal_in_file_manager(&refr)
-        }
+    let kind = classify_source_ref(&refr);
+    if kind == SourceRefKind::LocalPath {
+        // L-5 defense-in-depth: this path comes from the document row (populated by the
+        // now-guarded ingest / local-folder pipeline), but keep the reveal inside the folders
+        // PM tracks (or its own data dir) so it can never hand the OS shell an out-of-bounds
+        // location. Fails closed if the source has moved out of every tracked root.
+        let conn = state.conn()?;
+        pathguard::is_allowed(&app, &conn, &refr)?;
     }
+    spawn_blocking_result("open source", move || match kind {
+        SourceRefKind::Web => open_external_url(&refr),
+        SourceRefKind::LocalPath => reveal_in_file_manager(&refr),
+    })
+    .await
 }
 
 #[cfg(test)]

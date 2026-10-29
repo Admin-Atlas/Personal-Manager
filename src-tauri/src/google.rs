@@ -12,6 +12,7 @@
 //! refreshed transparently; the token blob lives only in the keychain, never on disk.
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 use crate::error::{Error, Result};
 use crate::oauth_loopback;
@@ -232,10 +233,11 @@ pub async fn revoke(token_json: &str) -> Result<()> {
 /// Google's consent screen for `scope`, catch the loopback redirect, and exchange the code. The
 /// caller chooses which keychain key to store it under — for a Drive account that key is derived
 /// from the account the token grants (known only after a follow-up `about` call), so persisting is
-/// the caller's job. `success_label` names the connected product on the browser success page.
-/// Errors (no client configured, browser failed, cancelled, timeout) surface to the UI.
-pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
-    run_consent_inner(scope, success_label, client_creds()?, None).await
+/// the caller's job. `success_label` names the connected product on the browser success page. While
+/// it waits, `app`'s window offers the page's link, for another browser ([`oauth_loopback::open_sign_in`]).
+/// Errors (no client configured, cancelled, timeout) surface to the UI.
+pub async fn run_consent(app: &AppHandle, scope: &str, success_label: &str) -> Result<Token> {
+    run_consent_inner(app, scope, success_label, client_creds()?, None).await
 }
 
 /// As [`run_consent`], for a token PM will save under an account's existing key (`token_key`): signs
@@ -243,12 +245,14 @@ pub async fn run_consent(scope: &str, success_label: &str) -> Result<Token> {
 /// the shared one ([`client_creds_for_saving`]), and starts Google's chooser on that account. The
 /// caller still checks which account actually consented — the chooser lets the user pick another.
 pub async fn run_consent_for_key(
+    app: &AppHandle,
     token_key: &str,
     email: &str,
     scope: &str,
     success_label: &str,
 ) -> Result<Token> {
     run_consent_inner(
+        app,
         scope,
         success_label,
         client_creds_for_saving(token_key, email)?,
@@ -262,6 +266,7 @@ pub async fn run_consent_for_key(
 /// second time. Refuses when no project is saved for the account (it was forgotten since the list was
 /// read): the button promised that project, and the shared one would be blocked or wrong.
 pub async fn run_consent_with_saved_project(
+    app: &AppHandle,
     email: &str,
     scope: &str,
     success_label: &str,
@@ -271,19 +276,21 @@ pub async fn run_consent_with_saved_project(
             "PM no longer holds a Cloud project for {email}. Paste its Client ID and secret instead."
         ))
     })?;
-    run_consent_inner(scope, success_label, own, Some(email)).await
+    run_consent_inner(app, scope, success_label, own, Some(email)).await
 }
 
 /// As [`run_consent`], but using an account's OWN client (id + secret) supplied explicitly — the path
 /// for connecting an Advanced-Protection account whose Cloud project isn't the shared one. The caller
 /// persists the per-account client (keyed by the email it learns) so later refreshes reuse it.
 pub async fn run_consent_with_client(
+    app: &AppHandle,
     scope: &str,
     success_label: &str,
     client_id: String,
     client_secret: String,
 ) -> Result<Token> {
     run_consent_inner(
+        app,
         scope,
         success_label,
         (client_id, Secret::from(client_secret)),
@@ -293,6 +300,7 @@ pub async fn run_consent_with_client(
 }
 
 async fn run_consent_inner(
+    app: &AppHandle,
     scope: &str,
     success_label: &str,
     (client_id, client_secret): (String, Secret),
@@ -315,8 +323,7 @@ async fn run_consent_inner(
         scope,
         login_hint,
     )?;
-    open::that(&auth_url)
-        .map_err(|e| Error::Other(format!("Couldn't open your browser to sign in: {e}")))?;
+    let shown = oauth_loopback::open_sign_in(app, "Google", success_label, &auth_url);
 
     // Wait for Google to redirect back with the code (blocking accept, off-runtime).
     let expected_state = state.clone();
@@ -326,6 +333,8 @@ async fn run_consent_inner(
     })
     .await
     .map_err(|e| Error::Other(format!("sign-in task panicked: {e}")))??;
+    // The browser is back: its link has done its job.
+    drop(shown);
 
     let mut token = exchange_code(
         &client_id,

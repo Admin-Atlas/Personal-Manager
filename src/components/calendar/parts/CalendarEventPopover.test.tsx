@@ -564,6 +564,52 @@ describe("CalendarEventPopover", () => {
     expect(text.closest(".pm-event-desc")).not.toBeNull();
   });
 
+  // The call and the event in Google open in the default browser; each link can be copied instead,
+  // for another browser.
+  it("offers the call's link and the event's link to copy, beside the buttons that open them", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      const call = "https://meet.google.com/abc-defg-hij";
+      const page = "https://www.google.com/calendar/event?eid=ZTE";
+      const { getByRole } = render(
+        <CalendarEventPopover
+          event={calendarEvent({ conference_url: call, html_link: page })}
+          anchor={rect(100)}
+          calendar={null}
+          color="#000"
+          milestone={null}
+          onClose={() => {}}
+        />,
+      );
+      // Each says what it copies, so the two can be told apart by name alone.
+      await act(async () => {
+        fireEvent.click(getByRole("button", { name: "Copy link to the call" }));
+      });
+      expect(writeText).toHaveBeenLastCalledWith(call);
+      await act(async () => {
+        fireEvent.click(getByRole("button", { name: "Copy link to this event" }));
+      });
+      expect(writeText).toHaveBeenLastCalledWith(page);
+    } finally {
+      Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+    }
+  });
+
+  it("offers no link to copy when the event has none", () => {
+    const { queryByRole } = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(queryByRole("button", { name: /^Copy link/ })).toBeNull();
+  });
+
   // The colour an event was given in Google is named, not only shown: the fill's hue alone doesn't
   // carry it for everyone.
   it("names the colour an event was given in Google, and says nothing for one without", () => {

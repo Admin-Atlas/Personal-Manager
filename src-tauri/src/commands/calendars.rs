@@ -183,6 +183,7 @@ async fn do_connect_google_calendar(
     let token = match (&own, &saved_account) {
         (Some((id, secret)), _) => {
             google::run_consent_with_client(
+                app,
                 google::CALENDAR_SCOPE,
                 "Google Calendar",
                 id.clone(),
@@ -191,10 +192,15 @@ async fn do_connect_google_calendar(
             .await?
         }
         (None, Some(email)) => {
-            google::run_consent_with_saved_project(email, google::CALENDAR_SCOPE, "Google Calendar")
-                .await?
+            google::run_consent_with_saved_project(
+                app,
+                email,
+                google::CALENDAR_SCOPE,
+                "Google Calendar",
+            )
+            .await?
         }
-        (None, None) => google::run_consent(google::CALENDAR_SCOPE, "Google Calendar").await?,
+        (None, None) => google::run_consent(app, google::CALENDAR_SCOPE, "Google Calendar").await?,
     };
     let raw = calendar::fetch_calendar_list_with_token(&token).await?;
     let email = raw
@@ -339,6 +345,7 @@ pub async fn enable_calendar_editing(
     }
     let token_key = google_calendar_token_key(&email);
     let token = google::run_consent_for_key(
+        &app,
         &token_key,
         &email,
         &google::calendar_editing_scopes(),
@@ -478,7 +485,7 @@ async fn migrate_legacy_google_calendar(app: &AppHandle) -> Result<()> {
 #[tauri::command]
 pub async fn connect_outlook_calendar(app: AppHandle) -> Result<calendar::CalendarAccount> {
     require_vault_owner(&app)?;
-    let token = microsoft::run_consent(microsoft::CALENDAR_SCOPE, "Outlook Calendar").await?;
+    let token = microsoft::run_consent(&app, microsoft::CALENDAR_SCOPE, "Outlook Calendar").await?;
     let (email, name) = outlook_calendar::me_account(&token).await?;
     // Normalise the account identity so a differently-cased reconnect doesn't duplicate the account
     // (Graph's `mail`/`userPrincipalName` casing can vary); keep `name` for the human-readable label.

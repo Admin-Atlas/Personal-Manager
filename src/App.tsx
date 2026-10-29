@@ -14,6 +14,7 @@ import { ProviderChip } from "./components/ProviderChip";
 import { ThinkingToggle } from "./components/ThinkingToggle";
 import { FallbackStrip } from "./components/FallbackStrip";
 import { PowerConsentStrip } from "./components/PowerConsentStrip";
+import { SignInStrip } from "./components/SignInStrip";
 import { ConversationTitle } from "./components/ConversationTitle";
 import { CommandPalette } from "./components/CommandPalette";
 import { Composer } from "./components/Composer";
@@ -57,6 +58,7 @@ import { aiReady as deriveAiReady } from "./lib/aiGate";
 import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useExternalLinks } from "./lib/useExternalLinks";
+import { useFollowSignIns } from "./lib/signInPages";
 import { hydrateStoredPrefs } from "./lib/storedPrefs";
 import { isDevBuild, useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
@@ -297,6 +299,10 @@ export default function App() {
   // External links open in the system browser. Extracted to a hook because the briefing window's
   // root (PopoverRoot) is not App and needs the same interception — see useExternalLinks.
   useExternalLinks();
+
+  // Browser sign-ins waiting, followed from launch so none starts before anything is listening;
+  // `SignInStrip` shows them (see signInPages).
+  useFollowSignIns();
 
   // Idle-gate seam (F-08): treat ANY real interaction as active use, so idle-gated background jobs
   // (chat indexer, summary/title/prefs reconcile, backup, activity rollup, flag scan) back off while
@@ -1128,6 +1134,9 @@ export default function App() {
             {/* The one-time On battery question (#432). App-wide, because the moment it matters is
                 whatever tab is open when the battery runs low; renders nothing until it is asked. */}
             <PowerConsentStrip status={localAi} />
+            {/* A browser sign-in in progress, with its link for another browser. Settings shows it
+                itself while open, as its scrim covers this; renders nothing otherwise. */}
+            {!showSettings && <SignInStrip />}
             <div
               className={`relative flex flex-1 overflow-hidden ${leftBar.resizing ? "select-none" : ""}`}
             >

@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.159.0-alpha",
+    date: "2026-10-28",
+    highlights: [
+      "Sign in with the browser you choose. When you connect Google, Microsoft or Proton, PM still opens your usual browser, and now Settings shows the sign-in link too while PM waits: copy it into another browser on this computer, the one signed in to the right account, or open it again if you closed the tab. If PM can't open a browser at all, it says so and the link still works.",
+      "Copy link sits beside the other buttons that open a page: joining a call and opening an event in Google Calendar or Outlook from its details, downloading the Proton Drive CLI, and reporting a document-engine problem on GitHub. Links in text could already be copied by right-clicking them.",
+    ],
+  },
+  {
     version: "3.158.2-alpha",
     date: "2026-10-28",
     highlights: [

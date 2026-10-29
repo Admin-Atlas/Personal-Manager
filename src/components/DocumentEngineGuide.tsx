@@ -12,7 +12,7 @@
 // the primary action becomes "report it" rather than "retry" or "fix your setup".
 
 import { useEffect, useState } from "react";
-import { Button, Card, Collapsible, Dialog } from "./ui";
+import { Button, Card, Collapsible, CopyLinkButton, Dialog } from "./ui";
 import { IngestProgress } from "./IngestProgress";
 import { useDepth } from "../theme";
 import type { SidecarStatus } from "../lib/types";
@@ -107,6 +107,8 @@ export function DocumentEngineGuide({ open, onClose, status, busy, onRetry }: Pr
             <Button variant="tertiary" onClick={onRetry} disabled={busy}>
               {busy ? "Working…" : "Retry anyway"}
             </Button>
+            {/* It looks like a button, not a link, so a right-click to copy it isn't obvious. */}
+            <CopyLinkButton url={reportUrl} to="the GitHub report" size="md" />
             <a
               href={reportUrl}
               target="_blank"

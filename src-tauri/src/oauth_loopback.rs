@@ -16,11 +16,17 @@
 //! (Microsoft does), the second refresh would post an already-invalidated refresh token and wedge the
 //! account. Serializing refreshes per key — and reloading the token blob under the lock — closes that
 //! race for both providers.
+//!
+//! And it sends the browser to the sign-in page ([`open_sign_in`]), offering the page's link in PM's
+//! window too, for a sign-in that belongs in another browser. Proton's CLI sign-in uses that part.
 
 use base64::Engine;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::error::{Error, Result};
@@ -218,6 +224,107 @@ fn write_page(stream: &mut std::net::TcpStream, message: &str) -> std::io::Resul
         body
     );
     stream.write_all(response.as_bytes())
+}
+
+// --- the sign-in page, offered in PM's window too ---
+
+/// A browser sign-in PM is waiting on, as the main window shows it: the page's link, to copy into
+/// another browser on this computer or to open again. The default browser isn't always the one
+/// signed in to the right account. Proton's sign-in comes through here as well, though its loopback
+/// is the CLI's.
+#[derive(Clone, Serialize)]
+pub struct SignInPage {
+    /// Tells one sign-in from another, so the end of one never takes away another's link.
+    pub id: u64,
+    /// Whose page it is, as the window names it ("Google").
+    pub provider: &'static str,
+    /// What it signs in for ("Google Drive backup"), so two of one provider's can be told apart.
+    pub label: String,
+    /// The page. It carries the sign-in's one-time state, so it is only ever shown for copying and
+    /// opening, never written to a log or an error.
+    pub url: String,
+    /// Whether the default browser opened on it. When it didn't, the link is the only way in.
+    pub opened: bool,
+}
+
+/// Keeps a sign-in page's link in PM's window until it drops, which is when the wait for the browser
+/// ends, however it ends (the redirect, an error, the timeout).
+pub struct SignInShown {
+    app: AppHandle,
+    page: SignInPage,
+    /// Whether the sign-in is still waiting. The browser opens on a thread of its own, which may
+    /// only report a failure while this holds, and under its lock, so no `signin://open` can follow
+    /// the `signin://closed` and leave a link nothing will take away.
+    live: Arc<Mutex<bool>>,
+}
+
+impl SignInShown {
+    /// Offer `url`, `provider`'s sign-in page for `label`, in PM's window. Before any browser is
+    /// asked to open it: a launcher can block until the browser it started quits (xdg-open does on
+    /// a desktop it doesn't know), and the link is wanted most then.
+    pub fn show(app: &AppHandle, provider: &'static str, label: &str, url: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let page = SignInPage {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            provider,
+            label: label.to_string(),
+            url: url.to_string(),
+            opened: true,
+        };
+        let _ = app.emit("signin://open", &page);
+        SignInShown {
+            app: app.clone(),
+            page,
+            live: Arc::new(Mutex::new(true)),
+        }
+    }
+
+    /// Open the default browser on the page, on a thread of its own, so a launcher that blocks
+    /// holds up neither the wait for the browser to come back (a link copied to another browser
+    /// can finish meanwhile) nor whatever called this. When it won't open, the window is told so
+    /// (the same id again, `opened: false`) and the link is the way in. The error is logged by its
+    /// kind only: a launcher's message repeats its command line, the link included.
+    pub fn open_browser(&self) {
+        let app = self.app.clone();
+        let mut page = self.page.clone();
+        let live = Arc::clone(&self.live);
+        std::thread::spawn(move || {
+            if let Err(e) = open::that(&page.url) {
+                eprintln!(
+                    "sign-in: couldn't open the browser for {} ({:?})",
+                    page.provider,
+                    e.kind()
+                );
+                let live = live.lock().unwrap_or_else(|e| e.into_inner());
+                if *live {
+                    page.opened = false;
+                    let _ = app.emit("signin://open", &page);
+                }
+            }
+        });
+    }
+}
+
+impl Drop for SignInShown {
+    fn drop(&mut self) {
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        *live = false;
+        let _ = self.app.emit("signin://closed", self.page.id);
+    }
+}
+
+/// Open the default browser on `url`, `provider`'s sign-in page for `label`, and offer the link in
+/// PM's window while PM waits ([`SignInShown`]). A browser that won't open no longer ends the
+/// sign-in: the window says so, and the link still works pasted into one, until the wait times out.
+pub fn open_sign_in(
+    app: &AppHandle,
+    provider: &'static str,
+    label: &str,
+    url: &str,
+) -> SignInShown {
+    let shown = SignInShown::show(app, provider, label, url);
+    shown.open_browser();
+    shown
 }
 
 // --- per-key refresh lock ---
