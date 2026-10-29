@@ -26,7 +26,12 @@ import {
   spokenName,
   type BandInput,
 } from "../../../lib/calendar-layout";
-import { HANDLE_MAX_PX } from "../../../lib/calendarDrag";
+import {
+  END_HANDLE_MAX_PX,
+  END_HANDLE_PARTS,
+  HANDLE_MAX_PX,
+  HANDLE_PARTS,
+} from "../../../lib/calendarDrag";
 import { declinedName, isDeclined } from "../../../lib/calendarEdit/rsvp";
 import { eventColour, eventFill, eventHover, inkOn } from "../../../theme/eventPalette";
 import { cn } from "../../ui";
@@ -69,8 +74,10 @@ export interface BandDrag {
 }
 
 const LANE_H = 20;
-/** A bar's draggable end: `bandHitZone`'s size, the handle's width or a quarter of the bar. */
-const EDGE_W = `min(${HANDLE_MAX_PX}px, 25%)`;
+/** A bar's draggable ends, as `handleSizes` sizes a card's: the start (its left end, where the title
+ *  begins) narrow, the end (its right) wider, each at most its share of a short bar. */
+const START_EDGE_W = `min(${HANDLE_MAX_PX}px, ${100 / HANDLE_PARTS}%)`;
+const END_EDGE_W = `min(${END_HANDLE_MAX_PX}px, ${100 / END_HANDLE_PARTS}%)`;
 
 interface Placed extends BandInput {
   ev: CalendarEvent;
@@ -222,13 +229,13 @@ export function AllDayBand({
                 {b.ev.summary}
               </span>
               {/* The ends that may be dragged, at the event's true ends only (one cut at the
-                  window's edge continues): as wide as the drag's hit test takes them. */}
+                  window's edge continues): a press on one takes that end. */}
               {edges && !b.continuesLeft && (
                 <div
                   aria-hidden="true"
                   data-edge="left"
                   className="absolute inset-y-0 left-0 cursor-ew-resize"
-                  style={{ width: EDGE_W }}
+                  style={{ width: START_EDGE_W }}
                 />
               )}
               {edges && !b.continuesRight && (
@@ -236,7 +243,7 @@ export function AllDayBand({
                   aria-hidden="true"
                   data-edge="right"
                   className="absolute inset-y-0 right-0 cursor-ew-resize"
-                  style={{ width: EDGE_W }}
+                  style={{ width: END_EDGE_W }}
                 />
               )}
             </div>

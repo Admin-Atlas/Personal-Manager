@@ -293,8 +293,8 @@ describe("TimeGridView — on a grid that drags", () => {
       interaction(),
     );
     const bar = container.querySelector<HTMLElement>('[data-event-id="a"]');
-    // The drag measures a press from the bar's outer edge, and the end's strip sits inside any
-    // border: with no border, a press on the strip is a press on the end.
+    // A press on the end's strip takes the end, and a border would sit outside the strip as the
+    // body's: with no border, the strip starts at the bar's very edge.
     expect(bar?.querySelector('[data-edge="left"]')).not.toBeNull();
     expect(bar?.style.borderLeftWidth).toBe("");
     // The calendar's stripe is still drawn there, inside the bar.

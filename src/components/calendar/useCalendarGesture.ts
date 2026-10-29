@@ -38,12 +38,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   autoScrollDelta,
-  bandHitZone,
-  cardHitZone,
   exceedsThreshold,
   gapText,
   ghostEvent,
   grabAllowed,
+  grabOf,
   inCancelZone,
   planClick,
   planGesture,
@@ -164,6 +163,27 @@ function streamBox(stream: HTMLElement): Box {
  *  isn't the drag's. */
 const surfaceOf = (s: string | undefined): Surface | null =>
   s === "grid" || s === "band" || s === "month" ? s : null;
+
+/** The edge a press at `y` on `t` inside `card` took (its strip's `data-edge`), or undefined for the
+ *  body. A press on a strip takes that edge: the strip shows the resize cursor, so what looks like an
+ *  edge is one (Month draws none). So does a press on the card's own box level with a strip: the
+ *  card clips its strips inside its border and rounded corners, and that border (the line drawn as
+ *  the event's top or bottom, the calendar's stripe down its side, the corners) is the edge too. */
+function edgeTaken(card: HTMLElement, t: Element, y: number): string | undefined {
+  const strip = t.closest<HTMLElement>("[data-edge]");
+  if (strip && card.contains(strip)) return strip.dataset.edge;
+  if (t !== card) return undefined;
+  // A strip not laid out (no height) is no band to be level with.
+  const band = (edge: string) => {
+    const r = card.querySelector<HTMLElement>(`[data-edge="${edge}"]`)?.getBoundingClientRect();
+    return r && r.height > 0 ? r : null;
+  };
+  const start = band("start");
+  if (start && y < start.bottom) return "start";
+  const end = band("end");
+  if (end && y >= end.top) return "end";
+  return undefined;
+}
 
 /** A no-break space, written as its code so it stays visible in the source. */
 const NBSP = String.fromCharCode(0xa0);
@@ -692,16 +712,7 @@ export function useCalendarGesture(host: GestureHost): CalendarGesture {
         const row = h.rowById(card.dataset.eventId ?? "");
         const surface = surfaceOf(card.closest<HTMLElement>("[data-surface]")?.dataset.surface);
         if (!row || !surface) return null;
-        const r = card.getBoundingClientRect();
-        // The ends the card draws as draggable are the ones it may be dragged by; Month draws
-        // none.
-        const has = (edge: string) => card.querySelector(`[data-edge="${edge}"]`) !== null;
-        const grab: Grab =
-          surface === "grid"
-            ? cardHitZone(e.clientY - r.top, r.height, { start: has("start"), end: has("end") })
-            : surface === "band"
-              ? bandHitZone(e.clientX - r.left, r.width, { left: has("left"), right: has("right") })
-              : "body";
+        const grab: Grab = grabOf(surface, edgeTaken(card, t, e.clientY));
         return {
           ...base,
           on: {

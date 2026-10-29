@@ -13,8 +13,6 @@ import {
   addWall,
   applyPending,
   autoScrollDelta,
-  bandHitZone,
-  cardHitZone,
   dragCapability,
   dropChoicesNeeded,
   exceedsThreshold,
@@ -23,6 +21,7 @@ import {
   gapText,
   ghostEvent,
   grabAllowed,
+  grabOf,
   handleSizes,
   inCancelZone,
   isNoop,
@@ -185,30 +184,27 @@ describe("snapping, pixels and days", () => {
 });
 
 describe("hitting an event", () => {
-  it("handleSizes and cardHitZone", () => {
-    const both = { start: true, end: true };
-    expect(handleSizes(60)).toEqual({ top: 6, bottom: 6 });
-    expect(cardHitZone(2, 60, both)).toBe("start");
-    expect(cardHitZone(30, 60, both)).toBe("body");
-    expect(cardHitZone(57, 60, both)).toBe("end");
-    // Short: no top edge, a small bottom one.
-    expect(handleSizes(20)).toEqual({ top: 0, bottom: 5 });
-    expect(cardHitZone(1, 20, both)).toBe("body");
-    expect(cardHitZone(16, 20, both)).toBe("end");
+  it("handleSizes: a narrow start, a wider end, and always a body", () => {
+    // The end reaches 10 px (6 px was too thin to hit); the start stays 6 px, off the title.
+    expect(handleSizes(60)).toEqual({ top: 6, bottom: 10 });
+    // Short: no top edge, a bottom one of a third, and the rest to move it by.
+    expect(handleSizes(20)).toEqual({ top: 0, bottom: 20 / 3 });
+    // Just tall enough for a top edge: a quarter, a third, and the rest body.
+    expect(handleSizes(24)).toEqual({ top: 6, bottom: 8 });
     // Shorter still: all body, so it can always be moved.
     expect(handleSizes(8)).toEqual({ top: 0, bottom: 0 });
-    expect(cardHitZone(7, 8, both)).toBe("body");
-    // A piece that continues has no edge there.
-    expect(cardHitZone(2, 60, { start: false, end: true })).toBe("body");
-    expect(cardHitZone(57, 60, { start: true, end: false })).toBe("body");
   });
 
-  it("bandHitZone keeps continuing ends", () => {
-    expect(bandHitZone(1, 100, { left: true, right: true })).toBe("left");
-    expect(bandHitZone(1, 100, { left: false, right: true })).toBe("body");
-    expect(bandHitZone(98, 100, { left: true, right: true })).toBe("right");
-    expect(bandHitZone(98, 100, { left: true, right: false })).toBe("body");
-    expect(bandHitZone(50, 100, { left: true, right: true })).toBe("body");
+  it("grabOf takes the strip pressed, where its surface has it", () => {
+    expect(grabOf("grid", "start")).toBe("start");
+    expect(grabOf("grid", "end")).toBe("end");
+    expect(grabOf("grid", undefined)).toBe("body");
+    expect(grabOf("band", "left")).toBe("left");
+    expect(grabOf("band", "right")).toBe("right");
+    // A strip that isn't its surface's is the body, as is anything in Month.
+    expect(grabOf("grid", "left")).toBe("body");
+    expect(grabOf("band", "end")).toBe("body");
+    expect(grabOf("month", "end")).toBe("body");
   });
 
   it("grabAllowed reads the capability for each part", () => {
@@ -412,12 +408,13 @@ describe("plans", () => {
   });
 
   it("planResize stays in its column", () => {
-    const end = (h: number, m = 0) => planResize(nine, "end", D, h * 60 + m, null);
+    // Taken right on the edge, so the edge goes where the pointer does.
+    const end = (h: number, m = 0) => planResize(nine, "end", D, 600, h * 60 + m, null);
     expect(end(11, 52)).toEqual(ok(timed(at(D, 9), at(D, 11, 45))));
     expect(end(11, 53)).toEqual(ok(timed(at(D, 9), at(D, 12))));
     expect(end(8)).toEqual(ok(timed(at(D, 9), at(D, 9, 15)))); // above the start
     expect(end(25)).toEqual(ok(timed(at(D, 9), at(WED, 0)))); // past 24:00
-    const start = (h: number, m = 0) => planResize(nine, "start", D, h * 60 + m, null);
+    const start = (h: number, m = 0) => planResize(nine, "start", D, 540, h * 60 + m, null);
     expect(start(8, 10)).toEqual(ok(timed(at(D, 8, 15), at(D, 10))));
     expect(start(11)).toEqual(ok(timed(at(D, 9, 45), at(D, 10)))); // below the end
     // A target in another column changes nothing about the day.
@@ -430,20 +427,63 @@ describe("plans", () => {
       at: { zone: "timed", day: D, minute: 595 },
       dismissOnly: false,
     };
+    // Taken 5 minutes above the end, the edge keeps that offset: 09:55 to 11:52 puts it at 11:57,
+    // 12:00 on the grid.
     expect(planGesture(press, { zone: "timed", day: THU, minute: 712 }, OPTS)).toEqual(
-      ok(timed(at(D, 9), at(D, 11, 45))),
+      ok(timed(at(D, 9), at(D, 12))),
     );
+  });
+
+  it("planResize goes as far as the pointer has, from where in the edge it was taken", () => {
+    // Taken 12 minutes above the end (inside a wide bottom edge): taking it changes nothing.
+    expect(planResize(nine, "end", D, 588, 588, null)).toEqual({
+      ok: true,
+      timing: nine,
+      noop: true,
+    });
+    // Nor does a wobble of under half a step, either way.
+    expect(planResize(nine, "end", D, 588, 595, null)).toEqual({
+      ok: true,
+      timing: nine,
+      noop: true,
+    });
+    expect(planResize(nine, "end", D, 588, 581, null)).toEqual({
+      ok: true,
+      timing: nine,
+      noop: true,
+    });
+    // Down 15 minutes: the end is 15 minutes later, not the pointer's own 09:63.
+    expect(planResize(nine, "end", D, 588, 603, null)).toEqual(ok(timed(at(D, 9), at(D, 10, 15))));
+    // Up 15: 15 minutes earlier.
+    expect(planResize(nine, "end", D, 588, 573, null)).toEqual(ok(timed(at(D, 9), at(D, 9, 45))));
+    // The top edge the same way, taken 4 minutes below the start.
+    expect(planResize(nine, "start", D, 544, 529, null)).toEqual(
+      ok(timed(at(D, 8, 45), at(D, 10))),
+    );
+    // An end off the grid (09:50) stays put until the pointer has gone half a step, then lands on
+    // the grid.
+    const offGrid = timed(at(D, 9), at(D, 9, 50));
+    expect(planResize(offGrid, "end", D, 585, 590, null)).toEqual({
+      ok: true,
+      timing: offGrid,
+      noop: true,
+    });
+    expect(planResize(offGrid, "end", D, 585, 600, null)).toEqual(ok(timed(at(D, 9), at(D, 10))));
   });
 
   it("planResize on the last piece of a multi-day event", () => {
     const night = timed(at(D, 22), at(WED, 7));
-    expect(planResize(night, "end", WED, 300, null)).toEqual(ok(timed(at(D, 22), at(WED, 5))));
-    expect(planResize(night, "end", WED, 0, null)).toEqual(ok(timed(at(D, 22), at(WED, 0))));
+    expect(planResize(night, "end", WED, 420, 300, null)).toEqual(ok(timed(at(D, 22), at(WED, 5))));
+    expect(planResize(night, "end", WED, 420, 0, null)).toEqual(ok(timed(at(D, 22), at(WED, 0))));
     // Midnight only while it stays a step after the start.
     const late = timed(at(D, 23, 50), at(WED, 7));
-    expect(planResize(late, "end", WED, 0, null)).toEqual(ok(timed(at(D, 23, 50), at(WED, 0, 5))));
+    expect(planResize(late, "end", WED, 420, 0, null)).toEqual(
+      ok(timed(at(D, 23, 50), at(WED, 0, 5))),
+    );
     // The start edge on the first piece stays on its day.
-    expect(planResize(night, "start", D, 1440, null)).toEqual(ok(timed(at(D, 23, 45), at(WED, 7))));
+    expect(planResize(night, "start", D, 1320, 1440, null)).toEqual(
+      ok(timed(at(D, 23, 45), at(WED, 7))),
+    );
   });
 
   it("planBandResize", () => {

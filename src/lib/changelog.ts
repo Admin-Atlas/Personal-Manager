@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.158.2-alpha",
+    date: "2026-10-28",
+    highlights: [
+      "Changing how long an event lasts by dragging its bottom edge is easier to catch. In Day and Week, the edge reaches further up into the event, so grabbing near the bottom changes when it ends instead of moving the whole event; the right end of an all-day event does the same for its days. An edge now moves only as far as you drag it, so taking hold of one never changes the event by itself, and wherever the pointer shows the resize arrows, an edge can be taken.",
+    ],
+  },
+  {
     version: "3.158.1-alpha",
     date: "2026-10-28",
     highlights: [
