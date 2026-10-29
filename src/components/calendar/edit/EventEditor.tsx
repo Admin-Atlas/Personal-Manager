@@ -53,6 +53,10 @@
 // (the guest list too) without touching what a later Save compares. What stays the organiser's is
 // greyed out with their reason; how it repeats always is, whatever they let guests change. Where
 // they let guests change it, Google's warning says a guest's change may not last.
+//
+// And its Google Meet call (C18), after the guests: "Add Google Meet video conferencing" where the
+// calendar offers Meet, Join and Remove once it has one, another service's call shown and kept. A
+// call Google is still making after the save is said in the saved notice.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -132,6 +136,7 @@ import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
 import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
+import { MeetField } from "./MeetField";
 import { NotifyPrompt } from "./NotifyPrompt";
 import { ReminderList } from "./ReminderList";
 import { RsvpControl } from "./RsvpControl";
@@ -1099,6 +1104,14 @@ export function EventEditor({
                 draftRef.current && setDraft({ ...draftRef.current, guest_perms })
               }
               onReject={setBadGuest}
+            />
+
+            <MeetField
+              call={loaded.event.call}
+              value={draft.meet}
+              offered={loaded.event.meet_offered}
+              disabled={!may("meet")}
+              onChange={(meet) => draftRef.current && setDraft({ ...draftRef.current, meet })}
             />
 
             <TextRow

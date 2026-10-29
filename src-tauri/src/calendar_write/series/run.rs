@@ -1772,9 +1772,10 @@ mod tests {
     #[test]
     fn a_plan_with_a_key_its_write_may_not_send_never_starts() {
         let (_, mut plan) = this_case();
-        // Guests are a key a save may send now (C12); a video call isn't.
+        // Guests are a key a save may send now (C12), and a video call (C18); attachments never
+        // are (a LATER card).
         if let Op::Patch { body, .. } = &mut plan.steps[0].op {
-            body.insert("conferenceData".into(), json!({}));
+            body.insert("attachments".into(), json!([]));
         }
         assert_eq!(Run::new(plan).err(), Some(Unfit));
     }

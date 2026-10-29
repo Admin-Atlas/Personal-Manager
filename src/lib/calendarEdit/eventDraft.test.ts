@@ -73,6 +73,8 @@ const event: EventForEdit = {
   label_id: null,
   reply: null,
   organizer_self: true,
+  call: null,
+  meet_offered: true,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -121,6 +123,7 @@ describe("the event draft", () => {
       guests: false,
       reminders: true,
       colour: true,
+      meet: true,
       delete: false,
       respond: false,
       reasons: ["locked"],
@@ -615,6 +618,7 @@ describe("guests in the draft", () => {
       guests: false,
       reminders: true,
       colour: true,
+      meet: true,
       delete: true,
       respond: false,
       reasons: [],
@@ -902,6 +906,7 @@ describe("a new event's starting fields", () => {
       recurrence: { kind: "once" },
       guests: [],
       guest_perms: { modify: false, invite_others: true, see_others: true },
+      meet: false,
       reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
       colour: { kind: "colour", id: "3" },
       show_as: "free",
@@ -1125,6 +1130,7 @@ describe("notifications and colour in the draft", () => {
       guests: false,
       reminders: true,
       colour: false,
+      meet: true,
       delete: false,
       respond: false,
       reasons: ["label_read_only"],
@@ -1236,5 +1242,87 @@ describe("notifications and colour in the draft", () => {
     expect(
       remindersAfterKindSwitch(listed, { ...same, time: listed.time }, true, false).note,
     ).toBeNull();
+  });
+});
+
+// C18: the video call is a field: whether the event has a Meet call after Save.
+describe("the video call in the draft", () => {
+  const meet = (state: "ready" | "pending" | "failed") => ({
+    kind: "meet" as const,
+    name: "Google Meet",
+    join: state === "ready" ? "https://meet.google.com/abc-defg-hij" : null,
+    state,
+  });
+
+  it("a Meet call seeds meet on, a failed one off", () => {
+    expect(seedDraft(event).meet).toBe(false);
+    expect(seedDraft({ ...event, call: meet("ready") }).meet).toBe(true);
+    expect(seedDraft({ ...event, call: meet("pending") }).meet).toBe(true);
+    expect(seedDraft({ ...event, call: meet("failed") }).meet).toBe(false);
+    const zoom = {
+      kind: "add_on" as const,
+      name: "Zoom Meeting",
+      join: null,
+      state: "ready" as const,
+    };
+    expect(seedDraft({ ...event, call: zoom }).meet).toBe(false);
+  });
+
+  it("turning the call on sends add, off sends remove, unchanged sends nothing", () => {
+    const none = base();
+    expect(toChanges(none, { ...none, meet: true })).toEqual({ meet: "add" });
+    const held = seedDraft({ ...event, call: meet("ready") });
+    expect(toChanges(held, { ...held, meet: false })).toEqual({ meet: "remove" });
+    expect(toChanges(held, held)).toEqual({});
+    expect(changedFields(none, { ...none, meet: true })).toEqual(["meet"]);
+    // Google emails guests about a call like any shared field, as the backend counts it.
+    expect(sameField("meet", none, { ...none, meet: true })).toBe(false);
+  });
+
+  it("goes with its own right, and a change Google made to it meanwhile shows Google's", () => {
+    const perms: FieldPermissions = {
+      summary: true,
+      time: true,
+      repeat: true,
+      location: true,
+      description: true,
+      show_as: true,
+      visibility: true,
+      guests: true,
+      reminders: true,
+      colour: true,
+      meet: false,
+      delete: true,
+      respond: false,
+      reasons: ["other_call"],
+    };
+    expect(canEdit(perms, "meet")).toBe(false);
+    expect(canEdit({ ...perms, meet: true }, "meet")).toBe(true);
+    const old = base();
+    const theirs = seedDraft({ ...event, call: meet("ready") });
+    const mine = { ...old, meet: true, summary: "Retro" };
+    const carried = rebaseDraft(old, theirs, mine);
+    // The same change on both sides is no conflict.
+    expect(carried.overwritten).toEqual([]);
+    expect(carried.draft.meet).toBe(true);
+    const removing = seedDraft({ ...event, call: meet("ready") });
+    const gone = rebaseDraft(removing, base(), { ...removing, meet: false, summary: "Retro" });
+    expect(gone.overwritten).toEqual([]);
+    const kept = rebaseDraft(old, base(), { ...old, meet: true });
+    expect(kept.draft.meet).toBe(true);
+    const clash = rebaseDraft(
+      removing,
+      { ...removing, summary: "Gym" },
+      { ...removing, meet: false },
+    );
+    expect(clash.draft.meet).toBe(false);
+  });
+
+  it("a new event starts with no call, and sends none", () => {
+    expect(NEW_EVENT_BASE.meet).toBe(false);
+    expect(
+      newEventSeed("2026-10-12", new Date("2026-10-11T12:00:00Z"), "Europe/London", 3_600_000).meet,
+    ).toBe(false);
+    expect(toNewEvent(base())).not.toHaveProperty("meet");
   });
 });

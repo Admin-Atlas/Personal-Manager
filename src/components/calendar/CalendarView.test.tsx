@@ -558,6 +558,8 @@ describe("CalendarView: guests", () => {
       label_id: null,
       reply: null,
       organizer_self: true,
+      call: null,
+      meet_offered: false,
     };
     const load: EditLoad = {
       outcome: "ready",
@@ -574,6 +576,7 @@ describe("CalendarView: guests", () => {
         guests: true,
         reminders: true,
         colour: true,
+        meet: false,
         delete: true,
         respond: false,
         reasons: [],
@@ -706,7 +709,7 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your reply, notifications, colour and busy or free are yours to change.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call. Your reply, notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
     expect(screen.getByRole("group", { name: "Going?" })).toBeTruthy();
@@ -739,7 +742,7 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your notifications, colour and busy or free are yours to change.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call. Your notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
   });

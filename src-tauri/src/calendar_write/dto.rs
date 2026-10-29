@@ -114,6 +114,60 @@ pub struct EventPatchDraft {
     pub reminders: Option<RemindersDraft>,
     /// Its colour (C13).
     pub colour: Option<ColourDraft>,
+    /// Add or remove its Google Meet call (C18). `None` leaves the call as it is.
+    pub meet: Option<MeetChange>,
+    /// The id of the request for a new call (`createRequest.requestId`): the editor session's, put in
+    /// by the backend before planning, never by the webview (R5). One per session, so the choices,
+    /// the save and a resend after a lost answer ask for one call, which Google makes once. `Debug`
+    /// carries it into the choice token's bind, so a token binds the very call asked for.
+    #[serde(skip)]
+    pub meet_request: Option<String>,
+}
+
+/// Adding or removing a Google Meet call, as the editor's video-call row sends it. Only Meet: PM never
+/// makes another service's call (the editing plan's CUT list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetChange {
+    Add,
+    Remove,
+}
+
+/// Whose video call an event has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    /// Google Meet (`hangoutsMeet`).
+    Meet,
+    /// Another service's, through a Calendar add-on (`addOn`): shown, never changed.
+    AddOn,
+    /// A kind Google no longer makes (`eventHangout`, `eventNamedHangout`), an empty or unknown kind,
+    /// or a bare `hangoutLink` with no call details: shown, never changed (Google's rule for
+    /// unfamiliar kinds).
+    Other,
+}
+
+/// How far Google has got with the call (`createRequest.status.statusCode`; absent is ready).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallState {
+    Ready,
+    Pending,
+    Failed,
+}
+
+/// The event's video call as the editor shows it, from Google's fresh copy. Never its phone details
+/// or notes: the notes may be HTML, and the phone entries carry PINs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallForEdit {
+    pub kind: CallKind,
+    /// The service's name as Google gives it ("Google Meet", "Zoom Meeting"), at most 100
+    /// characters; "" when Google gives none.
+    pub name: String,
+    /// The link to join by video: an `https://` entry point, else an `https://` `hangoutLink`. `None`
+    /// while there is none.
+    pub join: Option<String>,
+    pub state: CallState,
 }
 
 /// An event's notifications, as the editor holds them and as a save sends them: whole, since Google
@@ -441,6 +495,9 @@ pub enum ReadOnlyReason {
     /// Google holds a notification PM can't read, so a save that sends the list whole would lose
     /// it: the notifications stay as they are (C13).
     RemindersUnreadable,
+    /// The event's video call is another service's, or a kind PM doesn't make, which PM shows and
+    /// keeps (C18). A reason for the call alone ([`super::gate::reason_for`]).
+    OtherCall,
 }
 
 /// What may change on one event, field by field, and why the rest can't. The backend is the
@@ -461,6 +518,8 @@ pub struct FieldPermissions {
     /// Its notifications and its colour (C13).
     pub reminders: bool,
     pub colour: bool,
+    /// May add or remove a Google Meet call (C18).
+    pub meet: bool,
     pub delete: bool,
     /// The user may reply (Yes, No, Maybe). Not part of [`Self::any`]: a reply isn't one of the
     /// editor's fields (C14).
@@ -490,6 +549,7 @@ impl FieldPermissions {
             || self.guests
             || self.reminders
             || self.colour
+            || self.meet
             || self.delete
     }
 }
@@ -686,6 +746,11 @@ pub enum WriteWarning {
     /// A reply to every occurrence landed, and these occurrences, answered on their own before,
     /// kept their own answer: `Saved.left_behind` says which (C14 critiques C1-M3, C2-H1).
     KeptOwnReply,
+    /// Saved; Google is still making the video call asked for, and its link shows after a later
+    /// refresh (C18).
+    CallPending,
+    /// Saved, but Google didn't make the video call asked for (C18).
+    CallFailed,
 }
 
 /// What moving milestones to the new part of a "this and following" change needs (C9b-2). Dates
@@ -768,6 +833,10 @@ pub struct EventForEdit {
     pub reply: Option<ReplyForEdit>,
     /// Google's `organizer.self`: the calendar this copy is on organises the event.
     pub organizer_self: bool,
+    /// Its video call as Google holds it, `None` for none (C18).
+    pub call: Option<CallForEdit>,
+    /// The event's calendar offers Google Meet (C18).
+    pub meet_offered: bool,
 }
 
 /// What opening the editor came to.
@@ -969,6 +1038,11 @@ mod tests {
                 ReadOnlyReason::OrganizerOnlyGuests,
                 r#"{"outcome":"read_only","reason":"organizer_only_guests"}"#,
             ),
+            // C18: another service's video call, shown and kept.
+            (
+                ReadOnlyReason::OtherCall,
+                r#"{"outcome":"read_only","reason":"other_call"}"#,
+            ),
         ] {
             assert_eq!(
                 serde_json::to_string(&WriteOutcome::ReadOnly { reason }).unwrap(),
@@ -985,11 +1059,15 @@ mod tests {
             .unwrap(),
             r#"{"outcome":"saved","warnings":["mirror_refresh_pending"]}"#
         );
-        // The webview's `WriteWarning` names it so (C13 review round 1).
-        assert_eq!(
-            serde_json::to_string(&WriteWarning::PartlyApplied).unwrap(),
-            r#""partly_applied""#
-        );
+        // The webview's `WriteWarning` names it so (C13 review round 1), and the video call's
+        // two (C18).
+        for (warning, json) in [
+            (WriteWarning::PartlyApplied, r#""partly_applied""#),
+            (WriteWarning::CallPending, r#""call_pending""#),
+            (WriteWarning::CallFailed, r#""call_failed""#),
+        ] {
+            assert_eq!(serde_json::to_string(&warning).unwrap(), json);
+        }
         assert_eq!(
             serde_json::to_string(&WriteOutcome::Saved {
                 warnings: vec![WriteWarning::LeftOnOldSeries],
@@ -1453,6 +1531,55 @@ mod tests {
         );
     }
 
+    /// C18: a draft names a call change as the editor's row sends it, and never the request's id: the
+    /// webview can't set it (R5), so a JSON that names one deserialises without it.
+    #[test]
+    fn a_draft_reads_a_call_change_and_never_a_request_id() {
+        let add: EventPatchDraft = serde_json::from_str(r#"{"meet":"add"}"#).unwrap();
+        assert_eq!(add.meet, Some(MeetChange::Add));
+        let remove: EventPatchDraft = serde_json::from_str(r#"{"meet":"remove"}"#).unwrap();
+        assert_eq!(remove.meet, Some(MeetChange::Remove));
+        for json in [r#"{"summary":"Gym"}"#, r#"{"meet":null}"#] {
+            let untouched: EventPatchDraft = serde_json::from_str(json).unwrap();
+            assert!(untouched.meet.is_none(), "{json}");
+        }
+        assert!(serde_json::from_str::<EventPatchDraft>(r#"{"meet":"zoom"}"#).is_err());
+        let named: EventPatchDraft =
+            serde_json::from_str(r#"{"meet":"add","meet_request":"abc"}"#).unwrap();
+        assert!(
+            named.meet_request.is_none(),
+            "the webview named the request"
+        );
+        assert_eq!(named.meet, Some(MeetChange::Add));
+    }
+
+    /// C18: the call as the editor names its kind and state.
+    #[test]
+    fn a_call_reads_as_the_editor_names_it() {
+        let call = CallForEdit {
+            kind: CallKind::AddOn,
+            name: "Zoom Meeting".into(),
+            join: None,
+            state: CallState::Pending,
+        };
+        assert_eq!(
+            serde_json::to_string(&call).unwrap(),
+            r#"{"kind":"add_on","name":"Zoom Meeting","join":null,"state":"pending"}"#
+        );
+        for (kind, json) in [
+            (CallKind::Meet, r#""meet""#),
+            (CallKind::Other, r#""other""#),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), json);
+        }
+        for (state, json) in [
+            (CallState::Ready, r#""ready""#),
+            (CallState::Failed, r#""failed""#),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), json);
+        }
+    }
+
     /// What the editor sends for a new event: text and choices it leaves out take their defaults;
     /// a time of a kind PM doesn't know is refused, never guessed.
     #[test]
@@ -1560,6 +1687,11 @@ mod tests {
             // How it repeats, alone (C14 critique C1-H2: its own right now, not the time's).
             FieldPermissions {
                 repeat: true,
+                ..Default::default()
+            },
+            // The video call, alone (C18).
+            FieldPermissions {
+                meet: true,
                 ..Default::default()
             },
         ] {

@@ -24,6 +24,9 @@
 // So are notifications and colour (C13): the notifications go whole, compared in any order, and a
 // colour is the calendar's or one of Google's eleven. Both are the user's own, so a change to them
 // emails no guest.
+//
+// And the video call (C18): whether the event will have a Google Meet call after Save, sent as Add
+// or Remove; Google emails guests about it like any shared field.
 
 import type {
   ColourChoice,
@@ -80,6 +83,8 @@ export interface EditorFields {
   /** Who is on it, the organiser and the user included, in Google's order then the order added. */
   guests: GuestDraft[];
   guest_perms: GuestPerms;
+  /** The event will have a Google Meet call after Save (C18). */
+  meet: boolean;
   /** The calendar's default notifications, or the event's own list (C13). */
   reminders: RemindersDraft;
   /** The calendar's colour, or one of Google's eleven (C13). */
@@ -94,14 +99,16 @@ export interface EditorFields {
 export type EditorField = Exclude<keyof EditorFields, "organizer_email">;
 
 /** Every field, in the order the editor shows them: guests after the time, as Google's quick
- *  create has them (INFERRED); notifications and colour under the location, as Google's event page
- *  has them (INFERRED). */
+ *  create has them (INFERRED); the video call after the guests, above the place, as Google's event
+ *  page puts its Meet button (INFERRED); notifications and colour under the location, as Google's
+ *  event page has them (INFERRED). */
 export const EDITOR_FIELDS: readonly EditorField[] = [
   "summary",
   "time",
   "recurrence",
   "guests",
   "guest_perms",
+  "meet",
   "location",
   "reminders",
   "colour",
@@ -124,7 +131,8 @@ const copyColour = (c: ColourChoice): ColourChoice =>
 /** The editor's starting fields: Google's copy as it is, and how it repeats (`repeatSeed`), which a
  *  one-off has none of. Its colour is its `colorId`, any Google holds (one PM doesn't know is shown
  *  as that and sent only if changed); a label's colour isn't PM's to set, so a label leaves the
- *  colour field as `colorId` has it, read-only (the backend's `LabelReadOnly`). */
+ *  colour field as `colorId` has it, read-only (the backend's `LabelReadOnly`). It has a Meet call
+ *  when Google holds one, made or still being made; a request Google failed is none (C18). */
 export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): EditorFields {
   return {
     summary: event.summary,
@@ -138,6 +146,7 @@ export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): Edit
       invite_others: event.guests_can_invite_others,
       see_others: event.guests_can_see_other_guests,
     },
+    meet: event.call?.kind === "meet" && event.call.state !== "failed",
     reminders: copyReminders(event.reminders),
     colour: event.color_id ? { kind: "colour", id: event.color_id } : { kind: "calendar" },
     show_as: event.show_as,
@@ -215,6 +224,7 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
         a.colour.kind === b.colour.kind &&
         (a.colour.kind !== "colour" || b.colour.kind !== "colour" || a.colour.id === b.colour.id)
       );
+    case "meet":
     case "show_as":
     case "visibility":
       return a[field] === b[field];
@@ -305,6 +315,10 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
         break;
       case "colour":
         changes.colour = copyColour(draft.colour);
+        break;
+      // Add or Remove, never the call itself: the backend asks Google for a new one (C18).
+      case "meet":
+        changes.meet = draft.meet ? "add" : "remove";
         break;
       case "show_as":
         changes.show_as = draft.show_as;
@@ -746,6 +760,7 @@ export const NEW_EVENT_BASE: EditorFields = {
   recurrence: ONCE,
   guests: [],
   guest_perms: { ...GOOGLE_PERMS },
+  meet: false,
   reminders: calendarDefaults(),
   colour: CALENDAR_COLOUR,
   show_as: "busy",
@@ -796,6 +811,8 @@ export function newEventSeed(
     recurrence: ONCE,
     guests: [],
     guest_perms: { ...GOOGLE_PERMS },
+    // No video call until new events can ask for one.
+    meet: false,
     reminders: calendarDefaults(),
     colour: { kind: "calendar" } as const,
     visibility: "default" as const,
@@ -967,6 +984,9 @@ function setField(target: EditorFields, field: EditorField, from: EditorFields) 
       break;
     case "colour":
       target.colour = copyColour(from.colour);
+      break;
+    case "meet":
+      target.meet = from.meet;
       break;
     case "show_as":
       target.show_as = from.show_as;

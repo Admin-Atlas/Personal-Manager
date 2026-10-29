@@ -27,8 +27,9 @@ pub struct RequestPlan {
 /// Body features that need Google to be told which API version of them the client speaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionFlags {
-    /// The body adds or removes a conference (`conferenceDataVersion=1`). Sending it on any other
-    /// write would make Google ignore the calendar's "add Meet automatically" setting.
+    /// `conferenceDataVersion=1`. Every insert sets it (AS16: Google then adds no call of its own,
+    /// and PM applies the account's setting itself). A PATCH gets it from its body
+    /// ([`patch_event`]): exactly when the body carries `conferenceData` (C18).
     pub conference: bool,
     /// The body sets an event label (`eventLabelVersion=1`). Never sent otherwise.
     pub labels: bool,
@@ -144,6 +145,12 @@ pub fn patch_event(
     notify: Notify,
     flags: VersionFlags,
 ) -> RequestPlan {
+    // Version 1 exactly when this PATCH changes the call: never on any other PATCH, where it would
+    // only add risk (the plan's C18 card: "version 1 only when the user touched the row").
+    let flags = VersionFlags {
+        conference: flags.conference || body.get("conferenceData").is_some(),
+        ..flags
+    };
     RequestPlan {
         method: Method::Patch,
         url: url(
@@ -395,6 +402,55 @@ mod tests {
         );
         assert!(both.url.contains("conferenceDataVersion=1"));
         assert!(both.url.contains("eventLabelVersion=1"));
+    }
+
+    /// C18: a PATCH's call version follows its body, a call asked for or removed alike; one that
+    /// sends no call never says it. An insert always does (AS16).
+    #[test]
+    fn a_patch_with_a_call_says_version_one_and_one_without_doesnt() {
+        for call in [
+            Value::Null,
+            json!({ "createRequest": { "requestId": "r" } }),
+        ] {
+            let p = patch_event(
+                "c",
+                "e",
+                "\"1\"",
+                json!({ "conferenceData": call }),
+                Notify::None,
+                VersionFlags::default(),
+            );
+            assert!(
+                p.url
+                    .ends_with("/events/e?sendUpdates=none&conferenceDataVersion=1"),
+                "{}",
+                p.url
+            );
+        }
+        let title = patch_event(
+            "c",
+            "e",
+            "\"1\"",
+            json!({ "summary": "x" }),
+            Notify::None,
+            VersionFlags::default(),
+        );
+        assert!(
+            !title.url.contains("conferenceDataVersion"),
+            "{}",
+            title.url
+        );
+        let insert = insert_event(
+            "c",
+            "abcde",
+            json!({ "summary": "x" }),
+            Notify::None,
+            VersionFlags {
+                conference: true,
+                labels: false,
+            },
+        );
+        assert!(insert.url.contains("conferenceDataVersion=1"));
     }
 
     #[test]

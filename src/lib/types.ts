@@ -1587,7 +1587,10 @@ export type ReadOnlyReason =
   /** A Google Calendar label sets its colour, and PM doesn't change labels (C13). */
   | "label_read_only"
   /** Google holds a notification PM can't read, so the list stays as it is (C13). */
-  | "reminders_unreadable";
+  | "reminders_unreadable"
+  /** The event's video call is another service's, or a kind PM doesn't make: shown and kept
+   *  (C18). */
+  | "other_call";
 
 export type ShowAs = "busy" | "free";
 
@@ -1673,6 +1676,26 @@ export interface EventPatchDraft {
   reminders?: RemindersDraft | null;
   /** Its colour (C13). */
   colour?: ColourChoice | null;
+  /** Add or remove its Google Meet call (C18); omitted leaves the call as it is. Never the
+   *  request's id: the backend puts in its own. */
+  meet?: MeetChange | null;
+}
+
+/** Adding or removing a Google Meet call (C18). Only Meet: PM never makes another service's. */
+export type MeetChange = "add" | "remove";
+/** Whose video call an event has: Google Meet, another service's (a Calendar add-on), or a kind PM
+ *  doesn't make (Google's old Hangouts, a bare link). */
+export type CallKind = "meet" | "add_on" | "other";
+/** How far Google has got with the call: a request may still be pending, or have failed. */
+export type CallState = "ready" | "pending" | "failed";
+/** The event's video call, as Google holds it: never its phone details or notes (C18). */
+export interface CallForEdit {
+  kind: CallKind;
+  /** The service's name ("Google Meet", "Zoom Meeting"), "" when Google gives none. Text only. */
+  name: string;
+  /** The link to join by video (https), or null while there is none. */
+  join: string | null;
+  state: CallState;
 }
 
 /** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
@@ -1840,6 +1863,8 @@ export interface FieldPermissions {
   /** Its notifications and its colour (C13). */
   reminders: boolean;
   colour: boolean;
+  /** May add or remove a Google Meet call (C18). */
+  meet: boolean;
   delete: boolean;
   /** The user may reply (Yes, No, Maybe). No field of the editor's: the reply sits apart from
    *  them, and never makes a draft to save (C14). */
@@ -1884,6 +1909,10 @@ export interface EventForEdit {
   reply: ReplyForEdit | null;
   /** The calendar this copy is on organises the event (Google's `organizer.self`). */
   organizer_self: boolean;
+  /** Its video call as Google holds it, null for none (C18). */
+  call: CallForEdit | null;
+  /** The event's calendar offers Google Meet (C18). */
+  meet_offered: boolean;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
@@ -1981,14 +2010,17 @@ export type SeriesScope = "this" | "following" | "all";
  *  applied a one-event save without keeping all of it (a colour it wouldn't clear beside a new
  *  title, say), so the event is as Google holds it (C13 review round 1). `kept_own_reply`: a reply
  *  to every occurrence landed, and the occurrences `left_behind` names, answered on their own
- *  before, kept their own answer (C14). */
+ *  before, kept their own answer (C14). `call_pending`: saved, and Google is still making the video
+ *  call asked for; `call_failed`: saved, but Google didn't make it (C18). */
 export type WriteWarning =
   | "mirror_refresh_pending"
   | "left_on_old_series"
   | "outside_mirror"
   | "milestone_not_offered"
   | "partly_applied"
-  | "kept_own_reply";
+  | "kept_own_reply"
+  | "call_pending"
+  | "call_failed";
 
 /** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
  *  change. */

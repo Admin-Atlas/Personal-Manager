@@ -30,9 +30,10 @@ function unreachable(value: never): never {
 
 const NOT_ORGANISER = "Someone else organises this event.";
 
-/** What stays the organiser's on an event they haven't let guests change (C14c). */
+/** What stays the organiser's on an event they haven't let guests change (C14c), its video call
+ *  among it (C18). */
 const THEIRS =
-  "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+  "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call.";
 
 /** What the user may change on someone else's event: their reply only where its calendar is on the
  *  guest list (C14 critique C2-L1). */
@@ -68,8 +69,9 @@ export function reasonText(reason: ReadOnlyReason): string {
     // (C14 critique C2-M8).
     case "not_invited":
       return "PM can only reply where this calendar is on the guest list itself (not through a group).";
+    // The video call too, whatever the organiser lets guests change (C18).
     case "organizer_only_guests":
-      return "In PM, only the organiser can change who's invited.";
+      return "In PM, only the organiser can change who's invited and the video call.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
@@ -82,6 +84,9 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This event has a Google Calendar label, which sets its colour. Change it in Google Calendar.";
     case "reminders_unreadable":
       return "PM can't read one of this event's notifications, so it leaves them as they are.";
+    // Another service's, Google's old Hangouts, or a bare link (C18 critique C2-L2).
+    case "other_call":
+      return "This event's video call is a kind PM can't change, so PM leaves it as it is. Change it in Google Calendar.";
     default:
       return unreachable(reason);
   }
@@ -186,6 +191,8 @@ export function fieldLabel(field: EditorField): string {
       return "guests";
     case "guest_perms":
       return "guest permissions";
+    case "meet":
+      return "video call";
     case "location":
       return "location";
     // Google's word for them, never "reminders".
@@ -215,6 +222,8 @@ export function conflictFields(keys: readonly string[]): EditorField[] {
     guestsCanModify: "guest_perms",
     guestsCanInviteOthers: "guest_perms",
     guestsCanSeeOtherGuests: "guest_perms",
+    // A call added or removed in Google meanwhile (C18 critique C1-L5).
+    conferenceData: "meet",
     location: "location",
     reminders: "reminders",
     // A colour's conflict check watches the label too: to the user, both are the colour.
@@ -327,6 +336,12 @@ export function writeWarningText(
     // Only a reply for every occurrence comes back with it (C14): the days are its `leftBehind`.
     case "kept_own_reply":
       return keptReplyText(leftBehind?.length ?? 0);
+    // A save that asked for a Meet call (C18). The link can wait for a later sync: PM keeps the
+    // saved copy until Google's own is newer (critique C1-L11).
+    case "call_pending":
+      return "Google is still making the video call; its link shows after a later refresh.";
+    case "call_failed":
+      return "Google didn't make the video call. Add it again from Edit, or in Google Calendar.";
     default:
       return unreachable(warning);
   }
@@ -907,9 +922,10 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
  *  (`savedNotice`, and `settleText` for a Finish): outside the months PM syncs; then PM's calendar
  *  catching up, which beside an event outside is in a delete's words, since the saved event won't
  *  show after a refresh but what it replaced still does until then (C11c review); then occurrences
- *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1). A
- *  milestone that stayed has a notice of its own, naming it. `warn`: the user should look, and
- *  nothing says to edit it again here. */
+ *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1), and
+ *  the video call asked for last (C18). A milestone that stayed has a notice of its own, naming it.
+ *  `warn`: the user should look, and nothing says to edit it again here; a call still being made
+ *  isn't one, since the next refresh shows it. */
 function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
   words: string[];
   warn: boolean;
@@ -918,12 +934,16 @@ function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
   const outside = outcome.warnings.includes("outside_mirror");
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const left = outcome.warnings.includes("left_on_old_series");
+  const callPending = outcome.warnings.includes("call_pending");
+  const callFailed = outcome.warnings.includes("call_failed");
   const words: string[] = [];
   if (partly) words.push(writeWarningText("partly_applied", "save"));
   if (outside) words.push(writeWarningText("outside_mirror", "save"));
   if (pending) words.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
   if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
-  return { words, warn: partly || outside || left };
+  if (callPending) words.push(writeWarningText("call_pending", "save"));
+  if (callFailed) words.push(writeWarningText("call_failed", "save"));
+  return { words, warn: partly || outside || left || callFailed };
 }
 
 // --- moving an event (C16a) ---

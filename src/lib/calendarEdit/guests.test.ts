@@ -336,6 +336,8 @@ const opened: EventForEdit = {
   label_id: null,
   reply: null,
   organizer_self: true,
+  call: null,
+  meet_offered: false,
 };
 const fields = (guests: GuestDraft[]): EditorFields => seedDraft({ ...opened, guests });
 const retitled = (f: EditorFields): EditorFields => ({ ...f, summary: "Retro (moved)" });

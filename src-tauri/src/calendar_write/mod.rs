@@ -8,6 +8,7 @@
 //! - [`dto`]: what crosses the IPC boundary and what a save returns.
 //! - [`attendees`]: guests, as changes to Google's own guest list, and who a write would email
 //!   (C12): Send / Don't send is the user's every time (R9).
+//! - [`call`]: an event's video call, and the body that asks Google for a new Meet call (C18).
 //! - [`gate`]: what PM may change about an event, and why not.
 //! - [`time`]: wall-clock times in a named zone, DST included, and Google's start/end shapes.
 //! - [`patch`]: the PATCH body built from a fresh copy of the event, and the rules for a changed one.
@@ -24,6 +25,7 @@
 //! never overwritten (R2); the mirror is only ever written from Google's reply (R3).
 
 pub mod attendees;
+pub mod call;
 pub mod classify;
 pub mod dto;
 pub mod gate;

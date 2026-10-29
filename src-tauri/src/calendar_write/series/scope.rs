@@ -49,6 +49,8 @@ pub struct Change {
     /// A new rule, or none at all (C11).
     pub rule: Option<RuleChange>,
     pub delete: bool,
+    /// A video call added or removed (C18).
+    pub meet: bool,
 }
 
 /// A change to how the series repeats, as far as the choice cares (C11).
@@ -108,6 +110,7 @@ impl Change {
             visibility: body.contains_key("visibility"),
             guest_permissions: permissions.iter().any(|k| body.contains_key(*k)),
             rule: rule_change(draft, master),
+            meet: body.contains_key("conferenceData"),
             ..Change::default()
         };
         if let (Some(draft_time), true) = (&draft.time, body.contains_key("start")) {
@@ -172,6 +175,8 @@ pub enum ScopeReason {
     RuleIsSeriesWide,
     /// What guests may do is the whole series' (C12 critiques C1-M7, C2-L11).
     GuestPermissionsAreSeriesWide,
+    /// A video call goes on one occurrence or all of them, never a split's new part (C18 Q4).
+    CallFollowing,
 }
 
 /// Shown on the row as is, in the planners' own words for the same refusals.
@@ -184,6 +189,7 @@ impl fmt::Display for ScopeReason {
             ScopeReason::GuestPermissionsAreSeriesWide => {
                 SeriesRefusal::GuestPermissionsAreSeriesWide.fmt(f)
             }
+            ScopeReason::CallFollowing => SeriesRefusal::CallFollowing.fmt(f),
         }
     }
 }
@@ -221,6 +227,11 @@ pub fn scope_options(change: &Change, first: bool, text_only: Option<&TextOnly>)
     // absent when the rule changes", shown refused with its reason instead, C11 §0.4).
     if change.rule.is_some() {
         this = Row::Refused(ScopeReason::RuleIsSeriesWide);
+    }
+    // A split's new part never carries a call (DECISIONS 17-10 #3), so a call goes on this
+    // occurrence or every one (C18 Q4). From the first occurrence "this and following" is every one.
+    if change.meet && !first {
+        following = Row::Refused(ScopeReason::CallFollowing);
     }
     // A new time moves the series' rule, which a rule PM can only show can't be. A new rule replaces
     // the old one whole, so it doesn't stand in the way then (C11 §9.2). A move between all-day and
@@ -429,6 +440,37 @@ mod tests {
             delete.following,
             Row::Refused(ScopeReason::TextOnly(custom))
         );
+    }
+
+    /// C18 Q4: a call change offers "This event" and "All events"; "This and following" past the
+    /// first occurrence is refused in its own words, and from the first it is every occurrence.
+    #[test]
+    fn a_call_change_refuses_this_and_following_after_the_first() {
+        let call = change(EventPatchDraft {
+            meet: Some(crate::calendar_write::dto::MeetChange::Add),
+            meet_request: Some("r1".into()),
+            ..Default::default()
+        });
+        assert!(call.meet && !call.fields, "a call, nothing else");
+        assert_eq!(
+            scope_options(&call, false, None),
+            ScopeOptions {
+                this: Row::Offered,
+                following: Row::Refused(ScopeReason::CallFollowing),
+                all: Row::Offered
+            }
+        );
+        assert_eq!(scope_options(&call, true, None).following, Row::AsAll);
+        assert_eq!(
+            ScopeReason::CallFollowing.to_string(),
+            SeriesRefusal::CallFollowing.to_string()
+        );
+        // Removing a call the occurrence doesn't have changes nothing.
+        let none = change(EventPatchDraft {
+            meet: Some(crate::calendar_write::dto::MeetChange::Remove),
+            ..Default::default()
+        });
+        assert_eq!(none, Change::default());
     }
 
     /// A refused row says why in the planners' words for the same refusal.

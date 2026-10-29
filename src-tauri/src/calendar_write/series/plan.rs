@@ -69,8 +69,10 @@ use crate::calendar_recur::split::{
 use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
 use super::super::attendees::{self, GuestError, Own, Reach};
+use super::super::call;
 use super::super::dto::{
-    ColourDraft, EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason, SeenSummary,
+    CallKind, ColourDraft, EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason,
+    SeenSummary,
 };
 use super::super::patch::{
     bool_of, build_patch, check_draft_extras, delete_still_matches, description_is_html,
@@ -367,6 +369,9 @@ impl Op {
                 // C13: never a label, which PM doesn't set.
                 "reminders",
                 "colorId",
+                // C18: "This event" and "All events" add or remove a video call. Never a carry
+                // nor a split's new part (`TAIL_FIELDS`, DECISIONS 17-10 #3).
+                "conferenceData",
             ],
             Op::Carry { .. } => &[
                 "summary",
@@ -1062,6 +1067,8 @@ impl SeriesPlan {
             "extendedProperties" => super::without_pm_notes(a) == super::without_pm_notes(b),
             // In any order, the defaults however Google writes them (C13).
             "reminders" => reminders_eq(a, b),
+            // By the call it is (C18): PM's request against the call Google made of it.
+            "conferenceData" => call::same_call(a, b),
             _ => a.filter(|v| !v.is_null()) == b.filter(|v| !v.is_null()),
         }
     }
@@ -1814,6 +1821,21 @@ fn edit_plan(
     // C1-L10).
     invitation_check(input, &master, original, draft, scope)?;
     guests_ready(scope, input, draft)?;
+    // The planners' own guard behind the choices' rows (C18 Q4): a split's new part never carries a
+    // call (DECISIONS 17-10 #3), so a call goes on this occurrence or on every one.
+    if scope == Scope::Following
+        && !is_first(&master, input.fresh.instance)
+        && call::meet_value(input.fresh.instance.json(), draft)?.is_some()
+    {
+        return Err(SeriesRefusal::CallFollowing.into());
+    }
+    // Another service's call on the repeating event is shown and kept, as on one event (C18).
+    if scope != Scope::This
+        && draft.meet.is_some()
+        && matches!(master.call, Some(CallKind::AddOn | CallKind::Other))
+    {
+        return Err(NotPlanned::ReadOnly(ReadOnlyReason::OtherCall));
+    }
     match scope {
         Scope::This => plan_this(input, &master, draft, notify),
         Scope::All => plan_all(input, &master, original, draft, notify),
@@ -1860,7 +1882,9 @@ fn invitation_check(
     if scope == Scope::Following && !is_first(master, input.fresh.instance) {
         return Err(SeriesRefusal::InvitationFollowing.into());
     }
-    if draft.touches_guests() {
+    // Who is invited, and the video call (C18), stay the organiser's whatever guests may change: a
+    // call made on a guest's copy would be one nobody else sees.
+    if draft.touches_guests() || draft.meet.is_some() {
         return Err(NotPlanned::ReadOnly(if master.guests_can_modify {
             ReadOnlyReason::OrganizerOnlyGuests
         } else {
@@ -5253,14 +5277,27 @@ mod tests {
     /// G5: a key a create may not send, a body with no start PM can read, or an id that isn't one
     /// path segment builds no plan at all. The repeat rule is one a create sends since C11, the
     /// guests and what they may do since C12d, and the notifications and colour since C13; a label
-    /// never is.
+    /// never is. A call is in the create's list since C18 (beside a save's), but an insert still
+    /// can't carry one: its step fits only a split's new part's fields until new events ask for a
+    /// call (C18 critique C1-H3(a)).
     #[test]
     fn a_create_plan_refuses_a_key_a_create_may_not_send() {
-        for key in ["extendedProperties", "conferenceData", "eventLabelId", "id"] {
+        for key in ["extendedProperties", "eventLabelId", "id"] {
             let mut body = new_body();
             body.insert(key.into(), json!([]));
             assert!(create_plan(NEW, body).is_none(), "{key}");
         }
+        let mut calling = new_body();
+        calling.insert(
+            "conferenceData".into(),
+            crate::calendar_write::call::meet_request_body("r1"),
+        );
+        let plan = create_plan(NEW, calling).expect("a call is in the create's list");
+        assert!(!plan.steps[0].op.fits(), "an insert carries no call yet");
+        assert!(
+            super::super::run::Run::new(plan).is_err(),
+            "so its run never starts"
+        );
         let mut invited = new_body();
         invited.insert("attendees".into(), json!([{ "email": A }]));
         invited.insert("guestsCanModify".into(), json!(true));
@@ -5283,6 +5320,109 @@ mod tests {
         assert!(create_plan(NEW, no_start).is_none());
         for id in ["", "..", "a\nb"] {
             assert!(create_plan(id, new_body()).is_none(), "{id:?}");
+        }
+    }
+
+    /// C18 §4.5: a call goes on this occurrence or on every one, at version 1; the planners refuse it
+    /// on "this and following" past the first occurrence (Q4), another service's call on the
+    /// repeating event, and a call on someone else's (the organiser's, as the guest list is).
+    #[test]
+    fn a_call_change_is_planned_for_this_or_all_never_a_new_part() {
+        use crate::calendar_write::dto::MeetChange;
+        let add = EventPatchDraft {
+            meet: Some(MeetChange::Add),
+            meet_request: Some("r1".into()),
+            ..Default::default()
+        };
+        let asked: Map<String, Value> = [(
+            "conferenceData".to_string(),
+            crate::calendar_write::call::meet_request_body("r1"),
+        )]
+        .into_iter()
+        .collect();
+        let case = Case::new(weekly(), monday_19());
+        assert!(matches!(
+            case.edit(Scope::Following, add.clone()),
+            Err(NotPlanned::Refused(SeriesRefusal::CallFollowing))
+        ));
+        for (scope, event) in [(Scope::This, "abc_20261019T080000Z"), (Scope::All, "abc")] {
+            let plan = case.edit(scope, add.clone()).unwrap();
+            let step = &plan.steps[0];
+            assert!(
+                matches!(&step.op, Op::Patch { event: e, body, .. } if e == event && *body == asked),
+                "{scope:?}: the request, on the copy it's for"
+            );
+            assert!(step.op.fits(), "{scope:?}: a call is a patch's");
+            let request = step.op.request(step.notify).unwrap();
+            assert!(request.url.contains("conferenceDataVersion=1"), "{scope:?}");
+        }
+        // A step reads as landed on Google's call made of it, or on this very request Google
+        // failed (the write landed; the failure is said apart), and as not landed on no call.
+        let this = case.edit(Scope::This, add.clone()).unwrap();
+        let holding = |call: Value| with(monday_19(), "conferenceData", call);
+        let made = holding(json!({ "conferenceId": "abc-defg-hij",
+            "conferenceSolution": { "key": { "type": "hangoutsMeet" } } }));
+        let failed = |request: &str| {
+            holding(json!({ "createRequest": { "requestId": request,
+                "conferenceSolutionKey": { "type": "hangoutsMeet" },
+                "status": { "statusCode": "failure" } } }))
+        };
+        assert_eq!(this.verdict(0, Some(&made)), Applied::Yes);
+        assert_eq!(this.verdict(0, Some(&failed("r1"))), Applied::Yes);
+        assert_eq!(this.verdict(0, Some(&monday_19())), Applied::No);
+        assert_eq!(this.verdict(0, Some(&failed("r0"))), Applied::Unknown);
+        // From the first occurrence, "this and following" is every occurrence.
+        let first = Case::new(weekly(), plain("2026-10-05T09:00:00+01:00"));
+        assert_eq!(
+            first.edit(Scope::Following, add.clone()).unwrap().scope,
+            Scope::All
+        );
+        // Removing a call the occurrence doesn't have changes nothing, so it isn't refused.
+        let remove = EventPatchDraft {
+            meet: Some(MeetChange::Remove),
+            ..Default::default()
+        };
+        assert!(!matches!(
+            case.edit(Scope::Following, remove),
+            Err(NotPlanned::Refused(SeriesRefusal::CallFollowing))
+        ));
+        // Another service's call on the repeating event is shown and kept.
+        let zoom = json!({ "conferenceId": "9",
+            "conferenceSolution": { "key": { "type": "addOn" }, "name": "Zoom Meeting" } });
+        let zoomed = Case::new(
+            with(weekly(), "conferenceData", zoom.clone()),
+            with(monday_19(), "conferenceData", zoom),
+        );
+        assert!(matches!(
+            zoomed.edit(Scope::All, add.clone()),
+            Err(NotPlanned::ReadOnly(ReadOnlyReason::OtherCall))
+        ));
+        // Someone else's repeating event: the organiser's, whatever they let guests change.
+        let theirs = |modify: bool| {
+            let organiser = json!({ "email": "o@example.com" });
+            Case::new(
+                with(
+                    with(weekly(), "organizer", organiser.clone()),
+                    "guestsCanModify",
+                    json!(modify),
+                ),
+                with(
+                    with(monday_19(), "organizer", organiser),
+                    "guestsCanModify",
+                    json!(modify),
+                ),
+            )
+        };
+        for (modify, reason) in [
+            (false, ReadOnlyReason::NotOrganizer),
+            (true, ReadOnlyReason::OrganizerOnlyGuests),
+        ] {
+            for scope in [Scope::This, Scope::All] {
+                assert!(
+                    matches!(theirs(modify).edit(scope, add.clone()), Err(NotPlanned::ReadOnly(r)) if r == reason),
+                    "{scope:?}, modify {modify}"
+                );
+            }
         }
     }
 

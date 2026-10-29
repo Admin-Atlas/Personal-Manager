@@ -317,11 +317,12 @@ describe("the warnings", () => {
         "following",
         "Gym",
       );
+    // C18: a call is added from Edit now, not only in Google Calendar.
     expect(carried(true, true, true)).toBe(
-      "The new repeating event this makes won't have the video call, the attachments and the label. The earlier part keeps them. Add a call to it in Google Calendar if you need one.",
+      "The new repeating event this makes won't have the video call, the attachments and the label. The earlier part keeps them. Add a video call to it from Edit if you need one.",
     );
     expect(carried(false, true, false)).toBe(
-      "The new repeating event this makes won't have the video call. The earlier part keeps it. Add a call to it in Google Calendar if you need one.",
+      "The new repeating event this makes won't have the video call. The earlier part keeps it. Add a video call to it from Edit if you need one.",
     );
     expect(carried(true, false, true)).toBe(
       "The new repeating event this makes won't have the attachments and the label. The earlier part keeps them.",

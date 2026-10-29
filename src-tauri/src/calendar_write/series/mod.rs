@@ -45,7 +45,7 @@ use crate::calendar_recur::spec::SpecError;
 use crate::calendar_recur::{Point, RecurError, SeriesStart};
 
 use super::attendees::{guest_set, GuestError};
-use super::dto::ReadOnlyReason;
+use super::dto::{CallKind, ReadOnlyReason};
 use super::patch::PatchError;
 use super::time::TimeError;
 
@@ -165,6 +165,9 @@ pub struct Master {
     pub guests_can_modify: bool,
     pub event_type: Option<String>,
     pub locked: bool,
+    /// The series' video call, by kind, `None` for none (C18): another service's call on every
+    /// occurrence is shown and kept.
+    pub call: Option<CallKind>,
 }
 
 impl Master {
@@ -234,6 +237,7 @@ impl Master {
                 .unwrap_or(false),
             event_type: text("eventType"),
             locked: it.get("locked").and_then(Value::as_bool).unwrap_or(false),
+            call: super::call::call_of(it).map(|c| c.kind),
         })
     }
 
@@ -654,6 +658,10 @@ pub enum SeriesRefusal {
     /// A new rule, or a move of every occurrence, on someone else's repeating event: re-ruling the
     /// user's copy would leave it apart from the organiser's event (C14 §0.5 row 5).
     InvitationRule,
+    /// A video call added or removed on "this and following" past the first occurrence: a split's
+    /// new part never carries a call (DECISIONS 17-10 #3), so it is "This event" or "All events"
+    /// (C18 Q4).
+    CallFollowing,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -817,6 +825,11 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "Someone else organises this repeating event, so only they can change how it \
                  repeats or move all of it. You can move this occurrence."
+            ),
+            SeriesRefusal::CallFollowing => write!(
+                f,
+                "PM adds or removes a video call on this occurrence or on all of them, not on this \
+                 one and the ones after it."
             ),
         }
     }

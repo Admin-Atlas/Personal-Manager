@@ -17,10 +17,13 @@
 //! on the guest list, not who organises the event. A one-off that Google has since turned into a
 //! repeating event is read-only with its own reason on every path, since a write to it would change
 //! every occurrence with no choice asked.
+//!
+//! A video call is Meet only, where the calendar offers it, and the organiser's to add or remove;
+//! another service's call is shown and kept (C18).
 
 use crate::calendar_editing::EditingStatus;
 
-use super::dto::{FieldPermissions, ListRights, ReadOnlyReason};
+use super::dto::{CallKind, FieldPermissions, ListRights, ReadOnlyReason};
 
 /// Everything the gate needs to know about one event.
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +57,11 @@ pub struct EditFacts<'a> {
     /// The calendar this copy is on has an entry on the guest list (Google's `self`): it has a reply
     /// to give, the organiser's own included (C14).
     pub invited: bool,
+    /// The event's video call, by kind (`None`: none). From a fresh copy (`call::call_of`); the list
+    /// reads the mirror's link (`call::kind_of_link`) (C18).
+    pub call: Option<CallKind>,
+    /// The calendar offers Google Meet (its `allowedConferenceSolutionTypes` has `hangoutsMeet`).
+    pub meet_offered: bool,
 }
 
 /// What may change about the event described by `facts`, and whether the user may reply.
@@ -76,6 +84,11 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         guests: true,
         reminders: true,
         colour: true,
+        // Only Meet is made or removed here (the plan's CUT list), and added only where the calendar
+        // offers it; a Meet call already there may still go, as Google web lets it (C18 critiques
+        // C1-M1, C2-L14). A lock isn't Google's on the call.
+        meet: matches!(facts.call, None | Some(CallKind::Meet))
+            && (facts.meet_offered || facts.call == Some(CallKind::Meet)),
         delete: true,
         // A lock is Google's on the shared fields: a reply isn't among them.
         respond,
@@ -104,6 +117,13 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         }
         // Removing your copy from your calendar is a later layer's (C14d).
         perms.delete = false;
+        // A call is the organiser's, whatever they let guests change: one made on a guest's copy
+        // would be a call nobody else sees (A11; C18 §0.5 row 7). The reason above names it.
+        perms.meet = false;
+    } else if matches!(facts.call, Some(CallKind::AddOn | CallKind::Other)) {
+        // Shown and kept: Google's rule for a kind the client doesn't make (C18). On someone else's
+        // event the organiser's reason already says the call is theirs.
+        perms.reasons.push(ReadOnlyReason::OtherCall);
     }
     if facts.locked {
         // Google refuses changes to a locked copy's summary, description, location, start, end and
@@ -167,16 +187,20 @@ pub enum Field {
     Guests,
     Reminders,
     Colour,
+    /// The video call (C18).
+    Meet,
     Delete,
 }
 
 /// Reasons that close one field only: each is given for its own field alone, never for another
-/// field it says nothing about (C14 critique C1-L1; C13's C1-L1 for the colour and notifications).
-const ONE_FIELD: [ReadOnlyReason; 4] = [
+/// field it says nothing about (C14 critique C1-L1; C13's C1-L1 for the colour and notifications;
+/// C18 critique C1-L6 for another service's call).
+const ONE_FIELD: [ReadOnlyReason; 5] = [
     ReadOnlyReason::OrganizerOnlyGuests,
     ReadOnlyReason::HtmlDescription,
     ReadOnlyReason::LabelReadOnly,
     ReadOnlyReason::RemindersUnreadable,
+    ReadOnlyReason::OtherCall,
 ];
 
 /// The reason to give when a write touches `field` and `perms` (from [`edit_rights`]) closed it: the
@@ -184,14 +208,20 @@ const ONE_FIELD: [ReadOnlyReason; 4] = [
 /// field's own. Every refusal says this, so a delete on an event whose organiser lets guests change
 /// it never says "only the organiser can change who's invited" (C14 critique C1-L1).
 pub fn reason_for(perms: &FieldPermissions, field: Field) -> ReadOnlyReason {
-    let own = match field {
-        Field::Guests => Some(ReadOnlyReason::OrganizerOnlyGuests),
-        Field::Description => Some(ReadOnlyReason::HtmlDescription),
-        Field::Colour => Some(ReadOnlyReason::LabelReadOnly),
-        Field::Reminders => Some(ReadOnlyReason::RemindersUnreadable),
-        _ => None,
+    // The call's own first; under "modify" the organiser's guest reason covers it too (its words
+    // name the call, C18).
+    let own: &[ReadOnlyReason] = match field {
+        Field::Guests => &[ReadOnlyReason::OrganizerOnlyGuests],
+        Field::Description => &[ReadOnlyReason::HtmlDescription],
+        Field::Colour => &[ReadOnlyReason::LabelReadOnly],
+        Field::Reminders => &[ReadOnlyReason::RemindersUnreadable],
+        Field::Meet => &[
+            ReadOnlyReason::OtherCall,
+            ReadOnlyReason::OrganizerOnlyGuests,
+        ],
+        _ => &[],
     };
-    if let Some(own) = own.filter(|r| perms.reasons.contains(r)) {
+    if let Some(own) = own.iter().copied().find(|r| perms.reasons.contains(r)) {
         return own;
     }
     // Nothing else said: someone else's event, whose organiser lets guests change it, closes the
@@ -235,6 +265,9 @@ pub fn create_block(
         labelled: false,
         reminders_readable: true,
         invited: false,
+        // A create's call is the create command's to check.
+        call: None,
+        meet_offered: false,
     })
 }
 
@@ -284,7 +317,8 @@ mod tests {
     use super::*;
     use ReadOnlyReason::*;
 
-    /// A solo, one-off event you organise on your own calendar, with editing on.
+    /// A solo, one-off event you organise on your own calendar, with editing on, on a calendar that
+    /// offers Meet and with no call yet.
     fn editable() -> EditFacts<'static> {
         EditFacts {
             google: true,
@@ -300,6 +334,8 @@ mod tests {
             labelled: false,
             reminders_readable: true,
             invited: false,
+            call: None,
+            meet_offered: true,
         }
     }
 
@@ -965,6 +1001,8 @@ mod tests {
                 "{row}: busy or free, notifications, colour"
             );
             assert_eq!(p.repeat, repeat, "{row}: how it repeats");
+            // The call is the organiser's as how it repeats is, and these rows lock neither (C18).
+            assert_eq!(p.meet, repeat, "{row}: video call");
             assert_eq!(p.guests, guests, "{row}: guests");
             assert_eq!(p.delete, delete, "{row}: delete");
             assert_eq!(p.respond, respond, "{row}: reply");
@@ -1051,5 +1089,126 @@ mod tests {
             reason_for(&unreadable, Field::Reminders),
             RemindersUnreadable
         );
+        // C18: the call's own reason for the call alone (critique C1-L6): a locked event with another
+        // service's call refuses a title with the lock's words, the call with its own.
+        let zoom_locked = rights(EditFacts {
+            locked: true,
+            call: Some(CallKind::AddOn),
+            ..editable()
+        });
+        assert_eq!(reason_for(&zoom_locked, Field::Meet), OtherCall);
+        assert_eq!(reason_for(&zoom_locked, Field::Summary), Locked);
+        assert_eq!(reason_for(&zoom_locked, Field::Delete), Locked);
+        // Someone else's event: the organiser's reason, "modify" or not.
+        assert_eq!(reason_for(&g, Field::Meet), OrganizerOnlyGuests);
+        assert_eq!(reason_for(&plain, Field::Meet), NotOrganizer);
+    }
+
+    /// C18: who may add or remove a Google Meet call, and why not (§3.3, with critique C1-M1's
+    /// row G12): Meet only, the organiser's, added only where the calendar offers it; a Meet call
+    /// already there may still go. Another service's call is shown and kept, with its reason, on
+    /// the organiser's event; on someone else's the organiser's reason covers it.
+    #[test]
+    fn the_call_row_table() {
+        let organiser = |call, meet_offered| EditFacts {
+            call,
+            meet_offered,
+            ..editable()
+        };
+        let rows: Vec<(&str, EditFacts, bool, Vec<ReadOnlyReason>)> = vec![
+            ("G1", organiser(None, true), true, vec![]),
+            ("G2", organiser(Some(CallKind::Meet), true), true, vec![]),
+            (
+                "G3",
+                organiser(Some(CallKind::AddOn), true),
+                false,
+                vec![OtherCall],
+            ),
+            (
+                "G4",
+                organiser(Some(CallKind::Other), true),
+                false,
+                vec![OtherCall],
+            ),
+            ("G5", organiser(None, false), false, vec![]),
+            (
+                "G6",
+                organiser(Some(CallKind::AddOn), false),
+                false,
+                vec![OtherCall],
+            ),
+            (
+                "G7",
+                EditFacts {
+                    locked: true,
+                    ..organiser(None, true)
+                },
+                true,
+                vec![Locked],
+            ),
+            ("G8", invitation(), false, vec![NotOrganizer]),
+            (
+                "G9",
+                EditFacts {
+                    guests_can_modify: true,
+                    ..invitation()
+                },
+                false,
+                vec![OrganizerOnlyGuests],
+            ),
+            (
+                "G10",
+                EditFacts {
+                    event_type: Some("birthday"),
+                    ..editable()
+                },
+                false,
+                vec![SpecialType],
+            ),
+            (
+                "G11",
+                EditFacts {
+                    access_role: Some("writerWithoutPrivateAccess"),
+                    ..editable()
+                },
+                true,
+                vec![],
+            ),
+            ("G12", organiser(Some(CallKind::Meet), false), true, vec![]),
+            // Someone else's event with another service's call: the organiser's reason alone.
+            (
+                "G13",
+                EditFacts {
+                    call: Some(CallKind::AddOn),
+                    ..invitation()
+                },
+                false,
+                vec![NotOrganizer],
+            ),
+            (
+                "G14",
+                EditFacts {
+                    locked: true,
+                    ..organiser(Some(CallKind::AddOn), true)
+                },
+                false,
+                vec![OtherCall, Locked],
+            ),
+        ];
+        for (row, facts, meet, reasons) in rows {
+            let p = edit_rights(&facts);
+            assert_eq!(p.meet, meet, "{row}: the call");
+            assert_eq!(p.reasons, reasons, "{row}: reasons");
+        }
+        // A calendar without Meet still leaves the rest of the event to change (G5).
+        assert!(edit_rights(&organiser(None, false)).any());
+        // The call alone is something the editor can change.
+        let only = edit_rights(&EditFacts {
+            locked: true,
+            labelled: true,
+            reminders_readable: false,
+            ..editable()
+        });
+        assert!(only.meet);
     }
 }

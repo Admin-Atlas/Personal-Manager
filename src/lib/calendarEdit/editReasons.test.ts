@@ -105,6 +105,7 @@ const REASONS: ReadOnlyReason[] = [
   "html_description",
   "label_read_only",
   "reminders_unreadable",
+  "other_call",
 ];
 
 describe("edit reasons", () => {
@@ -124,13 +125,26 @@ describe("edit reasons", () => {
     for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/reminder/i);
   });
 
+  // C18: another service's call, Google's old Hangouts or a bare link, in one sentence, never
+  // Google's own word for a call.
+  it("words a call PM can't change plainly, as the backend does (C18)", () => {
+    expect(reasonText("other_call")).toBe(
+      "This event's video call is a kind PM can't change, so PM leaves it as it is. Change it in Google Calendar.",
+    );
+    for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/conference|add-on/i);
+    expect(fieldLabel("meet")).toBe("video call");
+  });
+
   it("names conflicting fields in the editor's words", () => {
     // A key the editor has no field for names nothing.
-    expect(conflictFields(["start", "end", "summary", "transparency", "conferenceData"])).toEqual([
+    expect(conflictFields(["start", "end", "summary", "transparency", "attachments"])).toEqual([
       "time",
       "summary",
       "show_as",
     ]);
+    // C18: the call is the video-call row's (critique C1-L5).
+    expect(conflictFields(["conferenceData", "summary"])).toEqual(["meet", "summary"]);
+    expect(listFields(conflictFields(["conferenceData"]))).toBe("video call");
     // Notifications and colour (C13): a colour's check watches the label too, and both are the
     // colour, said once.
     expect(conflictFields(["eventLabelId"])).toEqual(["colour"]);
@@ -368,6 +382,8 @@ describe("a write's warnings", () => {
       "milestone_not_offered",
       "partly_applied",
       "kept_own_reply",
+      "call_pending",
+      "call_failed",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
@@ -504,8 +520,9 @@ describe("what a reply came to (C14)", () => {
 
 // C14 critiques C1-L10, C2-L1, C2-L10: under someone else's event, what the user may still do.
 describe("the line under someone else's event (C14b, C14c)", () => {
+  // The video call is the organiser's too (C18).
   const theirs =
-    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call.";
 
   it("says what stays the organiser's and what the user may change, the reply only when this copy can", () => {
     // The reason alone never promises a reply: the calendar may not be on the guest list.
@@ -526,7 +543,7 @@ describe("the line under someone else's event (C14b, C14c)", () => {
 
   it("says the guest list is the organiser's, and why a group invitation can't be answered", () => {
     expect(reasonText("organizer_only_guests")).toBe(
-      "In PM, only the organiser can change who's invited.",
+      "In PM, only the organiser can change who's invited and the video call.",
     );
     expect(reasonText("not_invited")).toBe(
       "PM can only reply where this calendar is on the guest list itself (not through a group).",
@@ -660,6 +677,23 @@ describe("a repeating event's save, said once the editor has closed", () => {
     expect(outcomeText(saved(["partly_applied", "mirror_refresh_pending"])).text).toBe(
       "Saved to Google. Google didn't keep all of your changes, so check the event. PM's calendar will show it after the next refresh.",
     );
+  });
+
+  // C18 §13.3: a save that asked for a Meet call says when Google is still making it (the link can
+  // wait for a later sync, critique C1-L11), and when Google made none, which is worth a look.
+  it("says when Google is still making the video call, or made none", () => {
+    expect(savedNotice("Gym", saved(["call_pending"]), null)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym”. Google is still making the video call; its link shows after a later refresh.",
+    });
+    expect(savedNotice("Gym", saved(["call_failed"]), "this")).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” for this occurrence. Google didn't make the video call. Add it again from Edit, or in Google Calendar. To change it back, edit it again.",
+    });
+    expect(savedNotice("Gym", saved(["call_pending", "partly_applied"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym”. Google didn't keep all of your changes, so check the event. Google is still making the video call; its link shows after a later refresh.",
+    });
   });
 
   // C11 §10: a one-off made to repeat whose occurrences all fall outside the months PM syncs is in

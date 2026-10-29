@@ -290,7 +290,8 @@ export function seriesWarningText(
       ];
       if (missing.length === 0) return "";
       const keeps = missing.length === 1 ? "keeps it" : "keeps them";
-      const call = w.conference ? " Add a call to it in Google Calendar if you need one." : "";
+      // PM adds a video call from Edit since C18.
+      const call = w.conference ? " Add a video call to it from Edit if you need one." : "";
       return `The new repeating event this makes won't have ${andList(missing)}. The earlier part ${keeps}.${call}`;
     }
     case "new_identity":

@@ -114,7 +114,7 @@ vi.mock("../../../lib/markdown", () => ({
 }));
 
 import { EventEditor, UNREADABLE_REPEAT } from "./EventEditor";
-import { A11_NOTE } from "../../../lib/calendarEdit/editReasons";
+import { A11_NOTE, savedNotice } from "../../../lib/calendarEdit/editReasons";
 
 /** What the user may change on someone else's event whose copy can reply (C14c). */
 const YOURS_WITH_REPLY = "Your reply, notifications, colour and busy or free are yours to change.";
@@ -143,6 +143,7 @@ const ALL: FieldPermissions = {
   guests: true,
   reminders: true,
   colour: true,
+  meet: true,
   delete: true,
   respond: false,
   reasons: [],
@@ -180,6 +181,9 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     label_id: null,
     reply: null,
     organizer_self: true,
+    // No call, on a calendar without Meet: no video-call row unless a test asks for one (C18).
+    call: null,
+    meet_offered: false,
     ...over,
   };
 }
@@ -350,6 +354,89 @@ describe("EventEditor", () => {
       false,
       { rowId: row.id, sent: null },
     );
+  });
+
+  // C18: the video call is a field of the editor, after the guests.
+  it("shows an event's Meet call, and Remove sends remove", async () => {
+    const call = {
+      kind: "meet" as const,
+      name: "Google Meet",
+      join: "https://meet.google.com/abc-defg-hij",
+      state: "ready" as const,
+    };
+    openForEdit.mockResolvedValue(ready(event({ call, meet_offered: true })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const row_ = screen.getByRole("group", { name: "Video call" });
+    expect(within(row_).getByRole("button", { name: "Join with Google Meet" })).toBeTruthy();
+    fireEvent.click(within(row_).getByRole("button", { name: "Remove the video call" }));
+    expect(within(row_).getByText("The video call will be removed when you save.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { meet: "remove" }, ...UNSCOPED);
+  });
+
+  it("Add sends add, and the saved notice says when Google is still making it", async () => {
+    openForEdit.mockResolvedValue(ready(event({ meet_offered: true })));
+    const outcome: Extract<WriteOutcome, { outcome: "saved" }> = {
+      outcome: "saved",
+      warnings: ["call_pending"],
+    };
+    saveEdit.mockResolvedValue(outcome);
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Add Google Meet video conferencing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { meet: "add" }, ...UNSCOPED);
+    expect(noteSaved).toHaveBeenCalledWith("Dentist", outcome, null, "2026-10-12", false, false, {
+      rowId: row.id,
+      sent: null,
+    });
+    expect(savedNotice("Dentist", outcome, null).text).toBe(
+      "Saved “Dentist”. Google is still making the video call; its link shows after a later refresh.",
+    );
+  });
+
+  it("keeps another service's call, with its reason", async () => {
+    const zoom = {
+      kind: "add_on" as const,
+      name: "Zoom Meeting",
+      join: "https://zoom.us/j/987",
+      state: "ready" as const,
+    };
+    openForEdit.mockResolvedValue(
+      ready(event({ call: zoom, meet_offered: true }), {
+        ...ALL,
+        meet: false,
+        reasons: ["other_call"],
+      }),
+    );
+    await open();
+    const row_ = screen.getByRole("group", { name: "Video call" });
+    expect(within(row_).getByText("Zoom Meeting")).toBeTruthy();
+    expect(within(row_).getByRole("button", { name: "Join" })).toBeTruthy();
+    expect(within(row_).queryByRole("button", { name: /^Add|^Remove/ })).toBeNull();
+    expect(
+      screen.getByText(
+        "This event's video call is a kind PM can't change, so PM leaves it as it is. Change it in Google Calendar.",
+      ),
+    ).toBeTruthy();
+    // A Meet row the gate closed (someone else's event) can still be joined, never changed.
+    cleanup();
+    const meetCall = { ...zoom, kind: "meet" as const, name: "Google Meet" };
+    openForEdit.mockResolvedValue(
+      ready(event({ call: meetCall, meet_offered: true }), { ...ALL, meet: false }),
+    );
+    await open();
+    const closed = screen.getByRole("group", { name: "Video call" });
+    expect(
+      within(closed).getByRole<HTMLButtonElement>("button", { name: "Remove the video call" })
+        .disabled,
+    ).toBe(true);
+    expect(
+      within(closed).getByRole<HTMLButtonElement>("button", { name: "Join with Google Meet" })
+        .disabled,
+    ).toBe(false);
   });
 
   it("turns Close off with Cancel while a save is out, and back on after", async () => {
@@ -2717,7 +2804,7 @@ describe("EventEditor, an invitation", () => {
   };
   const saved: SaveAnswer = { outcome: "saved", warnings: [] };
   const theirsLine =
-    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call.";
   /** What the guest list says of the user's own entry. */
   const myEntry = () =>
     within(screen.getByRole("list", { name: "Guests" }))
@@ -2903,7 +2990,9 @@ describe("EventEditor, an invitation", () => {
     expect(
       screen.getByText("Someone else organises this event, so only they can make it repeat."),
     ).toBeTruthy();
-    expect(screen.getByText("In PM, only the organiser can change who's invited.")).toBeTruthy();
+    expect(
+      screen.getByText("In PM, only the organiser can change who's invited and the video call."),
+    ).toBeTruthy();
     expect(screen.queryByText(theirsLine, { exact: false })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
