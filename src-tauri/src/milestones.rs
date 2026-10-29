@@ -343,6 +343,16 @@ pub fn linked_on_or_after(
         .collect())
 }
 
+/// Whether any milestone is linked to the calendar event `ical`, met or not: what an event put on
+/// another calendar under a new identity leaves behind (#884, C18d).
+pub fn any_linked_to(conn: &Connection, ical: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project_milestones WHERE event_uid = ?1)",
+        [ical],
+        |r| r.get(0),
+    )?)
+}
+
 /// Every milestone, resolved and grouped by project name — one pass for `list_overviews`.
 pub fn all_by_project(conn: &Connection, today: &str) -> Result<HashMap<String, Vec<Milestone>>> {
     let uid_dates = calendar_dates_by_uid(conn, today)?;
@@ -919,6 +929,19 @@ mod tests {
         let other = linked_on_or_after(&conn, "past@x", "2026-10-05", today).unwrap();
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].due_date.as_deref(), Some("2026-10-05"));
+    }
+
+    /// C18d: whether a milestone names a calendar event, met or not, and only that event.
+    #[test]
+    fn any_linked_to_finds_a_link_to_that_event_only() {
+        let (_dir, conn) = store();
+        assert!(!any_linked_to(&conn, "abc@x").unwrap());
+        let id = add(&conn, "Atlas", "Launch", None, Some("abc@x".into())).unwrap();
+        add(&conn, "Atlas", "Kick-off", Some("2026-11-02".into()), None).unwrap();
+        assert!(any_linked_to(&conn, "abc@x").unwrap());
+        assert!(!any_linked_to(&conn, "abd@x").unwrap());
+        set_state(&conn, id, true).unwrap();
+        assert!(any_linked_to(&conn, "abc@x").unwrap(), "met still links");
     }
 
     /// C9b-2: linking says whether a milestone had that id, so "Moved" is never said of nothing;

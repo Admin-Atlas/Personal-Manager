@@ -10,7 +10,9 @@
 //! retried only where a second copy can't apply twice: a GET, or a PATCH or DELETE guarded by
 //! `If-Match` (an applied first copy makes the etag stale). An insert isn't: Google warns it can't
 //! guarantee to catch a repeated id, so after a server error the caller fetches the id PM chose before
-//! sending anything again (plan rule R2). Anything else goes back to the user.
+//! sending anything again (plan rule R2). Neither is putting an event on another calendar, which has
+//! no `If-Match`: the caller looks on both calendars instead (C18). Anything else goes back to the
+//! user.
 
 use serde_json::Value;
 
@@ -21,6 +23,8 @@ pub enum Method {
     Insert,
     Patch,
     Delete,
+    /// `events.move`: a POST with no body that puts the event on another calendar (C18).
+    Transfer,
 }
 
 /// What Google's answer means for PM.
@@ -97,7 +101,9 @@ pub fn should_retry(method: Method, verdict: &Verdict, attempt: u32) -> bool {
         // Maybe applied. Spelled out per method so a new one has to decide.
         Verdict::ServerError => match method {
             Method::Get | Method::Patch | Method::Delete => true,
-            Method::Insert => false,
+            // Maybe applied, and no If-Match to make a second copy harmless: the caller looks on
+            // both calendars.
+            Method::Insert | Method::Transfer => false,
         },
         _ => false,
     }
@@ -278,12 +284,19 @@ mod tests {
 
     #[test]
     fn only_transient_failures_are_retried_and_only_once() {
-        for method in [Method::Get, Method::Insert, Method::Patch, Method::Delete] {
+        for method in [
+            Method::Get,
+            Method::Insert,
+            Method::Patch,
+            Method::Delete,
+            Method::Transfer,
+        ] {
             assert!(should_retry(method, &Verdict::RateLimited, 1));
-            // A server error may have applied an insert: the caller fetches the id first instead.
+            // A server error may have applied an insert, or a calendar change: the caller looks
+            // first instead (the id PM chose; both calendars).
             assert_eq!(
                 should_retry(method, &Verdict::ServerError, 1),
-                method != Method::Insert,
+                !matches!(method, Method::Insert | Method::Transfer),
                 "{method:?}"
             );
             assert!(!should_retry(method, &Verdict::ServerError, 2));

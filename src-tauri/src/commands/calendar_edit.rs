@@ -185,10 +185,14 @@ fn new_meet_request() -> String {
 }
 
 /// `draft` as the backend plans it: the session's request id beside a call change, never one from
-/// the webview (R5). The choices and the save both plan from it, so a choice's token binds the very
-/// call the save asks for.
-fn sessioned(mut draft: EventPatchDraft, open: &EditSession) -> EventPatchDraft {
+/// the webview (R5), and a calendar change to the event's own calendar dropped, so it never refuses
+/// a save for nothing (C18 critique C1-L1). The choices and the save both plan from it, so a choice's
+/// token binds the very call the save asks for and the same calendar.
+fn normalised(mut draft: EventPatchDraft, open: &EditSession) -> EventPatchDraft {
     draft.meet_request = draft.meet.map(|_| open.meet_request.clone());
+    if draft.calendar.as_deref() == Some(open.target.calendar_id.as_str()) {
+        draft.calendar = None;
+    }
     draft
 }
 
@@ -604,6 +608,8 @@ fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<Re
         (draft.touches_guests() && !perms.guests, Field::Guests),
         // Its video call (C18): another service's says its own reason.
         (draft.meet.is_some() && !perms.meet, Field::Meet),
+        // The calendar it's on (C18d): the organiser's words, or the lock's.
+        (draft.calendar.is_some() && !perms.calendar, Field::Calendar),
         (draft.summary.is_some() && !perms.summary, Field::Summary),
         (draft.time.is_some() && !perms.time, Field::Time),
         // How it repeats: closed with the time, and on someone else's event (C14 critique C1-H2).
@@ -863,7 +869,8 @@ fn seen_of(calendar_id: &str, fresh: &Value) -> Option<SeenSummary> {
 ///
 /// `draft.meet` adds or removes its Google Meet call (C18), asked for under this editor's own
 /// request id, so a resend makes no second call; a call Google is still making is looked at again
-/// twice before the save is said.
+/// twice before the save is said. `draft.calendar` puts the event on another calendar of the same
+/// account (`events.move`, C18d), after the field changes, with one email question for both.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn update_calendar_event(
@@ -884,14 +891,24 @@ pub async fn update_calendar_event(
             message: SESSION_ENDED.into(),
         });
     };
-    let draft = sessioned(draft, &open);
+    let draft = normalised(draft, &open);
+    // Another calendar (C18d): resolved and checked from the DB alone, before anything is read.
+    let dest = match transfer_dest(&*state.conn()?, &open.target, &draft)? {
+        Ok(dest) => dest,
+        Err(refused) => return Ok(refused),
+    };
     #[cfg(debug_assertions)]
     {
         // A one-off given a repeat becomes a whole repeating event: that is series-wide too (C11
         // critique 1 L11).
         let series_wide = matches!(scope, Some(SeriesScope::Following | SeriesScope::All))
             || matches!(draft.recurrence, Some(RepeatDraft::Rule { .. }));
-        let allowed = dev_allow::check(&*state.conn()?, &open.target.remote_calendar, series_wide)?;
+        let mut allowed =
+            dev_allow::check(&*state.conn()?, &open.target.remote_calendar, series_wide)?;
+        // The calendar it would go to as well: the sender's backstop reads it too (§8.2).
+        if let (Ok(()), Some(dest)) = (allowed, &dest) {
+            allowed = dev_allow::check(&*state.conn()?, &dest.remote_calendar, series_wide)?;
+        }
         if let Err(message) = allowed {
             return Ok(WriteOutcome::Failed {
                 message: message.into(),
@@ -901,6 +918,7 @@ pub async fn update_calendar_event(
     let editing_choice = calendar_editing::choice(&*state.conn()?, &open.target.email)?;
     let editing = editing_status(editing_choice, &open.target.token_key);
     if let Some(scope) = scope {
+        // The plan refuses a calendar change for now (`prepare_change`); C18e passes `dest` on.
         let token_key = open.target.token_key.clone();
         let target = open.target.clone();
         let wire = GoogleWire(&token_key);
@@ -924,16 +942,14 @@ pub async fn update_calendar_event(
         .await);
     }
     let token_key = open.target.token_key.clone();
-    Ok(save_event(
-        &GoogleWire(&token_key),
-        &app,
-        &session,
-        &open,
-        &draft,
-        editing,
-        &GuestAnswer { notify, asked },
-    )
-    .await)
+    let wire = GoogleWire(&token_key);
+    let answer = GuestAnswer { notify, asked };
+    Ok(match &dest {
+        Some(dest) => {
+            save_and_transfer(&wire, &app, &session, &open, &draft, editing, &answer, dest).await
+        }
+        None => save_event(&wire, &app, &session, &open, &draft, editing, &answer).await,
+    })
 }
 
 /// What Google's copy shows of a one-event save: its reply, or a GET after an answer that can't be
@@ -1101,6 +1117,7 @@ fn with_warning(outcome: WriteOutcome, warning: Option<WriteWarning>) -> WriteOu
                 left_behind,
                 milestone_moves,
                 undo,
+                calendar,
             },
             Some(warning),
         ) => {
@@ -1110,6 +1127,7 @@ fn with_warning(outcome: WriteOutcome, warning: Option<WriteWarning>) -> WriteOu
                 left_behind,
                 milestone_moves,
                 undo,
+                calendar,
             }
         }
         (outcome, _) => outcome,
@@ -1599,9 +1617,24 @@ async fn ready_save<W: Wire, H: Host>(
         UpdateCheck::Conflict(fields) => return Err(WriteOutcome::Conflict { fields }),
     }
     // R9: who this would email is the user's to say, every time, for the numbers they saw; nobody,
-    // and it's `none` (R7). Asked before anything is sent, a second round included.
-    let guests = attendees::notify_required(fresh, &body, &own_of(target, &[fresh]));
-    let notify = answer.for_write(guests.clone())?;
+    // and it's `none` (R7). Asked before anything is sent, a second round included. With the event
+    // going to another calendar in the same Save, the question counts the guests that tells too, and
+    // this PATCH sends the answer only where it reaches someone itself (C18d, §8.8).
+    let own = own_of(target, &[fresh]);
+    let reach = attendees::Reach::of_patch(fresh, &body, &own);
+    let guests = reach.notice();
+    let asked_about = match draft.calendar {
+        Some(_) => reach
+            .merge(attendees::Reach::of_transfer(fresh, &body, &own))
+            .notice(),
+        None => guests.clone(),
+    };
+    let chosen = answer.for_write(asked_about)?;
+    let notify = if guests.is_some() {
+        chosen
+    } else {
+        Notify::None
+    };
     Ok(Ready {
         body,
         notify,
@@ -1736,6 +1769,476 @@ fn undo_refused(
         };
         (!open).then(|| gate::reason_for(perms, field))
     })
+}
+
+// --- putting an event on another calendar (C18d) ---
+
+/// Another Google account's calendar: Google changes an event's calendar within one account only
+/// (Q13: duplicate it there, then delete).
+const TRANSFER_OTHER_GOOGLE: &str = "PM can only put an event on another calendar of the same \
+                                     Google account. To put it on another account's calendar, \
+                                     duplicate it there, then delete this one.";
+/// A calendar PM doesn't sync: the event would land nothing in the mirror (C10's `NOT_SYNCED`).
+const TRANSFER_NOT_SYNCED: &str = "PM doesn't sync that calendar, so it won't put the event \
+                                   there. Choose it in Settings › Connectors first.";
+/// Either calendar one the user doesn't own (critique C1-M5): Google's help puts an event on "a
+/// calendar you own", and off a shared calendar its organiser would leave that calendar. Live probe
+/// L-T8 says whether Google web lists a calendar you can only edit.
+const TRANSFER_NOT_OWNED: &str = "PM puts an event on another calendar only when you own both \
+                                  calendars, as Google Calendar's help describes.";
+/// Google's own limit ("You can't transfer events with more than 200 guests", Help 78739).
+const TRANSFER_TOO_MANY: &str =
+    "Google can't put an event with more than 200 guests on another calendar.";
+const TRANSFER_MAX_GUESTS: usize = 200;
+/// The calendar chosen is a guest of the event: what Google would do is unknown, so nothing is
+/// sent (critique C2-L13).
+const TRANSFER_INVITED: &str =
+    "That calendar is already a guest of this event, so PM won't put the event there.";
+/// Google refused the request (a 400, a 409): its own message never reaches a log.
+const TRANSFER_REFUSED: &str =
+    "Google wouldn't put the event on that calendar. Try it in Google Calendar.";
+/// No answer, or a server error, and the event still on its own calendar: looked up on both, never
+/// sent again blind.
+const TRANSFER_LOST: &str =
+    "PM lost touch with Google, and the event is still on its calendar. Try again.";
+/// A 404 with the event still on its own calendar: the calendar chosen is the one Google can't find
+/// (critique C1-L7).
+const TRANSFER_UNREACHABLE: &str = "Google couldn't find that calendar, or PM can't write to it, \
+                                    so the event is still on its calendar.";
+/// The calendar chosen isn't in PM any more (critique C1-L8): an answer, not a command error.
+const TRANSFER_DISCONNECTED: &str = "That calendar is no longer connected.";
+/// A new repeat and a calendar change in one Save (critique C2-H1). Google web takes both at once;
+/// PM's checks for each assume the other stays as it is, so they go one at a time.
+const TRANSFER_WITH_REPEAT: &str = "Change the calendar on its own, then how it repeats.";
+
+/// The calendar `draft` puts the event `source` on, from the DB alone, before anything is read
+/// from Google: `None` for no change ([`normalised`] has dropped a change to its own calendar), or
+/// the refusal. Another account's calendar, one PM doesn't sync, or one the user doesn't own (on
+/// either side) is refused; so is a new repeat in the same Save.
+fn transfer_dest(
+    conn: &Connection,
+    source: &Target,
+    draft: &EventPatchDraft,
+) -> Result<std::result::Result<Option<CalendarTarget>, WriteOutcome>> {
+    let Some(id) = draft.calendar.as_deref() else {
+        return Ok(Ok(None));
+    };
+    let refuse = |message: &str| {
+        Ok(Err(WriteOutcome::Failed {
+            message: message.into(),
+        }))
+    };
+    if draft.recurrence.is_some() {
+        return refuse(TRANSFER_WITH_REPEAT);
+    }
+    if calendar::calendar_by_id(conn, id)?.is_none() {
+        return refuse(TRANSFER_DISCONNECTED);
+    }
+    let dest = match resolve_calendar(conn, id, TRANSFER_DISCONNECTED)? {
+        Ok(dest) => dest,
+        // An iCal or Outlook calendar.
+        Err(reason) => return Ok(Err(WriteOutcome::ReadOnly { reason })),
+    };
+    if !dest.email.eq_ignore_ascii_case(&source.email) {
+        return refuse(TRANSFER_OTHER_GOOGLE);
+    }
+    if !dest.selected {
+        return refuse(TRANSFER_NOT_SYNCED);
+    }
+    let owned = |facts: &CalendarFacts| facts.access_role.as_deref() == Some("owner");
+    if !owned(&source.facts) || !owned(&dest.facts) {
+        return refuse(TRANSFER_NOT_OWNED);
+    }
+    Ok(Ok(Some(dest)))
+}
+
+/// [`update_calendar_event`] for one event going to `dest` (C18d), past its shell. Under one claim
+/// on the row: the field changes first, in the round any save makes ([`send_one`], whose email
+/// question counts the calendar change too, §8.8), then the calendar ([`transfer_one`]). The
+/// calendar alone, or fields Google already holds, and the change asks its own question. No Undo:
+/// the row an Undo would be for is gone (Q3).
+#[allow(clippy::too_many_arguments)]
+async fn save_and_transfer<W: Wire, H: Host>(
+    wire: &W,
+    host: &H,
+    session: &str,
+    open: &EditSession,
+    draft: &EventPatchDraft,
+    editing: EditingStatus,
+    answer: &GuestAnswer,
+    dest: &CalendarTarget,
+) -> WriteOutcome {
+    let Some(_flight) = InFlight::claim(host.edit(), &open.target.row_id) else {
+        return WriteOutcome::Busy;
+    };
+    let one = OneWrite {
+        wire,
+        host,
+        target: &open.target,
+        editing,
+    };
+    let opened = seen_of(&open.target.calendar_id, &open.base);
+    if !draft.names_fields() {
+        return transfer_one(
+            &one,
+            dest,
+            opened.as_ref(),
+            TransferNotify::Ask(answer),
+            session,
+        )
+        .await;
+    }
+    let basis = Basis::Session {
+        session,
+        open,
+        draft,
+    };
+    match send_one(&one, &basis, answer).await.0 {
+        WriteOutcome::Saved { warnings, .. } => {
+            // What the user saw is what the save landed: the session moved onto it.
+            let landed = open_session(host.edit(), session)
+                .ok()
+                .flatten()
+                .and_then(|now| seen_of(&open.target.calendar_id, &now.base));
+            // The round's question counted the change, so no answer means it reaches nobody.
+            let decided = TransferNotify::Decided(answer.notify.unwrap_or(Notify::None));
+            let moved = transfer_one(&one, dest, landed.as_ref(), decided, session).await;
+            after_field_save(moved, warnings)
+        }
+        // Google already held every field: the calendar alone, asking for itself (R9).
+        WriteOutcome::NoChange => {
+            transfer_one(
+                &one,
+                dest,
+                opened.as_ref(),
+                TransferNotify::Ask(answer),
+                session,
+            )
+            .await
+        }
+        // Refused, a conflict, or a question: nothing went to another calendar.
+        outcome => outcome,
+    }
+}
+
+/// What a Save that changed fields and the calendar came to, the fields having landed with
+/// `saved` beside them: both together, or "your other changes are saved" with the calendar
+/// change's own refusal ([`WriteOutcome::NotMoved`]). Not knowing, and gone, are said as they are.
+fn after_field_save(moved: WriteOutcome, mut saved: Vec<WriteWarning>) -> WriteOutcome {
+    match moved {
+        WriteOutcome::Saved {
+            warnings, calendar, ..
+        } => {
+            for warning in warnings {
+                if !saved.contains(&warning) {
+                    saved.push(warning);
+                }
+            }
+            WriteOutcome::Saved {
+                warnings: saved,
+                left_behind: Vec::new(),
+                milestone_moves: None,
+                undo: None,
+                calendar,
+            }
+        }
+        outcome @ (WriteOutcome::Unconfirmed | WriteOutcome::Gone) => outcome,
+        refused => WriteOutcome::NotMoved {
+            message: transfer_words(&refused),
+        },
+    }
+}
+
+/// A calendar change's refusal, as the sentence after "it's still on {calendar}".
+fn transfer_words(outcome: &WriteOutcome) -> String {
+    match outcome {
+        WriteOutcome::Failed { message } => message.clone(),
+        WriteOutcome::ReadOnly { reason } => read_only_message(*reason).into(),
+        WriteOutcome::Busy => "Google is busy right now.".into(),
+        WriteOutcome::Conflict { .. } => "It changed in Google since you opened it.".into(),
+        WriteOutcome::Reauth => "Google needs you to sign in to this account again.".into(),
+        _ => "PM couldn't change its calendar. Try again.".into(),
+    }
+}
+
+/// How a calendar change gets its Send / Don't send (§8.8): asked for itself, or already given for
+/// the field changes in the same Save, whose question counted the guests it tells.
+enum TransferNotify<'a> {
+    Ask(&'a GuestAnswer),
+    Decided(Notify),
+}
+
+/// Google's copy on a calendar is that calendar's own event: its organiser is the calendar it was
+/// read from.
+fn organised_here(copy: &Value) -> bool {
+    copy.get("organizer")
+        .and_then(|o| o.get("self"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Put the one-off `one.target` on `dest`, another calendar of the same account (C18d): read it
+/// fresh, check it may go and is still what the user saw (`seen`, in the mirror's terms: a
+/// delete's rule, since the request has no If-Match), check `dest` doesn't hold it already, ask
+/// who is emailed, then send `events.move`. An answer PM can't trust is looked up on both
+/// calendars, never sent again blind. The caller holds the row's claim; only reads have gone out
+/// when it refuses.
+async fn transfer_one<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    dest: &CalendarTarget,
+    seen: Option<&SeenSummary>,
+    answer: TransferNotify<'_>,
+    session: &str,
+) -> WriteOutcome {
+    let (wire, host, target) = (one.wire, one.host, one.target);
+    let failed = |message: &str| WriteOutcome::Failed {
+        message: message.into(),
+    };
+    let fresh = match get(wire, &target.remote_calendar, &target.remote_event).await {
+        Fetched::Event(fresh) => fresh,
+        Fetched::Gone => return land_gone(host, target, None),
+        Fetched::Reauth => return WriteOutcome::Reauth,
+        Fetched::Busy => return WriteOutcome::Busy,
+        Fetched::Failed(message) => return WriteOutcome::Failed { message },
+    };
+    if patch::is_gone(&fresh) {
+        return land_gone(host, target, Some(&fresh));
+    }
+    // An occurrence: which occurrences is the user's to say (R9).
+    if fresh.get("recurringEventId").is_some() {
+        return WriteOutcome::needs_scope();
+    }
+    let perms = gate::edit_rights(&facts_from_fresh(&fresh, &target.facts, one.editing));
+    if !perms.calendar {
+        return WriteOutcome::ReadOnly {
+            reason: gate::reason_for(&perms, gate::Field::Calendar),
+        };
+    }
+    // The calendar chosen takes it as it would a new event: one that can't hold a private event
+    // never gets one (Q1).
+    let visibility = fresh.get("visibility").and_then(Value::as_str);
+    if let Some(reason) =
+        gate::create_block(one.editing, dest.facts.access_role.as_deref(), visibility)
+    {
+        return WriteOutcome::ReadOnly { reason };
+    }
+    if fresh
+        .get("attendees")
+        .and_then(Value::as_array)
+        .is_some_and(|guests| guests.len() > TRANSFER_MAX_GUESTS)
+    {
+        return failed(TRANSFER_TOO_MANY);
+    }
+    // The one-off new part of a change PM couldn't finish stays put until that change is settled:
+    // on another calendar, the settle would never find it.
+    if let Some(held) = held_new_part(wire, host, target, &fresh).await {
+        return held;
+    }
+    // R2: what the user saw is still what Google holds. A change to a field they didn't see (a
+    // description) doesn't stop it: the event goes whole, and nothing is overwritten.
+    let Some(seen) = seen else {
+        return WriteOutcome::Conflict {
+            fields: vec!["start".into()],
+        };
+    };
+    match patch::delete_still_matches(seen, &fresh) {
+        DeleteCheck::Matches => {}
+        DeleteCheck::Gone => return land_gone(host, target, Some(&fresh)),
+        DeleteCheck::Changed(fields) => return land_changed(host, target, &fresh, fields),
+    }
+    // Already there: an earlier change that landed unseen, or the calendar chosen is a guest of it.
+    match get(wire, &dest.remote_calendar, &target.remote_event).await {
+        Fetched::Event(there) if !patch::is_gone(&there) => {
+            return if organised_here(&there) {
+                land_transferred(host, target, dest, &fresh, &there, Some(session))
+            } else {
+                failed(TRANSFER_INVITED)
+            };
+        }
+        Fetched::Event(_) | Fetched::Gone => {}
+        Fetched::Reauth => return WriteOutcome::Reauth,
+        Fetched::Busy => return WriteOutcome::Busy,
+        Fetched::Failed(message) => return WriteOutcome::Failed { message },
+    }
+    // R9/R7: who it would email, asked for or already answered; nobody, and it's `none`.
+    let own = own_of(target, &[&fresh]);
+    let guests = attendees::Reach::of_transfer(&fresh, &serde_json::Map::new(), &own).notice();
+    let notify = match answer {
+        TransferNotify::Ask(answer) => match answer.for_write(guests) {
+            Ok(notify) => notify,
+            Err(ask) => return ask,
+        },
+        TransferNotify::Decided(chosen) if guests.is_some() => chosen,
+        TransferNotify::Decided(_) => Notify::None,
+    };
+    let request = plan::transfer_event(
+        &target.remote_calendar,
+        &target.remote_event,
+        &dest.remote_calendar,
+        notify,
+    );
+    let reply = match wire.send(&request).await {
+        Ok(reply) => reply,
+        Err(google_io::NoAnswer::Unsent { why, .. }) => return unsent_outcome(why),
+        Err(google_io::NoAnswer::Lost { .. }) => {
+            return after_lost_transfer(one, dest, &fresh, TRANSFER_LOST, session).await
+        }
+    };
+    // A server error on the way may have landed it, whatever the last answer says.
+    if reply.maybe_applied && reply.verdict != Verdict::Ok {
+        return after_lost_transfer(one, dest, &fresh, TRANSFER_LOST, session).await;
+    }
+    match reply.verdict {
+        Verdict::Ok => match serde_json::from_str::<Value>(&reply.body) {
+            Ok(moved) => land_transferred(host, target, dest, &fresh, &moved, Some(session)),
+            Err(_) => transfer_pending(host, target, dest, &fresh, session),
+        },
+        Verdict::ServerError => {
+            after_lost_transfer(one, dest, &fresh, TRANSFER_LOST, session).await
+        }
+        // A 404 may be an earlier copy of this change that already landed (the event isn't on its
+        // calendar any more), or the calendar chosen Google can't find (C1-L7).
+        Verdict::Gone => {
+            after_lost_transfer(one, dest, &fresh, TRANSFER_UNREACHABLE, session).await
+        }
+        // That id is already on the calendar chosen: this event, landed unseen, or another.
+        Verdict::Duplicate => {
+            after_lost_transfer(one, dest, &fresh, TRANSFER_REFUSED, session).await
+        }
+        // Google's own words never go further than this.
+        Verdict::BadRequest(_) | Verdict::Other(..) => failed(TRANSFER_REFUSED),
+        // Someone else's now, a calendar it can't write to, a rate limit, a sign-in: as any write.
+        verdict => outcome_for(verdict, one.editing),
+    }
+}
+
+/// A calendar change whose answer PM can't trust: none came, a server error, or a 404 or 409 that
+/// may hide one that landed. Looks on the calendar chosen first, where a landed one is, then on the
+/// event's own (`still`: the words when it's still there). Nothing is sent again. `before`: the
+/// event's copy the change went out on.
+async fn after_lost_transfer<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    dest: &CalendarTarget,
+    before: &Value,
+    still: &str,
+    session: &str,
+) -> WriteOutcome {
+    let (wire, host, target) = (one.wire, one.host, one.target);
+    match get(wire, &dest.remote_calendar, &target.remote_event).await {
+        Fetched::Event(there) if !patch::is_gone(&there) && organised_here(&there) => {
+            return land_transferred(host, target, dest, before, &there, Some(session));
+        }
+        Fetched::Event(_) | Fetched::Gone => {}
+        Fetched::Reauth | Fetched::Busy | Fetched::Failed(_) => return WriteOutcome::Unconfirmed,
+    }
+    // Not there. Still on its own calendar: nothing changed. Gone from both: deleted meanwhile, or
+    // changed and then deleted; the next sync shows which.
+    match get(wire, &target.remote_calendar, &target.remote_event).await {
+        Fetched::Event(now) if !patch::is_gone(&now) => WriteOutcome::Failed {
+            message: still.into(),
+        },
+        _ => WriteOutcome::Unconfirmed,
+    }
+}
+
+/// A calendar change landed (C18d): `before`, the event's last copy on its own calendar, and
+/// `moved`, Google's copy on `dest`. The row on its own calendar goes, remembered as removed at the
+/// version it had (a list that lags can't bring it back); Google's copy lands on `dest` as a new
+/// row, remembered as created (a list that lags can't take it off). Two landings, one per calendar,
+/// each telling the main window; the first retires any Undo of the row. The call goes with the
+/// event. The editor's session (`session`) ends: its row is gone.
+fn land_transferred(
+    host: &impl Host,
+    target: &Target,
+    dest: &CalendarTarget,
+    before: &Value,
+    moved: &Value,
+    session: Option<&str>,
+) -> WriteOutcome {
+    let off = land_on(
+        host,
+        &target.calendar_id,
+        Vec::new(),
+        &[],
+        vec![gone_row(target, Some(before))],
+    )
+    .is_ok();
+    // A copy PM can't read as a row is in Google all the same: the next sync shows it.
+    let on = calendar::parse_event(&dest.calendar_id, moved).is_some_and(|row| {
+        let id = row.id.clone();
+        land_on(host, &dest.calendar_id, vec![row], &[id], Vec::new()).is_ok()
+    });
+    let mut warnings = Vec::new();
+    for (calendar_id, landed) in [(&target.calendar_id, off), (&dest.calendar_id, on)] {
+        if !landed {
+            drop_hash(host, calendar_id);
+        }
+    }
+    if !(off && on) {
+        warnings.push(WriteWarning::MirrorRefreshPending);
+    }
+    if links_left_behind(host, before, moved) {
+        warnings.push(WriteWarning::LinksLeftBehind);
+    }
+    if let Some(session) = session {
+        end_session(host.edit(), session);
+    }
+    WriteOutcome::Saved {
+        warnings,
+        left_behind: Vec::new(),
+        milestone_moves: None,
+        undo: None,
+        calendar: Some(dest.calendar_id.clone()),
+    }
+}
+
+/// A calendar change Google answered with a copy PM can't read: it landed, so the row on its own
+/// calendar goes, and the next sync shows it on `dest`.
+fn transfer_pending(
+    host: &impl Host,
+    target: &Target,
+    dest: &CalendarTarget,
+    before: &Value,
+    session: &str,
+) -> WriteOutcome {
+    if land(
+        host,
+        target,
+        Vec::new(),
+        vec![gone_row(target, Some(before))],
+    )
+    .is_err()
+    {
+        drop_hash(host, &target.calendar_id);
+    }
+    drop_hash(host, &dest.calendar_id);
+    end_session(host.edit(), session);
+    WriteOutcome::Saved {
+        warnings: vec![WriteWarning::MirrorRefreshPending],
+        left_behind: Vec::new(),
+        milestone_moves: None,
+        undo: None,
+        calendar: Some(dest.calendar_id.clone()),
+    }
+}
+
+/// Whether PM's links to the event (a milestone, a reminder to prepare, keyed by its iCal UID)
+/// stayed with its old identity: Google gave `moved` another iCal UID than `before` had, and one of
+/// them names the old one (critique C2-L15). Read in one lock of its own.
+fn links_left_behind(host: &impl Host, before: &Value, moved: &Value) -> bool {
+    let Some(old) = ical_of(before) else {
+        return false;
+    };
+    if ical_of(moved).as_deref() == Some(old.as_str()) {
+        return false;
+    }
+    host.with_conn(|conn| {
+        Ok(milestones::any_linked_to(conn, &old)?
+            || crate::flags::list_active(conn, Some(crate::flags::ANCHOR_CALENDAR))?
+                .iter()
+                .any(|flag| flag.anchor == old))
+    })
+    .unwrap_or(false)
 }
 
 // --- creating an event (C10) ---
@@ -2341,6 +2844,7 @@ async fn land_new_series<W: Wire, H: Host>(
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         };
     }
     let mut listing = Listing::default();
@@ -2372,6 +2876,7 @@ async fn land_new_series<W: Wire, H: Host>(
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         },
         Err(_) => series_pending(host, cal.calendar_id, gone),
     }
@@ -2389,6 +2894,7 @@ fn series_pending(host: &impl Host, calendar_id: &str, gone: Vec<GoneRow>) -> Wr
         left_behind: Vec::new(),
         milestone_moves: None,
         undo: None,
+        calendar: None,
     }
 }
 
@@ -2433,6 +2939,7 @@ fn land_created(host: &impl Host, target: &CalendarTarget, copy: &Value) -> Writ
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         };
     }
     let id = row.id.clone();
@@ -2442,6 +2949,7 @@ fn land_created(host: &impl Host, target: &CalendarTarget, copy: &Value) -> Writ
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         },
         Err(_) => created_pending(host, target),
     }
@@ -2455,6 +2963,7 @@ fn created_pending(host: &impl Host, target: &CalendarTarget) -> WriteOutcome {
         left_behind: Vec::new(),
         milestone_moves: None,
         undo: None,
+        calendar: None,
     }
 }
 
@@ -3170,6 +3679,8 @@ fn with_undo(
                 left_behind,
                 milestone_moves,
                 undo: None,
+                // Never after a calendar change: the row an Undo would be for is gone (Q3).
+                calendar: None,
             },
             Some(landed),
         ) if warnings.is_empty() => WriteOutcome::Saved {
@@ -3177,6 +3688,7 @@ fn with_undo(
             warnings,
             left_behind,
             milestone_moves,
+            calendar: None,
         },
         (outcome, _) => outcome,
     }
@@ -3623,6 +4135,7 @@ async fn land_reply<W: Wire, H: Host>(
                 left_behind: Vec::new(),
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             },
             _ => saved_pending(host, target),
         };
@@ -3736,6 +4249,7 @@ async fn land_every_reply<W: Wire, H: Host>(
         left_behind: kept,
         milestone_moves: None,
         undo: None,
+        calendar: None,
     }
 }
 
@@ -3788,11 +4302,12 @@ pub async fn series_choices(
         }
     };
     // The editor's draft as the save will plan it: the session's request id beside a call change,
-    // so the token binds the call the save asks for (C18).
+    // so the token binds the call the save asks for (C18), and a calendar change to its own
+    // calendar dropped (C18 critique C1-L1).
     let request = match (request, &open) {
         (ChoiceRequest::Edit { session, draft }, Some(open)) => ChoiceRequest::Edit {
             session,
-            draft: Box::new(sessioned(*draft, open)),
+            draft: Box::new(normalised(*draft, open)),
         },
         (request, _) => request,
     };
@@ -4473,6 +4988,11 @@ async fn prepare_change<W: Wire>(
     if let ChoiceRequest::Edit { draft, .. } = request {
         if stop_held(draft, REPEAT_STOP_OK) {
             return failed(REPEAT_STOP_NOT_YET.into());
+        }
+        // A repeating event goes to another calendar through its series (C18e, the spec's §9);
+        // until that plan is built, an occurrence's calendar change plans nothing and sends nothing.
+        if draft.calendar.is_some() {
+            return failed(UNFIT.into());
         }
     }
     // A timed drop needs this computer's zone (R6): refused before anything is read.
@@ -5382,6 +5902,7 @@ async fn land_series<W: Wire, H: Host>(
                             left_behind: Vec::new(),
                             milestone_moves: None,
                             undo: None,
+                            calendar: None,
                         }
                     }
                     Err(_) => saved_pending(host, target),
@@ -5646,6 +6167,7 @@ fn series_saved(mut warnings: Vec<WriteWarning>, left_behind: Vec<String>) -> Wr
         left_behind,
         milestone_moves: None,
         undo: None,
+        calendar: None,
     }
 }
 
@@ -6095,6 +6617,7 @@ async fn with_moves<W: Wire, H: Host>(
             left_behind,
             milestone_moves: None,
             undo: None,
+            calendar: None,
         } => (warnings, left_behind),
         other => return other,
     };
@@ -6129,6 +6652,7 @@ async fn with_moves<W: Wire, H: Host>(
             left_behind,
             milestone_moves: None,
             undo: None,
+            calendar: None,
         };
     }
     let mut copy = inserted_copy(ran, facts.insert).cloned();
@@ -6180,6 +6704,7 @@ async fn with_moves<W: Wire, H: Host>(
             milestones,
         })),
         undo: None,
+        calendar: None,
     }
 }
 
@@ -7027,8 +7552,10 @@ fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> W
         | WriteOutcome::Gone
         | WriteOutcome::IgnoredByGoogle { .. }
         | WriteOutcome::SplitRemoved
-        // Only creating an event answers this; a settle never does.
-        | WriteOutcome::Ambiguous { .. } => return outcome,
+        // Only creating an event answers this, and only an editor's calendar change that one; a
+        // settle never does.
+        | WriteOutcome::Ambiguous { .. }
+        | WriteOutcome::NotMoved { .. } => return outcome,
     };
     let Some((offers, from, emails)) = edit.held_split(token) else {
         return outcome;
@@ -7740,7 +8267,9 @@ mod dev_allow {
         Ok(decide(var.as_deref(), ALLOWED.get(), remote, series_wide))
     }
 
-    /// The sender's backstop for every write: set, only a request under a resolved calendar.
+    /// The sender's backstop for every write: set, only a request under a resolved calendar, and a
+    /// calendar change only to one too (C18d: its destination is in the query, which the path's
+    /// prefix never sees).
     pub(super) fn permits(
         var: Option<&str>,
         allowed: Option<&Option<HashSet<String>>>,
@@ -7748,10 +8277,32 @@ mod dev_allow {
     ) -> bool {
         match (var, allowed) {
             (None, _) => true,
-            (Some(_), Some(Some(ids))) => ids
-                .iter()
-                .any(|id| url.starts_with(&crate::calendar_write::plan::calendar_prefix(id))),
+            (Some(_), Some(Some(ids))) => {
+                ids.iter()
+                    .any(|id| url.starts_with(&crate::calendar_write::plan::calendar_prefix(id)))
+                    && destination_of(url).is_none_or(|d| ids.contains(&d))
+            }
             (Some(_), _) => false,
+        }
+    }
+
+    /// The calendar a request to put an event on another calendar names (its path ends in
+    /// "/move"), decoded; `None` for any other request. One that ends so but names none, or names
+    /// it twice, is a calendar no list holds, so it's refused.
+    pub(super) fn destination_of(url: &str) -> Option<String> {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return Some(String::new());
+        };
+        if !parsed.path().ends_with("/move") {
+            return None;
+        }
+        let mut named = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "destination")
+            .map(|(_, value)| value.into_owned());
+        match (named.next(), named.next()) {
+            (Some(only), None) => Some(only),
+            _ => Some(String::new()),
         }
     }
 
@@ -8141,6 +8692,7 @@ fn outcome_for(verdict: Verdict, editing: EditingStatus) -> WriteOutcome {
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         },
         Verdict::Conflict => WriteOutcome::Conflict { fields: Vec::new() },
         Verdict::Gone => WriteOutcome::Gone,
@@ -8201,8 +8753,8 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
         // Never promises a reply: the calendar may not be on the guest list (C14 critique C2-L1).
         ReadOnlyReason::NotOrganizer => {
             "Someone else organises this event, so only they can change its title, time, place, \
-             description, visibility, guests and video call. Your notifications, colour and busy \
-             or free are yours to change."
+             description, visibility, guests, video call and calendar. Your notifications, colour \
+             and busy or free are yours to change."
         }
         // A group invitation lists the group, not this calendar (C14 critique C2-M8).
         ReadOnlyReason::NotInvited => {
@@ -8219,8 +8771,10 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
             "Birthdays, events from Gmail, focus time, out of office and working locations can't \
              be changed here."
         }
+        // And its calendar, which Google doesn't say a locked copy may change (C18d).
         ReadOnlyReason::Locked => {
-            "Google has locked this event's title, time, place and description."
+            "Google has locked this event's title, time, place and description, so PM also keeps \
+             it on its calendar."
         }
         ReadOnlyReason::HtmlDescription => {
             "This description has formatting, so PM shows its text here and can't change it yet."
@@ -8406,6 +8960,7 @@ fn saved_pending(host: &impl Host, target: &Target) -> WriteOutcome {
         left_behind: Vec::new(),
         milestone_moves: None,
         undo: None,
+        calendar: None,
     }
 }
 
@@ -8449,6 +9004,7 @@ fn land_deleted(host: &impl Host, target: &Target, deleted: &Value) -> WriteOutc
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         },
         Err(_) => saved_pending(host, target),
     }
@@ -8478,6 +9034,7 @@ fn land_saved(
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         },
         // Saved, but not as a row PM could mirror, or the mirror write failed: the next sync shows it.
         _ => saved_pending(host, target),
@@ -8672,23 +9229,7 @@ mod google_io {
                 &client,
                 token_key,
                 google::SendPolicy::INTERACTIVE,
-                |c, bearer| {
-                    let rb = match plan.method {
-                        Method::Get => c.get(&plan.url),
-                        Method::Patch => c.patch(&plan.url),
-                        Method::Delete => c.delete(&plan.url),
-                        Method::Insert => c.post(&plan.url),
-                    }
-                    .bearer_auth(bearer);
-                    let rb = match &plan.if_match {
-                        Some(etag) => rb.header(reqwest::header::IF_MATCH, etag),
-                        None => rb,
-                    };
-                    match &plan.body {
-                        Some(body) => rb.json(body),
-                        None => rb,
-                    }
-                },
+                |c, bearer| request(c, plan, bearer),
             )
             .await;
             let resp = match sent {
@@ -8720,6 +9261,35 @@ mod google_io {
                 maybe_applied,
                 date,
             });
+        }
+    }
+
+    /// `plan` as the request that goes out, under `bearer`. A POST with no body says its length
+    /// (critique C1-H1): without a body, hyper writes no length header at all, and Google's front
+    /// end answers such a POST with 411, so putting an event on another calendar would fail every
+    /// time while every scripted test passed.
+    pub(super) fn request(
+        c: &reqwest::Client,
+        plan: &RequestPlan,
+        bearer: &str,
+    ) -> reqwest::RequestBuilder {
+        let rb = match plan.method {
+            Method::Get => c.get(&plan.url),
+            Method::Patch => c.patch(&plan.url),
+            Method::Delete => c.delete(&plan.url),
+            Method::Insert | Method::Transfer => c.post(&plan.url),
+        }
+        .bearer_auth(bearer);
+        let rb = match &plan.if_match {
+            Some(etag) => rb.header(reqwest::header::IF_MATCH, etag),
+            None => rb,
+        };
+        match (&plan.body, plan.method) {
+            (Some(body), _) => rb.json(body),
+            (None, Method::Insert | Method::Transfer) => {
+                rb.header(reqwest::header::CONTENT_LENGTH, "0")
+            }
+            (None, _) => rb,
         }
     }
 
@@ -9117,6 +9687,8 @@ mod tests {
             colour: true,
             // This calendar offers no Meet, and the occurrence has no call (C18).
             meet: false,
+            // Its own gate opens it; the save asks which occurrences (C18d).
+            calendar: true,
             delete: true,
             // No guest list: nothing to reply to.
             respond: false,
@@ -10840,6 +11412,8 @@ mod tests {
         if_match: Option<String>,
         answer: Scripted,
         then: Option<Box<dyn Fn() + Send + Sync>>,
+        /// Google's id of the calendar it's on: [`CALENDAR`] unless a test says another (C18d).
+        on: &'static str,
     }
 
     enum Scripted {
@@ -10867,6 +11441,7 @@ mod tests {
                 if_match: None,
                 answer,
                 then: None,
+                on: CALENDAR,
             }
         }
 
@@ -10943,7 +11518,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("request {i} wasn't scripted: {}", plan.url));
             let (path, query) = plan.url.split_once('?').unwrap_or((&plan.url, ""));
             // On Google's id for the calendar, never the mirror's; every part of the query asked for.
-            let on = format!("/calendar/v3/calendars/{CALENDAR}{}", step.path);
+            let on = format!("/calendar/v3/calendars/{}{}", step.on, step.path);
             assert!(
                 plan.method == step.method
                     && path.ends_with(&on)
@@ -12734,6 +13309,7 @@ mod tests {
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         }
     }
 
@@ -12743,6 +13319,7 @@ mod tests {
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         }
     }
 
@@ -13530,6 +14107,7 @@ mod tests {
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             }
         );
         assert_eq!(
@@ -16338,6 +16916,7 @@ mod tests {
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             }
         );
         assert!(split_rows(&host)
@@ -18806,6 +19385,7 @@ mod tests {
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         };
         assert!(outcome == outside, "saved, and said to be outside");
         let row = host
@@ -19114,6 +19694,7 @@ mod tests {
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         };
         let patch = |answer: Scripted| Step::write(Method::Patch, "/events/solo", "\"s1\"", answer);
         let maybe = Scripted::Reply {
@@ -19211,6 +19792,7 @@ mod tests {
                     left_behind: Vec::new(),
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
             "applied, never ignored"
         );
@@ -19268,6 +19850,7 @@ mod tests {
                     left_behind: Vec::new(),
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
             "saved, said to be in part"
         );
@@ -20157,6 +20740,37 @@ mod tests {
             .iter()
             .map(|l| l.to_string()),
         );
+        // Putting an event on another calendar (C18d): never C16's word for a drag, nor Google's
+        // API's ("transfer" is only Google's help page heading).
+        let refusals = [
+            WriteOutcome::Busy,
+            WriteOutcome::Conflict { fields: Vec::new() },
+            WriteOutcome::Reauth,
+            WriteOutcome::NoChange,
+        ];
+        let calendar_change = [
+            TRANSFER_OTHER_GOOGLE,
+            TRANSFER_NOT_SYNCED,
+            TRANSFER_NOT_OWNED,
+            TRANSFER_TOO_MANY,
+            TRANSFER_INVITED,
+            TRANSFER_REFUSED,
+            TRANSFER_LOST,
+            TRANSFER_UNREACHABLE,
+            TRANSFER_DISCONNECTED,
+            TRANSFER_WITH_REPEAT,
+        ]
+        .map(str::to_string)
+        .into_iter()
+        .chain(refusals.iter().map(transfer_words))
+        .chain([read_only_message(ReadOnlyReason::Locked).to_string()]);
+        for line in calendar_change {
+            let lower = line.to_lowercase();
+            for word in ["move", "transfer"] {
+                assert!(!lower.contains(word), "“{line}” says “{word}”");
+            }
+            lines.push(line);
+        }
         lines.extend(
             [rsvp::RsvpError::NotInvited, rsvp::RsvpError::NoteTooLong]
                 .iter()
@@ -21226,6 +21840,7 @@ mod tests {
                     left_behind: Vec::new(),
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
             "saved in Google, and said to be outside"
         );
@@ -21825,6 +22440,7 @@ mod tests {
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
+            calendar: None,
         };
         // Monday 10-01-2028 is past the window; Monday 01-06-2026 three times ends before it.
         for draft in [
@@ -22572,7 +23188,7 @@ mod tests {
             milestones: vec![launch_offer(launch, "2026-10-19")],
         };
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(moves), undo: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(moves), undo: None, calendar: None }
                 if warnings.is_empty() && left_behind.is_empty() && **moves == want),
             "Launch is offered, the new part named from the insert's answer"
         );
@@ -22756,7 +23372,7 @@ mod tests {
         for looked in [true, false] {
             let (outcome, launch) = finish_left_behind(looked).await;
             assert!(
-                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
+                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None, calendar: None }
                     if *left_behind == ["2026-11-02"]
                         && warnings.contains(&WriteWarning::MirrorRefreshPending) != looked
                         && m.milestones == [launch_offer(launch, "2026-10-26")]),
@@ -23043,7 +23659,7 @@ mod tests {
             steps.extend(refetch_after_carry(&exception, left));
             let outcome = split_with(&host, &exception, events, steps).await;
             assert!(
-                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None }
+                matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None, calendar: None }
                     if *warnings == [WriteWarning::LeftOnOldSeries] && *left_behind == ["2026-10-26"]),
                 "saved with its occurrence left behind, nothing offered"
             );
@@ -23081,7 +23697,7 @@ mod tests {
         }
         let outcome = split_with(&host, &exception, events, steps).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None, calendar: None }
                 if *warnings == [WriteWarning::MirrorRefreshPending, WriteWarning::LeftOnOldSeries]
                     && *left_behind == ["2026-10-26"]),
             "pending, the occurrence left behind, and nothing offered"
@@ -23141,7 +23757,7 @@ mod tests {
             .any(|r| r.start.starts_with("2026-10-27"));
         assert!(kept, "the mirror keeps the occurrence on the earlier part");
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None, calendar: None }
                 if *warnings == [WriteWarning::MirrorRefreshPending, WriteWarning::LeftOnOldSeries]
                     && *left_behind == ["2026-10-26"]
                     && m.milestones == [launch_offer(launch, "2026-10-27")]),
@@ -23169,7 +23785,7 @@ mod tests {
         steps.extend(refetch_after_carry(&exception, left));
         let outcome = split_with(&host, &exception, events, steps).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: None, calendar: None }
                 if !warnings.contains(&WriteWarning::MirrorRefreshPending)
                     && *left_behind == ["2026-10-26"]),
             "saved from Google's read, the occurrence left behind, and nothing offered"
@@ -23403,7 +24019,7 @@ mod tests {
         );
         let outcome = split_from_moved(&host, &opened, events).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None, calendar: None }
                 if warnings.is_empty() && left_behind.is_empty()
                     && m.milestones == [launch_offer(launch, "2026-10-18")]
                     && m.first_day.as_deref() == Some("2026-10-18")
@@ -23441,7 +24057,7 @@ mod tests {
         );
         let outcome = split_from_moved(&host, &opened, events).await;
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None }
+            matches!(&outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: Some(m), undo: None, calendar: None }
                 if warnings.is_empty() && left_behind.is_empty()
                     && m.milestones == [launch_offer(launch, "2026-10-17")]
                     && m.first_day.as_deref() == Some("2026-10-17")
@@ -24464,6 +25080,7 @@ mod tests {
                     left_behind: vec!["2026-10-19".into()],
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
             "saved, with the occurrence that kept its own answer"
         );
@@ -24526,6 +25143,7 @@ mod tests {
                     left_behind: vec!["2026-10-19".into()],
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
             "saved, shown after the next refresh, with the occurrence that kept its own answer"
         );
@@ -24592,6 +25210,7 @@ mod tests {
                     left_behind: vec!["2026-10-19".into()],
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
             "landed from the second listing, only the occurrence answered on its own said"
         );
@@ -25047,6 +25666,22 @@ mod tests {
             ..facts_of_mine_locked()
         });
         assert_eq!(refused_field(&zoom_open, &title("Retro")), None);
+        // C18d: the calendar is the organiser's whatever guests may change (never the guest list's
+        // words, which don't name it), and a lock keeps it, saying so.
+        let elsewhere = to_second();
+        assert_eq!(
+            refused_field(&a3, &elsewhere),
+            Some(ReadOnlyReason::NotOrganizer)
+        );
+        assert_eq!(
+            refused_field(&a2, &elsewhere),
+            Some(ReadOnlyReason::NotOrganizer)
+        );
+        assert_eq!(
+            refused_field(&mine_locked, &elsewhere),
+            Some(ReadOnlyReason::Locked)
+        );
+        assert_eq!(refused_field(&zoom_open, &elsewhere), None);
     }
 
     /// Your own locked one-off, on a calendar that offers Meet, with no call.
@@ -25262,7 +25897,7 @@ mod tests {
     /// `Saved` with an Undo for 8 s and nothing else to say (C16 critique C1-M5: compared without
     /// printing the outcome).
     fn saved_with_undo(outcome: &WriteOutcome) -> bool {
-        matches!(outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: Some(u) }
+        matches!(outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None, undo: Some(u), calendar: None }
             if warnings.is_empty() && left_behind.is_empty() && u.undo_seconds == 8
                 && u.undo_token.len() == 32)
     }
@@ -27175,11 +27810,11 @@ mod tests {
     /// `Saved` with exactly `said` beside it, and no Undo (C16's Undo leaves the call out).
     fn saved_saying(outcome: &WriteOutcome, said: &[WriteWarning]) -> bool {
         matches!(outcome, WriteOutcome::Saved { warnings, left_behind, milestone_moves: None,
-            undo: None } if warnings.as_slice() == said && left_behind.is_empty())
+            undo: None, calendar: None } if warnings.as_slice() == said && left_behind.is_empty())
     }
 
     /// Save `draft` on the dentist one-off `event` held in `host`, from an editor opened on
-    /// `target`, its draft put through [`sessioned`] as the command does; Google answers the save's
+    /// `target`, its draft put through [`normalised`] as the command does; Google answers the save's
     /// own GET of `event`, then `answers`, built from the session's request id: the outcome, the
     /// script and that id.
     async fn save_call(
@@ -27191,7 +27826,7 @@ mod tests {
     ) -> (WriteOutcome, Script, String) {
         let session = keep_session(&host.edit, target, event.clone(), None, None).unwrap();
         let open = open_session(&host.edit, &session).unwrap().unwrap();
-        let draft = sessioned(draft, &open);
+        let draft = normalised(draft, &open);
         let mut steps = vec![Step::get("/events/solo", "", event.clone())];
         steps.extend(answers(&open.meet_request));
         let script = Script::new(steps);
@@ -27261,10 +27896,10 @@ mod tests {
             "each editor its own request"
         );
         assert_eq!(
-            sessioned(adding_meet(), &first).meet_request.as_deref(),
+            normalised(adding_meet(), &first).meet_request.as_deref(),
             Some(first.meet_request.as_str())
         );
-        assert!(sessioned(title("Retro"), &first).meet_request.is_none());
+        assert!(normalised(title("Retro"), &first).meet_request.is_none());
     }
 
     /// R5: a draft that names a request id goes out under the session's.
@@ -27770,7 +28405,7 @@ mod tests {
     }
 
     /// Save `draft` for `scope` from an editor on `instance` of `series` (a calendar that offers
-    /// Meet), the draft put through [`sessioned`]; `steps` built from the session's request id.
+    /// Meet), the draft put through [`normalised`]; `steps` built from the session's request id.
     async fn save_series_call(
         host: &TestHost,
         instance: &Value,
@@ -27781,7 +28416,7 @@ mod tests {
     ) -> (WriteOutcome, Script, String) {
         let (session, open) = open_meet_in(host, instance, series);
         let request = open.meet_request.clone();
-        let draft = sessioned(draft, &open);
+        let draft = normalised(draft, &open);
         let script = Script::new(steps(&request));
         let on = meet_target(instance);
         let outcome = save_series(
@@ -27904,7 +28539,7 @@ mod tests {
         let open = open_session(&host.edit, &session).unwrap().unwrap();
         let request = ChoiceRequest::Edit {
             session,
-            draft: Box::new(sessioned(adding_meet(), &open)),
+            draft: Box::new(normalised(adding_meet(), &open)),
         };
         let script = Script::new(vec![instance_read(&instance)]);
         let got = choices(
@@ -28035,7 +28670,7 @@ mod tests {
             let (session, open) = open_meet_in(&host, &instance, &series);
             let request = ChoiceRequest::Edit {
                 session,
-                draft: Box::new(sessioned(adding_meet(), &open)),
+                draft: Box::new(normalised(adding_meet(), &open)),
             };
             let script = Script::new(reads(&instance, &series, vec![series.clone()], october()));
             let got = choices(
@@ -28082,7 +28717,7 @@ mod tests {
         let host = TestHost::holding(&october());
         let (series, instance) = (weekly(), monday_19());
         let (session, open) = open_meet_in(&host, &instance, &series);
-        let draft = sessioned(adding_meet(), &open);
+        let draft = normalised(adding_meet(), &open);
         let request = ChoiceRequest::Edit {
             session: session.clone(),
             draft: Box::new(draft.clone()),
@@ -28113,7 +28748,7 @@ mod tests {
             &strict(&elsewhere, &host, &on),
             &session,
             open.clone(),
-            sessioned(adding_meet(), &other),
+            normalised(adding_meet(), &other),
             Scope::All,
             Some(&token),
             None,
@@ -28568,5 +29203,1184 @@ mod tests {
             .map(|row| row.conference_url)
             .collect();
         assert!(links.iter().all(|l| l.as_deref() == Some(MEET_LINK)));
+    }
+
+    // --- putting an event on another calendar (C18d) ---
+
+    /// Google's id of the account's second calendar, PM's "cal2".
+    const SECOND: &str = "team@group.calendar.google.com";
+
+    /// `step`, on [`SECOND`].
+    fn on_second(step: Step) -> Step {
+        Step { on: SECOND, ..step }
+    }
+
+    /// "cal2" as the shell resolves it: the same account's, synced, owned.
+    fn second() -> CalendarTarget {
+        CalendarTarget {
+            calendar_id: "cal2".into(),
+            remote_calendar: SECOND.into(),
+            email: "me@example.com".into(),
+            token_key: "key".into(),
+            facts: CalendarFacts {
+                access_role: Some("owner".into()),
+                time_zone: Some("Europe/London".into()),
+                ..Default::default()
+            },
+            selected: true,
+        }
+    }
+
+    fn to_second() -> EventPatchDraft {
+        EventPatchDraft {
+            calendar: Some("cal2".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A host whose mirror holds `events` on "cal", and "cal2" beside it, empty.
+    fn host_with_second(events: &[Value]) -> Arc<TestHost> {
+        let host = TestHost::holding(events);
+        host.with_conn(|conn| {
+            add_calendar(conn, "gcal:me@example.com", "google", "cal2", Some(SECOND));
+            Ok(())
+        })
+        .unwrap();
+        host
+    }
+
+    /// Google's copy of `event` once it's on [`SECOND`], which organises it now.
+    fn on_second_copy(event: &Value) -> Value {
+        written(
+            event,
+            &[("organizer", json!({ "email": SECOND, "self": true }))],
+            "\"m1\"",
+        )
+    }
+
+    /// The request that puts "solo" on [`SECOND`], its query holding `query`.
+    fn transfer_step(query: &'static str, answer: Scripted) -> Step {
+        Step::new(Method::Transfer, "/events/solo/move", query, answer)
+    }
+
+    /// Saved, now on "cal2", with exactly `warnings` beside it and no Undo.
+    fn now_on_second(warnings: Vec<WriteWarning>) -> WriteOutcome {
+        WriteOutcome::Saved {
+            warnings,
+            left_behind: Vec::new(),
+            milestone_moves: None,
+            undo: None,
+            calendar: Some("cal2".into()),
+        }
+    }
+
+    /// Save `draft` from an editor opened on `event` (as the mirror holds it on "cal"), put through
+    /// [`normalised`] as the command does, the calendar chosen resolved as `dest`; Google answers
+    /// `steps`. The outcome, the script and the editor's session.
+    async fn save_to(
+        host: &TestHost,
+        event: &Value,
+        draft: EventPatchDraft,
+        answer: GuestAnswer,
+        dest: &CalendarTarget,
+        steps: Vec<Step>,
+    ) -> (WriteOutcome, Script, String) {
+        let session = keep_session(&host.edit, target(event), event.clone(), None, None).unwrap();
+        let open = open_session(&host.edit, &session).unwrap().unwrap();
+        let draft = normalised(draft, &open);
+        let script = Script::new(steps);
+        let outcome = save_and_transfer(
+            &script,
+            host,
+            &session,
+            &open,
+            &draft,
+            EditingStatus::On,
+            &answer,
+            dest,
+        )
+        .await;
+        (outcome, script, session)
+    }
+
+    /// [`save_to`] "cal2".
+    async fn save_to_second(
+        host: &TestHost,
+        event: &Value,
+        draft: EventPatchDraft,
+        answer: GuestAnswer,
+        steps: Vec<Step>,
+    ) -> (WriteOutcome, Script, String) {
+        save_to(host, event, draft, answer, &second(), steps).await
+    }
+
+    fn transfers(script: &Script) -> usize {
+        script
+            .sent()
+            .iter()
+            .filter(|p| p.method == Method::Transfer)
+            .count()
+    }
+
+    /// §8.9: the calendar alone goes as one `events.move` with no body and no etag, after the
+    /// event's read and a look on the calendar chosen. The row leaves "cal" and lands on "cal2",
+    /// each remembered so a list that lags shows it neither twice nor nowhere, each calendar told;
+    /// the outcome names "cal2", offers no Undo, and the editor's session ends.
+    #[tokio::test]
+    async fn changing_the_calendar_puts_the_event_there_with_no_body() {
+        let event = dentist();
+        let host = host_with_second(std::slice::from_ref(&event));
+        let before = Instant::now();
+        let (outcome, script, session) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step(
+                    "destination=team%40group.calendar.google.com sendUpdates=none",
+                    Scripted::Json(on_second_copy(&event)),
+                ),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()), "saved, on cal2");
+        let sent = first_write(&script);
+        assert!(
+            sent.method == Method::Transfer && sent.body.is_none() && sent.if_match.is_none(),
+            "no body, no etag"
+        );
+        assert!(
+            sent.url.ends_with(
+                "/calendars/me@example.com/events/solo/move\
+                 ?destination=team%40group.calendar.google.com&sendUpdates=none"
+            ),
+            "{}",
+            sent.url
+        );
+        let row = |id: &str| {
+            host.with_conn(|conn| calendar::event_by_id(conn, id))
+                .unwrap()
+        };
+        assert!(row("cal:solo").is_none(), "off its own calendar");
+        assert!(row("cal2:solo").is_some_and(|r| r.calendar_id == "cal2" && r.summary == "Dentist"));
+        assert_eq!(host.told(), ["cal", "cal2"]);
+        // A list of "cal" begun before the change, still holding it, can't bring it back; a whole
+        // list of "cal2" begun after it, not showing it yet, can't take it off.
+        assert!(!ids_of(host.synced(std::slice::from_ref(&event), before))
+            .contains(&"cal:solo".to_string()));
+        let second_list = host
+            .edit
+            .recent
+            .lock()
+            .unwrap()
+            .merge("cal2", Vec::new(), true, Instant::now(), Stamp::now())
+            .rows;
+        assert_eq!(ids_of(second_list), ["cal2:solo"]);
+        assert!(
+            open_session(&host.edit, &session).unwrap().is_none(),
+            "the editor's session ended"
+        );
+    }
+
+    /// §8.4 steps 1-3 (critiques C1-L1, C1-M5, C1-L8, C2-H1): the calendar chosen is checked from
+    /// the DB alone, before anything is read: another account's, one PM doesn't sync, one the user
+    /// doesn't own (on either side), one gone from PM, a feed, and a new repeat beside it are
+    /// refused; the event's own calendar is no change at all.
+    #[test]
+    fn the_calendar_chosen_is_checked_before_anything_is_read() {
+        let (_dir, conn) = store();
+        let add = |id: &str, source: &str, provider: &str, role: &str, selected: bool| {
+            calendar::upsert_source(&conn, source, provider, Some("me"), "me").unwrap();
+            let remote = match id {
+                "cal" => CALENDAR.to_string(),
+                "cal2" => SECOND.to_string(),
+                other => format!("{other}@group.calendar.google.com"),
+            };
+            calendar::upsert_calendar(
+                &conn,
+                &calendar::Calendar {
+                    id: id.into(),
+                    source_id: source.into(),
+                    provider: provider.into(),
+                    remote_id: Some(remote),
+                    name: id.into(),
+                    color: None,
+                    selected,
+                    is_primary: false,
+                    quiet: false,
+                    kind: None,
+                    facts: CalendarFacts {
+                        access_role: Some(role.into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        };
+        add("cal", "gcal:me@example.com", "google", "owner", true);
+        add("cal2", "gcal:me@example.com", "google", "owner", true);
+        add("unsynced", "gcal:me@example.com", "google", "owner", false);
+        add("theirs", "gcal:other@x.org", "google", "owner", true);
+        add("shared", "gcal:me@example.com", "google", "writer", true);
+        add("viewed", "gcal:me@example.com", "google", "reader", true);
+        add("feed", "ics:feed", "ical", "reader", true);
+        let source = target(&dentist());
+        let dest =
+            |source: &Target, draft: EventPatchDraft| transfer_dest(&conn, source, &draft).unwrap();
+        let to = |id: &str| EventPatchDraft {
+            calendar: Some(id.into()),
+            ..Default::default()
+        };
+        let refused = |got: std::result::Result<Option<CalendarTarget>, WriteOutcome>,
+                       words: &str| {
+            matches!(got, Err(WriteOutcome::Failed { message }) if message == words)
+        };
+        assert!(matches!(
+            dest(&source, to("cal2")),
+            Ok(Some(d)) if d.remote_calendar == SECOND && d.calendar_id == "cal2" && d.selected
+        ));
+        assert!(refused(dest(&source, to("theirs")), TRANSFER_OTHER_GOOGLE));
+        assert!(refused(dest(&source, to("unsynced")), TRANSFER_NOT_SYNCED));
+        assert!(refused(dest(&source, to("shared")), TRANSFER_NOT_OWNED));
+        assert!(refused(dest(&source, to("viewed")), TRANSFER_NOT_OWNED));
+        assert!(refused(dest(&source, to("gone")), TRANSFER_DISCONNECTED));
+        assert!(matches!(
+            dest(&source, to("feed")),
+            Err(WriteOutcome::ReadOnly {
+                reason: ReadOnlyReason::NotGoogle
+            })
+        ));
+        // The event's own calendar one the user can only edit.
+        let shared_source = Target {
+            facts: CalendarFacts {
+                access_role: Some("writer".into()),
+                ..source.facts.clone()
+            },
+            ..source.clone()
+        };
+        assert!(refused(
+            dest(&shared_source, to("cal2")),
+            TRANSFER_NOT_OWNED
+        ));
+        // A new repeat beside it, before anything else is looked at.
+        let repeat = EventPatchDraft {
+            recurrence: Some(RepeatDraft::Once),
+            ..to("cal2")
+        };
+        assert!(refused(dest(&source, repeat), TRANSFER_WITH_REPEAT));
+        assert!(matches!(dest(&source, title("Retro")), Ok(None)));
+        // Its own calendar is no change: dropped before planning, so it never refuses a save.
+        let edit = CalendarEditState::default();
+        let session = keep_session(&edit, source.clone(), dentist(), None, None).unwrap();
+        let open = open_session(&edit, &session).unwrap().unwrap();
+        let own = normalised(
+            EventPatchDraft {
+                calendar: Some("cal".into()),
+                ..title("Retro")
+            },
+            &open,
+        );
+        assert!(own.calendar.is_none() && own.summary.as_deref() == Some("Retro"));
+        assert_eq!(
+            normalised(to("cal2"), &open).calendar.as_deref(),
+            Some("cal2")
+        );
+    }
+
+    /// §8.5 step 3: someone else's event and a locked one keep their calendar, each with only its
+    /// read sent and the gate's own reason; a calendar that can't hold a private event never gets
+    /// one (Q1), and more than 200 guests never go (Google's limit).
+    #[tokio::test]
+    async fn what_may_not_go_stays_with_only_its_read_sent() {
+        let theirs = with(dentist(), "organizer", json!({ "email": "o@x.org" }));
+        let locked = with(dentist(), "locked", json!(true));
+        let private = with(dentist(), "visibility", json!("private"));
+        let crowd: Vec<Value> = (0..=TRANSFER_MAX_GUESTS)
+            .map(|i| json!({ "email": format!("g{i}@x.org") }))
+            .collect();
+        let big = with(dentist(), "attendees", json!(crowd));
+        let no_private = CalendarTarget {
+            facts: CalendarFacts {
+                access_role: Some("writerWithoutPrivateAccess".into()),
+                ..second().facts
+            },
+            ..second()
+        };
+        let too_many = WriteOutcome::Failed {
+            message: TRANSFER_TOO_MANY.into(),
+        };
+        for (event, dest, want) in [
+            (
+                theirs,
+                second(),
+                WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::NotOrganizer,
+                },
+            ),
+            (
+                locked,
+                second(),
+                WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::Locked,
+                },
+            ),
+            (
+                private,
+                no_private,
+                WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::PrivateEvent,
+                },
+            ),
+            (big, second(), too_many),
+        ] {
+            let host = host_with_second(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_to(
+                &host,
+                &event,
+                to_second(),
+                GuestAnswer::default(),
+                &dest,
+                vec![Step::get("/events/solo", "", event.clone())],
+            )
+            .await;
+            script.finished();
+            assert!(outcome == want, "refused with its own reason");
+            assert!(host
+                .with_conn(|c| calendar::event_by_id(c, "cal:solo"))
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    /// R9, R2: an occurrence asks which occurrences; an event deleted in Google meanwhile lands as
+    /// gone; one PM is settling a change of (its new part) waits; a time changed in Google since
+    /// the editor opened stops it, Google's copy landing so the editor reloads it. Each with only
+    /// reads sent. A description changed meanwhile, which the user didn't see, doesn't stop it.
+    #[tokio::test]
+    async fn a_change_google_holds_meanwhile_is_read_first() {
+        let event = dentist();
+        let occurrence = with(event.clone(), "recurringEventId", json!("abc"));
+        // Google's copy of a deleted event: little more than its id, no organiser.
+        let cancelled = json!({ "id": "solo", "etag": "\"s9\"", "status": "cancelled" });
+        let later = written(
+            &event,
+            &[
+                ("start", json!({ "dateTime": "2026-10-12T10:00:00+01:00" })),
+                ("end", json!({ "dateTime": "2026-10-12T11:00:00+01:00" })),
+            ],
+            "\"s2\"",
+        );
+        for (read, want) in [
+            (
+                Step::get("/events/solo", "", occurrence),
+                WriteOutcome::needs_scope(),
+            ),
+            (Step::get("/events/solo", "", cancelled), WriteOutcome::Gone),
+            (Step::status("/events/solo", "", 404), WriteOutcome::Gone),
+        ] {
+            let host = host_with_second(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_to_second(
+                &host,
+                &event,
+                to_second(),
+                GuestAnswer::default(),
+                vec![read],
+            )
+            .await;
+            script.finished();
+            assert!(outcome == want);
+            if want == WriteOutcome::Gone {
+                assert!(host
+                    .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        let host = host_with_second(std::slice::from_ref(&event));
+        let running = Splitting::mark(&host.edit, series_key(CALENDAR, "solo"));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![Step::get("/events/solo", "", event.clone())],
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::Busy,
+            "a new part being settled waits"
+        );
+        drop(running);
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![Step::get("/events/solo", "", later.clone())],
+        )
+        .await;
+        script.finished();
+        assert!(
+            matches!(&outcome, WriteOutcome::Conflict { fields } if fields.contains(&"start".to_string())),
+            "the time changed"
+        );
+        assert_eq!(host.row("solo").start, rows_of(&[later])[0].start);
+        let noted = written(
+            &event,
+            &[("description", json!("Bring the form"))],
+            "\"s2\"",
+        );
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", noted.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step("sendUpdates=none", Scripted::Json(on_second_copy(&noted))),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()), "the event goes whole");
+    }
+
+    /// §8.5 step 5: the calendar chosen already holds it as its own (an earlier change that landed
+    /// unseen): landed there with nothing sent. Holding it as a guest: refused, nothing sent.
+    #[tokio::test]
+    async fn the_calendar_chosen_is_looked_at_before_anything_is_sent() {
+        let event = dentist();
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::get("/events/solo", "", on_second_copy(&event))),
+            ],
+        )
+        .await;
+        script.finished();
+        assert!(outcome == now_on_second(Vec::new()), "landed where it is");
+        let row = |host: &TestHost, id: &str| {
+            host.with_conn(|conn| calendar::event_by_id(conn, id))
+                .unwrap()
+        };
+        assert!(row(&host, "cal:solo").is_none() && row(&host, "cal2:solo").is_some());
+        let as_guest = with(
+            event.clone(),
+            "organizer",
+            json!({ "email": "me@example.com" }),
+        );
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::get("/events/solo", "", as_guest)),
+            ],
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: TRANSFER_INVITED.into()
+                }
+        );
+        assert!(row(&host, "cal:solo").is_some() && row(&host, "cal2:solo").is_none());
+    }
+
+    /// §8.6, critique C1-L7: an answer PM can't trust (none came, a server error, a 404, a 409) is
+    /// looked up on the calendar chosen first, then on the event's own; the request goes once,
+    /// whatever the looks find.
+    #[tokio::test]
+    async fn an_answer_pm_cant_trust_looks_on_the_calendar_chosen_first() {
+        let event = dentist();
+        let duplicate = Scripted::Reply {
+            status: 409,
+            body: Some(
+                json!({ "error": { "errors": [{ "reason": "duplicate" }], "message": "x" } }),
+            ),
+            date: None,
+            maybe_applied: false,
+        };
+        let there = || on_second(Step::get("/events/solo", "", on_second_copy(&event)));
+        let not_there = || on_second(Step::status("/events/solo", "", 404));
+        let still = || Step::get("/events/solo", "", event.clone());
+        let failed = |words: &str| WriteOutcome::Failed {
+            message: words.into(),
+        };
+        let cases: Vec<(&str, Scripted, Vec<Step>, WriteOutcome)> = vec![
+            (
+                "lost, landed",
+                lost(),
+                vec![there()],
+                now_on_second(Vec::new()),
+            ),
+            (
+                "lost, still on its calendar",
+                lost(),
+                vec![not_there(), still()],
+                failed(TRANSFER_LOST),
+            ),
+            (
+                "lost, gone from both",
+                lost(),
+                vec![not_there(), Step::status("/events/solo", "", 404)],
+                WriteOutcome::Unconfirmed,
+            ),
+            (
+                "lost, the calendar chosen unreadable",
+                lost(),
+                vec![on_second(Step::status("/events/solo", "", 500))],
+                WriteOutcome::Unconfirmed,
+            ),
+            // The calendar chosen holds it as a guest, not as its own: that isn't this change.
+            (
+                "lost, a guest's copy there, still on its calendar",
+                lost(),
+                vec![
+                    on_second(Step::get(
+                        "/events/solo",
+                        "",
+                        with(event.clone(), "organizer", json!({ "email": "o@x.org" })),
+                    )),
+                    still(),
+                ],
+                failed(TRANSFER_LOST),
+            ),
+            (
+                "a server error, landed",
+                Scripted::Status(503),
+                vec![there()],
+                now_on_second(Vec::new()),
+            ),
+            (
+                "a server error, still on its calendar",
+                Scripted::Status(503),
+                vec![not_there(), still()],
+                failed(TRANSFER_LOST),
+            ),
+            (
+                "a 404 that landed",
+                Scripted::Status(404),
+                vec![there()],
+                now_on_second(Vec::new()),
+            ),
+            (
+                "a 404, still on its calendar",
+                Scripted::Status(404),
+                vec![not_there(), still()],
+                failed(TRANSFER_UNREACHABLE),
+            ),
+            (
+                "a 409, still on its calendar",
+                duplicate,
+                vec![not_there(), still()],
+                failed(TRANSFER_REFUSED),
+            ),
+            // A refusal after a server error on the way: the first copy may have landed.
+            (
+                "a 403 after a server error, landed",
+                Scripted::Reply {
+                    status: 403,
+                    body: None,
+                    date: None,
+                    maybe_applied: true,
+                },
+                vec![there()],
+                now_on_second(Vec::new()),
+            ),
+        ];
+        for (name, answer, looks, want) in cases {
+            let host = host_with_second(std::slice::from_ref(&event));
+            let mut steps = vec![
+                Step::get("/events/solo", "", event.clone()),
+                not_there(),
+                transfer_step("sendUpdates=none", answer),
+            ];
+            steps.extend(looks);
+            let (outcome, script, _) =
+                save_to_second(&host, &event, to_second(), GuestAnswer::default(), steps).await;
+            script.asked_all();
+            assert!(outcome == want, "{name}");
+            assert_eq!(transfers(&script), 1, "{name}: sent once");
+        }
+        // Google refusing it outright: its own words never reach the user, and nothing is looked up.
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                not_there(),
+                transfer_step("sendUpdates=none", Scripted::Status(400)),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == failed(TRANSFER_REFUSED));
+    }
+
+    /// §8.4 step 5, §8.8: a title and the calendar in one Save ask one question counting both (one
+    /// person, an email for each), with only a read sent. Answered, the PATCH goes, then the
+    /// calendar change, each with the answer; no Undo is offered, and the saved title is on "cal2".
+    #[tokio::test]
+    async fn a_title_and_the_calendar_save_in_order_with_one_question() {
+        let event = with_a_guest(dentist());
+        let draft = EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..to_second()
+        };
+        let both = GuestNotice {
+            emails: 2,
+            ..one_updated()
+        };
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            draft.clone(),
+            GuestAnswer::default(),
+            vec![Step::get("/events/solo", "", event.clone())],
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome == WriteOutcome::needs_notify(both.clone()),
+            "one question, both counted"
+        );
+        let retitled = written(&event, &[("summary", json!("Retro"))], "\"s2\"");
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            draft,
+            answered(Notify::All, both),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    "sendUpdates=all",
+                    Scripted::Json(retitled.clone()),
+                ),
+                Step::get("/events/solo", "", retitled.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step(
+                    "destination=team%40group.calendar.google.com sendUpdates=all",
+                    Scripted::Json(on_second_copy(&retitled)),
+                ),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome == now_on_second(Vec::new()),
+            "saved, on cal2, no Undo"
+        );
+        let moved = host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal2:solo"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.summary, "Retro");
+    }
+
+    /// §8.8: the calendar alone, on an event with a guest, asks for itself (one person, one email)
+    /// after its reads; Don't send goes as `none`. A colour (the user's own) beside it counts only
+    /// the calendar change, and the PATCH, which emails nobody, goes as `none` whatever was chosen
+    /// (C12's per-write rule).
+    #[tokio::test]
+    async fn the_calendar_change_of_a_guests_event_asks_for_itself() {
+        let event = with_a_guest(dentist());
+        let one = one_updated();
+        let host = host_with_second(std::slice::from_ref(&event));
+        let reads = || {
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+            ]
+        };
+        let (outcome, script, _) =
+            save_to_second(&host, &event, to_second(), GuestAnswer::default(), reads()).await;
+        script.finished();
+        assert!(outcome == WriteOutcome::needs_notify(one.clone()));
+        let mut steps = reads();
+        steps.push(transfer_step(
+            "sendUpdates=none",
+            Scripted::Json(on_second_copy(&event)),
+        ));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            answered(Notify::None, one.clone()),
+            steps,
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()));
+        // A colour and the calendar, with Send.
+        let coloured = written(&event, &[("colorId", json!("3"))], "\"s2\"");
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            EventPatchDraft {
+                colour: Some(crate::calendar_write::dto::ColourDraft::Colour { id: "3".into() }),
+                ..to_second()
+            },
+            answered(Notify::All, one),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(coloured.clone()),
+                ),
+                Step::get("/events/solo", "", coloured.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step("sendUpdates=all", Scripted::Json(on_second_copy(&coloured))),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()));
+    }
+
+    /// A title Google already holds beside the calendar: nothing to PATCH, so the calendar goes on
+    /// its own, its reads first.
+    #[tokio::test]
+    async fn fields_google_already_holds_leave_the_calendar_alone() {
+        let event = dentist();
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            EventPatchDraft {
+                summary: Some("Dentist".into()),
+                ..to_second()
+            },
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step("sendUpdates=none", Scripted::Json(on_second_copy(&event))),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()));
+        assert!(script.sent().iter().all(|p| p.method != Method::Patch));
+    }
+
+    /// §8.4 step 5: the title landed and the calendar change was refused: "not moved", in the
+    /// refusal's words, the saved title in the mirror on "cal". Google holding it meanwhile on
+    /// "cal" as changed is said in its own words, never "Saved".
+    #[tokio::test]
+    async fn the_field_save_landing_and_the_calendar_change_not_is_not_moved() {
+        let event = dentist();
+        let retitled = written(&event, &[("summary", json!("Retro"))], "\"s2\"");
+        let draft = EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..to_second()
+        };
+        let save_then = |answer: Scripted| {
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                Step::write(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Json(retitled.clone()),
+                ),
+                Step::get("/events/solo", "", retitled.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step("sendUpdates=none", answer),
+            ]
+        };
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            draft.clone(),
+            GuestAnswer::default(),
+            save_then(Scripted::Status(403)),
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::NotMoved {
+                    message: read_only_message(ReadOnlyReason::CalendarReadOnly).into()
+                },
+            "the reader words"
+        );
+        assert_eq!(host.row("solo").summary, "Retro");
+        // The calendar chosen busy: its own words, the title still saved.
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, _, _) = save_to_second(
+            &host,
+            &event,
+            draft,
+            GuestAnswer::default(),
+            save_then(Scripted::Status(429)),
+        )
+        .await;
+        assert!(
+            outcome
+                == WriteOutcome::NotMoved {
+                    message: "Google is busy right now.".into()
+                }
+        );
+    }
+
+    /// Critique C2-L15: Google gave the event a new iCal UID on the calendar chosen, and a
+    /// milestone or a reminder to prepare names the old one: said. The same UID, or nothing
+    /// linked, says nothing.
+    #[tokio::test]
+    async fn a_new_identity_on_the_calendar_chosen_is_said_when_something_links_to_it() {
+        let event = with(dentist(), "iCalUID", json!("old@google.com"));
+        let renamed = with(on_second_copy(&event), "iCalUID", json!("new@google.com"));
+        let steps = |copy: Value| {
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step("sendUpdates=none", Scripted::Json(copy)),
+            ]
+        };
+        let none = GuestAnswer::default;
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, _, _) =
+            save_to_second(&host, &event, to_second(), none(), steps(renamed.clone())).await;
+        assert!(outcome == now_on_second(Vec::new()), "nothing linked");
+        for link in ["milestone", "flag"] {
+            let host = host_with_second(std::slice::from_ref(&event));
+            host.with_conn(|conn| {
+                if link == "milestone" {
+                    milestones::add(conn, "Atlas", "Launch", None, Some("old@google.com".into()))?;
+                } else {
+                    crate::flags::upsert_active(
+                        conn,
+                        &crate::flags::DraftFlag {
+                            anchor_kind: crate::flags::ANCHOR_CALENDAR.into(),
+                            anchor: "old@google.com".into(),
+                            r#type: crate::flags::TYPE_PREPARE_AHEAD.into(),
+                            threshold: None,
+                            artifact_ptr: None,
+                            artifact_url: None,
+                            instance_at: None,
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            let (outcome, _, _) =
+                save_to_second(&host, &event, to_second(), none(), steps(renamed.clone())).await;
+            assert!(
+                outcome == now_on_second(vec![WriteWarning::LinksLeftBehind]),
+                "{link}: said"
+            );
+        }
+        let host = host_with_second(std::slice::from_ref(&event));
+        host.with_conn(|conn| {
+            milestones::add(conn, "Atlas", "Launch", None, Some("old@google.com".into()))
+                .map(|_| ())
+        })
+        .unwrap();
+        let (outcome, _, _) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            none(),
+            steps(on_second_copy(&event)),
+        )
+        .await;
+        assert!(outcome == now_on_second(Vec::new()), "the same UID");
+    }
+
+    /// Until C18e plans a repeating event's calendar change, an occurrence's plans nothing: the
+    /// choices refuse it before anything is read, and so does a save that names a scope.
+    #[tokio::test]
+    async fn an_occurrences_calendar_change_plans_nothing_yet() {
+        let (series, instance) = (weekly(), monday_19());
+        let host = TestHost::holding(&[]);
+        let session = keep_session(
+            &host.edit,
+            target(&instance),
+            instance.clone(),
+            Some(series.clone()),
+            None,
+        )
+        .unwrap();
+        let open = open_session(&host.edit, &session).unwrap().unwrap();
+        let draft = normalised(to_second(), &open);
+        let request = ChoiceRequest::Edit {
+            session: session.clone(),
+            draft: Box::new(draft.clone()),
+        };
+        let script = Script::new(Vec::new());
+        let got = choices(
+            &script,
+            &*host,
+            &target(&instance),
+            EditingStatus::On,
+            &mirror(&["abc"]),
+            &request,
+            Some(open.opened()),
+        )
+        .await;
+        script.finished();
+        assert!(matches!(
+            got,
+            SeriesChoices::Refused { result: WriteOutcome::Failed { message } } if message == UNFIT
+        ));
+        let script = Script::new(Vec::new());
+        let ctx = SeriesWrite {
+            wire: &script,
+            host: &*host,
+            target: &target(&instance),
+            editing: EditingStatus::On,
+            missing_ok: true,
+            new_series_id: plan::client_event_id,
+        };
+        let outcome = save_series(&ctx, &session, open, draft, Scope::All, None, None).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: UNFIT.into()
+                }
+        );
+    }
+
+    /// §8.4 step 5: the field changes landed with `saved` beside them, then the calendar change
+    /// came to `moved`: both said together, each warning once; not knowing and gone said as they
+    /// are; anything else "not moved", in its own words.
+    #[test]
+    fn after_the_field_save_both_are_said_or_why_not() {
+        let landed = WriteOutcome::Saved {
+            warnings: vec![
+                WriteWarning::MirrorRefreshPending,
+                WriteWarning::LinksLeftBehind,
+            ],
+            left_behind: Vec::new(),
+            milestone_moves: None,
+            undo: None,
+            calendar: Some("cal2".into()),
+        };
+        assert!(
+            after_field_save(
+                landed,
+                vec![
+                    WriteWarning::CallPending,
+                    WriteWarning::MirrorRefreshPending
+                ]
+            ) == now_on_second(vec![
+                WriteWarning::CallPending,
+                WriteWarning::MirrorRefreshPending,
+                WriteWarning::LinksLeftBehind,
+            ]),
+            "both, each once"
+        );
+        for kept in [WriteOutcome::Unconfirmed, WriteOutcome::Gone] {
+            assert!(after_field_save(kept.clone(), Vec::new()) == kept);
+        }
+        for (refused, words) in [
+            (
+                WriteOutcome::Failed {
+                    message: TRANSFER_INVITED.into(),
+                },
+                TRANSFER_INVITED,
+            ),
+            (WriteOutcome::Busy, "Google is busy right now."),
+            (
+                WriteOutcome::Conflict { fields: Vec::new() },
+                "It changed in Google since you opened it.",
+            ),
+        ] {
+            assert!(
+                after_field_save(refused, Vec::new())
+                    == WriteOutcome::NotMoved {
+                        message: words.into()
+                    }
+            );
+        }
+    }
+
+    /// §8.8, C12's per-write rule: a guest taken off and the calendar in one Save, with Send. The
+    /// PATCH tells the one taken off; nobody is left on it to tell of the calendar, so that goes as
+    /// `none` whatever was chosen.
+    #[tokio::test]
+    async fn the_calendar_change_emails_only_who_is_on_it_then() {
+        let event = with_a_guest(dentist());
+        let alone = written(
+            &event,
+            &[(
+                "attendees",
+                json!([{ "email": "me@example.com", "self": true, "organizer": true,
+                         "responseStatus": "accepted" }]),
+            )],
+            "\"s2\"",
+        );
+        let removed = GuestNotice {
+            removed: 1,
+            people: 1,
+            emails: 1,
+            complete: true,
+            ..Default::default()
+        };
+        let host = host_with_second(std::slice::from_ref(&event));
+        let draft = EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: "a@x.org".into(),
+                to: GuestState::Absent,
+            }]),
+            ..to_second()
+        };
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            draft,
+            answered(Notify::All, removed),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    "sendUpdates=all",
+                    Scripted::Json(alone.clone()),
+                ),
+                Step::get("/events/solo", "", alone.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step("sendUpdates=none", Scripted::Json(on_second_copy(&alone))),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()));
+    }
+
+    /// §8.5 step 8: Google's 200 with a copy PM can't read: it landed, so the row leaves "cal" and
+    /// the next sync shows it on "cal2"; the editor's session ends.
+    #[tokio::test]
+    async fn an_answer_pm_cant_read_still_lands_it() {
+        let event = dentist();
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, session) = save_to_second(
+            &host,
+            &event,
+            to_second(),
+            GuestAnswer::default(),
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+                transfer_step(
+                    "sendUpdates=none",
+                    Scripted::Reply {
+                        status: 200,
+                        body: None,
+                        date: None,
+                        maybe_applied: false,
+                    },
+                ),
+            ],
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(vec![WriteWarning::MirrorRefreshPending]));
+        assert!(host
+            .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+            .unwrap()
+            .is_none());
+        assert!(open_session(&host.edit, &session).unwrap().is_none());
+    }
+
+    /// Critique C1-H1: a calendar change, a POST with no body, says its length is 0 (hyper writes
+    /// none, and Google answers such a POST 411); a read says none, and a PATCH keeps its etag and
+    /// its body.
+    #[test]
+    fn a_post_with_no_body_says_its_length() {
+        let client = reqwest::Client::new();
+        let length = |r: &reqwest::Request| {
+            r.headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let change = plan::transfer_event(CALENDAR, "e1", SECOND, Notify::None);
+        let built = google_io::request(&client, &change, "t").build().unwrap();
+        assert!(*built.method() == reqwest::Method::POST);
+        assert_eq!(length(&built).as_deref(), Some("0"));
+        assert!(built.body().is_none());
+        assert!(built.headers().get(reqwest::header::IF_MATCH).is_none());
+        let read = google_io::request(&client, &plan::get_event(CALENDAR, "e1"), "t")
+            .build()
+            .unwrap();
+        assert_eq!(length(&read), None);
+        let patch = plan::patch_event(
+            CALENDAR,
+            "e1",
+            "\"1\"",
+            json!({ "summary": "x" }),
+            Notify::None,
+            plan::VersionFlags::default(),
+        );
+        let built = google_io::request(&client, &patch, "t").build().unwrap();
+        assert!(*built.method() == reqwest::Method::PATCH);
+        assert!(built.headers().get(reqwest::header::IF_MATCH).is_some());
+        assert!(built.body().is_some());
+    }
+
+    /// §8.2: the sender's backstop reads a calendar change's destination, which the path's prefix
+    /// never sees: one to a calendar off the list is refused; a request that isn't one is read by
+    /// its path alone; one naming no destination, or two, is refused.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_calendar_change_off_the_list_is_refused_by_the_sender() {
+        let only = Some(Some(HashSet::from([CALENDAR.to_string()])));
+        let both = Some(Some(HashSet::from([
+            CALENDAR.to_string(),
+            SECOND.to_string(),
+        ])));
+        let change = plan::transfer_event(CALENDAR, "e1", SECOND, Notify::None).url;
+        assert_eq!(dev_allow::destination_of(&change).as_deref(), Some(SECOND));
+        assert!(!dev_allow::permits(Some("x"), only.as_ref(), &change));
+        assert!(dev_allow::permits(Some("x"), both.as_ref(), &change));
+        assert!(
+            dev_allow::permits(None, None, &change),
+            "unset: the shells decide"
+        );
+        let odd = format!(
+            "{}?destination=elsewhere",
+            plan::get_event(CALENDAR, "e1").url
+        );
+        assert_eq!(dev_allow::destination_of(&odd), None);
+        assert!(dev_allow::permits(Some("x"), only.as_ref(), &odd));
+        let bare = change.split_once('?').unwrap().0.to_string();
+        let twice = format!("{change}&destination={CALENDAR}");
+        for url in [bare, twice] {
+            assert!(!dev_allow::permits(Some("x"), both.as_ref(), &url), "{url}");
+        }
     }
 }

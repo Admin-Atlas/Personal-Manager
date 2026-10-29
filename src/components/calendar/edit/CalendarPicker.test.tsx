@@ -301,4 +301,23 @@ describe("CalendarPicker", () => {
     const trigger = screen.getByRole("button", { name: "Calendar: Personal" }) as HTMLButtonElement;
     expect(trigger.disabled).toBe(true);
   });
+
+  // C18 critique C2-L5: the editor's Calendar row names its list for what it's for.
+  it("names its list as the caller says", () => {
+    render(
+      <CalendarPicker
+        targets={createTargets(overview)}
+        value={`${ME}:me@x.com`}
+        onChange={vi.fn()}
+        privateDraft={false}
+        hidden={new Set()}
+        colorOf={() => "var(--accent)"}
+        shapeOf={() => undefined}
+        listName="Calendars this event can go on"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    expect(screen.getByRole("group", { name: "Calendars this event can go on" })).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Calendars that can take a new event" })).toBeNull();
+  });
 });

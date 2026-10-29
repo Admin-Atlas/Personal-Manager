@@ -32,9 +32,9 @@ function unreachable(value: never): never {
 const NOT_ORGANISER = "Someone else organises this event.";
 
 /** What stays the organiser's on an event they haven't let guests change (C14c), its video call
- *  among it (C18). */
+ *  (C18) and its calendar (C18d) among it. */
 const THEIRS =
-  "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call.";
+  "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar.";
 
 /** What the user may change on someone else's event: their reply only where its calendar is on the
  *  guest list (C14 critique C2-L1). */
@@ -77,8 +77,9 @@ export function reasonText(reason: ReadOnlyReason): string {
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
       return "Birthdays, events from Gmail, focus time, out of office and working locations can't be changed here.";
+    // And its calendar, which Google doesn't say a locked copy may change (C18d).
     case "locked":
-      return "Google has locked this event's title, time, place and description.";
+      return "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.";
     case "html_description":
       return "This description has formatting, so PM shows its text here and can't change it yet.";
     case "label_read_only":
@@ -327,11 +328,12 @@ export function leftBehindText(days?: readonly string[]): string {
 
 /** A warning a save or a delete came back with, as a sentence. `leftBehind`: the days of
  *  `left_on_old_series`. A delete's occurrences "may still show"; a save's may be on the earlier
- *  part. */
+ *  part. `calendar`: the name of the calendar a save put the event on (C18d). */
 export function writeWarningText(
   warning: WriteWarning,
   kind: ChoiceKind,
   leftBehind?: readonly string[],
+  calendar?: string | null,
 ): string {
   switch (warning) {
     case "mirror_refresh_pending":
@@ -364,6 +366,9 @@ export function writeWarningText(
       return "Google is still making the video call; its link shows after a later refresh.";
     case "call_failed":
       return "Google didn't make the video call. Add it again from Edit, or in Google Calendar.";
+    // Raised only when something linked to the old identity (critique C2-L15).
+    case "links_left_behind":
+      return `On ${calendar || "its new calendar"} Google gave it a new identity, so a milestone or reminder to prepare linked to it stayed with the old one.`;
     default:
       return unreachable(warning);
   }
@@ -543,9 +548,33 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
       };
     case "failed":
       return { tone: "error", text: outcome.message };
+    case "not_moved":
+      return { tone: "warn", text: notMovedText(outcome.message, null) };
     default:
       return unreachable(outcome);
   }
+}
+
+/** Under the editor's Calendar row while its Repeat row is changed, and the other way round (C18
+ *  critique C2-H1): Google web takes both in one Save, PM one at a time, as its backend refuses the
+ *  two together in the same words. */
+export const CALENDAR_ALONE = "Change the calendar on its own, then how it repeats.";
+
+/** The line under the editor's Calendar row (C18d): only the calendars the user owns on the event's
+ *  own account are listed (critique C1-M5: Google's help puts an event on "a calendar you own"),
+ *  and, where another account can take events (critique C2-L8), Duplicate is the way there. */
+export function calendarRowText(account: string, otherAccounts: boolean): string {
+  const other = otherAccounts
+    ? " To put it on another account's calendar, duplicate it there, then delete this one."
+    : "";
+  return `Only calendars you own on ${account} are listed.${other}`;
+}
+
+/** A save whose other changes landed and whose calendar change didn't (C18d), `calendar` being the
+ *  name of the one it's still on, when known. The message is the backend's, a sentence. */
+export function notMovedText(message: string, calendar: string | null): string {
+  const still = calendar ? `it's still on ${calendar}` : "its calendar didn't change";
+  return `Your other changes are saved, but ${still}. ${message}`;
 }
 
 /** What a delete of the event called `title` came to, as one sentence naming it. A delete that
@@ -628,6 +657,9 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       };
     case "failed":
       return notDeleted(outcome.message);
+    // Only an editor's save answers this; a delete never does, so it says what it carries.
+    case "not_moved":
+      return notDeleted(outcome.message);
     default:
       return unreachable(outcome);
   }
@@ -681,6 +713,7 @@ export function replyText(
     case "partial_split":
     case "split_removed":
     case "ambiguous":
+    case "not_moved":
       return { tone: "error", text: "Your reply wasn't sent." };
     default:
       return unreachable(outcome);
@@ -784,7 +817,8 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
         tone: "warn",
         text: `${t}: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.`,
       };
-    // `ambiguous` is listed for completeness: only creating an event answers it; a settle never does.
+    // `ambiguous` and `not_moved` are listed for completeness: only creating an event, or an
+    // editor's save, answers them; a settle never does.
     case "no_change":
     case "needs_choice":
     case "ignored_by_google":
@@ -794,6 +828,7 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
     case "reauth":
     case "unconfirmed":
     case "ambiguous":
+    case "not_moved":
     case "failed": {
       const said = outcomeText(result);
       return { tone: said.tone, text: `${t}: ${said.text}` };
@@ -817,7 +852,8 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
  *  left, `from` (C11c review); All's own stop names none, since the one it keeps is the first
  *  occurrence still there, which the choices named. One that left the event outside the months PM
  *  syncs says so, and points to Google Calendar, never to editing it again here (C11c review, C11d
- *  review 1). */
+ *  review 1). `moved`: the save put it on another calendar (C18d), named `to`, from the one named
+ *  `from`; it says where it is now and how to put it back, since there's no Undo for it (Q3). */
 export function savedNotice(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
@@ -826,8 +862,18 @@ export function savedNotice(
   stops = false,
   asAll = false,
   undo: { sent: Notify | null } | null = null,
+  moved: { to: string; from: string } | null = null,
 ): { tone: Tone; text: string } {
   const t = quote(title);
+  if (moved && scope === null) {
+    const said = savedWarnings(outcome, moved.to);
+    const parts = [
+      `${t} is now on ${moved.to}.`,
+      ...said.words,
+      `To put it back, open it and choose ${moved.from}.`,
+    ];
+    return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
+  }
   // A new event or a one-off made to repeat whose occurrences all fall outside the months PM syncs
   // (C11 §10), or the one event "Does not repeat" leaves there.
   const outside = outcome.warnings.includes("outside_mirror");
@@ -932,6 +978,7 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
     case "needs_choice":
     case "partial_split":
     case "split_removed":
+    case "not_moved":
       return notBack("Edit it again instead.", "warn");
     case "failed":
       return notBack(outcome.message);
@@ -947,8 +994,12 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
  *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1), and
  *  the video call asked for last (C18). A milestone that stayed has a notice of its own, naming it.
  *  `warn`: the user should look, and nothing says to edit it again here; a call still being made
- *  isn't one, since the next refresh shows it. */
-function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
+ *  isn't one, since the next refresh shows it. Links left with an old identity (C18d) close it,
+ *  `calendar` naming where the event went. */
+function savedWarnings(
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  calendar: string | null = null,
+): {
   words: string[];
   warn: boolean;
 } {
@@ -958,6 +1009,7 @@ function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
   const left = outcome.warnings.includes("left_on_old_series");
   const callPending = outcome.warnings.includes("call_pending");
   const callFailed = outcome.warnings.includes("call_failed");
+  const links = outcome.warnings.includes("links_left_behind");
   const words: string[] = [];
   if (partly) words.push(writeWarningText("partly_applied", "save"));
   if (outside) words.push(writeWarningText("outside_mirror", "save"));
@@ -965,7 +1017,8 @@ function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
   if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
   if (callPending) words.push(writeWarningText("call_pending", "save"));
   if (callFailed) words.push(writeWarningText("call_failed", "save"));
-  return { words, warn: partly || outside || left || callFailed };
+  if (links) words.push(writeWarningText("links_left_behind", "save", undefined, calendar));
+  return { words, warn: partly || outside || left || callFailed || links };
 }
 
 // --- moving an event (C16a) ---
@@ -1050,6 +1103,9 @@ export function moveText(
       return notMoved("PM removed the new part of an earlier change instead.", "warn");
     case "failed":
       return notMoved(outcome.message);
+    // Only an editor's save answers this; a drag never does, so it says what it carries.
+    case "not_moved":
+      return notMoved(outcome.message);
     default:
       return unreachable(outcome);
   }
@@ -1100,6 +1156,7 @@ export function moveBackText(outcome: WriteOutcome, title: string): { tone: Tone
     case "needs_choice":
     case "partial_split":
     case "split_removed":
+    case "not_moved":
       return notBack("Drag it back, or change it in Edit.", "warn");
     case "failed":
       return notBack(outcome.message);
@@ -1297,6 +1354,7 @@ export function createText(
     case "partial_split":
     case "split_removed":
     case "conflict":
+    case "not_moved":
     case "unconfirmed": {
       const said = outcomeText(outcome);
       return notMade(said.text, said.tone);

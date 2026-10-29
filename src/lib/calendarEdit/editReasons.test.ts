@@ -21,6 +21,8 @@ import type {
 } from "../types";
 import {
   A11_NOTE,
+  CALENDAR_ALONE,
+  calendarRowText,
   CALLOUT_TONE,
   CREATE_CHANGED,
   CREATE_LOST,
@@ -56,6 +58,7 @@ import {
   moveFailedText,
   moveLabel,
   moveOfferText,
+  notMovedText,
   notOrganizerText,
   outcomeText,
   partialText,
@@ -215,6 +218,7 @@ describe("edit reasons", () => {
       { outcome: "unconfirmed" },
       { outcome: "ambiguous", retry_token: "ref-1" },
       { outcome: "failed", message: "Google didn't accept the change: Invalid start" },
+      { outcome: "not_moved", message: "Google is busy right now." },
     ];
     for (const o of outcomes) {
       expect(outcomeText(o).text.length).toBeGreaterThan(0);
@@ -386,12 +390,17 @@ describe("a write's warnings", () => {
       "kept_own_reply",
       "call_pending",
       "call_failed",
+      "links_left_behind",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
         expect(writeWarningText(w, kind)).toMatch(/^[A-Z].*\.$/);
       }
     }
+    // C18d: it names the calendar the event went to, when it's known.
+    expect(writeWarningText("links_left_behind", "save", undefined, "Work")).toBe(
+      "On Work Google gave it a new identity, so a milestone or reminder to prepare linked to it stayed with the old one.",
+    );
     expect(writeWarningText("mirror_refresh_pending", "save")).toBe(
       "PM's calendar will show it after the next refresh.",
     );
@@ -420,6 +429,85 @@ describe("a write's warnings", () => {
 
   it("maps every tone onto a Callout's", () => {
     expect(CALLOUT_TONE).toEqual({ ok: "info", warn: "warning", error: "danger" });
+  });
+});
+
+// C18d: putting an event on another calendar, in the words the editor and its notice say.
+describe("another calendar (C18d)", () => {
+  const moved = { to: "Work", from: "Home" };
+
+  it("says where a saved event is now and how to put it back, from the backend's answer", () => {
+    const outcome: Extract<WriteOutcome, { outcome: "saved" }> = {
+      outcome: "saved",
+      warnings: [],
+      calendar: "gcal:me@x.com:work",
+    };
+    expect(savedNotice("Dentist", outcome, null, "2026-10-12", false, false, null, moved)).toEqual({
+      tone: "ok",
+      text: "“Dentist” is now on Work. To put it back, open it and choose Home.",
+    });
+    // Links left with the old identity: said, naming the calendar, and worth a look.
+    expect(
+      savedNotice(
+        "Dentist",
+        { ...outcome, warnings: ["links_left_behind"] },
+        null,
+        undefined,
+        false,
+        false,
+        null,
+        moved,
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "“Dentist” is now on Work. On Work Google gave it a new identity, so a milestone or reminder to prepare linked to it stayed with the old one. To put it back, open it and choose Home.",
+    });
+    // No calendar change: a save's own words, as before.
+    expect(savedNotice("Dentist", { outcome: "saved", warnings: [] }, null).text).toBe(
+      "Saved “Dentist”.",
+    );
+  });
+
+  it("says a save whose calendar change didn't land kept the rest, and why", () => {
+    expect(notMovedText("Google is busy right now.", "Home")).toBe(
+      "Your other changes are saved, but it's still on Home. Google is busy right now.",
+    );
+    expect(outcomeText({ outcome: "not_moved", message: "Try again." })).toEqual({
+      tone: "warn",
+      text: "Your other changes are saved, but its calendar didn't change. Try again.",
+    });
+    // Never any other write's answer, but each says what it carries rather than nothing.
+    const notMoved: WriteOutcome = { outcome: "not_moved", message: "Try again." };
+    expect(replyText(notMoved, "yes", null).text).toBe("Your reply wasn't sent.");
+    expect(saveBackText(notMoved, "Gym").text).toMatch(/^Couldn't undo the save of “Gym”\./);
+    expect(moveText(notMoved, "Gym", "", null).text).toMatch(/Try again\.$/);
+    expect(moveBackText(notMoved, "Gym").text.length).toBeGreaterThan(0);
+    expect(settleText(notMoved, "Gym").text).toMatch(/^“Gym”: /);
+    expect(createText(notMoved, "Gym", false).text.length).toBeGreaterThan(0);
+  });
+
+  it("says under the Calendar row whose calendars are listed, and Duplicate only where it helps", () => {
+    expect(calendarRowText("me@x.com", false)).toBe(
+      "Only calendars you own on me@x.com are listed.",
+    );
+    expect(calendarRowText("me@x.com", true)).toBe(
+      "Only calendars you own on me@x.com are listed. To put it on another account's calendar, duplicate it there, then delete this one.",
+    );
+    expect(CALENDAR_ALONE).toBe("Change the calendar on its own, then how it repeats.");
+    // A lock keeps it on its calendar, and says so; someone else's names the calendar as theirs.
+    expect(reasonText("locked")).toBe(
+      "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.",
+    );
+    expect(reasonText("not_organizer")).toMatch(/guests, video call and calendar\./);
+    // Never C16's word for a drag, nor Google's API's, for a calendar change.
+    for (const line of [
+      calendarRowText("me@x.com", true),
+      CALENDAR_ALONE,
+      notMovedText("x.", "Home"),
+      writeWarningText("links_left_behind", "save", undefined, "Work"),
+    ]) {
+      expect(line).not.toMatch(/move|transfer/i);
+    }
   });
 });
 
@@ -522,9 +610,9 @@ describe("what a reply came to (C14)", () => {
 
 // C14 critiques C1-L10, C2-L1, C2-L10: under someone else's event, what the user may still do.
 describe("the line under someone else's event (C14b, C14c)", () => {
-  // The video call is the organiser's too (C18).
+  // The video call is the organiser's too (C18), and so is the calendar (C18d).
   const theirs =
-    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call.";
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar.";
 
   it("says what stays the organiser's and what the user may change, the reply only when this copy can", () => {
     // The reason alone never promises a reply: the calendar may not be on the guest list.

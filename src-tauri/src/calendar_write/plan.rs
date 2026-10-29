@@ -175,6 +175,32 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
     }
 }
 
+/// Put the event on another of the account's calendars (`events.move`), `destination` being Google's
+/// id of that calendar (C18). Google keeps everything about the event but its organiser, which
+/// becomes the destination; whether its id and iCal UID stay is live probe L-T1. No body ("Do not
+/// supply a request body") and no If-Match (none documented): the caller compares first (R2) and
+/// looks on both calendars after an answer it can't trust. No version flags: none is documented for
+/// it, and it sends no call.
+pub fn transfer_event(
+    calendar: &str,
+    event: &str,
+    destination: &str,
+    notify: Notify,
+) -> RequestPlan {
+    RequestPlan {
+        method: Method::Transfer,
+        url: url(
+            &["calendars", calendar, "events", event, "move"],
+            &[
+                ("destination", destination),
+                ("sendUpdates", notify.as_param()),
+            ],
+        ),
+        if_match: None,
+        body: None,
+    }
+}
+
 /// Create an event under `id`, an id PM chose ([`client_event_id`]) and wrote into the body here,
 /// so an insert can't go out without one. After an answer that never arrived or a server error, the
 /// caller GETs that id before sending again (rule R2). Google warns it can't always catch a repeated
@@ -451,6 +477,27 @@ mod tests {
             },
         );
         assert!(insert.url.contains("conferenceDataVersion=1"));
+    }
+
+    /// C18d: putting an event on another calendar names its destination in the query, encoded as an
+    /// id is, states who is emailed, and carries no body, no etag and no version flag.
+    #[test]
+    fn a_transfer_names_its_destination_and_sends_no_body() {
+        for notify in [Notify::All, Notify::None] {
+            let p = transfer_event("me@x.org", "e1", "team#x@group.calendar.google.com", notify);
+            assert_eq!(p.method, Method::Transfer);
+            assert_eq!(
+                p.url,
+                format!(
+                    "https://www.googleapis.com/calendar/v3/calendars/me@x.org/events/e1/move\
+                     ?destination=team%23x%40group.calendar.google.com&sendUpdates={}",
+                    notify.as_param()
+                )
+            );
+            assert_eq!(p.if_match, None);
+            assert_eq!(p.body, None);
+            assert!(!p.url.contains("conferenceDataVersion"), "{}", p.url);
+        }
     }
 
     #[test]

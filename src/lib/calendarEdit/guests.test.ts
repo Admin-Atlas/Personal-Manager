@@ -422,6 +422,28 @@ describe("who a save would email (the backend's N1-N15)", () => {
       complete: false,
     });
   });
+
+  // C18d (§10.2): another calendar in the same Save tells everyone on the event then once more, as
+  // the backend's `Reach::of_transfer` counts it (attendees.rs, the same rows).
+  it("counts another calendar as a change everyone on it hears of", () => {
+    const moved = (base: EditorFields, draft: EditorFields, omitted = false) =>
+      guestNotice(base, draft, omitted, "cal@x.org", true);
+    // The calendar alone: each guest told once; nobody but the user and a room, nobody.
+    expect(moved(fields([ME, A]), fields([ME, A]))).toEqual(told(1));
+    expect(moved(fields([ME, R]), fields([ME, R]))).toBeNull();
+    // With a busy-or-free change, the user's own: still only the calendar's email.
+    expect(moved(fields([ME, A]), { ...fields([ME, A]), show_as: "free" })).toEqual(told(1));
+    // With a title: the same guest, an email for each.
+    expect(moved(fields([ME, A]), retitled(fields([ME, A])))).toEqual({ ...told(1), emails: 2 });
+    // A guest added in the same Save is on it when it goes: invited, then told.
+    expect(moved(fields([ME, A]), fields([ME, A, NEW_B]))).toEqual({ ...told(1, 1), emails: 4 });
+    // One taken off isn't on it any more when it goes.
+    expect(moved(fields([ME, A, B]), fields([ME, A]))).toEqual({ ...told(1, 0, 1), emails: 3 });
+    // A list Google cut short: "at least".
+    expect(moved(fields([ME, A]), fields([ME, A]), true)).toEqual({ ...told(1), complete: false });
+    // Without it, the calendar's own count goes: the same rows as before.
+    expect(guestNotice(fields([ME, A]), fields([ME, A]), false, "cal@x.org")).toBeNull();
+  });
 });
 
 describe("who a delete would tell (the backend's D1-D5, from the calendar's row)", () => {

@@ -57,12 +57,20 @@
 // And its Google Meet call (C18), after the guests: "Add Google Meet video conferencing" where the
 // calendar offers Meet, Join and Remove once it has one, another service's call shown and kept. A
 // call Google is still making after the save is said in the saved notice.
+//
+// Its calendar (C18d), above the title in place of "Saving to …", on an event you organise on a
+// calendar you own: the other calendars you own on the same account, as Google web's Calendar row
+// lists them; another account's is Duplicate's (Q13). One Save sends the other changes first, then
+// the calendar, with one email question for both. Saved, the notice says where it is now; if the
+// other changes landed and the calendar didn't, the editor reloads Google's copy, says why, and
+// keeps the calendar chosen, so Save tries it alone. A new repeat goes in a Save of its own.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type {
   Calendar,
   CalendarEvent,
+  CalendarOverview,
   EditLoad,
   EventForEdit,
   EventPatchDraft,
@@ -115,10 +123,13 @@ import {
 import {
   A11_NOTE,
   ambiguousText,
+  CALENDAR_ALONE,
+  calendarRowText,
   CALLOUT_TONE,
   earlierChangeText,
   listFields,
   loadText,
+  notMovedText,
   notOrganizerText,
   outcomeText,
   problemText,
@@ -127,6 +138,7 @@ import {
   repeatTheirsText,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
+import { createdWhere, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
@@ -138,6 +150,7 @@ import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
 import { MeetField } from "./MeetField";
 import { NotifyPrompt } from "./NotifyPrompt";
+import { CalendarPicker } from "./CalendarPicker";
 import { ReminderList } from "./ReminderList";
 import { RsvpControl } from "./RsvpControl";
 import {
@@ -174,8 +187,16 @@ interface Props {
   suggestions: readonly GuestSuggestion[];
   /** A milestone linked to this event, which moves with it. */
   milestone: Milestone | null;
-  /** The colour PM draws a calendar in: the colour list's "Calendar colour". */
+  /** The colour PM draws a calendar in: the colour list's "Calendar colour", and the Calendar row's
+   *  dots. */
   colorOf: (calendarId: string) => string;
+  /** Where events can go (C10's), for the Calendar row (C18d): null while the calendars load. */
+  targets: CreateTargets | null;
+  /** The calendar overview, for the names of the calendars and whether one chosen shows here. */
+  overview: CalendarOverview | null;
+  /** Calendars hidden in the calendar list: still on offer, and said. */
+  hidden: ReadonlySet<string>;
+  shapeOf: (calendarId: string) => number | undefined;
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
    *  passed carries what the editor showed (Google's fresh copy), which the delete compares. */
   onDelete?: (row: CalendarEvent) => void;
@@ -254,6 +275,10 @@ export function EventEditor({
   suggestions,
   milestone,
   colorOf,
+  targets,
+  overview,
+  hidden,
+  shapeOf,
   onDelete,
   onDuplicate,
   canDuplicate = false,
@@ -334,6 +359,15 @@ export function EventEditor({
     draftRef.current = next;
     setDraftState(next);
   };
+  // The calendar it's to be on (C18d): its own until another is chosen, and kept across a reload
+  // after a save that landed without it, so Save tries it again. Readable at once, as the draft is.
+  const calendarRef = useRef(row.calendar_id);
+  const [calendarId, setCalendarIdState] = useState(row.calendar_id);
+  const setCalendarId = (id: string) => {
+    calendarRef.current = id;
+    setCalendarIdState(id);
+  };
+  const moving = () => calendarRef.current !== row.calendar_id;
   const setCustomOpen = (open: boolean) => {
     customRef.current = open;
     setCustomOpenState(open);
@@ -403,7 +437,9 @@ export function EventEditor({
   }
 
   const isDirty = () =>
-    !!loaded && !!draftRef.current && changedFields(loaded.base, draftRef.current).length > 0;
+    !!loaded &&
+    !!draftRef.current &&
+    (changedFields(loaded.base, draftRef.current).length > 0 || moving());
 
   const requestClose = () => {
     if (saving || promptRef.current) return;
@@ -513,8 +549,10 @@ export function EventEditor({
     return endAfterStart(loaded.base, moved, length, loaded.event);
   }
 
-  /** Google changed the event on a field this save sends: take its copy, keep the rest. */
-  async function rebaseAfterConflict(head: string) {
+  /** Google changed the event on a field this save sends: take its copy, keep the rest. After a
+   *  save whose calendar change alone didn't land (`saved`, C18d), the fields are Google's already,
+   *  so `head` says it all unless Google's copy differs from the draft somewhere. */
+  async function rebaseAfterConflict(head: string, saved = false) {
     if (!loaded || !draftRef.current) return;
     let fresh: EditLoad;
     try {
@@ -563,7 +601,11 @@ export function EventEditor({
     });
     setDraft(next);
     if (note !== undefined) setRemindersNote(note);
-    setBanner({ tone: "warn", text: rebasedText(head, r.overwritten, r.lost_guests) });
+    const kept = saved && r.overwritten.length === 0 && r.lost_guests.length === 0;
+    setBanner({
+      tone: "warn",
+      text: kept ? head : rebasedText(head, r.overwritten, r.lost_guests),
+    });
   }
 
   /** A time change by the user. A rule picked in this editor whose day came from the start date
@@ -633,7 +675,12 @@ export function EventEditor({
       refocus(focused);
       return;
     }
-    const changes = toChanges(loaded.base, current);
+    // Another calendar goes with the rest, after it (C18d): Google's one Save, one question.
+    const elsewhere = moving();
+    const changes = {
+      ...toChanges(loaded.base, current),
+      ...(elsewhere ? { calendar: calendarRef.current } : {}),
+    };
     if (Object.keys(changes).length === 0) {
       onClose();
       return;
@@ -652,8 +699,15 @@ export function EventEditor({
       return;
     }
     // Who this would email, counted as the backend counts: asked before anything is sent, as
-    // Google's own question is. Nobody, and it goes (the backend has the last word either way).
-    const notice = guestNotice(loaded.base, current, loaded.event.guests_omitted, account);
+    // Google's own question is, another calendar telling the guests too. Nobody, and it goes (the
+    // backend has the last word either way).
+    const notice = guestNotice(
+      loaded.base,
+      current,
+      loaded.event.guests_omitted,
+      account,
+      elsewhere,
+    );
     if (notice) setPrompt({ what, picked: null, notice, again: false });
     else await send(what, null, null, null);
   }
@@ -803,7 +857,8 @@ export function EventEditor({
       switch (outcome.outcome) {
         case "saved":
           // "Does not repeat" leaves one event, never a repeating one. The row and the answer
-          // sent go with it, for an Undo the backend offers (C16d).
+          // sent go with it, for an Undo the backend offers (C16d). Where it went is the
+          // backend's to say, from Google's answer (C18d).
           noteSaved(
             what.title,
             outcome,
@@ -812,6 +867,12 @@ export function EventEditor({
             what.changes.recurrence?.kind === "once",
             picked?.asAll ?? false,
             { rowId: row.id, sent: notify },
+            outcome.calendar
+              ? {
+                  to: calendarName(outcome.calendar) ?? "the calendar you chose",
+                  from: calendar?.name ?? "its calendar",
+                }
+              : null,
           );
           stayOpen = false;
           onClose();
@@ -866,6 +927,11 @@ export function EventEditor({
         case "conflict":
           await rebaseAfterConflict(outcomeText(outcome).text);
           return;
+        // The other changes landed and the calendar change didn't (C18d): Google's copy is read
+        // again (the session moved on), the calendar chosen kept, so Save tries it alone.
+        case "not_moved":
+          await rebaseAfterConflict(notMovedText(outcome.message, calendar?.name ?? null), true);
+          return;
         // `ambiguous`: only creating an event answers it, never a save; read as a save it would be
         // unconfirmed.
         case "unconfirmed":
@@ -900,6 +966,8 @@ export function EventEditor({
   const title = (draft?.summary ?? row.summary).trim() || "(no title)";
   const perms = loaded?.permissions;
   const may = (f: Parameters<typeof canEdit>[1]) => !!perms && canEdit(perms, f) && !saving;
+  /** A calendar's name, from the overview; null for one PM no longer has. */
+  const calendarName = (id: string) => overview?.calendars.find((c) => c.id === id)?.name ?? null;
   // Once Google's copy has opened: an event that couldn't be read can't be copied either.
   const showDuplicate = canDuplicate && !!onDuplicate && !!loaded;
   const timeOff = deviceZone === null;
@@ -943,6 +1011,43 @@ export function EventEditor({
   const repeatHolds =
     !repeating && (repeat.state.state === "loading" || repeat.state.state === "refused");
 
+  // The Calendar row (C18d): an event you organise on a calendar you own, with another you own on
+  // the same account to put it on. Owned only, on both sides, as Google's help puts it ("a
+  // calendar you own", critique C1-M5): the list holds only owned calendars, and the event's own
+  // must be among them. The backend checks the same before anything is read.
+  const ownAccount = useMemo(() => {
+    const group = targets?.groups.find((g) => g.account.id === calendar?.source_id);
+    if (!group) return null;
+    return {
+      account: group.account,
+      targets: group.targets.filter((t) => t.calendar.access_role === "owner"),
+    };
+  }, [targets, calendar]);
+  const calendarRow =
+    !!perms?.calendar &&
+    !!ownAccount &&
+    ownAccount.targets.length > 1 &&
+    ownAccount.targets.some((t) => t.calendar.id === row.calendar_id);
+  const calendarMoved = calendarId !== row.calendar_id;
+  // One at a time, as the backend takes them (critique C2-H1): a new repeat holds the calendar,
+  // and another calendar holds the repeat.
+  const repeatChanged =
+    !!loaded && !!draft && !sameRepeat(draft.recurrence, loaded.base.recurrence);
+  const calendarLines: string[] = [];
+  if (calendarRow && ownAccount) {
+    const groups = targets?.groups.length ?? 0;
+    calendarLines.push(
+      calendarRowText(ownAccount.account.email || ownAccount.account.label, groups > 1),
+    );
+    const where = calendarMoved && overview ? createdWhere(overview, hidden, calendarId) : null;
+    if (where && hidden.has(calendarId) && where.hidden) {
+      calendarLines.push(
+        `${where.name} is hidden in your calendar list, so the event won't show until you show that calendar again.`,
+      );
+    }
+    if (repeatChanged) calendarLines.push(CALENDAR_ALONE);
+  }
+
   return (
     <>
       <Dialog
@@ -950,8 +1055,11 @@ export function EventEditor({
         onClose={requestClose}
         chrome="bar"
         title="Edit event"
+        // The Calendar row says where it is when it's shown (C18d).
         subtitle={
-          calendar ? `Saving to ${calendar.name}${account ? ` · ${account}` : ""}` : undefined
+          calendar && !calendarRow
+            ? `Saving to ${calendar.name}${account ? ` · ${account}` : ""}`
+            : undefined
         }
         closeLabel="Close"
         closeDisabled={saving}
@@ -1025,6 +1133,30 @@ export function EventEditor({
               <p className="text-xs leading-relaxed text-ink3">{A11_NOTE}</p>
             )}
 
+            {calendarRow && ownAccount && (
+              <div className="flex flex-col items-start gap-1">
+                <span className="text-sm text-ink2">Calendar</span>
+                <CalendarPicker
+                  targets={{ groups: [ownAccount], off: [] }}
+                  value={calendarId}
+                  onChange={setCalendarId}
+                  privateDraft={
+                    draft.visibility === "private" || draft.visibility === "confidential"
+                  }
+                  hidden={hidden}
+                  colorOf={colorOf}
+                  shapeOf={shapeOf}
+                  disabled={saving || repeatChanged}
+                  listName="Calendars this event can go on"
+                />
+                {calendarLines.map((line) => (
+                  <p key={line} className="text-xs leading-relaxed text-ink4">
+                    {line}
+                  </p>
+                ))}
+              </div>
+            )}
+
             <TextRow
               label="Title"
               value={draft.summary}
@@ -1064,7 +1196,9 @@ export function EventEditor({
                       ? repeatTheirsText(repeating)
                       : repeating && !series
                         ? UNREADABLE_REPEAT
-                        : undefined
+                        : calendarMoved
+                          ? CALENDAR_ALONE
+                          : undefined
                   }
                   standing={standing}
                   // Its own right, never the time's: a guest may move an occurrence where the

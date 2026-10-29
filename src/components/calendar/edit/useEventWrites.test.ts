@@ -1276,6 +1276,32 @@ describe("a repeating event", () => {
       "Saved “Gym” as one event that doesn't repeat, on 05-10. There's no Undo: to make it repeat again, edit it and pick a repeat.",
     );
   });
+
+  // C18d: a save that put the event on another calendar says where it is now and how to put it
+  // back; there's no Undo for it (Q3).
+  it("a saved calendar change says where it is now", async () => {
+    const { mod, hook, act } = await load();
+    act(() =>
+      mod.noteSaved(
+        "Dentist",
+        { outcome: "saved", warnings: [], calendar: "gcal:me@x.com:work" },
+        null,
+        "2026-10-12",
+        false,
+        false,
+        { rowId: "gcal:me@x.com:me@x.com:abc", sent: null },
+        { to: "Work", from: "Home" },
+      ),
+    );
+    expect(hook.result.current.notices).toEqual([
+      {
+        id: 1,
+        tone: "ok",
+        text: "“Dentist” is now on Work. To put it back, open it and choose Home.",
+      },
+    ]);
+    expect(hook.result.current.notices[0].undoToken).toBeUndefined();
+  });
 });
 
 // --- creating an event (#884, C10) ---

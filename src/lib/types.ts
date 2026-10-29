@@ -1683,6 +1683,9 @@ export interface EventPatchDraft {
   /** Add or remove its Google Meet call (C18); omitted leaves the call as it is. Never the
    *  request's id: the backend puts in its own. */
   meet?: MeetChange | null;
+  /** Another calendar of the same Google account to put the event on, by PM's calendar id
+   *  (C18d); omitted, or its own calendar, leaves it where it is. */
+  calendar?: string | null;
 }
 
 /** Adding or removing a Google Meet call (C18). Only Meet: PM never makes another service's. */
@@ -1871,6 +1874,9 @@ export interface FieldPermissions {
   colour: boolean;
   /** May add or remove a Google Meet call (C18). */
   meet: boolean;
+  /** May go to another calendar of the same account: the organiser's, never a locked event's
+   *  (C18d). The save checks the calendar chosen. */
+  calendar: boolean;
   delete: boolean;
   /** The user may reply (Yes, No, Maybe). No field of the editor's: the reply sits apart from
    *  them, and never makes a draft to save (C14). */
@@ -2017,7 +2023,9 @@ export type SeriesScope = "this" | "following" | "all";
  *  title, say), so the event is as Google holds it (C13 review round 1). `kept_own_reply`: a reply
  *  to every occurrence landed, and the occurrences `left_behind` names, answered on their own
  *  before, kept their own answer (C14). `call_pending`: saved, and Google is still making the video
- *  call asked for; `call_failed`: saved, but Google didn't make it (C18). */
+ *  call asked for; `call_failed`: saved, but Google didn't make it (C18). `links_left_behind`: put
+ *  on another calendar under a new identity, so a milestone or reminder to prepare linked to the
+ *  old one stayed with it (C18d). */
 export type WriteWarning =
   | "mirror_refresh_pending"
   | "left_on_old_series"
@@ -2026,7 +2034,8 @@ export type WriteWarning =
   | "partly_applied"
   | "kept_own_reply"
   | "call_pending"
-  | "call_failed";
+  | "call_failed"
+  | "links_left_behind";
 
 /** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
  *  change. */
@@ -2094,6 +2103,9 @@ export type WriteOutcome =
        *  that Google answered and that changed only the core fields, notifications or colour
        *  (C16a, C16d). Left out otherwise. */
       undo?: UndoOffer;
+      /** PM's id of the calendar the event is on now, when the save put it on another one (C18d):
+       *  from what Google holds, never from what the editor chose. Left out otherwise. */
+      calendar?: string;
     }
   | { outcome: "no_change" }
   /** Something must be chosen first; nothing was sent. `scope`: which occurrences (none was named,
@@ -2128,7 +2140,10 @@ export type WriteOutcome =
    *  first and sends it again, under the same id, only if Google still doesn't show it, so a
    *  second copy is very unlikely. PM's own token, never the event's id. */
   | { outcome: "ambiguous"; retry_token: string }
-  | { outcome: "failed"; message: string };
+  | { outcome: "failed"; message: string }
+  /** The other changes in a save landed and the calendar change didn't, for `message` (C18d): the
+   *  editor reads Google's copy again before anything more is sent. Only a save answers it. */
+  | { outcome: "not_moved"; message: string };
 
 /** A delete still waiting out its Undo window, for a webview that reloaded. */
 export interface HeldDeleteInfo {

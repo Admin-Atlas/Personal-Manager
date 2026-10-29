@@ -336,15 +336,17 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
  *  `notify_required`, the same table in both tests): null when nobody. A change to only busy or
  *  free, notifications or colour is the user's own and emails nobody. `omitted`: Google cut the list
  *  short, so "at least". `me`: the account saving, never a guest even where Google's copy doesn't
- *  mark it. The backend has the last word; this only lets the editor ask before a round trip. */
+ *  mark it. `calendarChanged`: the same Save puts it on another calendar, which tells its guests too
+ *  (C18d). The backend has the last word; this only lets the editor ask before a round trip. */
 export function guestNotice(
   base: EditorFields,
   draft: EditorFields,
   omitted: boolean,
   me: string | null = null,
+  calendarChanged = false,
 ): GuestNotice | null {
   const shared = changedFields(base, draft).some((f) => !PERSONAL.includes(f));
-  return changeNotice(base.guests, draft.guests, shared, omitted, me);
+  return changeNotice(base.guests, draft.guests, shared, omitted, me, calendarChanged);
 }
 
 /** Whether the editor may change `field` (the permission names match the fields). How it repeats

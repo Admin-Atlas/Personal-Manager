@@ -122,6 +122,10 @@ pub struct EventPatchDraft {
     /// carries it into the choice token's bind, so a token binds the very call asked for.
     #[serde(skip)]
     pub meet_request: Option<String>,
+    /// Another calendar of the same Google account to put the event on, by PM's calendar id (C18d).
+    /// `None`, or the event's own calendar, leaves it where it is. Never a body key: it goes after
+    /// the field changes, as a request of its own.
+    pub calendar: Option<String>,
 }
 
 /// Adding or removing a Google Meet call, as the editor's video-call row sends it. Only Meet: PM never
@@ -204,6 +208,19 @@ impl EventPatchDraft {
             || self.guests_can_modify.is_some()
             || self.guests_can_invite_others.is_some()
             || self.guests_can_see_other_guests.is_some()
+    }
+
+    /// Whether it changes anything about the event itself, beside the calendar it's on (C18d): a
+    /// Save of the calendar alone sends no PATCH. Every field but the calendar counts, a field added
+    /// later included; an empty guest list is no change, as everywhere.
+    pub fn names_fields(&self) -> bool {
+        let fields = EventPatchDraft {
+            calendar: None,
+            meet_request: None,
+            guests: self.guests.clone().filter(|ops| !ops.is_empty()),
+            ..self.clone()
+        };
+        fields != EventPatchDraft::default()
     }
 }
 
@@ -528,6 +545,9 @@ pub struct FieldPermissions {
     pub colour: bool,
     /// May add or remove a Google Meet call (C18).
     pub meet: bool,
+    /// May go to another calendar of the same account (C18d): the organiser's to change. The save
+    /// checks the calendar chosen.
+    pub calendar: bool,
     pub delete: bool,
     /// The user may reply (Yes, No, Maybe). Not part of [`Self::any`]: a reply isn't one of the
     /// editor's fields (C14).
@@ -558,6 +578,7 @@ impl FieldPermissions {
             || self.reminders
             || self.colour
             || self.meet
+            || self.calendar
             || self.delete
     }
 }
@@ -587,6 +608,11 @@ pub enum WriteOutcome {
         /// notifications and the colour). `None`, and left out, for every other write.
         #[serde(skip_serializing_if = "Option::is_none")]
         undo: Option<UndoOffer>,
+        /// PM's id of the calendar the event is on now, set only when the save put it on another
+        /// calendar (C18d), so the notice names where it went from what Google holds, never from
+        /// what the editor chose. `None`, and left out, for every other write.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        calendar: Option<String>,
     },
     /// Google already holds exactly this; nothing was sent.
     NoChange,
@@ -650,6 +676,11 @@ pub enum WriteOutcome {
     },
     /// The new part of a change PM couldn't finish was removed: the repeating event is as it was.
     SplitRemoved,
+    /// The other changes in this save landed, and the calendar change didn't, for `message` (C18d).
+    /// The editor reads Google's copy again before anything more is sent.
+    NotMoved {
+        message: String,
+    },
 }
 
 impl WriteOutcome {
@@ -759,6 +790,9 @@ pub enum WriteWarning {
     CallPending,
     /// Saved, but Google didn't make the video call asked for (C18).
     CallFailed,
+    /// On its new calendar Google gave the event a new identity, so PM's links to it (a milestone, a
+    /// reminder to prepare) stayed with the old one (C18d). Raised only when one does.
+    LinksLeftBehind,
 }
 
 /// What moving milestones to the new part of a "this and following" change needs (C9b-2). Dates
@@ -1063,16 +1097,30 @@ mod tests {
                 left_behind: Vec::new(),
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["mirror_refresh_pending"]}"#
         );
-        // The webview's `WriteWarning` names it so (C13 review round 1), and the video call's
-        // two (C18).
+        // C18d: a save that put the event on another calendar names it, by PM's id.
+        assert_eq!(
+            serde_json::to_string(&WriteOutcome::Saved {
+                warnings: Vec::new(),
+                left_behind: Vec::new(),
+                milestone_moves: None,
+                undo: None,
+                calendar: Some("cal-b".into()),
+            })
+            .unwrap(),
+            r#"{"outcome":"saved","warnings":[],"calendar":"cal-b"}"#
+        );
+        // The webview's `WriteWarning` names it so (C13 review round 1), the video call's two
+        // (C18), and links left with the old identity (C18d).
         for (warning, json) in [
             (WriteWarning::PartlyApplied, r#""partly_applied""#),
             (WriteWarning::CallPending, r#""call_pending""#),
             (WriteWarning::CallFailed, r#""call_failed""#),
+            (WriteWarning::LinksLeftBehind, r#""links_left_behind""#),
         ] {
             assert_eq!(serde_json::to_string(&warning).unwrap(), json);
         }
@@ -1082,6 +1130,7 @@ mod tests {
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["left_on_old_series"],"left_behind":["2026-11-02"]}"#
@@ -1093,6 +1142,7 @@ mod tests {
                 left_behind: vec!["2026-11-02".into()],
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["kept_own_reply"],"left_behind":["2026-11-02"]}"#
@@ -1161,6 +1211,13 @@ mod tests {
                 r#"{"outcome":"partial_split","token":"t","offers":["remove","check"],"from":"2026-11-02","emails":["remove"]}"#,
             ),
             (WriteOutcome::SplitRemoved, r#"{"outcome":"split_removed"}"#),
+            // C18d: the other changes saved, the calendar change not.
+            (
+                WriteOutcome::NotMoved {
+                    message: "x".into(),
+                },
+                r#"{"outcome":"not_moved","message":"x"}"#,
+            ),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),
             (WriteOutcome::Gone, r#"{"outcome":"gone"}"#),
             (WriteOutcome::Busy, r#"{"outcome":"busy"}"#),
@@ -1178,6 +1235,7 @@ mod tests {
                     left_behind: Vec::new(),
                     milestone_moves: None,
                     undo: None,
+                    calendar: None,
                 },
                 r#"{"outcome":"saved","warnings":["outside_mirror"]}"#,
             ),
@@ -1264,6 +1322,7 @@ mod tests {
                 left_behind: Vec::new(),
                 milestone_moves: Some(Box::new(moves.clone())),
                 undo: None,
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":[],"milestone_moves":{"new_series_ical":"tail@google.com","earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":"2026-10-19","earlier_last_day":"2026-10-12","today":"2026-10-13","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
@@ -1279,6 +1338,7 @@ mod tests {
                     ..moves
                 })),
                 undo: None,
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":["milestone_not_offered"],"milestone_moves":{"new_series_ical":null,"earlier_series_ical":"abc@google.com","new_title":"Gym","earlier_title":"Gym","first_day":null,"earlier_last_day":null,"today":"2026-10-13","milestones":[{"id":7,"label":"Launch","project":"Atlas","date":"2026-10-19"}]}}"#
@@ -1345,6 +1405,7 @@ mod tests {
                     undo_token: "u1".into(),
                     undo_seconds: 8,
                 }),
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":[],"undo":{"undo_token":"u1","undo_seconds":8}}"#
@@ -1355,6 +1416,7 @@ mod tests {
                 left_behind: Vec::new(),
                 milestone_moves: None,
                 undo: None,
+                calendar: None,
             })
             .unwrap(),
             r#"{"outcome":"saved","warnings":[]}"#
@@ -1539,6 +1601,42 @@ mod tests {
         );
     }
 
+    /// C18d: a draft names the calendar to put the event on by PM's id, and only a field beside it
+    /// is a field change: a Save of the calendar alone sends no PATCH.
+    #[test]
+    fn a_draft_names_a_calendar_and_counts_only_fields_beside_it() {
+        let only: EventPatchDraft = serde_json::from_str(r#"{"calendar":"cal-b"}"#).unwrap();
+        assert_eq!(only.calendar.as_deref(), Some("cal-b"));
+        assert!(!only.names_fields());
+        let untouched: EventPatchDraft = serde_json::from_str(r#"{"summary":"Gym"}"#).unwrap();
+        assert!(untouched.calendar.is_none());
+        assert!(untouched.names_fields());
+        // An empty guest list is no change; a call's request id alone is none either (the backend's).
+        let empty = EventPatchDraft {
+            calendar: Some("cal-b".into()),
+            guests: Some(Vec::new()),
+            meet_request: Some("r".into()),
+            ..Default::default()
+        };
+        assert!(!empty.names_fields());
+        for with in [
+            EventPatchDraft {
+                meet: Some(MeetChange::Add),
+                ..only.clone()
+            },
+            EventPatchDraft {
+                colour: Some(ColourDraft::Calendar),
+                ..only.clone()
+            },
+            EventPatchDraft {
+                guests_can_modify: Some(true),
+                ..only.clone()
+            },
+        ] {
+            assert!(with.names_fields());
+        }
+    }
+
     /// C18: a draft names a call change as the editor's row sends it, and never the request's id: the
     /// webview can't set it (R5), so a JSON that names one deserialises without it.
     #[test]
@@ -1717,6 +1815,11 @@ mod tests {
             // The video call, alone (C18).
             FieldPermissions {
                 meet: true,
+                ..Default::default()
+            },
+            // The calendar, alone (C18d).
+            FieldPermissions {
+                calendar: true,
                 ..Default::default()
             },
         ] {

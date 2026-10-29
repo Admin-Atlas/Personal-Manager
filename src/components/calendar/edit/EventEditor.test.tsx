@@ -12,7 +12,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   Calendar,
+  CalendarAccount,
   CalendarEvent,
+  CalendarOverview,
   EditLoad,
   EventForEdit,
   EventPatchDraft,
@@ -114,7 +116,8 @@ vi.mock("../../../lib/markdown", () => ({
 }));
 
 import { EventEditor, UNREADABLE_REPEAT } from "./EventEditor";
-import { A11_NOTE, savedNotice } from "../../../lib/calendarEdit/editReasons";
+import { A11_NOTE, CALENDAR_ALONE, savedNotice } from "../../../lib/calendarEdit/editReasons";
+import { createTargets } from "../../../lib/calendarEdit/createTargets";
 
 /** What the user may change on someone else's event whose copy can reply (C14c). */
 const YOURS_WITH_REPLY = "Your reply, notifications, colour and busy or free are yours to change.";
@@ -144,10 +147,20 @@ const ALL: FieldPermissions = {
   reminders: true,
   colour: true,
   meet: true,
+  calendar: true,
   delete: true,
   respond: false,
   reasons: [],
 };
+
+/** No calendars to choose from (C18d): the editor keeps its "Saving to …" line unless a test gives
+ *  it some. */
+const NO_CALENDARS = {
+  targets: null,
+  overview: null,
+  hidden: new Set<string>(),
+  shapeOf: () => undefined,
+} as const;
 
 function event(over: Partial<EventForEdit> = {}): EventForEdit {
   return {
@@ -217,6 +230,7 @@ async function open(
       suggestions={NO_SUGGESTIONS}
       milestone={null}
       colorOf={colourOf}
+      {...NO_CALENDARS}
       onClose={onClose}
       onDelete={onDelete}
     />,
@@ -330,6 +344,7 @@ describe("EventEditor", () => {
       false,
       false,
       { rowId: row.id, sent: null },
+      null,
     );
     expect(choicesForEdit).not.toHaveBeenCalled();
   });
@@ -353,6 +368,7 @@ describe("EventEditor", () => {
       false,
       false,
       { rowId: row.id, sent: null },
+      null,
     );
   });
 
@@ -388,10 +404,16 @@ describe("EventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveEdit).toHaveBeenCalledWith("s1", { meet: "add" }, ...UNSCOPED);
-    expect(noteSaved).toHaveBeenCalledWith("Dentist", outcome, null, "2026-10-12", false, false, {
-      rowId: row.id,
-      sent: null,
-    });
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Dentist",
+      outcome,
+      null,
+      "2026-10-12",
+      false,
+      false,
+      { rowId: row.id, sent: null },
+      null,
+    );
     expect(savedNotice("Dentist", outcome, null).text).toBe(
       "Saved “Dentist”. Google is still making the video call; its link shows after a later refresh.",
     );
@@ -609,6 +631,7 @@ describe("EventEditor", () => {
         suggestions={NO_SUGGESTIONS}
         milestone={null}
         colorOf={colourOf}
+        {...NO_CALENDARS}
         onClose={vi.fn()}
         onDelete={onDelete}
         onDuplicate={onDuplicate}
@@ -643,6 +666,7 @@ describe("EventEditor", () => {
         suggestions={NO_SUGGESTIONS}
         milestone={null}
         colorOf={colourOf}
+        {...NO_CALENDARS}
         onClose={vi.fn()}
         onDuplicate={onDuplicate}
         canDuplicate={canDuplicate}
@@ -1072,6 +1096,7 @@ describe("EventEditor", () => {
         suggestions={NO_SUGGESTIONS}
         milestone={null}
         colorOf={colourOf}
+        {...NO_CALENDARS}
         onClose={() => {}}
       />,
     );
@@ -1141,6 +1166,7 @@ describe("EventEditor, a repeating event", () => {
       false,
       false,
       { rowId: occurrence.id, sent: null },
+      null,
     );
   });
 
@@ -1167,6 +1193,7 @@ describe("EventEditor, a repeating event", () => {
       false,
       true,
       { rowId: occurrence.id, sent: null },
+      null,
     );
   });
 
@@ -1731,6 +1758,7 @@ describe("EventEditor, how it repeats", () => {
       true,
       false,
       expect.objectContaining({ sent: null }),
+      null,
     );
   });
 
@@ -2083,6 +2111,7 @@ describe("EventEditor, a linked milestone", () => {
       suggestions={NO_SUGGESTIONS}
       milestone={launch}
       colorOf={colourOf}
+      {...NO_CALENDARS}
       onClose={() => {}}
     />
   );
@@ -2869,7 +2898,7 @@ describe("EventEditor, an invitation", () => {
   };
   const saved: SaveAnswer = { outcome: "saved", warnings: [] };
   const theirsLine =
-    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call.";
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar.";
   /** What the guest list says of the user's own entry. */
   const myEntry = () =>
     within(screen.getByRole("list", { name: "Guests" }))
@@ -3112,5 +3141,290 @@ describe("EventEditor, an invitation", () => {
       emails: 2,
       complete: true,
     });
+  });
+});
+
+// C18d (§10): the Calendar row, on an event you organise on a calendar you own: the other
+// calendars you own on its account, sent with the rest in one Save.
+describe("EventEditor, its calendar", () => {
+  const ME = "gcal:me@x.com";
+  const WORK = "gcal:work@x.com";
+  const account = (id: string): CalendarAccount => {
+    const email = id.slice(id.indexOf(":") + 1);
+    return { id, provider: "google", email, label: email, state: "ok", last_synced_at: null };
+  };
+  const cal = (source: string, remote: string, over: Partial<Calendar> = {}): Calendar => ({
+    id: `${source}:${remote}`,
+    source_id: source,
+    provider: "google",
+    remote_id: remote,
+    name: remote,
+    color: null,
+    selected: true,
+    is_primary: false,
+    quiet: false,
+    kind: null,
+    access_role: "owner",
+    time_zone: "Europe/London",
+    default_reminders: [],
+    conference_types: [],
+    data_owner: null,
+    ...over,
+  });
+  // The row's own calendar is Personal (`row.calendar_id`).
+  const PERSONAL = cal(ME, "me@x.com", { name: "Personal", is_primary: true });
+  const SIDE = cal(ME, "side", { name: "Side" });
+  const QUIET = cal(ME, "quiet", { name: "Quiet" });
+  const SHARED = cal(ME, "shared", { name: "Shared", access_role: "writer" });
+  const WORK_CAL = cal(WORK, "work@x.com", { name: "Work", is_primary: true });
+  const overviewOf = (accounts: string[], calendars: Calendar[]): CalendarOverview => ({
+    google_client_configured: true,
+    microsoft_client_configured: false,
+    accounts: accounts.map(account),
+    calendars,
+    last_sync: null,
+    window_days: 7,
+    mirror_start: "2026-09-01T00:00:00Z",
+    mirror_end: "2027-11-01T00:00:00Z",
+    editing: Object.fromEntries(accounts.map((a) => [a, "on" as const])),
+    default_length: {},
+    auto_meet: {},
+  });
+  const BOTH = overviewOf([ME, WORK], [PERSONAL, SIDE, QUIET, SHARED, WORK_CAL]);
+  const saved: WriteOutcome = { outcome: "saved", warnings: [], calendar: SIDE.id };
+
+  /** Open `ev` with `permissions` on `on` (Personal unless said), the calendars of `overview`, Quiet
+   *  hidden in the calendar list. */
+  async function openOn(
+    ev = event(),
+    permissions = ALL,
+    overview = BOTH,
+    on: Calendar = PERSONAL,
+    onClose = vi.fn(),
+  ) {
+    openForEdit.mockResolvedValue(ready(ev, permissions));
+    render(
+      <EventEditor
+        row={{ ...row, calendar_id: on.id }}
+        calendar={on}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        targets={createTargets(overview)}
+        overview={overview}
+        hidden={new Set([QUIET.id])}
+        shapeOf={() => undefined}
+        onClose={onClose}
+      />,
+    );
+    await screen.findByLabelText("Title");
+    return onClose;
+  }
+
+  const trigger = (name: string) =>
+    screen.getByRole<HTMLButtonElement>("button", { name: `Calendar: ${name}` });
+  /** Pick `to` from the list `from` opens: by its name, a hidden one's mark after it. */
+  function pick(from: string, to: string) {
+    fireEvent.click(trigger(from));
+    const list = screen.getByRole("group", { name: "Calendars this event can go on" });
+    const name = new RegExp(`^${to}(hidden)?$`);
+    fireEvent.click(within(list).getByRole("radio", { name }), { detail: 1 });
+  }
+  const DUPLICATE_WORDS =
+    "Only calendars you own on me@x.com are listed. To put it on another account's calendar, duplicate it there, then delete this one.";
+
+  it("an event you organise shows a Calendar row with the calendars it owns on its account, and the Duplicate words", async () => {
+    await openOn();
+    // The row says where it is: no "Saving to" line beside it.
+    expect(screen.queryByText(/^Saving to /)).toBeNull();
+    expect(screen.getByText(DUPLICATE_WORDS)).toBeTruthy();
+    fireEvent.click(trigger("Personal"));
+    const list = within(screen.getByRole("group", { name: "Calendars this event can go on" }));
+    expect(list.getAllByRole("radio").map((r) => r.closest("label")?.textContent)).toEqual([
+      "Personal",
+      "Quiethidden",
+      "Side",
+    ]);
+    expect(list.queryByRole("radio", { name: "Shared" })).toBeNull();
+    expect(list.queryByRole("radio", { name: "Work" })).toBeNull();
+    cleanup();
+    // With no other account to take events, no Duplicate sentence.
+    await openOn(event(), ALL, overviewOf([ME], [PERSONAL, SIDE]));
+    expect(screen.getByText("Only calendars you own on me@x.com are listed.")).toBeTruthy();
+    expect(screen.queryByText(/duplicate it there/)).toBeNull();
+  });
+
+  it("an invitation, a locked event, a calendar you can only edit, or nowhere else to go keeps the subtitle", async () => {
+    const locked: FieldPermissions = { ...ALL, calendar: false, reasons: ["locked"] };
+    const cases: [FieldPermissions, CalendarOverview, Calendar, string][] = [
+      [locked, BOTH, PERSONAL, "Saving to Personal · me@x.com"],
+      [ALL, BOTH, SHARED, "Saving to Shared · me@x.com"],
+      [ALL, overviewOf([ME], [PERSONAL]), PERSONAL, "Saving to Personal · me@x.com"],
+    ];
+    for (const [permissions, overview, on, subtitle] of cases) {
+      await openOn(event(), permissions, overview, on);
+      expect(screen.queryByRole("button", { name: /^Calendar: / })).toBeNull();
+      expect(screen.getByText(subtitle)).toBeTruthy();
+      cleanup();
+    }
+  });
+
+  it("choosing another calendar makes Save send it, alone or with a title", async () => {
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    expect(trigger("Side")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { calendar: SIDE.id }, ...UNSCOPED);
+    // The notice names where it went, from the backend's answer, and where it was.
+    expect(noteSaved).toHaveBeenLastCalledWith(
+      "Dentist",
+      saved,
+      null,
+      "2026-10-12",
+      false,
+      false,
+      { rowId: row.id, sent: null },
+      { to: "Side", from: "Personal" },
+    );
+    cleanup();
+    const again = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(again).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s1",
+      { summary: "Retro", calendar: SIDE.id },
+      null,
+      "Retro",
+      null,
+      null,
+    );
+    cleanup();
+    // Chosen, then put back: nothing to send.
+    const back = await openOn();
+    pick("Personal", "Side");
+    pick("Side", "Personal");
+    saveEdit.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(back).toHaveBeenCalled());
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("a calendar chosen counts as a change: closing asks first", async () => {
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+  });
+
+  it("a hidden calendar says so", async () => {
+    await openOn();
+    expect(screen.queryByText(/is hidden in your calendar list/)).toBeNull();
+    pick("Personal", "Quiet");
+    expect(
+      screen.getByText(
+        "Quiet is hidden in your calendar list, so the event won't show until you show that calendar again.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("a guest's event asks once, the calendar change counted", async () => {
+    const me: GuestForEdit = {
+      email: "me@x.com",
+      name: null,
+      response: "accepted",
+      optional: false,
+      organizer: true,
+      self: true,
+      room: false,
+    };
+    const ann: GuestForEdit = {
+      ...me,
+      email: "ann@x.org",
+      name: "Ann",
+      organizer: false,
+      self: false,
+    };
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await openOn(event({ guests: [me, ann] }));
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    expect(within(prompt).getByText("1 guest already invited will get an update.")).toBeTruthy();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s1",
+      { summary: "Retro", calendar: SIDE.id },
+      null,
+      "Retro",
+      "all",
+      {
+        updated: 1,
+        invited: 0,
+        removed: 0,
+        told_cancelled: 0,
+        cancelled: false,
+        people: 1,
+        emails: 2,
+        complete: true,
+      },
+    );
+  });
+
+  it("not moved reloads Google's copy, says why, and keeps the calendar chosen", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    // Google's copy now: the title saved, under a new session.
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(
+        "Your other changes are saved, but it's still on Personal. Google is busy right now.",
+      ),
+    ).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(trigger("Side")).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    // Save tries the calendar again, alone, on the new session.
+    saveEdit.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { calendar: SIDE.id },
+      null,
+      "Retro",
+      null,
+      null,
+    );
+  });
+
+  it("a new repeat and another calendar go one at a time", async () => {
+    await openOn();
+    const repeat = () => screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / });
+    pick("Personal", "Side");
+    // Another calendar holds the repeat, saying why.
+    expect(repeat().disabled).toBe(true);
+    expect(screen.getByText(CALENDAR_ALONE)).toBeTruthy();
+    pick("Side", "Personal");
+    expect(repeat().disabled).toBe(false);
+    expect(screen.queryByText(CALENDAR_ALONE)).toBeNull();
+    // A new repeat holds the calendar, saying why under it.
+    await act(async () => {});
+    fireEvent.click(repeat());
+    const list = screen.getByRole("group", { name: "Repeat" });
+    fireEvent.click(within(list).getByRole("radio", { name: "Daily" }), { detail: 1 });
+    await act(async () => {});
+    expect(trigger("Personal").disabled).toBe(true);
+    expect(screen.getByText(CALENDAR_ALONE)).toBeTruthy();
   });
 });

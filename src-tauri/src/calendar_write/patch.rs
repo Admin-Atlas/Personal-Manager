@@ -1167,6 +1167,8 @@ mod tests {
             colour: Some(ColourDraft::Colour { id: "9".into() }),
             meet: Some(MeetChange::Add),
             meet_request: Some("r1".into()),
+            // Never a body key: it goes as a request of its own (C18d).
+            calendar: Some("cal-b".into()),
         };
         let body = build_patch(&unlabelled(), &draft).unwrap();
         for key in body.keys() {

@@ -440,6 +440,29 @@ impl Reach {
         }
     }
 
+    /// Putting `event` (Google's copy) on another calendar (C18d), after `body` is PATCHed onto it
+    /// in the same Save (empty when it changes nothing else): Google's `sendUpdates` on that request
+    /// is "about the change of the event's organizer", so everyone on it then, but the user and
+    /// rooms, counts as told of a change. Whether Google emails anyone at all is live probe L-T2; if
+    /// it never does, this becomes [`Reach::nobody`] and the question goes away.
+    pub fn of_transfer(event: &Value, body: &Map<String, Value>, own: &Own) -> Reach {
+        let was = recipients(event.get("attendees"), own);
+        let told = match body.get("attendees") {
+            Some(list) => recipients(Some(list), own),
+            None => was.clone(),
+        };
+        Reach {
+            emails: count(told.len()),
+            reached: told,
+            was,
+            removed: BTreeSet::new(),
+            only_cancelled: BTreeSet::new(),
+            complete: !omitted(event),
+            cancelled: false,
+            shared: true,
+        }
+    }
+
     /// A new event whose body is `body`: everyone on it is invited.
     pub fn of_insert(body: &Map<String, Value>, own: &Own) -> Reach {
         let everyone = recipients(body.get("attendees"), own);
@@ -1291,5 +1314,51 @@ mod tests {
         // A room the mirror's flag misses is still a room by its address.
         let unflagged = json!({ "email": "room2@resource.calendar.google.com" });
         assert!(!reaches_anyone(&event(&[me(), unflagged]), &Own::default()));
+    }
+
+    /// C18d (§8.8): putting an event on another calendar tells everyone on it but the user and
+    /// rooms; in the same Save as a PATCH, each guest hears of both, and the guest list it goes with
+    /// is the one the PATCH leaves. The editor counts the same rows (guests.test.ts).
+    #[test]
+    fn a_transfer_reaches_every_guest_but_the_user_and_rooms() {
+        let own = Own::default();
+        let none = Map::new();
+        let solo = Reach::of_transfer(&event(&[me(), room()]), &none, &own);
+        assert!(solo.notice().is_none(), "nobody but the user and a room");
+        let two = event(&[me(), a(), b_guest(), room()]);
+        assert!(Reach::of_transfer(&two, &none, &own).notice() == Some(notice(2, 0, 0)));
+        // A title and the calendar in one Save: the same two people, an email each for both.
+        let both = Reach::of_patch(&two, &title(), &own)
+            .merge(Reach::of_transfer(&two, &title(), &own))
+            .notice();
+        assert!(
+            both == Some(GuestNotice {
+                emails: 4,
+                ..notice(2, 0, 0)
+            }),
+            "two people, four emails"
+        );
+        // A guest added in the same Save is on the event when it goes: invited, then told.
+        let added = body(json!({ "attendees": [me(), a(), { "email": "c@x.org" }] }));
+        let with_new = Reach::of_patch(&event(&[me(), a()]), &added, &own)
+            .merge(Reach::of_transfer(&event(&[me(), a()]), &added, &own))
+            .notice();
+        assert!(
+            with_new
+                == Some(GuestNotice {
+                    emails: 4,
+                    ..notice(1, 1, 0)
+                }),
+            "one updated, one invited, two emails each"
+        );
+        // A list Google cut short: "at least".
+        let mut cut = event(&[me(), a()]);
+        cut["attendeesOmitted"] = json!(true);
+        assert!(
+            Reach::of_transfer(&cut, &none, &own)
+                .notice()
+                .is_some_and(|n| !n.complete),
+            "a list cut short is never whole"
+        );
     }
 }

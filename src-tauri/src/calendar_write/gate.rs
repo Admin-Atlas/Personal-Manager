@@ -19,7 +19,8 @@
 //! every occurrence with no choice asked.
 //!
 //! A video call is Meet only, where the calendar offers it, and the organiser's to add or remove;
-//! another service's call is shown and kept (C18).
+//! another service's call is shown and kept (C18). The calendar is the organiser's to change too, to
+//! another of the same account; a locked event keeps its own (C18d).
 
 use crate::calendar_editing::EditingStatus;
 
@@ -89,6 +90,8 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         // C1-M1, C2-L14). A lock isn't Google's on the call.
         meet: matches!(facts.call, None | Some(CallKind::Meet))
             && (facts.meet_offered || facts.call == Some(CallKind::Meet)),
+        // Another calendar of the same account (C18d): the save checks the one chosen.
+        calendar: true,
         delete: true,
         // A lock is Google's on the shared fields: a reply isn't among them.
         respond,
@@ -120,6 +123,9 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         // A call is the organiser's, whatever they let guests change: one made on a guest's copy
         // would be a call nobody else sees (A11; C18 §0.5 row 7). The reason above names it.
         perms.meet = false;
+        // So is its calendar: Google puts an event on another calendar from its organiser's copy
+        // (C18d). The reason above names it too.
+        perms.calendar = false;
     } else if matches!(facts.call, Some(CallKind::AddOn | CallKind::Other)) {
         // Shown and kept: Google's rule for a kind the client doesn't make (C18). On someone else's
         // event the organiser's reason already says the call is theirs.
@@ -128,14 +134,17 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
     if facts.locked {
         // Google refuses changes to a locked copy's summary, description, location, start, end and
         // recurrence. Whether it lets the copy be deleted, or its guests change, isn't documented,
-        // so PM offers neither (INFERRED: fails closed, C12 §4.4). Its notifications and colour
-        // aren't among them, so they stay open (the editing plan's C6 card, from C13).
+        // so PM offers neither (INFERRED: fails closed, C12 §4.4). Whether it can go to another
+        // calendar isn't documented either, so it stays on its own (C18d, §0.5 row 11). Its
+        // notifications and colour aren't among them, so they stay open (the editing plan's C6 card,
+        // from C13).
         perms.summary = false;
         perms.time = false;
         perms.repeat = false;
         perms.location = false;
         perms.description = false;
         perms.guests = false;
+        perms.calendar = false;
         perms.delete = false;
         perms.reasons.push(ReadOnlyReason::Locked);
     }
@@ -189,6 +198,8 @@ pub enum Field {
     Colour,
     /// The video call (C18).
     Meet,
+    /// The calendar it's on (C18d).
+    Calendar,
     Delete,
 }
 
@@ -595,6 +606,8 @@ mod tests {
         assert!(!perms.delete);
         // Google locks the rule with the start.
         assert!(!perms.repeat);
+        // Undocumented, so it keeps its calendar (C18d).
+        assert!(!perms.calendar);
         // Not among Google's locked fields, but undocumented, so closed (C12 §4.4).
         assert!(!perms.guests);
         assert!(perms.show_as && perms.visibility);
@@ -1003,6 +1016,8 @@ mod tests {
             assert_eq!(p.repeat, repeat, "{row}: how it repeats");
             // The call is the organiser's as how it repeats is, and these rows lock neither (C18).
             assert_eq!(p.meet, repeat, "{row}: video call");
+            // So is the calendar, and a lock closes both (C18d).
+            assert_eq!(p.calendar, repeat, "{row}: calendar");
             assert_eq!(p.guests, guests, "{row}: guests");
             assert_eq!(p.delete, delete, "{row}: delete");
             assert_eq!(p.respond, respond, "{row}: reply");
@@ -1210,5 +1225,108 @@ mod tests {
             ..editable()
         });
         assert!(only.meet);
+    }
+
+    /// C18d: who may put an event on another calendar, and why not (§3.3): the organiser, on a
+    /// calendar they can edit; never a locked event, someone else's (whatever they let guests
+    /// change) or a special kind. A refusal names the organiser's reason, never the guest list's.
+    #[test]
+    fn the_calendar_row_table() {
+        let rows: Vec<(&str, EditFacts, bool, Vec<ReadOnlyReason>)> = vec![
+            ("T1", editable(), true, vec![]),
+            (
+                "T2",
+                EditFacts {
+                    locked: true,
+                    ..editable()
+                },
+                false,
+                vec![Locked],
+            ),
+            ("T3", invitation(), false, vec![NotOrganizer]),
+            (
+                "T4",
+                EditFacts {
+                    guests_can_modify: true,
+                    ..invitation()
+                },
+                false,
+                vec![OrganizerOnlyGuests],
+            ),
+            (
+                "T5",
+                EditFacts {
+                    event_type: Some("birthday"),
+                    ..editable()
+                },
+                false,
+                vec![SpecialType],
+            ),
+            (
+                "T6",
+                EditFacts {
+                    editing: EditingStatus::Off,
+                    ..editable()
+                },
+                false,
+                vec![EditingOff],
+            ),
+            (
+                "T7",
+                EditFacts {
+                    access_role: Some("writerWithoutPrivateAccess"),
+                    ..editable()
+                },
+                true,
+                vec![],
+            ),
+            (
+                "T8",
+                EditFacts {
+                    access_role: Some("reader"),
+                    ..editable()
+                },
+                false,
+                vec![CalendarReadOnly],
+            ),
+        ];
+        for (row, facts, calendar, reasons) in rows {
+            let p = edit_rights(&facts);
+            assert_eq!(p.calendar, calendar, "{row}: the calendar");
+            assert_eq!(p.reasons, reasons, "{row}: reasons");
+        }
+        // The calendar alone is something the editor can change.
+        assert!(FieldPermissions {
+            calendar: true,
+            ..Default::default()
+        }
+        .any());
+        let rights = |facts: EditFacts| edit_rights(&facts);
+        assert_eq!(
+            reason_for(
+                &rights(EditFacts {
+                    locked: true,
+                    ..editable()
+                }),
+                Field::Calendar
+            ),
+            Locked
+        );
+        assert_eq!(
+            reason_for(&rights(invitation()), Field::Calendar),
+            NotOrganizer
+        );
+        // "Modify" lets guests change the event, never its calendar: the organiser's words, which
+        // name it, not the guest list's.
+        assert_eq!(
+            reason_for(
+                &rights(EditFacts {
+                    guests_can_modify: true,
+                    ..invitation()
+                }),
+                Field::Calendar
+            ),
+            NotOrganizer
+        );
     }
 }

@@ -1439,6 +1439,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               : null
           }
           colorOf={colorOf}
+          targets={targets}
+          overview={overview}
+          hidden={hidden}
+          shapeOf={shapeOf}
           onDelete={(row) => {
             // Close the editor first so its focus goes back to the event's chip, and the delete
             // dialog that opens next returns it there too.

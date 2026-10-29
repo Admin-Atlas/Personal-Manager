@@ -579,6 +579,7 @@ describe("CalendarView: guests", () => {
         reminders: true,
         colour: true,
         meet: false,
+        calendar: true,
         delete: true,
         respond: false,
         reasons: [],
@@ -711,7 +712,7 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call. Your reply, notifications, colour and busy or free are yours to change.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar. Your reply, notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
     expect(screen.getByRole("group", { name: "Going?" })).toBeTruthy();
@@ -744,7 +745,7 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests and video call. Your notifications, colour and busy or free are yours to change.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar. Your notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
   });
@@ -759,7 +760,9 @@ describe("CalendarView: invitations", () => {
     const groups = screen.getAllByRole("group", { name: /^Going\?/ });
     expect(groups[0]).toBe(screen.getByRole("group", { name: "Going? Replying for Work." }));
     expect(
-      screen.getByText("Google has locked this event's title, time, place and description."),
+      screen.getByText(
+        "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.",
+      ),
     ).toBeTruthy();
     // An invitation still wins over a copy that can't be changed at all.
     cleanup();
@@ -1002,6 +1005,7 @@ describe("CalendarView: Duplicate", () => {
       reminders: true,
       colour: true,
       meet: true,
+      calendar: true,
       delete: true,
       respond: false,
       reasons: [],
