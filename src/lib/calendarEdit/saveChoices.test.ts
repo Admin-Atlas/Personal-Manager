@@ -264,6 +264,7 @@ describe("a row Google changed since the editor opened", () => {
 describe("the warnings", () => {
   const every: SeriesWarning[] = [
     dayMove("every Sunday", "every Monday", 1),
+    { warning: "changes_calendar", to: "Work" },
     { warning: "becomes_one_event", day: "2026-10-05" },
     { warning: "start_moved", from: "2026-10-05", to: "2026-10-06" },
     { warning: "changes_lost", count: 2 },
@@ -284,7 +285,7 @@ describe("the warnings", () => {
         }
       }
     }
-    expect(seriesWarningText(every[2], "save", "all", "Gym")).toBe(
+    expect(seriesWarningText(every[3], "save", "all", "Gym")).toBe(
       "The first occurrence of “Gym” moves from 05-10 to 06-10.",
     );
     expect(seriesWarningText({ warning: "length_changes" }, "save", "following", "Gym")).toBe(
@@ -344,6 +345,17 @@ describe("the warnings", () => {
     expect(sibling("delete")).toMatch(
       /earlier “this and following” change\. Google may delete that part too\.$/,
     );
+  });
+
+  it("says where every occurrence goes when the calendar changes (C18e)", () => {
+    expect(
+      seriesWarningText(
+        { warning: "changes_calendar", to: "PM write test 2" },
+        "save",
+        "all",
+        "Gym",
+      ),
+    ).toBe("Every occurrence goes to PM write test 2.");
   });
 
   it("puts the question first, then the rest in a fixed order", () => {

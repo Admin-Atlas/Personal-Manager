@@ -1987,7 +1987,9 @@ export type SeriesWarning =
   /** It stops repeating: only the occurrence on `day` stays, as an event of its own. */
   | { warning: "becomes_one_event"; day: string }
   /** This many occurrences changed on their own fall on days a new repeat skips: their changes go. */
-  | { warning: "changes_lost"; count: number };
+  | { warning: "changes_lost"; count: number }
+  /** Every occurrence goes to the calendar PM calls `to` (C18e). */
+  | { warning: "changes_calendar"; to: string };
 
 /** One of "This event", "This and following" and "All events". `token` names the plan in the save;
  *  `guests`, who Google would email with Send, left out when nobody (C12). */

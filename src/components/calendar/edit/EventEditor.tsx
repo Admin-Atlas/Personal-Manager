@@ -63,7 +63,9 @@
 // lists them; another account's is Duplicate's (Q13). One Save sends the other changes first, then
 // the calendar, with one email question for both. Saved, the notice says where it is now; if the
 // other changes landed and the calendar didn't, the editor reloads Google's copy, says why, and
-// keeps the calendar chosen, so Save tries it alone. A new repeat goes in a Save of its own.
+// keeps the calendar chosen, so Save tries it alone. A new repeat goes in a Save of its own. A
+// repeating event goes whole (C18e): the choices offer "All events" only, and the line under the row
+// says so.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -124,6 +126,7 @@ import {
   A11_NOTE,
   ambiguousText,
   CALENDAR_ALONE,
+  CALENDAR_WHOLE,
   calendarRowText,
   CALLOUT_TONE,
   earlierChangeText,
@@ -1045,6 +1048,8 @@ export function EventEditor({
         `${where.name} is hidden in your calendar list, so the event won't show until you show that calendar again.`,
       );
     }
+    // A repeating event goes whole (C18e): the choices then offer "All events" only.
+    if (calendarMoved && repeating) calendarLines.push(CALENDAR_WHOLE);
     if (repeatChanged) calendarLines.push(CALENDAR_ALONE);
   }
 

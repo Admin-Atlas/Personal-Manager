@@ -1032,6 +1032,8 @@ pub enum SeriesWarningDto {
     BecomesOneEvent { day: String },
     /// This many occurrences changed on their own fall on days the new rule skips: their changes go.
     ChangesLost { count: u32 },
+    /// Every occurrence goes to the calendar PM calls `to` (C18e).
+    ChangesCalendar { to: String },
 }
 
 #[cfg(test)]
@@ -1571,6 +1573,11 @@ mod tests {
             (
                 SeriesWarningDto::ChangesLost { count: 2 },
                 r#"{"warning":"changes_lost","count":2}"#,
+            ),
+            // C18e: where every occurrence goes.
+            (
+                SeriesWarningDto::ChangesCalendar { to: "Work".into() },
+                r#"{"warning":"changes_calendar","to":"Work"}"#,
             ),
         ] {
             assert_eq!(serde_json::to_string(&warning).unwrap(), json);

@@ -662,6 +662,15 @@ pub enum SeriesRefusal {
     /// new part never carries a call (DECISIONS 17-10 #3), so it is "This event" or "All events"
     /// (C18 Q4).
     CallFollowing,
+    /// Another calendar for one occurrence: a repeating event goes there whole (C18e).
+    CalendarIsSeriesWide,
+    /// Another calendar from an occurrence past the first on: PM doesn't cut a repeating event
+    /// across two calendars (C18 Q2).
+    CalendarFollowing,
+    /// Another calendar for a repeating event that is one part of a "this and following" change
+    /// (PM's or Google's), or has a part split off it: the other part would stay behind, out of
+    /// reach of the checks such a change relies on, each on one calendar (C18 critique C1-H2).
+    TransferSplit,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -830,6 +839,23 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "PM adds or removes a video call on this occurrence or on all of them, not on this \
                  one and the ones after it."
+            ),
+            SeriesRefusal::CalendarIsSeriesWide => write!(
+                f,
+                "Changing the calendar can't apply to just this occurrence: the whole repeating \
+                 event goes to the other calendar."
+            ),
+            SeriesRefusal::CalendarFollowing => write!(
+                f,
+                "PM puts a whole repeating event on another calendar, not this one and the ones \
+                 after it."
+            ),
+            // C18 critique C1-H3(b): C9's own phrasing, true of a part Google made too.
+            SeriesRefusal::TransferSplit => write!(
+                f,
+                "An earlier “this and following” change made a new part of this repeating event, \
+                 so PM keeps it on this calendar: the other part would be left behind. Change it \
+                 in Google Calendar."
             ),
         }
     }
@@ -1233,6 +1259,8 @@ pub(crate) mod fixtures {
         pub instances: Option<Listing>,
         pub sibling: bool,
         pub later: LaterPart,
+        /// The name of the calendar a calendar change goes to (C18e).
+        pub calendar_to: Option<String>,
     }
 
     impl Case {
@@ -1246,6 +1274,7 @@ pub(crate) mod fixtures {
                 instances: None,
                 sibling: false,
                 later: LaterPart::None,
+                calendar_to: None,
             }
         }
 
@@ -1270,6 +1299,7 @@ pub(crate) mod fixtures {
                 sibling: self.sibling,
                 later: self.later,
                 me: CALENDAR,
+                calendar_to: self.calendar_to.as_deref(),
             }
         }
 

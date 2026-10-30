@@ -22,6 +22,7 @@ import type {
 import {
   A11_NOTE,
   CALENDAR_ALONE,
+  CALENDAR_WHOLE,
   calendarRowText,
   CALLOUT_TONE,
   CREATE_CHANGED,
@@ -468,6 +469,28 @@ describe("another calendar (C18d)", () => {
     );
   });
 
+  it("says every occurrence of a repeating event is there now (C18e)", () => {
+    const outcome: Extract<WriteOutcome, { outcome: "saved" }> = {
+      outcome: "saved",
+      warnings: ["mirror_refresh_pending"],
+      calendar: "gcal:me@x.com:work",
+    };
+    // "All events", and "This and following" from the first occurrence, which saved every one.
+    for (const [scope, asAll] of [
+      ["all", false],
+      ["following", true],
+    ] as const) {
+      expect(savedNotice("Gym", outcome, scope, "2026-10-19", false, asAll, null, moved)).toEqual({
+        tone: "ok",
+        text: `Every occurrence of “Gym” is now on Work. ${writeWarningText("mirror_refresh_pending", "save")} To put it back, open it and choose Home.`,
+      });
+    }
+    // Saved for every occurrence on its own calendar: as before.
+    expect(savedNotice("Gym", { outcome: "saved", warnings: [] }, "all").text).toBe(
+      "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    );
+  });
+
   it("says a save whose calendar change didn't land kept the rest, and why", () => {
     expect(notMovedText("Google is busy right now.", "Home")).toBe(
       "Your other changes are saved, but it's still on Home. Google is busy right now.",
@@ -494,6 +517,8 @@ describe("another calendar (C18d)", () => {
       "Only calendars you own on me@x.com are listed. To put it on another account's calendar, duplicate it there, then delete this one.",
     );
     expect(CALENDAR_ALONE).toBe("Change the calendar on its own, then how it repeats.");
+    // A repeating event goes whole (C18e), never claimed as what Google does with each occurrence.
+    expect(CALENDAR_WHOLE).toBe("Changing the calendar is for the whole repeating event.");
     // A lock keeps it on its calendar, and says so; someone else's names the calendar as theirs.
     expect(reasonText("locked")).toBe(
       "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.",
@@ -503,6 +528,7 @@ describe("another calendar (C18d)", () => {
     for (const line of [
       calendarRowText("me@x.com", true),
       CALENDAR_ALONE,
+      CALENDAR_WHOLE,
       notMovedText("x.", "Home"),
       writeWarningText("links_left_behind", "save", undefined, "Work"),
     ]) {

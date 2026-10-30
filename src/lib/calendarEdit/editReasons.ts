@@ -560,6 +560,11 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
  *  two together in the same words. */
 export const CALENDAR_ALONE = "Change the calendar on its own, then how it repeats.";
 
+/** Under the Calendar row of a repeating event with another calendar chosen (C18e): it goes whole,
+ *  "All events" the only row offered (C18 Q2). Not "every occurrence moves": what Google does with
+ *  an occurrence changed on its own is live probe L-T5's (critique C2-L13). */
+export const CALENDAR_WHOLE = "Changing the calendar is for the whole repeating event.";
+
 /** The line under the editor's Calendar row (C18d): only the calendars the user owns on the event's
  *  own account are listed (critique C1-M5: Google's help puts an event on "a calendar you own"),
  *  and, where another account can take events (critique C2-L8), Duplicate is the way there. */
@@ -853,7 +858,9 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
  *  occurrence still there, which the choices named. One that left the event outside the months PM
  *  syncs says so, and points to Google Calendar, never to editing it again here (C11c review, C11d
  *  review 1). `moved`: the save put it on another calendar (C18d), named `to`, from the one named
- *  `from`; it says where it is now and how to put it back, since there's no Undo for it (Q3). */
+ *  `from`; it says where it is now and how to put it back, since there's no Undo for it (Q3). A
+ *  repeating event goes there whole, from "All events" (C18e), so with a scope it's every
+ *  occurrence. */
 export function savedNotice(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
@@ -865,10 +872,12 @@ export function savedNotice(
   moved: { to: string; from: string } | null = null,
 ): { tone: Tone; text: string } {
   const t = quote(title);
-  if (moved && scope === null) {
+  if (moved) {
     const said = savedWarnings(outcome, moved.to);
     const parts = [
-      `${t} is now on ${moved.to}.`,
+      scope === null
+        ? `${t} is now on ${moved.to}.`
+        : `Every occurrence of ${t} is now on ${moved.to}.`,
       ...said.words,
       `To put it back, open it and choose ${moved.from}.`,
     ];

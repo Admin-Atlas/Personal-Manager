@@ -116,7 +116,12 @@ vi.mock("../../../lib/markdown", () => ({
 }));
 
 import { EventEditor, UNREADABLE_REPEAT } from "./EventEditor";
-import { A11_NOTE, CALENDAR_ALONE, savedNotice } from "../../../lib/calendarEdit/editReasons";
+import {
+  A11_NOTE,
+  CALENDAR_ALONE,
+  CALENDAR_WHOLE,
+  savedNotice,
+} from "../../../lib/calendarEdit/editReasons";
 import { createTargets } from "../../../lib/calendarEdit/createTargets";
 
 /** What the user may change on someone else's event whose copy can reply (C14c). */
@@ -3405,6 +3410,82 @@ describe("EventEditor, its calendar", () => {
       "Retro",
       null,
       null,
+    );
+  });
+
+  it("a repeating event says it goes whole and asks which occurrences, All its only row (C18e)", async () => {
+    const onClose = vi.fn();
+    const occurrence: CalendarEvent = {
+      ...row,
+      calendar_id: PERSONAL.id,
+      series_id: "abc",
+      recurring: true,
+    };
+    openForEdit.mockResolvedValue(ready(event(), ALL));
+    render(
+      <EventEditor
+        row={occurrence}
+        calendar={PERSONAL}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        targets={createTargets(BOTH)}
+        overview={BOTH}
+        hidden={new Set([QUIET.id])}
+        shapeOf={() => undefined}
+        onClose={onClose}
+      />,
+    );
+    await screen.findByLabelText("Title");
+    expect(screen.queryByText(CALENDAR_WHOLE)).toBeNull();
+    pick("Personal", "Side");
+    expect(screen.getByText(CALENDAR_WHOLE)).toBeTruthy();
+    const refused = (message: string): ScopeRow => ({ row: "refused", message });
+    const whole: SeriesChoices = {
+      outcome: "ready",
+      this: refused(
+        "Changing the calendar can't apply to just this occurrence: the whole repeating event goes to the other calendar.",
+      ),
+      following: refused(
+        "PM puts a whole repeating event on another calendar, not this one and the ones after it.",
+      ),
+      all: {
+        row: "offered",
+        warnings: [{ warning: "changes_calendar", to: "Side" }],
+        token: "t-all",
+      },
+    };
+    choicesForEdit.mockResolvedValue(whole);
+    saveEdit.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    expect(choicesForEdit).toHaveBeenCalledWith("s1", { calendar: SIDE.id });
+    expect(dialog.getByRole<HTMLInputElement>("radio", { name: /^This event/ }).disabled).toBe(
+      true,
+    );
+    fireEvent.click(dialog.getByRole("radio", { name: /^All events/ }));
+    expect(dialog.getByText("Every occurrence goes to Side.")).toBeTruthy();
+    fireEvent.click(dialog.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s1",
+      { calendar: SIDE.id },
+      { scope: "all", token: "t-all", asAll: false },
+      "Dentist",
+      null,
+      null,
+    );
+    // Where it went, from the backend's answer: every occurrence, said by the notice.
+    expect(noteSaved).toHaveBeenLastCalledWith(
+      "Dentist",
+      saved,
+      "all",
+      "2026-10-12",
+      false,
+      false,
+      { rowId: occurrence.id, sent: null },
+      { to: "Side", from: "Personal" },
     );
   });
 

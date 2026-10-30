@@ -113,6 +113,9 @@ pub struct SeriesInput<'a> {
     /// The address the account reads this calendar with: the user, never a guest Google emails,
     /// whatever a list PM built calls it (C12 critiques C1-H1, C2-H1).
     pub me: &'a str,
+    /// PM's name for the calendar a calendar change puts the event on (C18e), from the DB: what
+    /// the choices say, and so what a choice's token binds.
+    pub calendar_to: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -584,6 +587,9 @@ pub enum SeriesWarning {
     /// This many occurrences changed on their own fall on days the new rule skips, so their changes
     /// go with them (C11).
     ChangesLost { count: u32 },
+    /// Every occurrence goes to the calendar PM calls `to` (C18e): in the token, so a calendar
+    /// renamed between the choice and the save asks again.
+    ChangesCalendar { to: String },
 }
 
 /// What guests may do: Google applies it to the whole series, like visibility (C12 critiques C1-M7,
@@ -1841,6 +1847,11 @@ fn edit_plan(
     // Before the guest list's own checks, so a guest change says whose list it is (C14 critique
     // C1-L10).
     invitation_check(input, &master, original, draft, scope)?;
+    // Another calendar (C18e): the whole repeating event goes, never part of it. The planners' own
+    // guard behind the choices' rows; the name it goes to must be known.
+    if draft.calendar.is_some() {
+        calendar_check(input, &master, scope)?;
+    }
     guests_ready(scope, input, draft)?;
     // The planners' own guard behind the choices' rows (C18 Q4): a split's new part never carries a
     // call (DECISIONS 17-10 #3), so a call goes on this occurrence or on every one.
@@ -1856,6 +1867,25 @@ fn edit_plan(
         && matches!(master.call, Some(CallKind::AddOn | CallKind::Other))
     {
         return Err(NotPlanned::ReadOnly(ReadOnlyReason::OtherCall));
+    }
+    // Every occurrence, and the calendar with it: the field changes as "all events" plans them,
+    // then the calendar change, said on the row (C18e §9.2). The calendar alone writes no field,
+    // which is a change all the same, never "nothing to save" (critique C1-M6).
+    if let Some(to) = draft.calendar.as_ref().and(input.calendar_to) {
+        let mut plan = match plan_all(input, &master, original, draft, notify) {
+            Err(NotPlanned::NoChange) => calendar_only(&master),
+            planned => planned?,
+        };
+        // Google's copy as the user opened it: what goes to the other calendar must be what they
+        // saw, whatever the draft changes (R2, A8's fields; the field write checks its own).
+        let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
+        let changed = series_changed(opened.json(), input.fresh.master.json(), &master.start, &[]);
+        if !changed.is_empty() {
+            return Err(NotPlanned::Conflict(changed));
+        }
+        plan.warnings
+            .push(SeriesWarning::ChangesCalendar { to: to.to_string() });
+        return Ok(plan);
     }
     match scope {
         Scope::This => plan_this(input, &master, draft, notify),
@@ -1912,6 +1942,11 @@ fn invitation_check(
             ReadOnlyReason::NotOrganizer
         }));
     }
+    // So is its calendar: Google changes it from the organiser's copy (C18d), whose reason names it
+    // whatever guests may change (the gate's own for the field).
+    if draft.calendar.is_some() {
+        return Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer));
+    }
     // The rule as the choices read it: the very rule it has is no change (C11 critique 1 L12).
     let new_rule = rule_change(draft, master).is_some();
     let shared = draft.summary.is_some()
@@ -1931,6 +1966,74 @@ fn invitation_check(
         return Err(SeriesRefusal::InvitationRule.into());
     }
     Ok(())
+}
+
+/// A repeating event going to another calendar (C18e): the whole of it, so never "This event", nor
+/// "this and following" past the first occurrence (C18 Q2: PM doesn't cut one across two
+/// calendars). Nor one that is a part of an earlier "this and following" change, or has a part
+/// split off it: PM's note on it, a part Google made of it (`sibling`, its `_R` ids), or a later
+/// part of either kind (`later`, one PM can't place included). The other part would stay on this
+/// calendar, out of reach of the split record and the overlap check, each of which reads one
+/// calendar (critique C1-H2). The calendar's name must be at hand, for the row to say it.
+fn calendar_check(input: &SeriesInput, master: &Master, scope: Scope) -> Result<(), NotPlanned> {
+    match scope {
+        Scope::This => return Err(SeriesRefusal::CalendarIsSeriesWide.into()),
+        Scope::Following if !is_first(master, input.fresh.instance) => {
+            return Err(SeriesRefusal::CalendarFollowing.into())
+        }
+        Scope::Following | Scope::All => {}
+    }
+    let noted_part = input
+        .fresh
+        .master
+        .json()
+        .pointer("/extendedProperties/private/pmSplitOf")
+        .is_some();
+    if noted_part || input.sibling || input.later != LaterPart::None {
+        return Err(SeriesRefusal::TransferSplit.into());
+    }
+    if input.calendar_to.is_none() {
+        return Err(SeriesRefusal::NoBase.into());
+    }
+    Ok(())
+}
+
+/// "All events" that changes nothing but the calendar (C18e): no write of its own, since the
+/// calendar change goes after the plan (critique C1-M6). Never "nothing to save".
+fn calendar_only(master: &Master) -> SeriesPlan {
+    SeriesPlan {
+        scope: Scope::All,
+        steps: Vec::new(),
+        warnings: Vec::new(),
+        expect: Vec::new(),
+        removes: Removes::Nothing,
+        start: master.start,
+        rule_start: master.start,
+        guests: None,
+        chosen: None,
+        own: Own::default(),
+    }
+}
+
+/// What a whole repeating event is checked on before it is deleted or put on another calendar
+/// (A8): its title, start and rule.
+pub const SERIES_WATCH: &[&str] = &["summary", "start", "recurrence"];
+
+/// Which of [`SERIES_WATCH`] differ between `planned` and `fresh`, two copies of a repeating event,
+/// a rule read at `start` by what it means (as a 412's recheck reads it), leaving out `written`:
+/// fields a write in the same save just changed, whose landing was checked already.
+pub fn series_changed(
+    planned: &Value,
+    fresh: &Value,
+    start: &SeriesStart,
+    written: &[String],
+) -> Vec<String> {
+    let keys: Vec<String> = SERIES_WATCH
+        .iter()
+        .filter(|k| !written.iter().any(|w| w == *k))
+        .map(|k| k.to_string())
+        .collect();
+    changed_since_opened(start, planned, fresh, &keys)
 }
 
 /// Whether `draft`'s time, sent for every occurrence, moves them all: it puts the occurrence
@@ -2037,6 +2140,31 @@ impl SeriesPlan {
         if let Some(body) = self.inserted() {
             all = all.taking_off(attendees::left_off(input.fresh.master.json(), body, &own));
         }
+        // A calendar change (C18e) tells everyone on the repeating event once the plan's writes
+        // have landed, though no step sends it: counted in the one question, as a one-off's is
+        // (C18d), "at least" where an occurrence may have guests of its own.
+        if self.changes_calendar() {
+            let master_json = input.fresh.master.json();
+            let sent = self
+                .steps
+                .iter()
+                .find_map(|s| match &s.op {
+                    Op::Patch { event, body, .. }
+                        if master_json.get("id").and_then(Value::as_str)
+                            == Some(event.as_str()) =>
+                    {
+                        Some(body.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let moved = Reach::of_transfer(master_json, &sent, &own);
+            all = all.merge(if own_lists(input, master_json) {
+                moved.short()
+            } else {
+                moved
+            });
+        }
         self.guests = all.cancelling(deletes).notice();
         self.chosen = chosen;
         self.own = own;
@@ -2079,21 +2207,34 @@ impl SeriesPlan {
         {
             return reach;
         }
-        let series_list = attendees::guest_set(master_json.get("attendees"));
-        let own_lists = self.scope == Scope::All
-            && input
-                .exceptions
-                .items
-                .iter()
-                .filter(|item| item.get("recurringEventId") == master_json.get("id"))
-                .filter(|item| !is_gone(item))
-                .any(|item| attendees::guest_set(item.get("attendees")) != series_list);
-        if !input.exceptions.complete || own_lists {
+        if !input.exceptions.complete || (self.scope == Scope::All && own_lists(input, master_json))
+        {
             reach.short()
         } else {
             reach
         }
     }
+
+    /// It puts the repeating event on another calendar (C18e).
+    pub fn changes_calendar(&self) -> bool {
+        self.warnings
+            .iter()
+            .any(|w| matches!(w, SeriesWarning::ChangesCalendar { .. }))
+    }
+}
+
+/// Whether an occurrence of the series `master_json` has a guest list of its own, or PM couldn't
+/// see them all: a write to every occurrence then reaches "at least" those PM counted.
+fn own_lists(input: &SeriesInput, master_json: &Value) -> bool {
+    let series_list = attendees::guest_set(master_json.get("attendees"));
+    !input.exceptions.complete
+        || input
+            .exceptions
+            .items
+            .iter()
+            .filter(|item| item.get("recurringEventId") == master_json.get("id"))
+            .filter(|item| !is_gone(item))
+            .any(|item| attendees::guest_set(item.get("attendees")) != series_list)
 }
 
 /// The event `op` writes, when Google has it before the write: never an insert's or a carry's.
@@ -5454,6 +5595,200 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn to_cal2() -> EventPatchDraft {
+        EventPatchDraft {
+            calendar: Some("cal2".into()),
+            ..Default::default()
+        }
+    }
+
+    /// [`Case::new`] whose calendar change goes to "PM write test 2".
+    fn moving(master: Value, instance: Value) -> Case {
+        Case {
+            calendar_to: Some("PM write test 2".into()),
+            ..Case::new(master, instance)
+        }
+    }
+
+    fn changes_to(plan: &SeriesPlan) -> bool {
+        plan.warnings
+            == [SeriesWarning::ChangesCalendar {
+                to: "PM write test 2".into(),
+            }]
+    }
+
+    /// C18e §9.2: another calendar is the whole repeating event's. "All events" with the calendar
+    /// alone plans no write and says where every occurrence goes, never "nothing to save" (critique
+    /// C1-M6); with a title too, the series' one PATCH and the same words. "This event" and "this
+    /// and following" past the first occurrence are refused by the planner too; from the first,
+    /// "this and following" is every occurrence.
+    #[test]
+    fn a_calendar_change_plans_the_whole_repeating_event() {
+        let case = moving(weekly(), monday_19());
+        let alone = case.edit(Scope::All, to_cal2()).unwrap();
+        assert!(alone.scope == Scope::All && alone.steps.is_empty());
+        assert!(changes_to(&alone) && alone.changes_calendar());
+        assert!(
+            alone.guests.is_none() && !alone.needs_notify(),
+            "nobody to tell"
+        );
+        let titled = case
+            .edit(
+                Scope::All,
+                EventPatchDraft {
+                    summary: Some("Retro".into()),
+                    ..to_cal2()
+                },
+            )
+            .unwrap();
+        assert!(changes_to(&titled));
+        assert!(
+            matches!(&titled.steps[..], [Step { op: Op::Patch { event, body, .. }, .. }]
+                if event == "abc" && body.keys().eq(["summary"])),
+            "the series' title, and no key for the calendar"
+        );
+        assert!(matches!(
+            case.edit(Scope::This, to_cal2()),
+            Err(NotPlanned::Refused(SeriesRefusal::CalendarIsSeriesWide))
+        ));
+        assert!(matches!(
+            case.edit(Scope::Following, to_cal2()),
+            Err(NotPlanned::Refused(SeriesRefusal::CalendarFollowing))
+        ));
+        let first = moving(weekly(), plain("2026-10-05T09:00:00+01:00"));
+        let from_first = first.edit(Scope::Following, to_cal2()).unwrap();
+        assert!(from_first.scope == Scope::All && changes_to(&from_first));
+        // Without the calendar's name the plan can't say where it goes: refused, not planned bare.
+        assert!(matches!(
+            Case::new(weekly(), monday_19()).edit(Scope::All, to_cal2()),
+            Err(NotPlanned::Refused(SeriesRefusal::NoBase))
+        ));
+        // The name is in the token: a calendar renamed between the choice and the save asks again.
+        let renamed = Case {
+            calendar_to: Some("Work".into()),
+            ..moving(weekly(), monday_19())
+        };
+        assert_ne!(
+            alone.choice_digest("s"),
+            renamed
+                .edit(Scope::All, to_cal2())
+                .unwrap()
+                .choice_digest("s")
+        );
+    }
+
+    /// Critique C1-H2: a repeating event that is a part of an earlier "this and following" change,
+    /// or has a part split off it, keeps its calendar: PM's note on it, a part Google made
+    /// (`sibling`), or a later part of either kind, placed or not. Nothing is planned.
+    #[test]
+    fn a_split_repeating_event_keeps_its_calendar() {
+        let noted = moving(
+            with(
+                weekly(),
+                "extendedProperties",
+                json!({ "private": { "pmSplitOf": "xyz" } }),
+            ),
+            monday_19(),
+        );
+        let day = NaiveDate::from_ymd_opt(2026, 10, 26).unwrap();
+        let later = |later: LaterPart| Case {
+            later,
+            ..moving(weekly(), monday_19())
+        };
+        let sibling = Case {
+            sibling: true,
+            ..moving(weekly(), monday_19())
+        };
+        for case in [
+            noted,
+            sibling,
+            later(LaterPart::At(Point::Day(day))),
+            later(LaterPart::Through(day)),
+            later(LaterPart::Unread),
+        ] {
+            assert!(matches!(
+                case.edit(Scope::All, to_cal2()),
+                Err(NotPlanned::Refused(SeriesRefusal::TransferSplit))
+            ));
+        }
+    }
+
+    /// C18e §9.2: the one question counts the guests the calendar change tells, beside the PATCH's,
+    /// so "All events" with guests and no answer never runs (R9); answered, the PATCH takes the
+    /// answer where it reaches someone. Changed in Google since the editor opened (its title or its
+    /// rule; A8's start alike), it's a conflict. Someone else's repeating event keeps its calendar.
+    #[test]
+    fn a_calendar_change_asks_once_and_checks_what_was_opened() {
+        let guested = guests_on_it(weekly(), &["g@example.org"]);
+        let case = moving(guested.clone(), monday_19());
+        let alone = case.edit(Scope::All, to_cal2()).unwrap();
+        let g = alone.guests.clone().expect("the change tells the guest");
+        assert!(g.updated == 1 && g.people == 1 && g.emails == 1 && g.complete);
+        assert!(alone.needs_notify());
+        let titled = EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..to_cal2()
+        };
+        let both = case.edit(Scope::All, titled.clone()).unwrap();
+        let g = both.guests.clone().unwrap();
+        assert!(g.people == 1 && g.emails == 2, "the update and the change");
+        let told = case
+            .edit_told(Scope::All, titled, Some(Notify::All))
+            .unwrap();
+        assert!(!told.needs_notify() && told.steps[0].notify == Notify::All);
+        // An occurrence with a guest list of its own: "at least".
+        let own = with(
+            guests_on_it(monday_19(), &["g@example.org", "h@example.org"]),
+            "summary",
+            json!("Standup"),
+        );
+        let short = moving(guested, monday_19())
+            .exceptions(vec![own])
+            .edit(Scope::All, to_cal2())
+            .unwrap();
+        assert!(!short.guests.unwrap().complete);
+        // Renamed or re-ruled in Google since the editor opened.
+        for (key, value) in [
+            ("summary", json!("Standup v2")),
+            ("recurrence", json!(["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"])),
+        ] {
+            let mut changed = moving(weekly(), monday_19());
+            changed.master = fresh(with(weekly(), key, value));
+            assert!(
+                matches!(changed.edit(Scope::All, to_cal2()), Err(NotPlanned::Conflict(f)) if f == [key]),
+                "{key}"
+            );
+        }
+        let organiser = json!({ "email": "o@example.com" });
+        let theirs = moving(
+            with(weekly(), "organizer", organiser.clone()),
+            with(monday_19(), "organizer", organiser),
+        );
+        assert!(matches!(
+            theirs.edit(Scope::All, to_cal2()),
+            Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer))
+        ));
+        // A guest added in the same Save is told of the change too: the list after the PATCH.
+        let added = EventPatchDraft {
+            guests: Some(vec![GuestOp {
+                email: "h@example.org".into(),
+                to: crate::calendar_write::dto::GuestState::Required,
+            }]),
+            ..to_cal2()
+        };
+        let both = moving(
+            guests_on_it(weekly(), &["g@example.org"]),
+            guests_on_it(monday_19(), &["g@example.org"]),
+        )
+        .edit(Scope::All, added)
+        .unwrap();
+        let g = both.guests.unwrap();
+        assert!(
+            g.people == 2 && g.emails == 4,
+            "each told of the update and of the change"
+        );
     }
 
     /// C12d: a new event's guests are each invited, never the calendar's own address or a room; its
