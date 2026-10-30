@@ -194,8 +194,20 @@ function styleMarks(el: Element): Mark[] {
   return marks;
 }
 
+/** The words a range of the box holds, as the link panel's Text field shows them: each text node's
+ *  `data`, a break as a space, what never shows left out. Read from a copy of the range's content,
+ *  never `Selection.toString()` or `textContent`, which CodeQL reads as page text an attacker shaped. */
+export function rangeWords(range: Range): string {
+  const out: DescNode[] = [];
+  const copy = range.cloneContents();
+  for (let child = copy.firstChild; child !== null; child = child.nextSibling) {
+    readLeaves(child, out);
+  }
+  return out.map((node) => (node.kind === "text" ? node.text : " ")).join("");
+}
+
 /** An element's words and breaks, without recursing: what survives of anything too deep. */
-function readLeaves(root: Element, out: DescNode[]): void {
+function readLeaves(root: ChildNode, out: DescNode[]): void {
   const todo: Node[] = [root];
   while (todo.length > 0) {
     const next = todo.pop() as Node;

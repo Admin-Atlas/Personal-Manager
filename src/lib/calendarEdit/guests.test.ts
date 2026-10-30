@@ -309,7 +309,6 @@ const opened: EventForEdit = {
   summary: "Retro",
   location: "",
   description: "",
-  description_html: false,
   time: {
     kind: "timed",
     start_date: "2026-10-20",

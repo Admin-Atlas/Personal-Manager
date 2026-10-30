@@ -51,8 +51,11 @@
 // It can open on a copy of an event (Duplicate, C18c, `copyOf`): the copy's fields are the seed, so
 // closing it unchanged asks nothing and sends nothing; a line under the bar says what it copies and
 // what it doesn't. Its call starts off and stays so until pressed, whatever the setting, as Google's
-// Duplicate makes none; a formatted description is copied unchanged and shown read-only, as the
-// editor of an existing event shows one.
+// Duplicate makes none; its description is copied unchanged.
+//
+// The description is formatted with Google Calendar's buttons, as when editing (C19d). A copy's
+// description with formatting PM can't write back shows as Google shows it, with "Replace with plain
+// text…", and is created exactly as Google holds it unless replaced.
 
 import {
   useCallback,
@@ -88,13 +91,14 @@ import {
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
 import { kindNoteText, type KindSwitchNote } from "../../../lib/calendarEdit/reminders";
-import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
+import { parseDescription, replacementText } from "../../../lib/calendarEdit/descriptionHtml";
 import {
   ambiguousText,
   CALLOUT_TONE,
   createText,
   heldCreateText,
   problemText,
+  reasonText,
   retryAfter,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
@@ -116,6 +120,7 @@ import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { DescriptionEditor, DescriptionView, ReplaceQuestion } from "./DescriptionEditor";
 import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
 import { MeetField } from "./MeetField";
@@ -133,6 +138,7 @@ import {
 } from "./EventFields";
 import { createEvent, noteCreateResult, noteHeldCreate, type CreateSent } from "./useEventWrites";
 import { useRepeatView } from "./useRepeat";
+import { useMailLink } from "../parts/useMailLink";
 
 interface Props {
   /** The fields it starts with (`newEventSeed`): closing unchanged from these asks nothing. */
@@ -168,7 +174,6 @@ export interface CopyOf {
   title: string;
   notes: string[];
   callNote: string | null;
-  formatted: boolean;
 }
 
 /** What quick create hands the full editor (C10c): nothing is sent on the way. */
@@ -281,6 +286,20 @@ export function NewEventEditor({
   const [meetNote, setMeetNote] = useState<string | null>(null);
   // A copy's word that the original's call isn't copied: under the row until it's pressed.
   const [copyCallNote, setCopyCallNote] = useState<string | null>(copyOf?.callNote ?? null);
+  // A copy's description as Google holds it (the copy's seed, never the draft), C19d: one with
+  // formatting PM can't write back shows as Google shows it, with "Replace with plain text…", and
+  // goes to Google unchanged unless replaced. A new event sends whatever the draft holds, so the
+  // replacement is the draft's alone: nothing else needs telling.
+  const copiedDescription = useMemo(
+    () => (copyOf ? parseDescription(seed.description) : null),
+    [copyOf, seed.description],
+  );
+  const [askReplace, setAskReplace] = useState(false);
+  const [replaced, setReplaced] = useState(false);
+  const descriptionId = useId();
+  const descriptionBoxId = useId();
+  const formattingReasonId = useId();
+  const mail = useMailLink("new event");
   // Handed over while PM may already have made it: locked on what was sent, saying so; or after a
   // token ended unproven there, still saying that.
   const handedHeld: Held | null = handover?.held
@@ -962,25 +981,46 @@ export function NewEventEditor({
             />
           </div>
 
-          {copyOf?.formatted ? (
-            // A copy's formatted description goes as Google holds it, its formatting kept, and is
-            // shown as its text, read-only, as the editor of an existing event shows one (C18
-            // critique C2-L12).
-            <div className="flex flex-col gap-1">
-              <span className="text-sm text-ink2">Description</span>
-              <p className="whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
-                {descriptionText(draft.description)}
-              </p>
-            </div>
-          ) : (
-            <TextRow
-              label="Description"
-              multiline
-              value={draft.description}
-              disabled={locked}
-              onChange={(description) => setDraft({ ...draft, description })}
-            />
-          )}
+          <div className="flex flex-col gap-1">
+            {/* Text, not a label element: the box is a div, which a label can't name. Clicking it
+                still puts the caret in the box (critique C2-L7). */}
+            <span
+              id={descriptionId}
+              className="text-sm text-ink2"
+              onClick={() => document.getElementById(descriptionBoxId)?.focus()}
+            >
+              Description
+            </span>
+            {copiedDescription && !copiedDescription.supported && !replaced ? (
+              // A copy's description PM can't write back goes as Google holds it, formatting kept
+              // (C18 critique C2-L12), shown as Google shows it until the user replaces it.
+              <>
+                <DescriptionView
+                  doc={copiedDescription.doc}
+                  labelledBy={descriptionId}
+                  describedBy={formattingReasonId}
+                  onReplace={locked ? undefined : () => setAskReplace(true)}
+                  onMail={mail.open}
+                />
+                <p id={formattingReasonId} className="text-xs leading-relaxed text-ink4">
+                  {reasonText("unsupported_formatting")}
+                </p>
+              </>
+            ) : (
+              <DescriptionEditor
+                id={descriptionBoxId}
+                value={draft.description}
+                onChange={(description) => setDraft({ ...draftRef.current, description })}
+                disabled={locked}
+                labelledBy={descriptionId}
+                autoFocus={replaced}
+                onMail={mail.open}
+              />
+            )}
+            <p role="status" className="text-xs text-st-due">
+              {mail.failure ?? ""}
+            </p>
+          </div>
 
           <div className="flex flex-wrap items-center gap-4">
             <ShowAsControl
@@ -1018,6 +1058,20 @@ export function NewEventEditor({
             onClose={closeCustom}
           />
         )}
+        {/* "Replace with plain text…", nested the same way. */}
+        <ReplaceQuestion
+          open={askReplace}
+          onKeep={() => setAskReplace(false)}
+          onReplace={() => {
+            setAskReplace(false);
+            if (!copiedDescription) return;
+            setDraft({
+              ...draftRef.current,
+              description: replacementText(copiedDescription.doc),
+            });
+            setReplaced(true);
+          }}
+        />
         {/* The email question, nested the same way: Escape and Back close only it. */}
         {prompt && (
           <NotifyPrompt

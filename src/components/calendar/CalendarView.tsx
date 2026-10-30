@@ -942,7 +942,6 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         title: copy.fields.summary,
         notes: linked ? [...copy.notes, copyMilestoneNote(linked.label)] : copy.notes,
         callNote: copy.callNote,
-        formatted: copy.formatted,
         from: row.id,
       },
     });

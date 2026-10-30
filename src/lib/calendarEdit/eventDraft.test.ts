@@ -30,6 +30,7 @@ import {
   switchNewKind,
   toChanges,
   toNewEvent,
+  withReplace,
   COPY_ATTACHMENTS_NOTE,
   COPY_CALL_NOTE,
   COPY_GUESTS_NOTE,
@@ -61,7 +62,6 @@ const event: EventForEdit = {
   summary: "Dentist",
   location: "High St",
   description: "Bring the form\r\nand the card",
-  description_html: false,
   time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
   start_at: "2026-10-12T08:00:00Z",
   end_at: "2026-10-12T09:00:00Z",
@@ -106,6 +106,43 @@ describe("the event draft", () => {
     // The textarea hands back \n for Google's \r\n.
     const draft = { ...base(), description: "Bring the form\nand the card" };
     expect(changedFields(base(), draft)).toEqual([]);
+    const placed = seedDraft({ ...event, location: "Room 2\r\nfloor 4" });
+    expect(changedFields(placed, { ...placed, location: "Room 2\nfloor 4" })).toEqual([]);
+  });
+
+  // C19 §2.6, §7.8: an editor that only opened a formatted description sends none of it.
+  it("the_description_is_compared_by_what_it_shows", () => {
+    const formatted = seedDraft({ ...event, description: "<html-blob>a<br>b</html-blob>" });
+    // What the description editor reports for it, untouched: the same lines, written plainly.
+    const same = { ...formatted, description: "a\nb" };
+    expect(changedFields(formatted, same)).toEqual([]);
+    expect(toChanges(formatted, { ...same, summary: "Moved" })).toEqual({ summary: "Moved" });
+    expect(
+      sameField("description", formatted, { ...formatted, description: "<p>a<br>b</p>" }),
+    ).toBe(false);
+    // Google's own bold and PM's are the same; bold and plain aren't.
+    const bold = seedDraft({ ...event, description: "<strong>x</strong>" });
+    expect(changedFields(bold, { ...bold, description: "<b>x</b>" })).toEqual([]);
+    expect(toChanges(bold, { ...bold, description: "x" })).toEqual({ description: "x" });
+    // One PM can't write back compares by its text: replacing it is a change.
+    const table = seedDraft({ ...event, description: "<table><tr><td>a</td></tr></table>" });
+    expect(toChanges(table, { ...table, description: "a" })).toEqual({ description: "a" });
+  });
+
+  it("withReplace_marks_only_a_save_that_sends_the_description", () => {
+    expect(withReplace({ description: "Room 4.12" }, true)).toEqual({
+      description: "Room 4.12",
+      replace_formatting: true,
+    });
+    // Cleared is still a description sent.
+    expect(withReplace({ description: "" }, true)).toEqual({
+      description: "",
+      replace_formatting: true,
+    });
+    expect(withReplace({ description: "Room 4.12" }, false)).toEqual({ description: "Room 4.12" });
+    // Replaced, then put back as it was: the save carries no mark without a description.
+    expect(withReplace({ summary: "Moved" }, true)).toEqual({ summary: "Moved" });
+    expect(withReplace({}, true)).toEqual({});
   });
 
   it("sends a time change whole, and a switch to all day", () => {
@@ -481,6 +518,22 @@ describe("carrying a draft onto Google's newer copy", () => {
     const r = rebaseDraft(base(), { ...base(), time: later }, { ...base(), time: { ...later } });
     expect(r.overwritten).toEqual([]);
     expect(toChanges(r.base, r.draft)).toEqual({});
+  });
+
+  // C19d: a description Google only wrote another way (its wrapper, its bold) is no change of
+  // Google's, so the user's edit of it stands.
+  it("takes a description Google wrote another way as the same one", () => {
+    const old = seedDraft({ ...event, description: "<b>Plan</b>" });
+    const google = { ...old, description: "<html-blob><strong>Plan</strong></html-blob>" };
+    const mine = { ...old, description: "<b>Plan</b> today" };
+    const r = rebaseDraft(old, google, mine);
+    expect(r.overwritten).toEqual([]);
+    expect(r.draft.description).toBe("<b>Plan</b> today");
+    expect(toChanges(r.base, r.draft)).toEqual({ description: "<b>Plan</b> today" });
+    // Changed in Google too, to something that shows otherwise: Google's wins, and is said.
+    const changed = rebaseDraft(old, { ...old, description: "<b>Plan</b> tomorrow" }, mine);
+    expect(changed.overwritten).toEqual(["description"]);
+    expect(changed.draft.description).toBe("<b>Plan</b> tomorrow");
   });
 });
 
@@ -1372,7 +1425,7 @@ describe("seedDuplicate", () => {
     expect(copy.fields.summary).toBe("Dentist");
     expect(copy.fields.meet).toBe(false);
     expect(copy.fields.recurrence).toEqual({ kind: "once" });
-    expect(copy).toMatchObject({ notes: [], callNote: null, formatted: false });
+    expect(copy).toEqual({ fields: copy.fields, notes: [], callNote: null });
   });
 
   it("never copies a call, and says so; a formatted description is copied unchanged", () => {
@@ -1388,16 +1441,13 @@ describe("seedDuplicate", () => {
     expect(withCall.notes).toEqual([]);
     const other = seedDuplicate({ ...event, call: { ...meet, kind: "add_on" } }, null, false);
     expect(other.callNote).toBe(COPY_CALL_NOTE);
-    // Critique C2-L12: as Google holds it, no note; the editor shows it read-only.
-    const html = "<b>Bring</b> the form";
-    const formatted = seedDuplicate(
-      { ...event, description: html, description_html: true },
-      null,
-      false,
-    );
-    expect(formatted.fields.description).toBe(html);
-    expect(formatted.formatted).toBe(true);
-    expect(formatted.notes).toEqual([]);
+    // Critique C2-L12 (C19 critique C2-H1): as Google holds it, formatting PM can edit or not, with
+    // no note; the editor decides how it shows.
+    for (const html of ["<b>Bring</b> the form", "<table><tr><td>Room</td></tr></table>"]) {
+      const formatted = seedDuplicate({ ...event, description: html }, null, false);
+      expect(formatted.fields.description).toBe(html);
+      expect(formatted.notes).toEqual([]);
+    }
     expect(seedDuplicate({ ...event, attachments: ["a.pdf"] }, null, false).notes).toEqual([
       COPY_ATTACHMENTS_NOTE,
     ]);

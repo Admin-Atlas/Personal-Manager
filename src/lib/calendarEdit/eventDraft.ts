@@ -46,6 +46,7 @@ import type {
   TimeDraft,
 } from "../types";
 import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
+import { sameDescription } from "./descriptionHtml";
 import { addressKey, changeNotice, isEmail } from "./guests";
 import { calendarDefaults, copyReminders, sameReminders, type KindSwitchNote } from "./reminders";
 import {
@@ -166,9 +167,9 @@ export function repeatSeed(series: SeriesInfo | null, repeating: boolean): Repea
   return repeating ? { kind: "kept", words: "Repeats" } : ONCE;
 }
 
-/** A textarea hands back `\n` whatever Google stored, so `\r\n` and `\n` are the same text: without
- *  this, opening an event whose description has Windows line endings and saving the title would send
- *  the description too. */
+/** A field hands back `\n` whatever Google stored, so `\r\n` and `\n` are the same text: without
+ *  this, opening an event whose location has Windows line endings and saving the title would send
+ *  the location too. The description's own comparison (`sameDescription`) starts the same way. */
 const sameText = (a: string, b: string) => a.replace(/\r\n?/g, "\n") === b.replace(/\r\n?/g, "\n");
 
 function sameTime(a: TimeDraft, b: TimeDraft): boolean {
@@ -207,8 +208,11 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
   switch (field) {
     case "summary":
     case "location":
-    case "description":
       return sameText(a[field], b[field]);
+    // By what it shows (C19): Google's `<html-blob>` wrapper, `<strong>` for `<b>`, or `<br>` for a
+    // line are no change, so an editor that only opened a formatted description never sends it.
+    case "description":
+      return sameDescription(a.description, b.description);
     case "time":
       return sameTime(a.time, b.time);
     case "recurrence":
@@ -330,6 +334,16 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
     }
   }
   return changes;
+}
+
+/** The save's changes, marked as the user's "Replace with plain text…" when they replaced a
+ *  description and the save sends one (C19). The mark reopens only a description whose formatting PM
+ *  can't edit (the backend's `replacing_formatting`), so it never goes without the description it is
+ *  about: a save of the title alone after a Replace that was then undone by hand carries none. */
+export function withReplace(changes: EventPatchDraft, replaced: boolean): EventPatchDraft {
+  return replaced && changes.description !== undefined
+    ? { ...changes, replace_formatting: true }
+    : changes;
 }
 
 /** Who saving `draft` over `base` would email, judged as the backend judges it (its
@@ -983,9 +997,6 @@ export interface EventCopy {
   notes: string[];
   /** Said under the video-call row when the original had a call, which a copy never takes. */
   callNote: string | null;
-  /** The description is Google's formatted text: copied unchanged and shown read-only, as the
-   *  editor shows one (C18 critique C2-L12). */
-  formatted: boolean;
 }
 
 /** Google's own Duplicate makes no video call ("no video conferencing by default", Workspace admin
@@ -1009,8 +1020,8 @@ export const copyMilestoneNote = (label: string): string =>
 /** A new event's fields copied from `event` (Google's fresh copy of the row the user chose) and, for
  *  an occurrence, its repeating event's `series` (`repeating`: the row is one, though PM may not
  *  have read its series), as Google's Duplicate makes a copy. The title, time, place, description
- *  (unchanged, formatted or not), busy or free, visibility, notifications, colour and guest
- *  permissions are the original's. A copy of an event the user organises keeps its guests, all but
+ *  (unchanged, formatted or not, with no note: C18 critique C2-L12, C19 critique C2-H1), busy or
+ *  free, visibility, notifications, colour and guest permissions are the original's. A copy of an event the user organises keeps its guests, all but
  *  the user's own entry, none of them the organiser, with no replies; a copy of an invitation starts
  *  with none, since "Don't send" may still put it on their calendars (C18 critique C2-M7, probe
  *  L-CP5). An occurrence's copy starts as a one-off at that occurrence's time (critiques C1-M4,
@@ -1036,7 +1047,6 @@ export function seedDuplicate(
     fields: { ...seedDraft(event), guests, meet: false, organizer_email: null },
     notes,
     callNote: event.call !== null ? COPY_CALL_NOTE : null,
-    formatted: event.description_html,
   };
 }
 

@@ -862,10 +862,10 @@ pub struct MilestoneOffer {
 pub struct EventForEdit {
     pub summary: String,
     pub location: String,
-    /// As Google holds it. When `description_html` is set it's formatted
-    /// ([`super::description::is_html`]), and the editor shows it read-only.
+    /// As Google holds it, plain lines or formatted: the webview reads which, and whether its
+    /// editor writes it back; the gate says whether a save may change it
+    /// ([`super::description::pm_can_edit`]).
     pub description: String,
-    pub description_html: bool,
     /// In the event's own zone(s), as the editor's fields hold them.
     pub time: TimeDraft,
     /// Google's exact start and end of a timed event (RFC 3339), `None` for an all-day one. `HH:MM`

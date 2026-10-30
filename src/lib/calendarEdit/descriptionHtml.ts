@@ -5,7 +5,8 @@
 // contain HTML": its own editor writes bold, italic, underline, lists and links. This is the document
 // model of that formatting; one reader that says both what shows and whether PM can write it back
 // with nothing Google shows lost; the writer; the comparison that tells an unchanged description
-// from a changed one; and, for drawing only, the addresses written in a description's words.
+// from a changed one; the plain text "Replace with plain text…" leaves; and, for drawing only, the
+// addresses written in a description's words.
 //
 // PM's second sanitising boundary, beside markdown.tsx's, for Google event descriptions only. Nothing
 // here parses HTML with the browser: descriptionTokens.ts reads the characters, and the document is
@@ -1062,8 +1063,164 @@ export function docsEqual(a: DescDoc, b: DescDoc): boolean {
  *  compares by text only, so one with an image and nothing else still differs from an empty one. */
 export function sameDescription(a: string, b: string): boolean {
   if (a.replace(/\r\n?/g, "\n") === b.replace(/\r\n?/g, "\n")) return true;
-  const x = parseDescription(a);
-  const y = parseDescription(b);
+  const x = parsedOf(a);
+  const y = parsedOf(b);
   if (!x.supported || !y.supported) return false;
   return (isEmptyDoc(x.doc) && isEmptyDoc(y.doc)) || docsEqual(x.doc, y.doc);
+}
+
+/** The last few descriptions read for a comparison. The editor compares Google's copy with the draft
+ *  on every keystroke, so the copy is read once rather than each time (the documents never change). */
+const recent: { text: string; parsed: ParsedDescription }[] = [];
+const RECENT = 4;
+
+function parsedOf(text: string): ParsedDescription {
+  const hit = recent.find((r) => r.text === text);
+  if (hit) return hit.parsed;
+  const parsed = parseDescription(text);
+  recent.unshift({ text, parsed });
+  recent.length = Math.min(recent.length, RECENT);
+  return parsed;
+}
+
+// --- replacing ---
+
+/** "Replace with plain text…": the words and lines of what shows, a list's items as "• " and "1. "
+ *  lines (two spaces more per level), and each link's address after its words, "(…)", unless the
+ *  words are the address. Runs of three or more line breaks become two, and the ends are trimmed, as
+ *  the editor's old read-only text was. */
+export function replacementText(doc: DescDoc): string {
+  const plain = new PlainText();
+  plain.nodes(doc, 0, 1);
+  return plain
+    .text()
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+class PlainText {
+  /** What is written so far, in pieces joined once at the end: asking a string built by `+=` how it
+   *  ends makes the engine copy it whole each time, which a long description would make quadratic. */
+  private readonly parts: string[] = [];
+  /** The last character written, "" before any. */
+  private last = "";
+  /** What a line inside the current item starts with, after its first. */
+  private indent = "";
+  /** The current item's marker, until its first words take it. */
+  private marker: string | null = null;
+
+  text(): string {
+    return this.parts.join("");
+  }
+
+  nodes(doc: DescDoc, level: number, depth: number): void {
+    for (const node of doc) this.node(node, level, depth);
+  }
+
+  private node(node: DescNode, level: number, depth: number): void {
+    if (node.kind === "text") {
+      node.text.split("\n").forEach((part, k) => {
+        if (k > 0) this.put("\n");
+        this.words(part);
+      });
+      return;
+    }
+    if (node.kind === "br") {
+      this.put("\n");
+      return;
+    }
+    // Deeper than the model ever is: the words alone.
+    if (depth > MAX_DEPTH) {
+      for (const leaf of flat(node)) this.node(leaf, level, depth);
+      return;
+    }
+    switch (node.kind) {
+      case "p":
+        this.newLine();
+        this.nodes(node.children, level, depth + 1);
+        this.newLine();
+        return;
+      case "ul":
+      case "ol": {
+        this.newLine();
+        let n = 0;
+        for (const child of node.children) {
+          if (child.kind !== "li") this.node(child, level, depth + 1);
+          else this.item(child, node.kind === "ol" ? `${++n}. ` : "• ", level + 1, depth + 1);
+        }
+        this.newLine();
+        return;
+      }
+      case "li":
+        // An item outside a list, as Google may hold one, is a bulleted line.
+        this.item(node, "• ", level + 1, depth);
+        return;
+      case "a": {
+        this.nodes(node.children, level, depth + 1);
+        const said = shownAddress(node.href);
+        const words = wordsOf(node.children).trim();
+        if (words !== said && linkFromTyped(words) !== node.href) this.words(` (${said})`);
+        return;
+      }
+      default:
+        this.nodes(node.children, level, depth + 1);
+    }
+  }
+
+  /** A list item: its marker on its first line, its later lines under its words. */
+  private item(node: { readonly children: DescDoc }, marker: string, level: number, depth: number) {
+    const outer = this.indent;
+    const pad = "  ".repeat(level - 1);
+    this.newLine();
+    this.marker = pad + marker;
+    this.indent = pad + "  ";
+    this.nodes(node.children, level, depth + 1);
+    this.newLine();
+    this.marker = null;
+    this.indent = outer;
+  }
+
+  /** Words, after the item's marker or a line's indent when they start a line. */
+  private words(text: string): void {
+    if (text === "") return;
+    if (this.atLineStart()) {
+      this.put(this.marker ?? this.indent);
+      this.marker = null;
+    }
+    this.put(text);
+  }
+
+  private newLine(): void {
+    if (!this.atLineStart()) this.put("\n");
+  }
+
+  private atLineStart(): boolean {
+    return this.last === "" || this.last === "\n";
+  }
+
+  private put(s: string): void {
+    if (s === "") return;
+    this.parts.push(s);
+    this.last = s[s.length - 1];
+  }
+}
+
+/** A link's address as plain text says it: a mail or phone address without its scheme. */
+function shownAddress(href: string): string {
+  const scheme = asciiLower(href.slice(0, 7));
+  if (scheme === "mailto:") return href.slice(7);
+  if (scheme.startsWith("tel:")) return href.slice(4);
+  return href;
+}
+
+/** A document's words, a break as a space, without recursing. */
+function wordsOf(doc: DescDoc): string {
+  let words = "";
+  const todo: DescNode[] = [...doc].reverse();
+  for (let next = todo.pop(); next !== undefined; next = todo.pop()) {
+    if (next.kind === "text") words += next.text;
+    else if (next.kind === "br") words += " ";
+    else for (let k = next.children.length - 1; k >= 0; k--) todo.push(next.children[k]);
+  }
+  return words;
 }

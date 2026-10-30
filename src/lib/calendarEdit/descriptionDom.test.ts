@@ -7,7 +7,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import fixture from "./descriptionHtml.fixture.json";
-import { docToNodes, nodesToDoc } from "./descriptionDom";
+import { docToNodes, nodesToDoc, rangeWords } from "./descriptionDom";
 import {
   MAX_DEPTH,
   docsEqual,
@@ -283,6 +283,43 @@ describe("reading the box", () => {
     }
     expect(content).not.toHaveBeenCalled();
     expect(markup).not.toHaveBeenCalled();
+  });
+});
+
+// The link panel's Text field (C19d): the words a selection or a link holds.
+describe("rangeWords", () => {
+  it("reads_a_ranges_words_node_by_node", () => {
+    const words = h("b", {}, "two");
+    const link = h("a", { href: "https://example.com" }, "the ", h("i", {}, "site"));
+    // Never put in the page: jsdom here runs a script that is.
+    const host = box("one ", words, h("br"), link, h("script", {}, "alert(1)"), " end");
+    const range = document.createRange();
+    // From inside the first word to the end of the link.
+    range.setStart(host.firstChild as Text, 1);
+    range.setEndAfter(link);
+    expect(rangeWords(range)).toBe("ne two the site");
+    // A link's own words.
+    range.selectNodeContents(link);
+    expect(rangeWords(range)).toBe("the site");
+    // What never shows has no words.
+    range.selectNodeContents(host);
+    expect(rangeWords(range)).toBe("one two the site end");
+    // Nothing selected: no words.
+    range.collapse(true);
+    expect(rangeWords(range)).toBe("");
+  });
+
+  it("reads_a_ranges_words_without_textContent", () => {
+    const host = box("one ", h("b", {}, "two"), h("a", { href: "https://example.com" }, "link"));
+    const range = document.createRange();
+    range.selectNodeContents(host);
+    const content = vi.spyOn(Node.prototype, "textContent", "get");
+    const markup = vi.spyOn(Element.prototype, "innerHTML", "get");
+    const said = vi.spyOn(Range.prototype, "toString");
+    expect(rangeWords(range)).toBe("one twolink");
+    expect(content).not.toHaveBeenCalled();
+    expect(markup).not.toHaveBeenCalled();
+    expect(said).not.toHaveBeenCalled();
   });
 });
 

@@ -46,7 +46,6 @@ const event: EventForEdit = {
   summary: "Retro",
   location: "Room 2",
   description: "Notes",
-  description_html: false,
   time: {
     kind: "timed",
     start_date: "2026-10-20",

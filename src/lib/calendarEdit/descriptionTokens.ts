@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The tokens of an event description Google holds as HTML (#884, C19): what its text, tags and
-// attributes are, for the readers that show or edit it (descriptionText.ts, descriptionHtml.ts).
+// attributes are, for the reader that shows and edits it (descriptionHtml.ts).
 //
 // A character scanner, not the browser's parser: nothing here hands the description to DOMParser,
 // innerHTML or a <template>, and the readers built on it make React elements or text, so no markup in

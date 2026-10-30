@@ -272,6 +272,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Which calendars show",
     body: "Tick the connected calendars you want laid over each other; untick one to hide it here without disconnecting it. Each keeps its own colour so you can tell sources apart. This only changes what's shown — it doesn't stop PM syncing that calendar.",
   },
+  "calendar-description-format": {
+    title: "Format the description",
+    body: "When you create an event or change one, the description has formatting buttons: bold, italic, underline, bulleted and numbered lists, a link, and remove formatting. Each has its shortcut (hover to see it): Ctrl+B, Ctrl+I, Ctrl+U, Ctrl+Shift+8, Ctrl+Shift+7, Ctrl+K and Ctrl+\\ (⌘ instead of Ctrl on a Mac). Select words first to format them or link them; with the cursor in a link, Link changes its words or address, or removes it. Pasting, or dropping text from elsewhere, brings in the words only; format them with the buttons. Ctrl+click (⌘-click on a Mac) opens a link. A description with formatting PM can't edit, such as a table or coloured text, shows what PM can of it, with a button to replace it with plain text: its words, lines and lists stay, and each link's address follows its words. Nothing changes in Google Calendar until you save.",
+  },
 
   // Settings
   "settings-api-key": {

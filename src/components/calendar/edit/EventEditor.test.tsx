@@ -125,9 +125,29 @@ import {
   A11_NOTE,
   CALENDAR_ALONE,
   CALENDAR_WHOLE,
+  reasonText,
   savedNotice,
 } from "../../../lib/calendarEdit/editReasons";
 import { createTargets } from "../../../lib/calendarEdit/createTargets";
+
+/** Why a description shows read-only (C19). */
+const FORMATTING = reasonText("unsupported_formatting");
+
+/** The description's box (C19d). */
+const description = () => screen.getByRole("textbox", { name: "Description" });
+
+/** What the user typed into the box, as the engine leaves it, then the input event it fires. */
+function typeInto(box: HTMLElement, ...nodes: (Node | string)[]) {
+  box.replaceChildren(...nodes);
+  fireEvent.input(box);
+}
+
+/** An element made by hand, never by parsing. */
+function h(tag: string, ...children: (Node | string)[]) {
+  const made = document.createElement(tag);
+  made.append(...children);
+  return made;
+}
 
 /** What the user may change on someone else's event whose copy can reply (C14c). */
 const YOURS_WITH_REPLY = "Your reply, notifications, colour and busy or free are yours to change.";
@@ -177,7 +197,6 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     summary: "Dentist",
     location: "High St",
     description: "",
-    description_html: false,
     time: {
       kind: "timed",
       start_date: "2026-10-12",
@@ -311,9 +330,9 @@ afterEach(() => {
 });
 
 describe("EventEditor", () => {
-  // Google's formatted description shows read-only, as Google shows it (C19b): bold as bold, a list
-  // as a list, escapes decoded once, and nothing of a script on screen. Its mail link opens the mail
-  // app, and a line under it says so with the address when nothing opens.
+  // A description PM can't write back shows read-only, as Google shows it (C19b): bold as bold, a
+  // list as a list, escapes decoded once, and nothing of a script on screen. Its mail link opens the
+  // mail app, and a line under it says so with the address when nothing opens.
   it("shows a formatted description as Google does", async () => {
     openForEdit.mockResolvedValue(
       ready(
@@ -321,7 +340,6 @@ describe("EventEditor", () => {
           description:
             "<b>Agenda</b><br><ul><li>One &amp; two</li></ul><script>alert(1)</script>&lt;i&gt; " +
             '<a href="mailto:ann@example.com">mail</a>',
-          description_html: true,
         }),
       ),
     );
@@ -332,8 +350,9 @@ describe("EventEditor", () => {
     expect(view.querySelector("ul > li")?.textContent).toBe("One & two");
     expect(view.querySelector("script, i")).toBeNull();
     expect(view.textContent).toBe("AgendaOne & two<i> mail");
-    // Still read-only: no field to type it into.
-    expect(screen.queryByLabelText("Description")).toBeNull();
+    // Still read-only: no box to type it into (C19d offers Replace instead).
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.getByRole("group", { name: "Description" })).toBeTruthy();
 
     await act(async () => {
       expect(fireEvent.click(view.querySelector("a")!)).toBe(false);
@@ -1100,15 +1119,297 @@ describe("EventEditor", () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
     const onClose = await open();
-    const desc = screen.getByLabelText("Description");
-    // Nothing between the field and the window swallows Enter (fireEvent is false if anything
-    // called preventDefault), so the textarea's own line break happens.
+    const desc = description();
+    // Nothing between the box and the window swallows Enter (fireEvent is false if anything called
+    // preventDefault), so the engine's own line break happens.
     expect(fireEvent.keyDown(desc, { key: "Enter" })).toBe(true);
     expect(fireEvent.keyDown(desc, { key: "Enter", shiftKey: true })).toBe(true);
-    fireEvent.change(desc, { target: { value: "line one\nline two" } });
+    typeInto(desc, "line one", h("div", "line two"));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveEdit).toHaveBeenCalledWith("s1", { description: "line one\nline two" }, ...UNSCOPED);
+  });
+
+  // --- the description, formatted in place (C19d) ---
+
+  it("a_formatted_description_is_edited_in_place", async () => {
+    openForEdit.mockResolvedValue(ready(event({ description: "<b>Agenda</b><br>one" })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const box = description();
+    expect(box.querySelector("b")?.textContent).toBe("Agenda");
+    expect(box.classList.contains("pm-desc-box")).toBe(true);
+    expect(screen.getByRole("toolbar", { name: "Description formatting" })).toBeTruthy();
+    typeInto(box, h("b", "Agenda"), h("br"), "one ", h("i", "two"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "<b>Agenda</b><br>one <i>two</i>" },
+      ...UNSCOPED,
+    );
+  });
+
+  // C19 §7.8: what Google holds in its own wrapper, opened and left, is never sent.
+  it("only_the_title_changed_sends_no_description", async () => {
+    const held = "<html-blob><u></u><strong>Plan</strong><br>Room 2</html-blob>";
+    openForEdit.mockResolvedValue(ready(event({ description: held })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const box = description();
+    box.focus();
+    fireEvent.blur(box);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { summary: "Dentist (moved)" },
+      null,
+      "Dentist (moved)",
+      null,
+      null,
+    );
+  });
+
+  // The backend refuses a table (C19c); PM shows it as Google does and offers to replace it. The
+  // save then says it's the user's choice (`replace_formatting`), which alone reopens it.
+  it("a_description_pm_cant_edit_shows_with_replace", async () => {
+    const table = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
+    openForEdit.mockResolvedValue(
+      ready(event({ description: table }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const view = screen.getByRole("group", { name: "Description" });
+    expect(view.textContent).toBe("Room 4.12");
+    const reason = screen.getByText(FORMATTING);
+    expect(view.getAttribute("aria-describedby")).toBe(reason.id);
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    // Nothing changed until the user says so.
+    expect(screen.getByRole("group", { name: "Description" })).toBeTruthy();
+    fireEvent.click(within(ask).getByRole("button", { name: "Replace" }));
+    const box = description();
+    expect(document.activeElement).toBe(box);
+    expect(box.textContent).toBe("Room 4.12");
+    // The reason goes with the formatting.
+    expect(screen.queryByText(FORMATTING)).toBeNull();
+    typeInto(box, "Room 4.12 today");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "Room 4.12 today", replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  it("a replaced description sent unchanged still says it was replaced", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: '<span style="color: red">Red</span> words' }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "Red words", replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  it("replace isn't offered while a save is out", async () => {
+    let answer: (o: SaveAnswer) => void = () => {};
+    saveEdit.mockReturnValue(new Promise<SaveAnswer>((resolve) => (answer = resolve)));
+    openForEdit.mockResolvedValue(
+      ready(event({ description: "<h2>Agenda</h2>" }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(saveEdit).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+    await act(async () => answer({ outcome: "busy" }));
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+  });
+
+  it("replace_is_not_offered_on_a_locked_description", async () => {
+    const locked: FieldPermissions = {
+      ...ALL,
+      summary: false,
+      time: false,
+      repeat: false,
+      location: false,
+      description: false,
+      guests: false,
+      meet: false,
+      calendar: false,
+      reasons: ["locked"],
+    };
+    openForEdit.mockResolvedValue(
+      ready(event({ description: "<table><tr><td>Room</td></tr></table>" }), locked),
+    );
+    await open();
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Room");
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+    // A plain one locked shows the same way, with no box to type in.
+    cleanup();
+    openForEdit.mockResolvedValue(ready(event({ description: "Bring the form" }), locked));
+    await open();
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Bring the form");
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+  });
+
+  // The backend lets through a link PM's own reading refuses (it reads tags only): the view says
+  // why itself, and offers Replace. A link PM keeps keeps its address in the plain text; one to an
+  // address PM never opens (ftp:) was never a link to it, and leaves its words.
+  it.each([
+    [
+      '<a href="https://example.com/file" onclick="steal()">the file</a>',
+      "the file (https://example.com/file)",
+    ],
+    ['<a href="ftp://example.com/file">the file</a>', "the file"],
+  ])("a_link_the_backend_allows_but_pm_cant_open_still_offers_replace: %j", async (held, plain) => {
+    openForEdit.mockResolvedValue(ready(event({ description: held })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const view = screen.getByRole("group", { name: "Description" });
+    expect(view.textContent).toBe("the file");
+    expect(view.getAttribute("aria-describedby")).toBe(screen.getByText(FORMATTING).id);
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    expect(description().textContent).toBe(plain);
+    expect(screen.queryByText(FORMATTING)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: plain, replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  it("a_conflict_on_the_description_reseeds_the_box", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ description: "<b>Plan</b>" })))
+      .mockResolvedValueOnce(ready(event({ description: "<b>Plan</b> from Google" }), ALL, "s2"));
+    saveEdit.mockResolvedValue({ outcome: "conflict", fields: ["description"] });
+    const onClose = await open();
+    const box = description();
+    typeInto(box, h("b", "Plan"), " from PM");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Google's version of the description is shown now/);
+    // Google's copy is in the box now, made afresh.
+    expect(description().textContent).toBe("Plan from Google");
+    expect(description().querySelector("b")?.textContent).toBe("Plan");
+    expect(onClose).not.toHaveBeenCalled();
+    // Typing after it is the user's again.
+    typeInto(description(), h("b", "Plan"), " from Google, and PM");
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { description: "<b>Plan</b> from Google, and PM" },
+      null,
+      "Dentist",
+      null,
+      null,
+    );
+  });
+
+  // After a Replace, a conflict that brings Google's description back puts the view back: the
+  // replacement is gone with the user's edit, and so is the mark.
+  it("a conflict on a replaced description shows Google's again, with Replace", async () => {
+    const table = "<table><tr><td>Room</td></tr></table>";
+    const held: FieldPermissions = {
+      ...ALL,
+      description: false,
+      reasons: ["unsupported_formatting"],
+    };
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ description: table }), held))
+      .mockResolvedValueOnce(
+        ready(event({ description: "<table><tr><td>Hall</td></tr></table>" }), held, "s2"),
+      );
+    saveEdit.mockResolvedValue({ outcome: "conflict", fields: ["description"] });
+    await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Google's version of the description is shown now/);
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Hall");
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+    expect(screen.getByText(FORMATTING)).toBeTruthy();
+  });
+
+  it("the_dialog_closes_only_the_replace_question_on_escape", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: "<h2>Agenda</h2>" }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    expect(
+      screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+    ).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "Replace the description with plain text?" }),
+    ).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Edit event" })).toBeTruthy();
+    expect(screen.queryByText("Discard your changes?")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    // Nothing was replaced.
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Agenda");
+  });
+
+  it("a mail link in the box opens only on Ctrl+click", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: '<a href="mailto:ann@example.com">Ann</a> and more' })),
+    );
+    openUrl.mockResolvedValue();
+    await open();
+    const link = description().querySelector("a") as HTMLAnchorElement;
+    expect(fireEvent.click(link)).toBe(false);
+    expect(openUrl).not.toHaveBeenCalled();
+    await act(async () => {
+      expect(fireEvent.click(link, { ctrlKey: true })).toBe(false);
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com");
   });
 
   it("says why it couldn't open", async () => {
@@ -3431,6 +3732,39 @@ describe("EventEditor, its calendar", () => {
       null,
       null,
     );
+  });
+
+  // C19d: the replacement landed with the other changes, so the choice is spent. A description
+  // Google's copy still holds with formatting PM can't edit shows read-only again, never in the box.
+  it("a replaced description that landed without the calendar asks again before replacing", async () => {
+    const held: FieldPermissions = {
+      ...ALL,
+      description: false,
+      reasons: ["unsupported_formatting"],
+    };
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    await openOn(event({ description: "<h2>Agenda</h2>" }), held);
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    pick("Personal", "Side");
+    openForEdit.mockResolvedValue(ready(event({ description: "<h3>Agenda</h3>" }), held, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "Agenda", replace_formatting: true, calendar: SIDE.id },
+      null,
+      "Dentist",
+      null,
+      null,
+    );
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Agenda");
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
   });
 
   it("a repeating event says it goes whole and asks which occurrences, All its only row (C18e)", async () => {

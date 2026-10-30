@@ -17,6 +17,7 @@ import { TUNING_TITLE } from "../components/localai/locate";
 import { LOCALAI_SECTIONS } from "../components/localai/sections";
 import { STATUS_LABEL } from "../components/ui/StatusBadge";
 import { inCancelZone } from "./calendarDrag";
+import { FORMAT_BUTTONS } from "./calendarEdit/formatKeys";
 import { CHANGELOG } from "./changelog";
 import { HELP } from "./help";
 
@@ -158,5 +159,34 @@ describe("calendar help agrees with the drag and its Undo", () => {
       expect(text).toMatch(/one event,? or (of )?one occurrence/);
       expect(text).toMatch(/guests, what they may do, or how (it|the event) repeats/);
     }
+  });
+});
+
+// The description's toolbar (#884, C19d): its help names every button and shortcut the toolbar has,
+// in the toolbar's order, so the two can't drift apart.
+describe("the description's formatting help agrees with its toolbar", () => {
+  /** Whether `body` says each of `words`, in that order. */
+  const inOrder = (body: string, words: readonly string[]) => {
+    let at = 0;
+    for (const w of words) {
+      const next = body.indexOf(w, at);
+      if (next < 0) return false;
+      at = next + w.length;
+    }
+    return true;
+  };
+  const body = HELP["calendar-description-format"].body;
+
+  it("names each button and its shortcut, in order", () => {
+    // "Bulleted list" is said "bulleted and numbered lists".
+    const named = FORMAT_BUTTONS.map((b) => b.label.toLowerCase().replace(/ list$/, ""));
+    expect(inOrder(body, named), named.join(", ")).toBe(true);
+    const keys = FORMAT_BUTTONS.map((b) => b.hint);
+    expect(inOrder(body, keys), keys.join(", ")).toBe(true);
+    expect(body).toContain("⌘ instead of Ctrl on a Mac");
+  });
+
+  it("doesn't claim the toolbar is Google Calendar's own (probe E11-0 hasn't said)", () => {
+    expect(body).not.toMatch(/same (buttons )?as Google/i);
   });
 });

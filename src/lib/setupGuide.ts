@@ -17,6 +17,11 @@ import type { SidecarErrorKind } from "./types";
 export const IS_MAC =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
+/** A shortcut's modifier glyphs as a tooltip writes them ("⌘⇧7" on a Mac, "Ctrl+Shift+7" elsewhere):
+ *  the Pinboard note's and the event description's formatting buttons. */
+export const MOD = IS_MAC ? "⌘" : "Ctrl+";
+export const SHIFT = IS_MAC ? "⇧" : "Shift+";
+
 /** True on desktop Linux (WebKitGTK reports e.g. "X11; Linux x86_64"). Checked after
  *  IS_MAC so an iPadOS UA can never fall through here. */
 export const IS_LINUX =

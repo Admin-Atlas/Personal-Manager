@@ -2299,7 +2299,7 @@ const copyOf = (
   of: Partial<CopyOf> = {},
 ): { fields: EditorFields; of: CopyOf } => ({
   fields: { ...seed, summary: "Retro", location: "Room 2", ...fields },
-  of: { title: "Retro", notes: [], callNote: null, formatted: false, ...of },
+  of: { title: "Retro", notes: [], callNote: null, ...of },
 });
 
 const guestOf = (email: string): EditorFields["guests"][number] => ({
@@ -2389,16 +2389,142 @@ describe("NewEventEditor opened on a copy (C18c)", () => {
     expect(createEvent.mock.calls[0][1].summary).toBe("Retro");
   });
 
-  // Critique C2-L12: a formatted description goes as Google holds it, shown as its text, read-only.
-  it("a formatted description is shown as text and sent unchanged", async () => {
+  // Critique C2-L12: a formatted description goes as Google holds it. Formatting PM writes back is
+  // edited in place (C19d), and an untouched copy sends it byte for byte, Google's wrapper and all.
+  it("a copy's formatted description is edited in place and sent unchanged when untouched", async () => {
     createEvent.mockResolvedValue(saved);
-    const html = "<b>Bring</b> the form";
-    const { onClose } = open({ copy: copyOf({ description: html }, { formatted: true }) });
-    expect(screen.queryByLabelText("Description")).toBeNull();
-    expect(screen.getByText("Bring the form")).toBeTruthy();
-    expect(document.querySelector("b")).toBeNull();
+    const html = "<html-blob><strong>Bring</strong> the form</html-blob>";
+    const { onClose } = open({ copy: copyOf({ description: html }) });
+    const box = description();
+    expect(box.querySelector("b")?.textContent).toBe("Bring");
+    expect(screen.getByRole("toolbar", { name: "Description formatting" })).toBeTruthy();
+    fireEvent.blur(box);
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls[0][1].description).toBe(html);
+  });
+
+  // C19d: one PM can't write back shows as Google shows it, with Replace, which is the copy's own.
+  it("a copy's description PM can't edit shows as Google does, with Replace", async () => {
+    createEvent.mockResolvedValue(saved);
+    const html = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
+    const { onClose } = open({ copy: copyOf({ description: html }) });
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    const view = screen.getByRole("group", { name: "Description" });
+    expect(view.textContent).toBe("Room 4.12");
+    expect(view.getAttribute("aria-describedby")).toBe(
+      screen.getByText(/This description has formatting PM can't edit/).id,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Replace" }));
+    const box = description();
+    expect(document.activeElement).toBe(box);
+    expect(screen.queryByText(/This description has formatting PM can't edit/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe("Room 4.12");
+  });
+
+  it("Replace isn't offered while the copy is being created", async () => {
+    const answer = later();
+    createEvent.mockReturnValue(answer.promise);
+    open({ copy: copyOf({ description: "<h2>Agenda</h2>" }) });
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(createEvent).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+    expect(createEvent.mock.calls[0][1].description).toBe("<h2>Agenda</h2>");
+    await act(async () => answer.answer(saved));
+  });
+
+  it("an untouched copy with a description PM can't edit sends it as Google holds it", async () => {
+    createEvent.mockResolvedValue(saved);
+    const html = '<p style="color: red">Red</p>';
+    const { onClose } = open({ copy: copyOf({ description: html }) });
+    // "Keep the formatting" closes only the question.
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Keep the formatting" }));
+    expect(screen.getByRole("dialog", { name: "New event" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Description" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe(html);
+  });
+});
+
+// --- the description (C19d) ---
+
+/** The description's box. */
+const description = () => screen.getByRole("textbox", { name: "Description" });
+
+/** What the user typed into the box, as the engine leaves it, then the input event it fires. */
+function typeInto(box: HTMLElement, ...nodes: (Node | string)[]) {
+  box.replaceChildren(...nodes);
+  fireEvent.input(box);
+}
+
+/** An element made by hand, never by parsing. */
+function h(tag: string, ...children: (Node | string)[]) {
+  const made = document.createElement(tag);
+  made.append(...children);
+  return made;
+}
+
+describe("NewEventEditor's description (C19d)", () => {
+  it("a_new_event_sends_formatting_and_plain_lines_as_written", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Plan" } });
+    typeInto(description(), h("b", "Agenda"), h("ul", h("li", "one & two")));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe(
+      "<b>Agenda</b><ul><li>one &amp; two</li></ul>",
+    );
+
+    cleanup();
+    createEvent.mockResolvedValue(saved);
+    const second = open();
+    fireEvent.change(title(), { target: { value: "Plan" } });
+    // WebKit's lines: a div per Enter.
+    typeInto(description(), "first", h("div", "second"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(second.onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[1][1].description).toBe("first\nsecond");
+  });
+
+  it("an_emptied_description_is_sent_as_nothing", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ copy: copyOf({ description: "<b>Bring</b> the form" }) });
+    // What an engine leaves when everything is deleted.
+    typeInto(description(), h("br"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe("");
+  });
+
+  it("clicking the Description text puts the caret in the box", () => {
+    open();
+    fireEvent.click(screen.getByText("Description", { selector: "span" }));
+    expect(document.activeElement).toBe(description());
+  });
+
+  it("the box stands still while a save is out", async () => {
+    const answer = later();
+    createEvent.mockReturnValue(answer.promise);
+    open();
+    fireEvent.change(title(), { target: { value: "Plan" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(createEvent).toHaveBeenCalled());
+    expect(description().getAttribute("contenteditable")).toBe("false");
+    expect(description().getAttribute("aria-disabled")).toBe("true");
+    for (const button of within(
+      screen.getByRole("toolbar", { name: "Description formatting" }),
+    ).getAllByRole("button")) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
+    await act(async () => answer.answer(saved));
   });
 });

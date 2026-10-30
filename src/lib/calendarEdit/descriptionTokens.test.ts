@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The description tokenizer (C19 §1): what a Google description's characters are, read as the HTML
-// tokenizer reads them wherever that changes what shows. descriptionText.test.ts, left as it was
-// before the tokenizer existed, proves the readers built on it read as the old scanner did.
+// tokenizer reads them wherever that changes what shows. The words the editor's old read-only text
+// (descriptionText.ts, gone in C19d) showed are read here from the tokens, its cases as they were;
+// its lines, lists and links moved to descriptionHtml.test.ts's `replacementText`.
 
 import { describe, expect, it } from "vitest";
-import { descriptionText } from "./descriptionText";
 import { tokens, type Token } from "./descriptionTokens";
 
 const start = (name: string, attrs: [string, string][] = [], selfClosing = false): Token => ({
@@ -22,6 +22,95 @@ const COMMENT: Token = { kind: "comment" };
 const CUT: Token = { kind: "cut" };
 /** U+212A, spelled as a code point so the test reads plainly (it looks like "K"). */
 const KELVIN = String.fromCodePoint(0x212a);
+// Invisible or stand-in characters, spelled as code points so the test reads plainly.
+const NBSP = String.fromCodePoint(0xa0);
+const REPLACEMENT = String.fromCodePoint(0xfffd);
+
+/** The words a description's tokens hold, as every reader shows them: its text and the addresses
+ *  written in angle brackets, up to where it was cut. */
+function words(html: string): string {
+  let out = "";
+  for (const token of tokens(html)) {
+    if (token.kind === "cut") break;
+    if (token.kind === "text" || token.kind === "literal") out += token.text;
+  }
+  return out;
+}
+
+// The editor's old read-only text's cases (descriptionText.test.ts, C19a-c), read as words.
+describe("the words a description shows", () => {
+  it.each([
+    ["a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &apos;f&apos;", `a & b <c> "d" 'e' 'f'`],
+    ["caf&eacute; M&uuml;nchen &szlig; &Aring; &yuml; &times; &divide;", "café München ß Å ÿ × ÷"],
+    ["a&nbsp;b", `a${NBSP}b`],
+    ["&ndash; &mdash; &hellip; &rsquo;s &euro;5 &trade;", "– — … ’s €5 ™"],
+    // The rest of HTML 4, as Java's escapeHtml4 or PHP's htmlentities write it.
+    ["x &le; 5 &rArr; pass &infin; &hearts;", "x ≤ 5 ⇒ pass ∞ ♥"],
+    ["&Kappa;&alpha;&lambda;&eta; &thetasym; &lang;a&rang;", "Καλη ϑ ⟨a⟩"],
+    ["&#233;&#xE9;&#XE9;&#x1F600;", "ééé😀"],
+    ["&#65 &#x42", "A B"],
+    ["&#0000000233;&#x00000000E9;&#000000065;", "ééA"],
+    // Windows-1252's punctuation, as a browser reads the C1 codes.
+    ["Don&#146;t &#147;go&#148; &#150; &#128;5 &#x99;", "Don’t “go” – €5 ™"],
+    ["&#0;&#xD800;&#x110000;&#99999999999;", REPLACEMENT.repeat(4)],
+    // Not references: left as written.
+    [
+      "a & b, &#; &#x; &foo; &constructor; &toString; &valueOf;",
+      "a & b, &#; &#x; &foo; &constructor; &toString; &valueOf;",
+    ],
+    // Deliberately unlike a browser: HTML 5's own names, and the old forms without ";", stay as
+    // written. Encoders write HTML 4's names with the ";", Google included.
+    ["&colon; &check; &amp &copy 2026", "&colon; &check; &amp &copy 2026"],
+  ])("decodes %j", (html, text) => {
+    expect(words(html)).toBe(text);
+  });
+
+  // Decoded once, onto the output: escaped markup shows as text and is never read as a tag.
+  it("never reads decoded text as markup", () => {
+    expect(words("&lt;b&gt;not bold&lt;/b&gt; &lt;script&gt;x&lt;/script&gt;")).toBe(
+      "<b>not bold</b> <script>x</script>",
+    );
+  });
+
+  it.each([
+    ["Hi<script>alert(1)</script> there<style>p { color: red }</style>!", "Hi there!"],
+    ["a<SCRIPT type=x>b</script >c", "ac"],
+    ["a<script>b</scriptx>c</script>d", "ad"],
+    ["a<title>t</title>b<template><p>x</p></template>c", "abc"],
+    // Nothing ends it: the rest stays hidden.
+    ["a<style>b", "a"],
+  ])("hides what never shows: %j", (html, text) => {
+    expect(words(html)).toBe(text);
+  });
+
+  it.each([
+    ["a<!-- <b>hidden</b> -->b", "ab"],
+    ["a<!-->b", "ab"],
+    ["a<!--->b", "ab"],
+    ["a<!-- x --->b", "ab"],
+    ["a<!-- x --!>b", "ab"],
+    ["a<!-- b", "a"],
+    ["<!DOCTYPE html><html><body>x</body></html>", "x"],
+    ["<?xml version='1.0'?>x", "x"],
+    ["</>x", "x"],
+    ["</ 3>x", "x"],
+  ])("drops comments and declarations: %j", (html, text) => {
+    expect(words(html)).toBe(text);
+  });
+
+  it.each([
+    // A ">" inside a quoted value doesn't end the tag; one outside quotes does.
+    ["<a href=\"x>y\" title='p>q'>link</a>", "link"],
+    ["<a href=x>y>link</a>", "y>link"],
+    // A "<" that can't open a tag is text.
+    ["1 < 2 and 3 <4 and <>", "1 < 2 and 3 <4 and <>"],
+    // The text ends inside a tag (or a quoted value): it and the rest go.
+    ["a <b", "a "],
+    ['a <a href="x>text', "a "],
+  ])("reads tags as the tokenizer does: %j", (html, text) => {
+    expect(words(html)).toBe(text);
+  });
+});
 
 describe("tokens", () => {
   it("reads_tags_with_their_attributes", () => {
@@ -184,10 +273,9 @@ describe("tokens", () => {
     ]);
   });
 
-  it("the_editors_text_keeps_addresses_in_angle_brackets", () => {
-    // descriptionText.ts, rebuilt on these tokens, shows them as words rather than dropping them as
-    // an element named "https:" (its own tests, left as they were, have no such case).
-    expect(descriptionText("<b>Join</b> <https://example.com/j/1> or mail <ann@example.com>")).toBe(
+  it("the_words_keep_addresses_in_angle_brackets", () => {
+    // Words, rather than an element named "https:" that shows nothing.
+    expect(words("<b>Join</b> <https://example.com/j/1> or mail <ann@example.com>")).toBe(
       "Join <https://example.com/j/1> or mail <ann@example.com>",
     );
   });

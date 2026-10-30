@@ -509,7 +509,6 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
             .unwrap_or("")
             .to_string()
     };
-    let description = text("description");
     let instant = |node: &Value| {
         node.get("dateTime")
             .and_then(Value::as_str)
@@ -519,8 +518,7 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
     Some(EventForEdit {
         summary: text("summary"),
         location: text("location"),
-        description_html: description::is_html(&description),
-        description,
+        description: text("description"),
         time,
         start_at: (!all_day).then(|| instant(start)).flatten(),
         end_at: (!all_day).then(|| instant(end)).flatten(),

@@ -17,6 +17,7 @@ import {
   looksLikeHtml,
   normalise,
   parseDescription,
+  replacementText,
   sameDescription,
   serialiseDescription,
   textLinks,
@@ -889,6 +890,83 @@ describe("drawing (C19b)", () => {
   });
 });
 
+describe("replacing (C19d)", () => {
+  /** "Replace with plain text…" on a description Google holds. */
+  const replaced = (description: string) => replacementText(parseDescription(description).doc);
+
+  // The editor's old read-only text (descriptionText.ts, gone in C19d) read these; its cases moved
+  // here with what that reader left out: a list's items now start "• " or "1. ", and a link's
+  // address follows its words (Q2).
+  it.each([
+    // What Google's own editor writes.
+    ["Line one<br>Line two<br/>Line three<BR />", "Line one\nLine two\nLine three"],
+    ["<b>Agenda</b><br><ul><li>One</li><li>Two</li></ul>", "Agenda\n• One\n• Two"],
+    [
+      'See <a href="https://example.com/a?b=1&amp;c=2">the doc</a>.',
+      "See the doc (https://example.com/a?b=1&c=2).",
+    ],
+    ["<p>First</p><p>Second</p>", "First\nSecond"],
+    ["<h2>Title</h2><div>Body</div >", "Title\nBody"],
+    ["Line one<br><br>Line three", "Line one\n\nLine three"],
+    ["  <p>padded</p>  ", "padded"],
+    // What other editors write: a line opens a block, and edges that meet break once.
+    ["Line one<div>Line two</div><div>Line three</div>", "Line one\nLine two\nLine three"],
+    ["<div><p>a</p></div><p>b</p>", "a\nb"],
+    ["<p>a</p><p></p><p></p><p>b</p>", "a\nb"],
+    [
+      "<table><tr><td>Dial-in</td><td>+1 555</td></tr><tr><td>PIN</td></tr></table>",
+      "Dial-in +1 555\nPIN",
+    ],
+    ["<table>\n<tr><td>a</td>\n<td>b</td></tr></table>", "a\nb"],
+    // The description's own line breaks and spacing stay; CR LF and a lone CR are line breaks, and
+    // three or more break as two.
+    ["one\ntwo  three", "one\ntwo  three"],
+    ["<b>a</b>\r\n\r\n\r\n\r\nb", "a\n\nb"],
+    ["<b>a</b>\rb", "a\nb"],
+    // An address written in angle brackets is words, kept as written (critique C1-H1).
+    [
+      "<b>Join</b> <https://example.com/j/1> or mail <ann@example.com>",
+      "Join <https://example.com/j/1> or mail <ann@example.com>",
+    ],
+  ])("replacement_text_keeps_words_lines_lists_and_addresses: %j", (description, text) => {
+    expect(replaced(description)).toBe(text);
+  });
+
+  it.each([
+    // Lists: numbered from 1 in each list, two spaces more per level, an item's later lines under
+    // its words.
+    ["<ol><li>x</li><li>y</li></ol><ol><li>z</li></ol>", "1. x\n2. y\n1. z"],
+    [
+      "<ul><li>a<ul><li>b</li><li>c<ol><li>d</li></ol></li></ul></li><li>e</li></ul>",
+      "• a\n  • b\n  • c\n    1. d\n• e",
+    ],
+    ["<ul><li>a<br>b</li></ul>after", "• a\n  b\nafter"],
+    ["<li>loose</li>", "• loose"],
+    // Links: the address after the words, unless the words are the address, as written or typed.
+    ['<a href="https://example.com/x">https://example.com/x</a>', "https://example.com/x"],
+    ['<a href="example.com">example.com</a>', "example.com"],
+    ['<a href="mailto:ann@example.com">Ann</a>', "Ann (ann@example.com)"],
+    ['<a href="mailto:ann@example.com">ann@example.com</a>', "ann@example.com"],
+    ['<a href="tel:+15550100">Call us</a>', "Call us (+15550100)"],
+    [
+      '<ul><li><a href="https://example.com"><b>site</b></a> notes</li></ul>',
+      "• site (https://example.com) notes",
+    ],
+    // What PM can't write back keeps its words: a link it can't open is words alone.
+    ['<a href="javascript:alert(1)">x</a> and <font color="red">red</font>', "x and red"],
+    ["<b>a</b><script>alert(1)</script>", "a"],
+    ["", ""],
+  ])("replacing_keeps_lists_and_link_addresses_as_words: %j", (description, text) => {
+    expect(replaced(description)).toBe(text);
+  });
+
+  it("replacing_what_is_deeper_than_the_limit_keeps_its_words", () => {
+    let doc: DescDoc = [t("deep")];
+    for (let k = 0; k < MAX_DEPTH * 2; k++) doc = [b(...doc)];
+    expect(replacementText([ul(li(t("a")), li(...doc))])).toBe("• a\n• deep");
+  });
+});
+
 describe("costs", () => {
   it.each([
     ["one run of openers", "(".repeat(200_000) + "https://example.com"],
@@ -914,6 +992,8 @@ describe("costs", () => {
     ["plain off and on", '<b><span style="font-weight: normal">x</span>'.repeat(30_000)],
     ["lines", "<div>a</div>".repeat(50_000)],
     ["breaks", "a" + "<br>".repeat(100_000)],
+    ["nested lists", "<ul><li>a".repeat(50_000)],
+    ["links in items", '<ol><li><a href="https://example.com">x</a></li></ol>'.repeat(20_000)],
   ])("reading_is_linear: %s", (_name, description) => {
     // Each pass timed on its own, so a busy machine running every suite at once keeps the margin a
     // quadratic reader would blow through many times over.
@@ -925,6 +1005,7 @@ describe("costs", () => {
     let doc: DescDoc = [];
     expect(took(() => (doc = parseDescription(description).doc))).toBeLessThan(1_000);
     expect(took(() => serialiseDescription(doc))).toBeLessThan(1_000);
+    expect(took(() => replacementText(doc))).toBeLessThan(1_000);
     // Two reads: the texts differ, so both are parsed.
     expect(took(() => sameDescription(description, description + " "))).toBeLessThan(2_000);
   });

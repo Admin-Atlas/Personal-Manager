@@ -533,7 +533,6 @@ describe("CalendarView: guests", () => {
       summary: "Standup",
       location: "",
       description: "",
-      description_html: false,
       time: {
         kind: "timed",
         start_date: today,
@@ -959,7 +958,6 @@ describe("CalendarView: Duplicate", () => {
     summary: "Standup",
     location: "Room 2",
     description: "",
-    description_html: false,
     time: {
       kind: "timed",
       start_date: today,

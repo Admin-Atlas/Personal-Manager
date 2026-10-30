@@ -66,6 +66,11 @@
 // keeps the calendar chosen, so Save tries it alone. A new repeat goes in a Save of its own. A
 // repeating event goes whole (C18e): the choices offer "All events" only, and the line under the row
 // says so.
+//
+// Its description (C19d) is formatted in place, with Google Calendar's buttons. One with formatting
+// PM can't write back (a table, a colour) shows as Google shows it, with "Replace with plain text…",
+// and only a save after that choice may replace it. A description is compared by what it shows, so
+// one only opened is never sent.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -111,6 +116,7 @@ import {
   repeatSeed,
   seedDraft,
   toChanges,
+  withReplace,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
@@ -143,7 +149,7 @@ import {
 } from "../../../lib/calendarEdit/editReasons";
 import { createdWhere, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
-import { parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
+import { parseDescription, replacementText } from "../../../lib/calendarEdit/descriptionHtml";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
@@ -154,6 +160,7 @@ import { GuestField } from "./GuestField";
 import { MeetField } from "./MeetField";
 import { NotifyPrompt } from "./NotifyPrompt";
 import { CalendarPicker } from "./CalendarPicker";
+import { DescriptionEditor, DescriptionView, ReplaceQuestion } from "./DescriptionEditor";
 import { ReminderList } from "./ReminderList";
 import { RsvpControl } from "./RsvpControl";
 import {
@@ -166,7 +173,6 @@ import {
   ZonePanel,
   type Timed,
 } from "./EventFields";
-import { RichDescription } from "../parts/RichDescription";
 import { useMailLink } from "../parts/useMailLink";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
 import { useRepeatView, type RepeatState } from "./useRepeat";
@@ -273,6 +279,9 @@ const firstDay = (t: TimeDraft) => (t.kind === "timed" ? t.start_date : t.first_
 /** Said under the Repeat row of an occurrence whose repeating event PM couldn't read. */
 export const UNREADABLE_REPEAT = "PM couldn't read how this repeats, so it can't change it here.";
 
+/** Why a description shows read-only: formatting PM can't edit. */
+const FORMATTING_REASON = reasonText("unsupported_formatting");
+
 export function EventEditor({
   row,
   calendar,
@@ -355,6 +364,12 @@ export function EventEditor({
   // The Custom dialog, while open: no save goes from behind it.
   const customRef = useRef(false);
   const [customOpen, setCustomOpenState] = useState(false);
+  // "Replace with plain text…" (C19d): asked, then chosen. Chosen, the description PM couldn't edit
+  // is the editor's to change, and a save that sends it says so (`withReplace`), until Google's copy
+  // replaces it after a conflict. The box takes focus once it shows.
+  const [askReplace, setAskReplace] = useState(false);
+  const [replaced, setReplaced] = useState(false);
+  const [justReplaced, setJustReplaced] = useState(false);
   // Focus returns here whenever the choices close or a save stays open: the button was blurred
   // before the dialog opened, so the dialog's own restore has nowhere to go back to.
   const saveRef = useRef<HTMLButtonElement>(null);
@@ -606,6 +621,10 @@ export function EventEditor({
     });
     setDraft(next);
     if (note !== undefined) setRemindersNote(note);
+    // Google's description stands in place of the replacement: one PM can't edit shows read-only
+    // again, with Replace. (A replacement that landed is Google's copy now, so nothing of it is
+    // left to send, and the mark goes with nothing.)
+    if (r.overwritten.includes("description")) setReplaced(false);
     const kept = saved && r.overwritten.length === 0 && r.lost_guests.length === 0;
     setBanner({
       tone: "warn",
@@ -680,10 +699,12 @@ export function EventEditor({
       refocus(focused);
       return;
     }
-    // Another calendar goes with the rest, after it (C18d): Google's one Save, one question.
+    // Another calendar goes with the rest, after it (C18d): Google's one Save, one question. A
+    // description the user replaced with plain text says so, in the very changes both the choices
+    // and the save are asked for (C19d).
     const elsewhere = moving();
     const changes = {
-      ...toChanges(loaded.base, current),
+      ...withReplace(toChanges(loaded.base, current), replaced),
       ...(elsewhere ? { calendar: calendarRef.current } : {}),
     };
     if (Object.keys(changes).length === 0) {
@@ -977,12 +998,40 @@ export function EventEditor({
   const showDuplicate = canDuplicate && !!onDuplicate && !!loaded;
   const timeOff = deviceZone === null;
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
+  // The description (C19d): edited in place, formatting and all, unless it has formatting PM can't
+  // write back. The backend says so of what it can tell (a table, a heading); the webview's reading
+  // is stricter (a link it can't open, a colour), and says so itself. Either way it shows as Google
+  // shows it (Google's copy as the editor last read it, never the draft), with "Replace with plain
+  // text…", until the user replaces it.
+  const baseDescription = loaded?.base.description;
+  const shownDescription = useMemo(
+    () => (baseDescription === undefined ? [] : parseDescription(baseDescription).doc),
+    [baseDescription],
+  );
+  const draftDescription = draft?.description;
+  const draftEditable = useMemo(
+    () => draftDescription === undefined || parseDescription(draftDescription).supported,
+    [draftDescription],
+  );
+  const formattingHeld = !!perms?.reasons.includes("unsupported_formatting");
+  const formattingBlocked = !replaced && (formattingHeld || !draftEditable);
+  const descriptionLive =
+    !formattingBlocked && (!!perms?.description || (replaced && formattingHeld));
+  // Only the webview refused it: the backend left the description open, so its words come from here.
+  const formattingSaid = formattingBlocked && !formattingHeld && !!perms?.description;
+  const descriptionId = useId();
+  const descriptionBoxId = useId();
+  const formattingReasonId = useId();
+  const mail = useMailLink(row.id);
   // Someone else's event says the reply is the user's only where this copy can send one (C14
-  // critique C2-L1).
+  // critique C2-L1). The formatting reason goes once the user replaced the description.
   const reasons = [
-    ...(perms?.reasons.map((r) =>
-      r === "not_organizer" ? notOrganizerText(perms.respond, true) : reasonText(r),
-    ) ?? []),
+    ...(perms?.reasons
+      .filter((r) => !(replaced && r === "unsupported_formatting"))
+      .map((r) =>
+        r === "not_organizer" ? notOrganizerText(perms.respond, true) : reasonText(r),
+      ) ?? []),
+    ...(formattingSaid ? [FORMATTING_REASON] : []),
     ...(timeOff && perms?.time ? [NO_ZONE] : []),
   ];
   // Someone else's event: its reply on top, and how it repeats always theirs (C14c).
@@ -1002,14 +1051,6 @@ export function EventEditor({
     () => (loaded && timed ? endDateMin(loaded.base, timed, loaded.event) : undefined),
     [loaded, timed],
   );
-  // A formatted description shows its formatting, read once per copy of Google's (C19b): Google's
-  // copy as the editor last read it, never the draft.
-  const baseDescription = loaded?.base.description;
-  const shownDescription = useMemo(
-    () => (baseDescription === undefined ? [] : parseDescription(baseDescription).doc),
-    [baseDescription],
-  );
-  const mail = useMailLink(row.id);
   // The Repeat row's words: a repeating event's own rule in the words it came with, any other rule
   // in the backend's. Only a one-off's repeat holds Save (`repeatReady`).
   const series = loaded?.series ?? null;
@@ -1323,26 +1364,47 @@ export function EventEditor({
               />
             </div>
 
-            {loaded.event.description_html ? (
-              <div className="flex flex-col gap-1">
-                <span className="text-sm text-ink2">Description</span>
-                {/* A div: the view holds paragraphs and lists (critique C1-L3). */}
-                <div className="rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
-                  <RichDescription doc={shownDescription} onMail={mail.open} />
-                </div>
-                <p role="status" className="text-xs text-st-due">
-                  {mail.failure ?? ""}
-                </p>
-              </div>
-            ) : (
-              <TextRow
-                label="Description"
-                multiline
-                value={draft.description}
-                disabled={!may("description")}
-                onChange={(description) => setDraft({ ...draft, description })}
-              />
-            )}
+            <div className="flex flex-col gap-1">
+              {/* Text, not a label element: the box is a div, which a label can't name. Clicking
+                  it still puts the caret in the box (critique C2-L7). */}
+              <span
+                id={descriptionId}
+                className="text-sm text-ink2"
+                onClick={() => document.getElementById(descriptionBoxId)?.focus()}
+              >
+                Description
+              </span>
+              {descriptionLive ? (
+                <DescriptionEditor
+                  id={descriptionBoxId}
+                  value={draft.description}
+                  // Into the latest draft: a blur before a save reports after other changes.
+                  onChange={(description) =>
+                    draftRef.current && setDraft({ ...draftRef.current, description })
+                  }
+                  disabled={saving}
+                  labelledBy={descriptionId}
+                  autoFocus={justReplaced}
+                  onMail={mail.open}
+                />
+              ) : (
+                <DescriptionView
+                  doc={shownDescription}
+                  labelledBy={descriptionId}
+                  describedBy={reasons.includes(FORMATTING_REASON) ? formattingReasonId : undefined}
+                  // Not on a description locked or kept by the organiser: its reason says why.
+                  onReplace={
+                    formattingBlocked && !saving && (formattingHeld || perms?.description)
+                      ? () => setAskReplace(true)
+                      : undefined
+                  }
+                  onMail={mail.open}
+                />
+              )}
+              <p role="status" className="text-xs text-st-due">
+                {mail.failure ?? ""}
+              </p>
+            </div>
 
             <div className="flex flex-wrap items-center gap-4">
               <ShowAsControl
@@ -1378,7 +1440,11 @@ export function EventEditor({
             )}
 
             {reasons.map((r) => (
-              <p key={r} className="text-xs leading-relaxed text-ink4">
+              <p
+                key={r}
+                id={r === FORMATTING_REASON ? formattingReasonId : undefined}
+                className="text-xs leading-relaxed text-ink4"
+              >
                 {r}
               </p>
             ))}
@@ -1413,6 +1479,20 @@ export function EventEditor({
             onClose={() => setCustomOpen(false)}
           />
         )}
+        {/* "Replace with plain text…", nested the same way: Escape closes only it. Nothing is sent
+            until Save, so Cancel, or closing the editor, keeps the formatting. */}
+        <ReplaceQuestion
+          open={askReplace}
+          onKeep={() => setAskReplace(false)}
+          onReplace={() => {
+            setAskReplace(false);
+            const now = draftRef.current;
+            if (!now) return;
+            setDraft({ ...now, description: replacementText(shownDescription) });
+            setReplaced(true);
+            setJustReplaced(true);
+          }}
+        />
         {/* The email question, nested the same way: Escape and Back close only it. */}
         {prompt && (
           <NotifyPrompt

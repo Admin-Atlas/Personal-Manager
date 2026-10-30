@@ -1899,8 +1899,8 @@ export interface FieldPermissions {
 export interface EventForEdit {
   summary: string;
   location: string;
+  /** As Google holds it, plain lines or formatted: the editor reads which (`looksLikeHtml`, C19d). */
   description: string;
-  description_html: boolean;
   time: TimeDraft;
   /** Google's exact start and end of a timed event (RFC 3339), null for all-day: which of a repeated
    *  hour's two times an untouched half is, for the pre-save check. */
