@@ -108,7 +108,7 @@ const REASONS: ReadOnlyReason[] = [
   "became_repeating",
   "special_type",
   "locked",
-  "html_description",
+  "unsupported_formatting",
   "label_read_only",
   "reminders_unreadable",
   "other_call",
@@ -129,6 +129,14 @@ describe("edit reasons", () => {
       "PM can't read one of this event's notifications, so it leaves them as they are.",
     );
     for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/reminder/i);
+  });
+
+  it("words formatting PM can't edit as the backend does, never promising Google's look (C19)", () => {
+    const line = reasonText("unsupported_formatting");
+    expect(line).toBe(
+      "This description has formatting PM can't edit. PM shows what it can of it here; Google Calendar shows all of it.",
+    );
+    expect(line).not.toMatch(/html|rich text|markup|tag/i);
   });
 
   // C18: another service's call, Google's old Hangouts or a bare link, in one sentence, never

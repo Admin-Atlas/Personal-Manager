@@ -80,8 +80,10 @@ export function reasonText(reason: ReadOnlyReason): string {
     // And its calendar, which Google doesn't say a locked copy may change (C18d).
     case "locked":
       return "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.";
-    case "html_description":
-      return "This description has formatting, so PM shows its text here and can't change it yet.";
+    // Not "as Google shows it": PM draws only the formatting its own editor writes (C19 critique
+    // C2-M1). The backend's `read_only_message` says these very words.
+    case "unsupported_formatting":
+      return "This description has formatting PM can't edit. PM shows what it can of it here; Google Calendar shows all of it.";
     case "label_read_only":
       return "This event has a Google Calendar label, which sets its colour. Change it in Google Calendar.";
     case "reminders_unreadable":

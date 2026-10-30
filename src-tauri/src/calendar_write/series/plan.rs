@@ -70,14 +70,15 @@ use crate::calendar_recur::{rfc_instant, Point, RecurError, SeriesStart};
 
 use super::super::attendees::{self, GuestError, Own, Reach};
 use super::super::call;
+use super::super::description;
 use super::super::dto::{
     CallKind, ColourDraft, EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason,
     SeenSummary,
 };
 use super::super::patch::{
-    bool_of, build_patch, check_draft_extras, delete_still_matches, description_is_html,
-    drop_other_kind, is_gone, reminders_eq, reminders_value, series_patch, update_check, watched,
-    when_eq, PatchError, CREATABLE,
+    bool_of, build_patch, check_draft_extras, delete_still_matches, drop_other_kind, is_gone,
+    reminders_eq, reminders_value, series_patch, update_check, watched, when_eq, PatchError,
+    CREATABLE,
 };
 use super::super::patch::{DeleteCheck, UpdateCheck};
 use super::super::plan::{
@@ -1281,20 +1282,25 @@ pub(super) fn exceptions_from<'a>(
     Ok(out)
 }
 
-/// The gate reads the occurrence's description; a draft for the series writes the series' own, and
-/// would save a formatted one as plain text (C9 design review L7).
-pub(super) fn keeps_formatting(
+/// The gate reads the occurrence's description; a draft for the series writes the series' own (C9
+/// design review L7). One whose formatting PM can't edit is replaced only when the user chose to,
+/// and only when it is the very description the gate read on the occurrence (`instance`), byte for
+/// byte (C19 critique C1-M6): a replace chosen over the occurrence's own plain text never reaches a
+/// series description the user wasn't shown.
+pub(super) fn keeps_what_pm_cant_edit(
     master_json: &Value,
+    instance: &Value,
     draft: &EventPatchDraft,
 ) -> Result<(), NotPlanned> {
-    let formatted = master_json
-        .get("description")
-        .and_then(Value::as_str)
-        .is_some_and(description_is_html);
-    if formatted && draft.description.is_some() {
-        return Err(SeriesRefusal::FormattedDescription.into());
+    let held = master_json.get("description").and_then(Value::as_str);
+    if !held.is_some_and(|d| !description::pm_can_edit(d)) || draft.description.is_none() {
+        return Ok(());
     }
-    Ok(())
+    let shown = instance.get("description").and_then(Value::as_str);
+    if draft.replace_formatting && shown == held {
+        return Ok(());
+    }
+    Err(SeriesRefusal::FormattedDescription.into())
 }
 
 /// A cleanup cancel of the original's own copy of the occurrence at `original`, which moved to the new
@@ -2347,7 +2353,7 @@ fn plan_all(
     }
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    keeps_formatting(master_json, draft)?;
+    keeps_what_pm_cant_edit(master_json, instance, draft)?;
     let text_only = EventPatchDraft {
         time: None,
         ..draft.clone()
@@ -2583,7 +2589,7 @@ fn plan_split(
     let SplitCut { cut, moved, before } = cut;
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    keeps_formatting(master_json, draft)?;
+    keeps_what_pm_cant_edit(master_json, instance, draft)?;
     // The new part takes the series' notifications and colour where the draft leaves them: the
     // draft's are checked against the series, as a save onto it is (C13).
     check_draft_extras(master_json, Some(instance), draft)?;

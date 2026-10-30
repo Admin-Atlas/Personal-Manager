@@ -38,10 +38,10 @@ use super::super::time;
 use super::diff::{Expect, Removes};
 use super::plan::{
     all_plan, cancel_exception, cancelled_points, cut_step, draft_fields, exceptions_from,
-    insert_step, keeps_formatting, last_kept, not_carried, own_exceptions, rest_start, snapshot,
-    split_unchanged_since_opened, start_of, tail_body, unchanged_since_opened, when_nodes_in,
-    NotPlanned, Op, Recheck, SeriesInput, SeriesPlan, SeriesWarning, Shows, SplitCut, Stage, Step,
-    Undo, TAIL_WATCH,
+    insert_step, keeps_what_pm_cant_edit, last_kept, not_carried, own_exceptions, rest_start,
+    snapshot, split_unchanged_since_opened, start_of, tail_body, unchanged_since_opened,
+    when_nodes_in, NotPlanned, Op, Recheck, SeriesInput, SeriesPlan, SeriesWarning, Shows,
+    SplitCut, Stage, Step, Undo, TAIL_WATCH,
 };
 use super::scope::{RuleChange, Scope};
 use super::{
@@ -569,7 +569,7 @@ pub(super) fn plan_all_rule(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    keeps_formatting(master_json, draft)?;
+    keeps_what_pm_cant_edit(master_json, instance, draft)?;
     every_line_readable(master)?;
     // The draft's time is read against the occurrence as Google holds it now, and a new rule moves
     // the times whatever the draft says: it must still be where the user saw it (R2).
@@ -845,7 +845,7 @@ pub(super) fn plan_split_rule(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    keeps_formatting(master_json, draft)?;
+    keeps_what_pm_cant_edit(master_json, instance, draft)?;
     // The new part takes the draft's notifications and colour, checked as a save onto the series'
     // own copy is (C13).
     check_draft_extras(master_json, Some(instance), draft)?;
@@ -3606,10 +3606,18 @@ mod tests {
             && g.complete));
     }
 
-    /// A formatted description is never saved over as plain text, whatever the rule.
+    /// Formatting PM can't edit is never saved over, whatever the rule, unless the user replaced the
+    /// very description the occurrence showed (C19 §5.5, critique C1-M6); formatting the editor
+    /// writes is no reason to refuse.
     #[test]
-    fn a_rule_change_keeps_a_formatted_description() {
-        let case = Case::new(
+    fn a_rule_change_keeps_formatting_pm_cant_edit() {
+        let table = json!("<table><tr><td>Agenda</td></tr></table>");
+        let plain = Case::new(with(weekly(), "description", table.clone()), monday_19());
+        let showing = Case::new(
+            with(weekly(), "description", table.clone()),
+            with(monday_19(), "description", table),
+        );
+        let bold = Case::new(
             with(weekly(), "description", json!("<b>Agenda</b>")),
             monday_19(),
         );
@@ -3620,9 +3628,23 @@ mod tests {
                     recurrence: Some(recurrence),
                     ..Default::default()
                 };
-                assert_eq!(
-                    case.edit(scope, notes),
-                    Err(NotPlanned::Refused(SeriesRefusal::FormattedDescription))
+                let replacing = EventPatchDraft {
+                    replace_formatting: true,
+                    ..notes.clone()
+                };
+                for (case, draft) in [(&plain, &notes), (&plain, &replacing), (&showing, &notes)] {
+                    assert_eq!(
+                        case.edit(scope, draft.clone()),
+                        Err(NotPlanned::Refused(SeriesRefusal::FormattedDescription))
+                    );
+                }
+                assert!(
+                    showing.edit(scope, replacing.clone()).is_ok(),
+                    "replacing the description the user saw"
+                );
+                assert!(
+                    bold.edit(scope, notes.clone()).is_ok(),
+                    "bold is the editor's"
                 );
             }
         }

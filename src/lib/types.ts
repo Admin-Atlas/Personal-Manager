@@ -1591,7 +1591,9 @@ export type ReadOnlyReason =
   | "became_repeating"
   | "special_type"
   | "locked"
-  | "html_description"
+  /** The description has formatting PM can't edit, such as a table or coloured text: it stays as
+   *  Google holds it unless the user replaces it with plain text (C19). */
+  | "unsupported_formatting"
   /** A Google Calendar label sets its colour, and PM doesn't change labels (C13). */
   | "label_read_only"
   /** Google holds a notification PM can't read, so the list stays as it is (C13). */
@@ -1665,7 +1667,11 @@ export interface UndoOffer {
 export interface EventPatchDraft {
   summary?: string | null;
   location?: string | null;
+  /** Plain lines, or formatting as PM's editor writes it (Google's own subset). "" clears it. */
   description?: string | null;
+  /** The user chose "Replace with plain text…": a description whose formatting PM can't edit may
+   *  change. Only beside the description it replaces; on its own it reopens nothing (C19). */
+  replace_formatting?: boolean;
   time?: TimeDraft | null;
   show_as?: ShowAs | null;
   visibility?: EventVisibility | null;
@@ -1776,6 +1782,7 @@ export interface NewEventDraft {
   summary: string;
   time: TimeDraft;
   location: string;
+  /** Plain lines, or formatting as PM's editor writes it. */
   description: string;
   show_as: ShowAs;
   visibility: EventVisibility;

@@ -597,6 +597,20 @@
       "pm_can_edit": true,
       "supported": true,
       "why": "a name neither side knows still reads as formatting, and shows as written"
+    },
+    {
+      "description": "<b>a</b> <u class=x",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "ends inside a tag, with no quote open (C19c)"
+    },
+    {
+      "description": "<b title=\"x><h2>\">a</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a tag after a > in a quoted value is part of the value; the title fails closed (C19c)"
     }
   ]
 }

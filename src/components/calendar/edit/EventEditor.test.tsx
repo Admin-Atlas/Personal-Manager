@@ -607,7 +607,7 @@ describe("EventEditor", () => {
         ...ALL,
         reminders: false,
         colour: false,
-        reasons: ["label_read_only", "reminders_unreadable", "html_description"],
+        reasons: ["label_read_only", "reminders_unreadable", "unsupported_formatting"],
       }),
     );
     await open(vi.fn(), vi.fn());

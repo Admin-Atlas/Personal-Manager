@@ -945,38 +945,6 @@ pub fn timing_still_matches(seen: &SeenTimes, fresh: &Value) -> DeleteCheck {
     }
 }
 
-/// Whether a description is formatted rather than plain text. Editing it in a plain-text box would
-/// strip the formatting, so a formatted one is read-only until the rich-text layer (C19). Errs
-/// towards "formatted": a plain description that merely looks like markup is only made read-only.
-pub fn description_is_html(s: &str) -> bool {
-    for (i, c) in s.char_indices() {
-        let rest = &s[i + c.len_utf8()..];
-        match c {
-            // A tag: `<b>`, `</p>`, `<a href=…>`, `<br/>`.
-            '<' => {
-                let name = rest.strip_prefix('/').unwrap_or(rest);
-                if name.starts_with(|n: char| n.is_ascii_alphabetic()) && name.contains('>') {
-                    return true;
-                }
-            }
-            // An entity: `&amp;`, `&nbsp;`, `&#39;`.
-            '&' => {
-                if let Some(end) = rest.find(';').filter(|e| (1..=8).contains(e)) {
-                    let entity = &rest[..end];
-                    let numeric = entity
-                        .strip_prefix('#')
-                        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
-                    if numeric || entity.chars().all(|c| c.is_ascii_alphabetic()) {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
 // --- comparing one field the way Google means it ---
 
 /// A text field, with absent read as empty (Google omits empty ones).
@@ -1148,6 +1116,8 @@ mod tests {
             summary: Some("x".into()),
             location: Some("".into()),
             description: Some("notes".into()),
+            // The gate's to read, never a body key (C19).
+            replace_formatting: true,
             time: Some(TimeDraft::AllDay {
                 first_day: "2026-10-13".into(),
                 last_day: "2026-10-13".into(),
@@ -2597,31 +2567,6 @@ mod tests {
             .unwrap();
             assert!(!body.contains_key("transparency"));
             assert!(!body.contains_key("visibility"), "{visibility:?}");
-        }
-    }
-
-    #[test]
-    fn formatted_descriptions_are_recognised() {
-        for html in [
-            "<b>Agenda</b>",
-            "line one<br>line two",
-            "see <a href=\"https://x\">this</a>",
-            "</p>",
-            "fish &amp; chips",
-            "it&#39;s",
-            "a&nbsp;b",
-        ] {
-            assert!(description_is_html(html), "{html}");
-        }
-        for plain in [
-            "a < b and c > d",
-            "Q&A at 3",
-            "5<6",
-            "just notes",
-            "",
-            "café ☕ <",
-        ] {
-            assert!(!description_is_html(plain), "{plain}");
         }
     }
 

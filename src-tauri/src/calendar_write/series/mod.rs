@@ -595,7 +595,8 @@ pub enum SeriesRefusal {
     /// An occurrence after the split has guests, attachments, a call, a label or a visibility of its
     /// own.
     CannotCarry(NaiveDate),
-    /// The series' description is formatted (HTML), and the draft would save it as plain text.
+    /// The series' own description has formatting PM can't edit, which the draft would replace, and
+    /// the user didn't choose to replace that very description (C19).
     FormattedDescription,
     /// Its visibility applies to every occurrence (Google), so it can't change for one.
     VisibilityIsSeriesWide,
@@ -711,8 +712,8 @@ impl fmt::Display for SeriesRefusal {
             ),
             SeriesRefusal::FormattedDescription => write!(
                 f,
-                "This repeating event's description has formatting, which saving it here as plain \
-                 text would remove. Change this occurrence on its own instead."
+                "This repeating event's own description has formatting PM can't edit, which this \
+                 change would replace. Change this occurrence on its own instead."
             ),
             SeriesRefusal::VisibilityIsSeriesWide => write!(
                 f,

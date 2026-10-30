@@ -3053,12 +3053,10 @@ mod tests {
         );
         // Nor does one stored before descriptions kept 8,000 characters (C19), so a description cut
         // at 2,000 is stored again, longer, on the next sync.
-        for older in ["mirror-format:2\n"] {
-            assert_ne!(
-                events_hash(&[]),
-                crate::ingest::hex_digest(older.as_bytes())
-            );
-        }
+        assert_ne!(
+            events_hash(&[]),
+            crate::ingest::hex_digest(b"mirror-format:2\n")
+        );
     }
 
     #[test]

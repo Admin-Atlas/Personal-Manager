@@ -21,6 +21,10 @@
 //! A video call is Meet only, where the calendar offers it, and the organiser's to add or remove;
 //! another service's call is shown and kept (C18). The calendar is the organiser's to change too, to
 //! another of the same account; a locked event keeps its own (C18d).
+//!
+//! A description with formatting PM can't write back is read-only (C19, R9: the lift of the old
+//! "formatted" reason); a save the user chose to make plain reopens it
+//! ([`FieldPermissions::replacing_formatting`]).
 
 use crate::calendar_editing::EditingStatus;
 
@@ -48,8 +52,10 @@ pub struct EditFacts<'a> {
     /// would change every occurrence with no choice asked (C9 design §0.7, critique 2 M6). Known only
     /// from a fresh copy; the mirror never holds a series itself.
     pub series_master: bool,
-    /// The description is formatted. Known only from a fresh copy (the mirror clips descriptions).
-    pub html_description: bool,
+    /// The description has formatting PM's editor can't write back
+    /// ([`super::description::pm_can_edit`]). Known only from a fresh copy (the mirror clips
+    /// descriptions).
+    pub unsupported_formatting: bool,
     /// The event has a Google Calendar label (`eventLabelId`), which sets its colour (C13).
     pub labelled: bool,
     /// PM can read every notification Google holds on it ([`super::patch::reminders_of`]). Known
@@ -148,9 +154,11 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         perms.delete = false;
         perms.reasons.push(ReadOnlyReason::Locked);
     }
-    if facts.html_description && perms.description {
+    // Only on a description otherwise open, so reopening it for a replace can never undo a lock or
+    // the organiser's hold ([`FieldPermissions::replacing_formatting`]).
+    if facts.unsupported_formatting && perms.description {
         perms.description = false;
-        perms.reasons.push(ReadOnlyReason::HtmlDescription);
+        perms.reasons.push(ReadOnlyReason::UnsupportedFormatting);
     }
     // A label sets the colour Google draws, and PM doesn't change labels (R-LABEL).
     if facts.labelled {
@@ -168,7 +176,7 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
 /// What the list offers on a row (see [`ListRights`]): the one reason it shows when nothing in the
 /// editor may change (`None` when something can), Delete exactly where a delete's own check would
 /// allow it, the reply, and a drag where a move's own check would allow one (C16a). Computed from
-/// the mirror's copy, so a formatted description (unknown there) never blocks it.
+/// the mirror's copy, so formatting PM can't edit (unknown there) never blocks it.
 pub fn list_rights(facts: &EditFacts) -> ListRights {
     let perms = edit_rights(facts);
     ListRights {
@@ -208,7 +216,7 @@ pub enum Field {
 /// C18 critique C1-L6 for another service's call).
 const ONE_FIELD: [ReadOnlyReason; 5] = [
     ReadOnlyReason::OrganizerOnlyGuests,
-    ReadOnlyReason::HtmlDescription,
+    ReadOnlyReason::UnsupportedFormatting,
     ReadOnlyReason::LabelReadOnly,
     ReadOnlyReason::RemindersUnreadable,
     ReadOnlyReason::OtherCall,
@@ -223,7 +231,7 @@ pub fn reason_for(perms: &FieldPermissions, field: Field) -> ReadOnlyReason {
     // name the call, C18).
     let own: &[ReadOnlyReason] = match field {
         Field::Guests => &[ReadOnlyReason::OrganizerOnlyGuests],
-        Field::Description => &[ReadOnlyReason::HtmlDescription],
+        Field::Description => &[ReadOnlyReason::UnsupportedFormatting],
         Field::Colour => &[ReadOnlyReason::LabelReadOnly],
         Field::Reminders => &[ReadOnlyReason::RemindersUnreadable],
         Field::Meet => &[
@@ -272,7 +280,7 @@ pub fn create_block(
         locked: false,
         visibility,
         series_master: false,
-        html_description: false,
+        unsupported_formatting: false,
         labelled: false,
         reminders_readable: true,
         invited: false,
@@ -341,7 +349,7 @@ mod tests {
             locked: false,
             visibility: None,
             series_master: false,
-            html_description: false,
+            unsupported_formatting: false,
             labelled: false,
             reminders_readable: true,
             invited: false,
@@ -625,21 +633,115 @@ mod tests {
     }
 
     #[test]
-    fn a_formatted_description_is_read_only_and_says_why() {
+    fn formatting_pm_cant_edit_is_read_only_and_says_why() {
         let perms = edit_rights(&EditFacts {
-            html_description: true,
+            unsupported_formatting: true,
             ..editable()
         });
         assert!(!perms.description);
         assert!(perms.summary && perms.time && perms.delete);
-        assert_eq!(perms.reasons, vec![HtmlDescription]);
+        assert_eq!(perms.reasons, vec![UnsupportedFormatting]);
         // Locked already covers the description, so it isn't given twice.
         let both = edit_rights(&EditFacts {
-            html_description: true,
+            unsupported_formatting: true,
             locked: true,
             ..editable()
         });
         assert_eq!(both.reasons, vec![Locked]);
+    }
+
+    /// C19 §8: "Replace with plain text…" reopens a description closed for its formatting, and
+    /// nothing a lock or the organiser closed.
+    #[test]
+    fn replacing_formatting_reopens_only_its_own_reason() {
+        let rows: [(&str, EditFacts, bool, bool, Vec<ReadOnlyReason>); 7] = [
+            (
+                "G1",
+                EditFacts {
+                    unsupported_formatting: true,
+                    ..editable()
+                },
+                false,
+                false,
+                vec![UnsupportedFormatting],
+            ),
+            (
+                "G2",
+                EditFacts {
+                    unsupported_formatting: true,
+                    ..editable()
+                },
+                true,
+                true,
+                vec![],
+            ),
+            (
+                "G3",
+                EditFacts {
+                    unsupported_formatting: true,
+                    locked: true,
+                    ..editable()
+                },
+                true,
+                false,
+                vec![Locked],
+            ),
+            (
+                "G4",
+                EditFacts {
+                    unsupported_formatting: true,
+                    ..invitation()
+                },
+                true,
+                false,
+                vec![NotOrganizer],
+            ),
+            ("G5", editable(), true, true, vec![]),
+            // Someone else's event whose organiser lets guests change it: the description is theirs
+            // to change, so a replace reopens it; the guest list stays the organiser's.
+            (
+                "G6",
+                EditFacts {
+                    unsupported_formatting: true,
+                    guests_can_modify: true,
+                    ..invitation()
+                },
+                true,
+                true,
+                vec![OrganizerOnlyGuests],
+            ),
+            // A calendar shown read-only: nothing reopens.
+            (
+                "G7",
+                EditFacts {
+                    unsupported_formatting: true,
+                    access_role: Some("reader"),
+                    ..editable()
+                },
+                true,
+                false,
+                vec![CalendarReadOnly],
+            ),
+        ];
+        for (row, facts, replacing, description, reasons) in rows {
+            let perms = edit_rights(&facts);
+            let perms = if replacing {
+                perms.replacing_formatting()
+            } else {
+                perms
+            };
+            assert_eq!(perms.description, description, "{row}: description");
+            assert_eq!(perms.reasons, reasons, "{row}: reasons");
+            // Nothing else moves: the rest is as the gate gave it.
+            let gate = edit_rights(&facts);
+            assert!(
+                perms.summary == gate.summary
+                    && perms.time == gate.time
+                    && perms.guests == gate.guests
+                    && perms.delete == gate.delete,
+                "{row}: only the description reopens"
+            );
+        }
     }
 
     /// R-LABEL (C13): a label sets the colour Google draws, so a labelled event's colour is
@@ -978,7 +1080,7 @@ mod tests {
             (
                 "A9",
                 EditFacts {
-                    html_description: true,
+                    unsupported_formatting: true,
                     ..i()
                 },
                 [false, false, true, false, false, false],
@@ -989,18 +1091,18 @@ mod tests {
             (
                 "A10",
                 EditFacts {
-                    html_description: true,
+                    unsupported_formatting: true,
                     ..with_g(i())
                 },
                 [true, true, true, false, false, false],
                 true,
-                vec![OrganizerOnlyGuests, HtmlDescription],
+                vec![OrganizerOnlyGuests, UnsupportedFormatting],
             ),
         ];
         for (row, facts, open, respond, reasons) in rows {
             let p = edit_rights(&facts);
             let [shared, visibility, own, repeat, guests, delete] = open;
-            let description = shared && !facts.html_description;
+            let description = shared && !facts.unsupported_formatting;
             assert_eq!(
                 [p.summary, p.time, p.location],
                 [shared; 3],
@@ -1075,12 +1177,12 @@ mod tests {
         assert_eq!(reason_for(&g_locked, Field::Guests), OrganizerOnlyGuests);
         let g_formatted = rights(EditFacts {
             guests_can_modify: true,
-            html_description: true,
+            unsupported_formatting: true,
             ..invitation()
         });
         assert_eq!(
             reason_for(&g_formatted, Field::Description),
-            HtmlDescription
+            UnsupportedFormatting
         );
         assert_eq!(reason_for(&g_formatted, Field::Delete), NotOrganizer);
         let plain = rights(invitation());

@@ -96,8 +96,15 @@ pub struct EventPatchDraft {
     pub summary: Option<String>,
     /// `Some("")` clears it.
     pub location: Option<String>,
-    /// Plain text. `Some("")` clears it.
+    /// Plain lines, or formatting as PM's editor writes it (Google's own subset). `Some("")` clears
+    /// it.
     pub description: Option<String>,
+    /// The user chose "Replace with plain text…": a description whose formatting PM can't edit may
+    /// change. Reopens only that reason ([`FieldPermissions::replacing_formatting`]), and only for a
+    /// draft that sends a description. `Debug` carries it into the choice token's bind, so a token
+    /// asked for without it never lets a save replace formatting.
+    #[serde(default)]
+    pub replace_formatting: bool,
     pub time: Option<TimeDraft>,
     pub show_as: Option<ShowAs>,
     pub visibility: Option<Visibility>,
@@ -212,11 +219,13 @@ impl EventPatchDraft {
 
     /// Whether it changes anything about the event itself, beside the calendar it's on (C18d): a
     /// Save of the calendar alone sends no PATCH. Every field but the calendar counts, a field added
-    /// later included; an empty guest list is no change, as everywhere.
+    /// later included; an empty guest list is no change, as everywhere, and neither is "Replace with
+    /// plain text…" on its own, which only lets a description it sends through (C19).
     pub fn names_fields(&self) -> bool {
         let fields = EventPatchDraft {
             calendar: None,
             meet_request: None,
+            replace_formatting: false,
             guests: self.guests.clone().filter(|ops| !ops.is_empty()),
             ..self.clone()
         };
@@ -320,7 +329,7 @@ pub struct NewEventDraft {
     pub time: TimeDraft,
     #[serde(default)]
     pub location: String,
-    /// Plain text.
+    /// Plain lines, or formatting as PM's editor writes it.
     #[serde(default)]
     pub description: String,
     /// `None` is Google's default (busy).
@@ -512,8 +521,10 @@ pub enum ReadOnlyReason {
     SpecialType,
     /// Google has locked its title, time, place and description.
     Locked,
-    /// The description is formatted (HTML); editing it as plain text would strip that.
-    HtmlDescription,
+    /// The description has formatting PM can't edit, such as a table or coloured text
+    /// ([`super::description::pm_can_edit`]): it stays as Google holds it unless the user replaces it
+    /// with plain text (C19).
+    UnsupportedFormatting,
     /// The event has a Google Calendar label, which sets its colour, and PM doesn't change labels:
     /// its colour stays as it is (R-LABEL, C13). Its notifications may still change.
     LabelReadOnly,
@@ -580,6 +591,23 @@ impl FieldPermissions {
             || self.meet
             || self.calendar
             || self.delete
+    }
+
+    /// The rights with a description PM can't edit opened again, for a save the user chose to make
+    /// plain (C19). Only that reason reopens it: a locked description, or one the organiser keeps,
+    /// stays closed, because the gate adds this reason only to a description that was otherwise
+    /// open.
+    pub fn replacing_formatting(mut self) -> Self {
+        if self
+            .reasons
+            .contains(&ReadOnlyReason::UnsupportedFormatting)
+        {
+            self.description = true;
+            // PM's own list of reasons, never fetched data.
+            self.reasons
+                .retain(|r| *r != ReadOnlyReason::UnsupportedFormatting);
+        }
+        self
     }
 }
 
@@ -834,7 +862,8 @@ pub struct MilestoneOffer {
 pub struct EventForEdit {
     pub summary: String,
     pub location: String,
-    /// As Google holds it. When `description_html` is set it's formatted, and shown read-only.
+    /// As Google holds it. When `description_html` is set it's formatted
+    /// ([`super::description::is_html`]), and the editor shows it read-only.
     pub description: String,
     pub description_html: bool,
     /// In the event's own zone(s), as the editor's fields hold them.
@@ -1050,10 +1079,10 @@ mod tests {
         assert_eq!(json, r#"{"outcome":"conflict","fields":["summary"]}"#);
         assert_eq!(
             serde_json::to_string(&WriteOutcome::ReadOnly {
-                reason: ReadOnlyReason::HtmlDescription
+                reason: ReadOnlyReason::UnsupportedFormatting
             })
             .unwrap(),
-            r#"{"outcome":"read_only","reason":"html_description"}"#
+            r#"{"outcome":"read_only","reason":"unsupported_formatting"}"#
         );
         assert_eq!(
             serde_json::to_string(&WriteOutcome::ReadOnly {
@@ -1626,6 +1655,12 @@ mod tests {
             ..Default::default()
         };
         assert!(!empty.names_fields());
+        // Nor is "Replace with plain text…" without a description (C19).
+        let flag_only = EventPatchDraft {
+            replace_formatting: true,
+            ..only.clone()
+        };
+        assert!(!flag_only.names_fields());
         for with in [
             EventPatchDraft {
                 meet: Some(MeetChange::Add),
@@ -1642,6 +1677,28 @@ mod tests {
         ] {
             assert!(with.names_fields());
         }
+    }
+
+    /// C19: "Replace with plain text…" travels as a flag beside the description; a draft from an
+    /// editor that never offered it reads as not replacing.
+    #[test]
+    fn a_draft_reads_whether_it_replaces_formatting() {
+        let replacing: EventPatchDraft =
+            serde_json::from_str(r#"{"description":"Room 4.12","replace_formatting":true}"#)
+                .unwrap();
+        assert!(replacing.replace_formatting);
+        assert_eq!(replacing.description.as_deref(), Some("Room 4.12"));
+        let plain: EventPatchDraft = serde_json::from_str(r#"{"description":"Room"}"#).unwrap();
+        assert!(!plain.replace_formatting);
+        // The choice token binds the draft's Debug form: a token for one never fits the other.
+        let keeping = EventPatchDraft {
+            replace_formatting: false,
+            ..replacing.clone()
+        };
+        assert!(
+            format!("{replacing:?}") != format!("{keeping:?}"),
+            "the flag is part of what a choice token binds"
+        );
     }
 
     /// C18: a draft names a call change as the editor's row sends it, and never the request's id: the

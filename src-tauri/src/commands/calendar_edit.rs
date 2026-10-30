@@ -46,6 +46,7 @@ use crate::calendar_recur::{Point, SeriesStart};
 use crate::calendar_write::attendees::{self, Own};
 use crate::calendar_write::call;
 use crate::calendar_write::classify::{Method, Verdict};
+use crate::calendar_write::description;
 use crate::calendar_write::dto::{
     CallKind, CallState, ChoiceRequest, DeleteSettled, DeleteStart, EditLoad, EventForEdit,
     EventPatchDraft, FieldPermissions, GuestForEdit, GuestNotice, HeldDeleteInfo, ListRights,
@@ -338,7 +339,7 @@ fn facts_from_fresh<'a>(
             .unwrap_or(false),
         visibility: text("visibility"),
         series_master: turned_series(fresh),
-        html_description: text("description").is_some_and(patch::description_is_html),
+        unsupported_formatting: text("description").is_some_and(|d| !description::pm_can_edit(d)),
         labelled: text("eventLabelId").is_some_and(|label| !label.is_empty()),
         reminders_readable: patch::reminders_of(fresh).is_some(),
         invited: rsvp::invited(fresh),
@@ -393,7 +394,7 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         // The mirror never holds a series itself (`calendar::parse_event`). An occurrence is
         // editable like a one-off here: which occurrences is asked at the write (rule R9).
         series_master: false,
-        html_description: false,
+        unsupported_formatting: false,
         labelled: row.event_label_id.is_some(),
         // The mirror doesn't hold notifications; the editor's fresh copy says.
         reminders_readable: true,
@@ -518,7 +519,7 @@ fn event_for_edit(fresh: &Value, fallback_zone: &str) -> Option<EventForEdit> {
     Some(EventForEdit {
         summary: text("summary"),
         location: text("location"),
-        description_html: patch::description_is_html(&description),
+        description_html: description::is_html(&description),
         description,
         time,
         start_at: (!all_day).then(|| instant(start)).flatten(),
@@ -604,9 +605,19 @@ fn guest_for_edit(entry: &Value) -> Option<GuestForEdit> {
 /// ([`gate::reason_for`]). The guest list is looked at first, so under "modify" a guest change says
 /// the guest list is the organiser's (C14 §9.1), and the video call beside it, the organiser's too
 /// (C18); notifications and colour last, so their own reasons (a label, a notification PM can't
-/// read; C13 critique C1-L1) are given only when nothing else the draft touches is closed.
+/// read; C13 critique C1-L1) are given only when nothing else the draft touches is closed. A draft
+/// that replaces formatting PM can't edit with plain text reopens that one reason (C19): only the
+/// description, which is checked only when the draft sends one, so the flag on its own reopens
+/// nothing.
 fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<ReadOnlyReason> {
     use gate::Field;
+    let replaced;
+    let perms = if draft.replace_formatting {
+        replaced = perms.clone().replacing_formatting();
+        &replaced
+    } else {
+        perms
+    };
     [
         // The guest list and what guests may do (C12).
         (draft.touches_guests() && !perms.guests, Field::Guests),
@@ -970,7 +981,8 @@ enum Shown {
     Partly,
     /// It doesn't: nothing of the save is there.
     NotThere,
-    /// It repeats, but not as sent: PM can't tell.
+    /// It repeats, but not as sent, or it holds a formatted description in a form PM didn't send:
+    /// PM can't tell.
     Unsure,
 }
 
@@ -988,6 +1000,8 @@ fn shown_by(
     let held_in_part = || {
         if patch::any_applied(before, now, body) {
             Shown::Partly
+        } else if formatting_rewritten(before, now, body) {
+            Shown::Unsure
         } else {
             Shown::NotThere
         }
@@ -1014,6 +1028,29 @@ fn shown_by(
     } else {
         Shown::Unsure
     }
+}
+
+/// Asked once nothing the save `body` sent is in Google's copy `now`: whether its description has
+/// changed all the same since the copy the save went out on (`before`), where the one sent was
+/// formatted. Whether Google rewrites formatting it is sent is live probe E11-1's to say; until it
+/// does, a description is compared byte for byte, so a copy Google rewrote never reads as landed.
+/// Nor does it read as "nothing was saved": PM can't tell (C19 risk 4).
+fn formatting_rewritten(
+    before: &Value,
+    now: &Value,
+    body: &serde_json::Map<String, Value>,
+) -> bool {
+    let Some(sent) = body.get("description").and_then(Value::as_str) else {
+        return false;
+    };
+    let text = |event: &Value| {
+        event
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    description::is_html(sent) && text(now) != text(before)
 }
 
 /// A `recurrence` value's lines: none for `null`, `[]` or a value left out alike.
@@ -9084,8 +9121,11 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
             "Google has locked this event's title, time, place and description, so PM also keeps \
              it on its calendar."
         }
-        ReadOnlyReason::HtmlDescription => {
-            "This description has formatting, so PM shows its text here and can't change it yet."
+        // Not "as Google shows it": PM draws only the formatting its own editor writes (C19 critique
+        // C2-M1).
+        ReadOnlyReason::UnsupportedFormatting => {
+            "This description has formatting PM can't edit. PM shows what it can of it here; \
+             Google Calendar shows all of it."
         }
         ReadOnlyReason::LabelReadOnly => {
             "This event has a Google Calendar label, which sets its colour. Change it in Google \
@@ -9906,10 +9946,21 @@ mod tests {
         let mine = json!({
             "organizer": { "self": true }, "eventType": "default",
             "attendees": [{ "email": "me@x.com", "self": true }],
-            "description": "<b>agenda</b>"
+            "description": "<table><tr><td>agenda</td></tr></table>"
         });
         let f = facts_from_fresh(&mine, &facts, EditingStatus::On);
-        assert!(f.organizer_self && f.html_description && !f.series_master);
+        assert!(f.organizer_self && f.unsupported_formatting && !f.series_master);
+        // C19: formatting PM's editor writes back, and plain text, leave the description open.
+        for editable in ["<b>agenda</b>", "agenda &amp; notes", "a < b", ""] {
+            let mut copy = mine.clone();
+            copy["description"] = json!(editable);
+            let f = facts_from_fresh(&copy, &facts, EditingStatus::On);
+            assert!(!f.unsupported_formatting, "{editable}");
+            assert!(gate::edit_rights(&f).description, "{editable}");
+        }
+        let mut none = mine.clone();
+        none.as_object_mut().unwrap().remove("description");
+        assert!(!facts_from_fresh(&none, &facts, EditingStatus::On).unsupported_formatting);
         // C13: no label and no notifications of its own read as unlabelled and readable.
         assert!(!f.labelled && f.reminders_readable);
         // C14: the calendar is on its own guest list.
@@ -10143,7 +10194,7 @@ mod tests {
             locked: true,
             visibility: None,
             series_master: false,
-            html_description: false,
+            unsupported_formatting: false,
             labelled: false,
             reminders_readable: true,
             invited: false,
@@ -10155,6 +10206,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(refused_field(&locked, &title), Some(ReadOnlyReason::Locked));
+        // "Replace with plain text…" never opens what a lock closed (C19).
+        let replacing = EventPatchDraft {
+            description: Some("plain".into()),
+            replace_formatting: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            refused_field(&locked, &replacing),
+            Some(ReadOnlyReason::Locked)
+        );
         let busy = EventPatchDraft {
             show_as: Some(ShowAs::Free),
             ..Default::default()
@@ -10204,6 +10265,61 @@ mod tests {
         assert_eq!(refused_field(&locked, &untouched), None);
     }
 
+    /// C19: formatting PM can't edit closes the description with its own reason; a draft that
+    /// replaces it with plain text and sends it goes through, and the flag alone reopens nothing.
+    #[test]
+    fn a_description_pm_cant_edit_is_refused_unless_replaced() {
+        let perms = gate::edit_rights(&EditFacts {
+            google: true,
+            editing: EditingStatus::On,
+            access_role: Some("owner"),
+            event_type: None,
+            organizer_self: true,
+            guests_can_modify: false,
+            locked: false,
+            visibility: None,
+            series_master: false,
+            unsupported_formatting: true,
+            labelled: false,
+            reminders_readable: true,
+            invited: false,
+            call: None,
+            meet_offered: true,
+        });
+        let notes = EventPatchDraft {
+            description: Some("Room 4.12".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            refused_field(&perms, &notes),
+            Some(ReadOnlyReason::UnsupportedFormatting)
+        );
+        let replacing = EventPatchDraft {
+            replace_formatting: true,
+            ..notes.clone()
+        };
+        assert_eq!(refused_field(&perms, &replacing), None);
+        // The flag with a title only: the title goes through, as it would without the flag, and the
+        // rights it was checked on stay as the gate gave them.
+        let titled = EventPatchDraft {
+            summary: Some("Retro".into()),
+            replace_formatting: true,
+            ..Default::default()
+        };
+        assert_eq!(refused_field(&perms, &titled), None);
+        assert!(!perms.description, "the caller's rights are never changed");
+        // Someone else's event, whose organiser keeps the description: the flag changes nothing.
+        let theirs = FieldPermissions {
+            description: false,
+            reasons: vec![ReadOnlyReason::NotOrganizer],
+            ..perms.clone()
+        };
+        assert_eq!(
+            refused_field(&theirs, &replacing),
+            Some(ReadOnlyReason::NotOrganizer)
+        );
+    }
+
     /// C13: a lock leaves notifications and colour open; closed, each names its own reason (C1-L1),
     /// even under a lock, and the lock's when something it closes is touched too.
     #[test]
@@ -10219,7 +10335,7 @@ mod tests {
                 locked,
                 visibility: None,
                 series_master: false,
-                html_description: false,
+                unsupported_formatting: false,
                 labelled,
                 reminders_readable,
                 invited: false,
@@ -12548,54 +12664,70 @@ mod tests {
         }
     }
 
-    /// C9 design review L7: an occurrence with a plain description of its own, in a series whose
-    /// description is formatted, may change its own; the series' rows would overwrite the formatted
-    /// one as plain text.
+    /// C9 design review L7, C19 §5.5: an occurrence with a plain description of its own, in a series
+    /// whose description has formatting PM can't edit, may change its own; the series' rows would
+    /// replace that formatting, so they wait for the user's "Replace with plain text…", and even
+    /// then only for the very description the user was shown (critique C1-M6). Formatting PM can
+    /// edit holds nothing back.
     #[tokio::test]
-    async fn a_formatted_series_description_is_never_saved_as_plain_text() {
-        let series = with(weekly(), "description", json!("<b>Agenda</b>"));
-        let instance = monday_19();
-        let script = Script::new(reads(
-            &instance,
-            &series,
-            vec![series.clone(), instance.clone()],
-            vec![instance.clone()],
-        ));
+    async fn a_series_description_pm_cant_edit_holds_back_all_and_following() {
+        let table = json!("<table><tr><td>Agenda</td></tr></table>");
+        let choices_for = |series: Value, instance: Value, draft: EventPatchDraft| async move {
+            let script = Script::new(reads(
+                &instance,
+                &series,
+                vec![series.clone(), instance.clone()],
+                vec![instance.clone()],
+            ));
+            ask(
+                &script,
+                &instance,
+                edit(draft),
+                Some((&instance, Some(&series))),
+                &["abc"],
+            )
+            .await
+        };
         let notes = EventPatchDraft {
             description: Some("New notes".into()),
             ..Default::default()
         };
-        let (this, following, all) = ask(
-            &script,
-            &instance,
-            edit(notes),
-            Some((&instance, Some(&series))),
-            &["abc"],
-        )
-        .await;
-        assert!(matches!(this, ScopeRow::Offered { .. }));
-        for row in [following, all] {
+        let replacing = EventPatchDraft {
+            replace_formatting: true,
+            ..notes.clone()
+        };
+        let offered = |row: &ScopeRow| matches!(row, ScopeRow::Offered { .. });
+        let held = |row: &ScopeRow| matches!(row, ScopeRow::Refused { message } if message.contains("formatting PM can't edit"));
+        let table_series = with(weekly(), "description", table.clone());
+        // A plain occurrence, with the flag or without: this one only.
+        for draft in [notes.clone(), replacing.clone()] {
+            let flagged = draft.replace_formatting;
+            let (this, following, all) =
+                choices_for(table_series.clone(), monday_19(), draft).await;
+            assert!(offered(&this), "flag {flagged}: this event is offered");
             assert!(
-                matches!(&row, ScopeRow::Refused { message } if message.contains("formatting")),
-                "{row:?}"
+                held(&following) && held(&all),
+                "flag {flagged}: the series' own formatting holds back the rest"
             );
         }
+        // An occurrence showing the series' own description, replaced: every row.
+        let showing = with(monday_19(), "description", table.clone());
+        let (this, following, all) =
+            choices_for(table_series.clone(), showing, replacing.clone()).await;
+        assert!(
+            offered(&this) && offered(&following) && offered(&all),
+            "a replace of the description the user saw reaches the series"
+        );
+        // Formatting PM's editor writes holds nothing back.
+        let bold_series = with(weekly(), "description", json!("<b>Agenda</b>"));
+        let (this, following, all) = choices_for(bold_series, monday_19(), notes.clone()).await;
+        assert!(
+            offered(&this) && offered(&following) && offered(&all),
+            "bold is the editor's own"
+        );
         // A title is no reason to hold the series back.
-        let script = Script::new(reads(
-            &instance,
-            &series,
-            vec![series.clone(), instance.clone()],
-            vec![instance.clone()],
-        ));
-        let (_, _, all) = ask(
-            &script,
-            &instance,
-            edit(title("Retro")),
-            Some((&instance, Some(&series))),
-            &["abc"],
-        )
-        .await;
-        assert!(matches!(all, ScopeRow::Offered { .. }));
+        let (_, _, all) = choices_for(table_series, monday_19(), title("Retro")).await;
+        assert!(offered(&all), "a title alone");
     }
 
     /// DS16: a part split off this series earlier (Google's own `_R`) is said where the choice
@@ -13185,7 +13317,12 @@ mod tests {
             .await,
             read_only(ReadOnlyReason::CalendarReadOnly)
         );
-        let formatted = with(instance.clone(), "description", json!("<b>Notes</b>"));
+        // Formatting PM can't edit (C19): a bold description is the editor's to change, a table isn't.
+        let formatted = with(
+            instance.clone(),
+            "description",
+            json!("<table><tr><td>Notes</td></tr></table>"),
+        );
         let notes = EventPatchDraft {
             description: Some("Notes".into()),
             ..Default::default()
@@ -13199,7 +13336,7 @@ mod tests {
                 edit(notes)
             )
             .await,
-            read_only(ReadOnlyReason::HtmlDescription)
+            read_only(ReadOnlyReason::UnsupportedFormatting)
         );
         // Someone else's occurrence: its title is the organiser's, refused before any row; its
         // busy or free is the user's own, so the gate lets it through to the rows (C14c).
@@ -19241,6 +19378,199 @@ mod tests {
         }
     }
 
+    // --- formatted descriptions (C19) ---
+
+    /// The dentist one-off with Google's `description`.
+    fn dentist_described(description: &str) -> Value {
+        with(dentist(), "description", json!(description))
+    }
+
+    /// C19 §8: a description whose formatting PM can't edit changes only when the user replaced it:
+    /// without the flag only the save's GET goes out; with it, one PATCH sends the draft's
+    /// description; the flag beside a title alone sends the title and no description.
+    #[tokio::test]
+    async fn a_description_pm_cant_edit_changes_only_when_replaced() {
+        let event = dentist_described("<table><tr><td>Room</td><td>4.12</td></tr></table>");
+        let plain = EventPatchDraft {
+            description: Some("Room 4.12".into()),
+            ..Default::default()
+        };
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &plain, Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::UnsupportedFormatting
+                },
+            "refused for its formatting, nothing sent"
+        );
+        let replacing = EventPatchDraft {
+            replace_formatting: true,
+            ..plain.clone()
+        };
+        let landed = written(&event, &[("description", json!("Room 4.12"))], "\"s2\"");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &replacing,
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "replaced and saved");
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(body["description"], json!("Room 4.12"));
+        assert!(
+            body.as_object().is_some_and(|b| b.len() == 1),
+            "the description alone: the flag is never a body key"
+        );
+        // The flag with a title only: the title goes, the description stays as Google holds it.
+        let titled = EventPatchDraft {
+            summary: Some("Retro".into()),
+            replace_formatting: true,
+            ..Default::default()
+        };
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &titled,
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(retitled(&event, "\"s2\"")),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "the title saved");
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(body["summary"], json!("Retro"));
+        assert!(body.get("description").is_none(), "no description sent");
+    }
+
+    /// C19 §8: formatting the editor writes is saved byte for byte, over a description whose
+    /// formatting PM can edit (before C19 every formatted one was read-only).
+    #[tokio::test]
+    async fn formatting_saves_exactly_as_the_editor_wrote_it() {
+        let event = dentist_described("<b>Notes</b>");
+        let wrote = "<b>Agenda</b><ul><li>one &amp; two</li></ul><a href=\"https://example.com/?a=1&amp;b=2\">site</a><br>&lt;b&gt; as words";
+        let draft = EventPatchDraft {
+            description: Some(wrote.into()),
+            ..Default::default()
+        };
+        let landed = written(&event, &[("description", json!(wrote))], "\"s2\"");
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &draft,
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(landed),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(saved_with_undo(&outcome), "saved");
+        let body = first_write(&script).body.unwrap();
+        assert_eq!(body["description"], json!(wrote), "the editor's bytes");
+    }
+
+    /// C19 risk 4: whether Google rewrites formatting it is sent is live probe E11-1's to say. Until
+    /// then, after an answer that never came, a description Google holds in another form than the
+    /// one sent never reads as landed, nor as "nothing was saved": PM can't tell.
+    #[tokio::test]
+    async fn a_lost_answer_never_reads_rewritten_formatting_as_landed() {
+        let event = dentist_described("<b>Notes</b>");
+        let sent = "<b>Agenda</b>";
+        let draft = EventPatchDraft {
+            description: Some(sent.into()),
+            ..Default::default()
+        };
+        let lost = || {
+            Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Lost { retried: false },
+            )
+        };
+        let holding =
+            |description: &str| written(&event, &[("description", json!(description))], "\"s2\"");
+        let nothing_saved = WriteOutcome::Failed {
+            message: "PM lost touch with Google, and your change isn't there. Nothing was saved; \
+                      try again."
+                .into(),
+        };
+        for (now, landed, expected, why) in [
+            (
+                holding("<strong>Agenda</strong>"),
+                false,
+                WriteOutcome::Unconfirmed,
+                "rewritten",
+            ),
+            (
+                holding("<b>Agenda</b>\n"),
+                false,
+                WriteOutcome::Unconfirmed,
+                "a byte more",
+            ),
+            (event.clone(), false, nothing_saved, "as it was"),
+            (holding(sent), true, saved(), "as sent"),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &draft,
+                vec![lost(), Step::get("/events/solo", "", now)],
+            )
+            .await;
+            script.asked_all();
+            let as_expected = if landed {
+                saved_with_undo(&outcome)
+            } else {
+                outcome == expected
+            };
+            assert!(as_expected, "Google's copy {why}");
+        }
+        // A plain description sent is compared as before: another one there is someone else's.
+        let plain = EventPatchDraft {
+            description: Some("Agenda".into()),
+            ..Default::default()
+        };
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &plain,
+            vec![lost(), Step::get("/events/solo", "", holding("Agenda!"))],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            matches!(outcome, WriteOutcome::Failed { .. }),
+            "plain text Google never rewrites"
+        );
+    }
+
     // --- a one-off Google has since turned into a repeating event (C9 design critique 2 M6) ---
 
     /// The dentist one-off as Google holds it once a weekly rule was added there: a series itself,
@@ -21028,7 +21358,7 @@ mod tests {
             ReadOnlyReason::BecameRepeating,
             ReadOnlyReason::SpecialType,
             ReadOnlyReason::Locked,
-            ReadOnlyReason::HtmlDescription,
+            ReadOnlyReason::UnsupportedFormatting,
             ReadOnlyReason::OtherCall,
         ];
         let mut lines: Vec<String> = refusals.iter().map(ToString::to_string).collect();
@@ -22932,6 +23262,23 @@ mod tests {
                 "{name}: the webview's copy differs from the backend's"
             );
         }
+    }
+
+    /// C19 critique C2-M1: the reason for formatting PM can't edit is the same sentence on both
+    /// sides, since a row of the choices says the backend's and the editor its own.
+    #[test]
+    fn the_formatting_reason_is_the_webviews_sentence() {
+        let words = include_str!("../../../src/lib/calendarEdit/editReasons.ts");
+        let at = words
+            .find("case \"unsupported_formatting\":")
+            .expect("the webview names the reason");
+        let rest = &words[at..];
+        let line = &rest[..rest.find(";\n").unwrap_or(rest.len())];
+        let text = read_only_message(ReadOnlyReason::UnsupportedFormatting);
+        assert!(
+            line.contains(&format!("return \"{text}\"")),
+            "the webview's words differ from the backend's"
+        );
     }
 
     /// The retry's table: two empty looks before a re-send, a cancelled copy gone, anything it
@@ -25909,7 +26256,7 @@ mod tests {
                 locked,
                 visibility: None,
                 series_master: false,
-                html_description: false,
+                unsupported_formatting: false,
                 labelled: true,
                 reminders_readable: true,
                 invited: true,
@@ -26032,7 +26379,7 @@ mod tests {
             locked: true,
             visibility: None,
             series_master: false,
-            html_description: false,
+            unsupported_formatting: false,
             labelled: false,
             reminders_readable: true,
             invited: false,
