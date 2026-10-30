@@ -124,6 +124,7 @@ const overview: CalendarOverview = {
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
   auto_meet: {},
+  ask_access: {},
 };
 
 const seed: EditorFields = {
@@ -337,6 +338,12 @@ function zOf(el: Element | null): number {
 }
 
 describe("QuickCreatePopover", () => {
+  // Help mode (C20b §11): the quick box explains a new event, not the grid around it.
+  it("carries the new event's help", () => {
+    open();
+    expect(box().getAttribute("data-help")).toBe("calendar-new-event");
+  });
+
   it("Enter in the title creates with no notify and closes on saved", async () => {
     createEvent.mockResolvedValue(saved);
     const { onClose, header } = open();

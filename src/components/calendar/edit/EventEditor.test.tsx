@@ -366,6 +366,15 @@ describe("EventEditor", () => {
     ).toBe("status");
   });
 
+  // Help mode (C20b §11): the editor explains itself, its description's buttons their own.
+  it("carries the editor's help", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    expect(screen.getByRole("dialog", { name: "Edit event" }).getAttribute("data-help")).toBe(
+      "calendar-editor",
+    );
+  });
+
   it("sends only what changed, then closes and says so, asking no choices of a one-off", async () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
@@ -3517,6 +3526,7 @@ describe("EventEditor, its calendar", () => {
     editing: Object.fromEntries(accounts.map((a) => [a, "on" as const])),
     default_length: {},
     auto_meet: {},
+    ask_access: {},
   });
   const BOTH = overviewOf([ME, WORK], [PERSONAL, SIDE, QUIET, SHARED, WORK_CAL]);
   const saved: WriteOutcome = { outcome: "saved", warnings: [], calendar: SIDE.id };

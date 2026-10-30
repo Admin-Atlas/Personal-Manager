@@ -954,7 +954,26 @@ export interface CalendarOverview {
    *  keyed by account id like `editing` (C18b). An account missing here has none stored yet: a new
    *  event then starts with no call. */
   auto_meet: Record<string, boolean>;
+  /** Whom to ask for edit access, keyed by PM's calendar id (C20b): only calendars shared with you
+   *  to view only, with an owner PM can name. The backend decides; the view only offers it. */
+  ask_access: Record<string, AskOwner>;
 }
+
+/** Whom to ask for edit access to one calendar shared with you to view only (`calendar_ask`). */
+export interface AskOwner {
+  /** The owner's address, as Google gave it. */
+  owner: string;
+  /** The owner is one of the Google accounts connected to PM: the view says how to share the
+   *  calendar from there, rather than opening an email to themselves. */
+  connected: boolean;
+}
+
+/** What asking a calendar's owner for edit access came to (`requestCalendarAccess`). PM opens an
+ *  email in the mail app and sends nothing itself. */
+export type AccessAsk =
+  | { outcome: "opened"; owner: string }
+  | { outcome: "no_mail_app"; owner: string }
+  | { outcome: "no_owner" };
 
 /** Calendar editing for one Google account (`calendar_editing::EditingStatus`). `paused` is the
  *  user's own "Turn off editing" in PM (Google still allows it); `needs_consent` means editing was

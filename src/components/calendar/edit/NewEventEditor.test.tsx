@@ -141,6 +141,7 @@ const overview: CalendarOverview = {
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
   auto_meet: {},
+  ask_access: {},
 };
 
 const seed: EditorFields = {
@@ -333,6 +334,14 @@ function pickCalendar(from: string, to: string) {
 }
 
 describe("NewEventEditor", () => {
+  // Help mode (C20b §11): the full editor's create mode explains a new event.
+  it("carries the new event's help", () => {
+    open();
+    expect(screen.getByRole("dialog", { name: "New event" }).getAttribute("data-help")).toBe(
+      "calendar-new-event",
+    );
+  });
+
   it("with no zone, the time controls and Save are disabled, and it says nothing can be saved", async () => {
     deviceZone = null;
     open();

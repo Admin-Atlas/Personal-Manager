@@ -29,10 +29,17 @@ import {
   listAllMilestones,
   onCalendarSynced,
   onCalendarWriteLanded,
+  requestCalendarAccess,
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { copyRank, dragReason, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
+import {
+  askOwnerFor,
+  copyRank,
+  dragReason,
+  duplicable,
+  eventRights,
+} from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
@@ -113,7 +120,11 @@ import {
 } from "../../theme";
 import { Callout, Skeleton, VisuallyHidden } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
-import { CalendarEventPopover, type PopoverEditing } from "./parts/CalendarEventPopover";
+import {
+  CalendarEventPopover,
+  type PopoverAsk,
+  type PopoverEditing,
+} from "./parts/CalendarEventPopover";
 import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
@@ -946,6 +957,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       },
     });
   };
+  // On a calendar shared with the user to view only, whom to ask for edit access (C20b): the email
+  // names PM's calendar id alone, and the backend decides whom it goes to and what it says.
+  const askFor = (ev: CalendarEvent): PopoverAsk | null => {
+    const owner = askOwnerFor(ev, overview);
+    const calendar = overview?.calendars.find((c) => c.id === ev.calendar_id);
+    if (!owner || !calendar) return null;
+    return {
+      ...owner,
+      own: accountOf(ev),
+      calendar: calendar.name,
+      onAsk: () => requestCalendarAccess(ev.calendar_id),
+    };
+  };
   const popoverEditing = (ev: CalendarEvent): PopoverEditing => ({
     ...rights(ev),
     canDuplicate: canCopy(ev),
@@ -975,6 +999,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       forWhom,
       onReply: (reply, scope) => writes.respond(event.id, reply, null, scope),
     })),
+    ask: askFor(ev),
   });
   // The popover reads its row afresh from the list, so after a reply lands and the list reloads,
   // its guest list and its reply strip show what Google holds now. A row gone from the list keeps

@@ -5,7 +5,9 @@
 // aggregator, so this surfaces everything the mirror holds — source calendar, when, busy/free,
 // location, attendees + organiser, conferencing, recurrence, description, and any linked milestone /
 // project / PM flag — plus buttons to open the event in its source calendar or its project, and, on
-// an event the user is invited to (#884, C14b), "Going?" with Yes, No and Maybe. It's an
+// an event the user is invited to (#884, C14b), "Going?" with Yes, No and Maybe. On a calendar
+// shared with the user to view only, the line saying so offers to ask its owner for edit access
+// (C20b): an email PM opens in the mail app for the user to send, never one PM sends. It's an
 // in-place floating panel (the pinboard folder-popup pattern): fixed-position, clamped to the
 // viewport, dismissed by click-outside or Escape. The description is the one piece of untrusted
 // provider text, so it renders only through a sanitising boundary: `<Markdown>`, or, for a Google
@@ -34,6 +36,7 @@ import {
   type ReactNode,
 } from "react";
 import type {
+  AccessAsk,
   Calendar,
   CalendarEvent,
   Flag,
@@ -42,6 +45,7 @@ import type {
   RsvpScope,
   WriteOutcome,
 } from "../../../lib/types";
+import { askConnectedText, askLabel, askText } from "../../../lib/calendarEdit/editReasons";
 import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
 import { linkTarget, parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
 import { eventFlags, openUrl } from "../../../lib/ipc";
@@ -93,6 +97,23 @@ export interface PopoverEditing {
   onDuplicate: () => void;
   /** Copies the user can reply from, the one shown first (C14b). Empty or absent: no reply strip. */
   rsvp?: readonly PopoverRsvp[];
+  /** On a calendar shared with you to view only: whom to ask for edit access, and how (C20b). Shown
+   *  with the reason line, so only where there is one. */
+  ask?: PopoverAsk | null;
+}
+
+/** Asking a view-only calendar's owner for edit access (C20b, plan Q10). */
+export interface PopoverAsk {
+  owner: string;
+  /** The owner is one of the user's own Google accounts in PM: a sentence on how to share it from
+   *  there, and no email. */
+  connected: boolean;
+  /** This account's address, for the words. */
+  own: string | null;
+  /** The calendar's name, for the words. */
+  calendar: string;
+  /** Opens the email in the mail app (the backend decides to whom, and what it says). */
+  onAsk: () => Promise<AccessAsk>;
 }
 
 /** One copy of the event the user can reply from. */
@@ -155,6 +176,54 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span className="w-20 shrink-0 font-mono uppercase tracking-wide text-ink4">{label}</span>
       <div className="min-w-0 flex-1 text-ink2">{children}</div>
     </div>
+  );
+}
+
+/** The reason line of an event on a calendar shared with you to view only, with the ask for edit
+ *  access after it (C20b): an inline button that opens an email in the mail app, and a status line
+ *  under it saying what came of that. The status line is there, empty, from the start: a live region
+ *  that appears together with its words isn't announced (critique C2-L2). Keyed by the event, so a
+ *  re-pointed pop-up never shows the last event's answer. A long address wraps anywhere. */
+function AskLine({ reason, ask }: { reason: string; ask: PopoverAsk }) {
+  const [asking, setAsking] = useState(false);
+  const [said, setSaid] = useState("");
+  const onClick = () => {
+    // aria-disabled, not disabled, so focus stays on the button while it waits.
+    if (asking) return;
+    setAsking(true);
+    // Anything the command refuses with comes back as the backend's own words.
+    void ask
+      .onAsk()
+      .then(
+        (result) => askText(result, ask.calendar),
+        (e: unknown) =>
+          askText(
+            { outcome: "failed", message: typeof e === "string" ? e : String(e) },
+            ask.calendar,
+          ),
+      )
+      .then((text) => {
+        setSaid(text);
+        setAsking(false);
+      });
+  };
+  return (
+    <>
+      <p>
+        {reason}{" "}
+        <button
+          type="button"
+          aria-disabled={asking || undefined}
+          onClick={onClick}
+          className="border-0 bg-transparent p-0 text-left align-baseline text-accent-text underline decoration-dotted underline-offset-2 transition [overflow-wrap:anywhere] hover:brightness-110 motion-reduce:transition-none"
+        >
+          {askLabel(ask.owner)}
+        </button>
+      </p>
+      <p role="status" className="text-ink3 [overflow-wrap:anywhere]">
+        {said}
+      </p>
+    </>
   );
 }
 
@@ -348,6 +417,9 @@ export function CalendarEventPopover({
       // No `aria-modal`: the calendar behind this stays live and Tab must be able to leave.
       aria-label={title}
       tabIndex={-1}
+      // Its own help in the calendar view, on the panel rather than the grid's (C20b). Without
+      // `editing` (Focus › Upcoming) the help is the agenda's around it.
+      data-help={editing ? "calendar-event" : undefined}
       className="fixed z-50 flex max-h-[75vh] w-[340px] flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl focus:outline-none"
       style={{
         left: pos?.left ?? anchor.left,
@@ -573,9 +645,22 @@ export function CalendarEventPopover({
         )}
       </div>
       {editing?.reason && (
-        <p className="border-t border-border px-3 py-2 text-[0.6875rem] leading-relaxed text-ink4">
-          {editing.reason}
-        </p>
+        <div className="border-t border-border px-3 py-2 text-[0.6875rem] leading-relaxed text-ink4">
+          {editing.ask && !editing.ask.connected ? (
+            <AskLine key={event.id} reason={editing.reason} ask={editing.ask} />
+          ) : (
+            <p>
+              {editing.reason}
+              {/* The owner is one of the user's own accounts: how to share it from there. */}
+              {editing.ask && (
+                <span className="[overflow-wrap:anywhere]">
+                  {" "}
+                  {askConnectedText(editing.ask.owner, editing.ask.own)}
+                </span>
+              )}
+            </p>
+          )}
+        </div>
       )}
     </div>
   );

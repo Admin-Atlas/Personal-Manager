@@ -16,7 +16,9 @@ use std::time::Instant;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::blocking::spawn_blocking_result;
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
+use crate::calendar_ask::{self, AskOwner};
 use crate::calendar_editing::{self, Choice, ConsentVerdict, EditingStatus};
 use crate::calendar_fresh::{Freshness, Plan, Verdict};
 use crate::calendar_write::dto::ListRights;
@@ -28,9 +30,9 @@ use crate::{briefing, drive, flags, microsoft, outlook_calendar, secrets, AppSta
 use super::shared::own_client;
 use super::shared::resolve_zone;
 use super::shared::{
-    google_account_emails, google_grant_token_keys, google_grant_users, pin_existing_grants,
-    release_plan, require_main_window, saved_project_account, wrong_account, GoogleDisconnect,
-    GoogleUse,
+    caller_may_write, google_account_emails, google_grant_token_keys, google_grant_users,
+    pin_existing_grants, release_plan, require_main_window, saved_project_account, wrong_account,
+    GoogleDisconnect, GoogleUse,
 };
 use super::vaults::require_vault_owner;
 
@@ -74,6 +76,10 @@ pub struct CalendarOverview {
     /// keyed by account id like `editing` (C18b). An account with none stored is missing: a new
     /// event then starts with no call.
     pub auto_meet: BTreeMap<String, bool>,
+    /// Whom to ask for edit access, keyed by PM's calendar id: only calendars shared with you to view
+    /// only, with an owner PM can name (`calendar_ask`, C20b). Computed here only, so the rule lives
+    /// in Rust.
+    pub ask_access: BTreeMap<String, AskOwner>,
 }
 
 /// `by_email`'s values (keyed by lowercased address) keyed by the id of each Google account in
@@ -112,6 +118,13 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     };
     let default_length = by_account(&accounts, &lengths);
     let auto_meet = by_account(&accounts, &meets);
+    // No fetch: Google's role and owner for each calendar are refreshed on every sync.
+    let connected: Vec<&str> = accounts
+        .iter()
+        .filter(|a| a.provider == "google")
+        .filter_map(|a| a.email.as_deref())
+        .collect();
+    let ask_access = calendar_ask::ask_map(&calendars, &connected);
     // Token scopes come from the keychain, read with the DB lock released. Only an account with a
     // stored choice needs one: without it, editing is off whatever the token holds.
     let editing = accounts
@@ -141,6 +154,71 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         editing,
         default_length,
         auto_meet,
+        ask_access,
+    })
+}
+
+/// What asking for edit access came to. The owner's address is the user's own data (their calendar
+/// list), shown back to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AccessAsk {
+    /// The system handed the email to the mail app.
+    Opened { owner: String },
+    /// The system couldn't start anything to open it.
+    NoMailApp { owner: String },
+    /// Nobody to ask now: the calendar is gone, its role changed, its owner is connected to PM, or PM
+    /// doesn't know this account's address.
+    NoOwner,
+}
+
+/// Open a new email in the system's mail app asking the owner of a calendar shared with you to view
+/// only for edit access (plan Q10, A12). `calendar_id` is PM's calendar id; whom to ask and what the
+/// email says come from the stored calendar list, never from the webview. Nothing is sent: the user
+/// sends the email, or doesn't. Checked like a calendar write (the main window, the vault's owner),
+/// since the email names the owner's account. Not one: it changes nothing in Google.
+#[tauri::command]
+pub async fn request_calendar_access(
+    app: AppHandle,
+    window: tauri::Window,
+    calendar_id: String,
+) -> Result<AccessAsk> {
+    if !caller_may_write(window.label()) {
+        return Err(Error::Other(
+            "PM can only open this email from its main window.".into(),
+        ));
+    }
+    require_vault_owner(&app).map_err(|_| {
+        Error::Other("On a shared vault, only its owner can ask for access from PM.".into())
+    })?;
+    let plan = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let calendars = calendar::list_calendars(&conn)?;
+        let sources = calendar::list_sources(&conn, Some("google"))?;
+        let addresses: Vec<(&str, &str)> = sources
+            .iter()
+            .filter_map(|s| Some((s.id.as_str(), s.email.as_deref()?)))
+            .collect();
+        calendar_ask::ask_plan(&calendars, &addresses, &calendar_id)
+    };
+    let Some((owner, link)) = plan else {
+        return Ok(AccessAsk::NoOwner);
+    };
+    // Detached, and on the blocking pool all the same: a launcher that waits (macOS's `open`, or
+    // xdg-open on a desktop it doesn't know) must never hold the main thread. Started is all PM can
+    // know; whether a mail app then opened, it can't tell. The error is logged by its kind only: its
+    // text repeats the link.
+    let opened = spawn_blocking_result("ask for access", move || {
+        Ok(open::that_detached(&link)
+            .map_err(|e| eprintln!("ask for access: no mail app opened ({:?})", e.kind()))
+            .is_ok())
+    })
+    .await?;
+    Ok(if opened {
+        AccessAsk::Opened { owner }
+    } else {
+        AccessAsk::NoMailApp { owner }
     })
 }
 
@@ -1558,5 +1636,86 @@ mod tests {
         );
         let json = serde_json::to_value(&listed).unwrap();
         assert_eq!(json["description_cut"], true);
+    }
+
+    /// What asking for edit access came to, in the words the view reads (C20b).
+    #[test]
+    fn an_ask_says_what_came_of_it_flat() {
+        let json = |ask: AccessAsk| serde_json::to_value(ask).unwrap();
+        assert!(
+            json(AccessAsk::Opened {
+                owner: "boss@x.org".into()
+            }) == serde_json::json!({"outcome": "opened", "owner": "boss@x.org"}),
+            "opened, with whom it asked"
+        );
+        assert!(
+            json(AccessAsk::NoMailApp {
+                owner: "boss@x.org".into()
+            }) == serde_json::json!({"outcome": "no_mail_app", "owner": "boss@x.org"}),
+            "no mail app, with whom to write to"
+        );
+        assert!(
+            json(AccessAsk::NoOwner) == serde_json::json!({"outcome": "no_owner"}),
+            "nobody to ask"
+        );
+    }
+
+    /// The ask's command needs the app, so its shape is read from the source (C20b): the window and
+    /// the vault's owner checked before anything is read, the DB lock let go before the email
+    /// opens, and the email opened detached on the blocking pool, its error logged by kind only.
+    /// And the overview computes whom to ask in Rust.
+    #[test]
+    fn asking_is_checked_like_a_write_and_opens_off_the_main_thread() {
+        let source = include_str!("calendars.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body_of = |name: &str| {
+            let start = shipped.find(name).expect("the command is there");
+            let end = shipped[start..]
+                .find("\n}\n")
+                .map_or(shipped.len(), |e| start + e);
+            &shipped[start..end]
+        };
+        let ask = body_of("pub async fn request_calendar_access(");
+        let at = |needle: &str| ask.find(needle).unwrap_or(usize::MAX);
+        let order = [
+            "if !caller_may_write(window.label()) {",
+            "require_vault_owner(&app).map_err(",
+            "let conn = state.conn()?;",
+            // Only a Google sign-in counts as the user's own address or a connected owner.
+            "calendar::list_sources(&conn, Some(\"google\"))?;",
+            "calendar_ask::ask_plan(&calendars, &addresses, &calendar_id)",
+            // The block that holds the lock ends before the email opens.
+            "};\n    let Some((owner, link)) = plan else {",
+            "spawn_blocking_result(\"ask for access\", move || {",
+            "open::that_detached(&link)",
+            "e.kind()",
+            "Ok(if opened {\n        AccessAsk::Opened { owner }\n    } else {\n        AccessAsk::NoMailApp { owner }",
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                at(pair[0]) < at(pair[1]) && at(pair[1]) != usize::MAX,
+                "the ask's steps are in order: {} before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(
+            !ask.contains("open::that(") && !ask.contains("{e}") && !ask.contains("{e:?}"),
+            "never the waiting opener, and never the error's text"
+        );
+        let overview = body_of("pub async fn calendar_overview(");
+        assert!(
+            overview.contains(
+                "let connected: Vec<&str> = accounts\n        .iter()\n        \
+                 .filter(|a| a.provider == \"google\")"
+            ),
+            "only a Google account is a connected owner: an Outlook sign-in can't share a Google calendar"
+        );
+        assert!(
+            overview.contains("let ask_access = calendar_ask::ask_map(&calendars, &connected);")
+        );
     }
 }

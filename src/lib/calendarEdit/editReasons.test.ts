@@ -21,6 +21,10 @@ import type {
 } from "../types";
 import {
   A11_NOTE,
+  askConnectedText,
+  askLabel,
+  askOwnerFor,
+  askText,
   CALENDAR_ALONE,
   CALENDAR_WHOLE,
   calendarRowText,
@@ -1588,6 +1592,79 @@ describe("an event's rights in the calendar", () => {
     expect(rank(row({}))).toBe(2);
     expect(rank(row(theirs))).toBe(1);
     expect(rank(row({}), overview("off"))).toBe(0);
+  });
+});
+
+// Asking a view-only calendar's owner for edit access (C20b §10, §14.4 and the Adopted words).
+describe("asking for edit access", () => {
+  const SHARED = "gcal:me@x.org:team@group.calendar.google.com";
+  const BOSS = { owner: "boss@x.org", connected: false };
+  const overview = { ask_access: { [SHARED]: BOSS } } as unknown as CalendarOverview;
+  const row = (over: Partial<CalendarEvent>): CalendarEvent => ({
+    id: `${SHARED}:e1`,
+    calendar_id: SHARED,
+    summary: "Retro",
+    description: null,
+    location: null,
+    start: "2026-10-20T09:00:00Z",
+    end: "2026-10-20T10:00:00Z",
+    all_day: false,
+    html_link: null,
+    uid: null,
+    edit_block: "calendar_read_only",
+    ...over,
+  });
+
+  it("a view-only row asks the owner the overview names", () => {
+    expect(askOwnerFor(row({}), overview)).toBe(BOSS);
+  });
+
+  it("no ask on a row the list didn't mark view-only, or without an owner", () => {
+    for (const block of [null, "not_google", "editing_off", "private_event", "locked"] as const) {
+      expect(askOwnerFor(row({ edit_block: block }), overview), String(block)).toBeNull();
+    }
+    expect(askOwnerFor(row({ calendar_id: "gcal:me@x.org:other" }), overview)).toBeNull();
+    expect(askOwnerFor(row({}), null)).toBeNull();
+  });
+
+  it("says what came of it, naming the owner, the permission and the calendar", () => {
+    const permission = "“Make changes and see event details”";
+    expect(askLabel("boss@x.org")).toBe("Ask boss@x.org for edit access");
+    expect(askText({ outcome: "opened", owner: "boss@x.org" }, "Team")).toBe(
+      `PM asked your system to open an email to boss@x.org in your mail app. If nothing opened, write to boss@x.org and ask for ${permission}.`,
+    );
+    expect(askText({ outcome: "no_mail_app", owner: "boss@x.org" }, "Team")).toBe(
+      `PM couldn't open your mail app. Write to boss@x.org and ask for ${permission} on “Team”.`,
+    );
+    expect(askText({ outcome: "no_owner" }, "Team")).toBe(
+      "PM can't tell who to ask for this calendar now. If its sharing just changed, refresh the calendar.",
+    );
+    expect(askText({ outcome: "failed", message: "Not now." }, "Team")).toBe(
+      "PM couldn't open the email: Not now.",
+    );
+    expect(askConnectedText("boss@x.org", "me@x.org")).toBe(
+      `boss@x.org is connected to PM too: open Google Calendar as boss@x.org and share this calendar with me@x.org, choosing ${permission}.`,
+    );
+    expect(askConnectedText("boss@x.org", null)).toContain(
+      "share this calendar with this account, choosing",
+    );
+  });
+
+  it("names Google's permission as the email does", () => {
+    // The email (calendar_ask.rs) asks for the permission by the name these lines tell the user to
+    // ask for, so the two can't drift apart.
+    const email = Object.values(
+      import.meta.glob<string>("../../../src-tauri/src/calendar_ask.rs", {
+        query: "?raw",
+        import: "default",
+        eager: true,
+      }),
+    );
+    expect(email).toHaveLength(1);
+    const named = email[0].match(/const PERMISSION: &str = "([^"]+)";/)?.[1];
+    expect(named).toBe("Make changes and see event details");
+    expect(askText({ outcome: "opened", owner: "o@x.org" }, "T")).toContain(`“${named}”`);
+    expect(askConnectedText("o@x.org", null)).toContain(`“${named}”`);
   });
 });
 

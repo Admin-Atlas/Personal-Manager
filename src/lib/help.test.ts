@@ -133,9 +133,17 @@ describe("the Local AI tab's help", () => {
   });
 });
 
+/** The calendar's help entries (#884, C20b): the tab's, its editing switch's, and every part's. */
+const CALENDAR_HELP = Object.keys(HELP).filter(
+  (id) => id.startsWith("calendar-") || id === "nav-calendar" || id === "settings-calendar-editing",
+);
+
 // The calendar's drag (#884, PR C): help and What's New say what it does, not more.
 describe("calendar help agrees with the drag and its Undo", () => {
-  const said = [HELP["calendar-view"].body, ...CHANGELOG.flatMap((e) => e.highlights)];
+  const said = [
+    ...CALENDAR_HELP.map((id) => HELP[id].body),
+    ...CHANGELOG.flatMap((e) => e.highlights),
+  ];
 
   it("puts an event back only where letting go does", () => {
     // Beside or above the calendar puts it back; below scrolls and drops, so "outside" says more.
@@ -188,5 +196,111 @@ describe("the description's formatting help agrees with its toolbar", () => {
 
   it("doesn't claim the toolbar is Google Calendar's own (probe E11-0 hasn't said)", () => {
     expect(body).not.toMatch(/same (buttons )?as Google/i);
+  });
+});
+
+// The calendar's help (#884, C20b §11): each part of the calendar explains itself on its own element,
+// in a panel that can't scroll (HelpOverlay's is fixed with no height limit), and says nothing the
+// editing stack made untrue.
+describe("the calendar's help", () => {
+  /** Every component's source, tests left out: where the help ids are put on elements. */
+  const SHIPPED = Object.entries(
+    import.meta.glob<string>("../components/**/*.tsx", {
+      query: "?raw",
+      import: "default",
+      eager: true,
+    }),
+  )
+    .filter(([path]) => !/\.test\.tsx$/.test(path))
+    .map(([, text]) => text)
+    .join("\n");
+  /** The parts of the calendar, each with an element of its own. */
+  const PARTS = [
+    "calendar-view",
+    "calendar-header",
+    "calendar-event",
+    "calendar-editor",
+    "calendar-new-event",
+    "calendar-choices",
+    "calendar-delete",
+    "calendar-description-format",
+  ];
+
+  it("has an entry for every part of the calendar, each put on an element", () => {
+    for (const id of PARTS) expect(HELP[id], id).toBeDefined();
+    // Both ways: no calendar entry is left with nothing to explain.
+    for (const id of CALENDAR_HELP) expect(SHIPPED, id).toContain(`"${id}"`);
+  });
+
+  it("names only ids that exist", () => {
+    // `data-help="x"`, `helpId="x"`, and `data-help={… ? "x" : …}`: every one in the calendar's
+    // components, and every calendar id anywhere.
+    const ids = (text: string) =>
+      [...text.matchAll(/\b(?:data-help|helpId)=(?:"([^"]+)"|\{[^}]*?"([^"]+)")/g)].map(
+        (m) => m[1] ?? m[2],
+      );
+    const calendar = Object.entries(
+      import.meta.glob<string>("../components/calendar/**/*.tsx", {
+        query: "?raw",
+        import: "default",
+        eager: true,
+      }),
+    )
+      .filter(([path]) => !/\.test\.tsx$/.test(path))
+      .flatMap(([, text]) => ids(text));
+    expect(calendar.length).toBeGreaterThanOrEqual(PARTS.length);
+    const named = [...calendar, ...ids(SHIPPED).filter((id) => id.startsWith("calendar-"))];
+    for (const id of named) expect(HELP[id], id).toBeDefined();
+  });
+
+  it("fits on the screen", () => {
+    for (const id of CALENDAR_HELP) {
+      expect(HELP[id].body.length, id).toBeLessThanOrEqual(1000);
+    }
+    // An event's details may gain an action, and its sentence still fits.
+    expect(HELP["calendar-event"].body.length).toBeLessThanOrEqual(810);
+  });
+
+  it("says nothing the stack made untrue", () => {
+    for (const id of CALENDAR_HELP) {
+      const body = HELP[id].body;
+      for (const stale of [
+        "one-off",
+        "without guests",
+        "for now",
+        "or label",
+        "Settings → Google Calendar",
+        "read-only",
+      ]) {
+        expect(body, `${id}: ${stale}`).not.toContain(stale);
+      }
+      // Parts are named, never pointed at by direction. Where letting go of a drag puts it back is a
+      // place on the screen, pinned by the drag's own test above.
+      expect(body.replace("beside or above the calendar", ""), id).not.toMatch(/\b(above|below)\b/);
+    }
+  });
+
+  it("promises nothing that isn't built", () => {
+    for (const id of CALENDAR_HELP) {
+      const body = HELP[id].body;
+      // The details offer no Remove, and the help never says it is complete.
+      expect(body, id).not.toMatch(/\bRemove\b|remove (it )?from (my|your) calendar/);
+      expect(body, id).not.toMatch(/\bfinal\b|\bcomplete\b/i);
+    }
+  });
+
+  it("says where each thing is done", () => {
+    // The grid: drags and clicks. The details: the ask. The editor: its buttons. A new event: both
+    // ways of making one. The which-occurrences question: a delete's too.
+    expect(HELP["calendar-view"].body).toMatch(/drag an event to move it/);
+    expect(HELP["calendar-event"].body).toMatch(/ask the owner for edit access/);
+    expect(HELP["calendar-event"].body).toMatch(/when PM knows who owns it/);
+    // Its buttons have their own help (`calendar-description-format`, on the toolbar).
+    expect(HELP["calendar-editor"].body).toMatch(/format the description with its buttons \(hover/);
+    expect(HELP["calendar-editor"].body).toMatch(/Duplicate makes a copy to change/);
+    expect(HELP["calendar-editor"].body).toMatch(/organiser's unless they let guests change it/);
+    expect(HELP["calendar-new-event"].body).toMatch(/full editor.*quick box/);
+    expect(HELP["calendar-choices"].body).toMatch(/a delete offers the same choices/);
+    expect(HELP["focus-agenda"].body).toContain("Settings → Connectors");
   });
 });

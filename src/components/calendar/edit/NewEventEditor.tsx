@@ -772,6 +772,7 @@ export function NewEventEditor({
         onClose={requestClose}
         chrome="bar"
         title="New event"
+        helpId="calendar-new-event"
         subtitle={copyOf ? `A copy of “${copyOf.title.trim() || "(no title)"}”.` : undefined}
         closeLabel="Close"
         closeDisabled={saving}

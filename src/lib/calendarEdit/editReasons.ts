@@ -8,6 +8,8 @@
 import type { Tone as CalloutTone } from "../../components/ui/tone";
 import { formatDateOnly } from "../format";
 import type {
+  AccessAsk,
+  AskOwner,
   Calendar,
   CalendarEvent,
   CalendarOverview,
@@ -217,6 +219,50 @@ export function dragReason(ev: CalendarEvent, rights: EventRights): string | nul
  *  same of deleting one from Calendar. */
 export const SPECIAL_DATE_DELETE =
   "Deleting it here doesn't change Google Contacts or your Google Account.";
+
+/** The permission an owner gives in Google Calendar's sharing settings for someone to change a
+ *  calendar's events, by Google's name for it (Help 37082; live probe G-A2 checks the label). The
+ *  email PM opens asks for it by the same name (`calendar_ask.rs`). */
+const EDIT_PERMISSION = "“Make changes and see event details”";
+
+/** Whom a row's reason line may ask for edit access (C20b, plan Q10): only a row the list marked
+ *  view-only, on a calendar the overview names an owner for. */
+export function askOwnerFor(ev: CalendarEvent, overview: CalendarOverview | null): AskOwner | null {
+  if (ev.edit_block !== "calendar_read_only") return null;
+  return overview?.ask_access[ev.calendar_id] ?? null;
+}
+
+/** The ask's button. */
+export function askLabel(owner: string): string {
+  return `Ask ${owner} for edit access`;
+}
+
+/** Instead of the button when the owner is one of the user's own Google accounts in PM: an email to
+ *  themselves would ask nobody. `own` is the address of the account this copy is on, when known. */
+export function askConnectedText(owner: string, own: string | null): string {
+  return `${owner} is connected to PM too: open Google Calendar as ${owner} and share this calendar with ${own ?? "this account"}, choosing ${EDIT_PERMISSION}.`;
+}
+
+/** What asking came to, or why it couldn't start. */
+export type AskResult = AccessAsk | { outcome: "failed"; message: string };
+
+/** The line under the ask after it was pressed (C20b, critiques C2-L4, C2-L12). PM can tell only
+ *  that the system took the email, never that a mail app showed it, so `opened` says what to do if
+ *  nothing did. */
+export function askText(result: AskResult, calendar: string): string {
+  switch (result.outcome) {
+    case "opened":
+      return `PM asked your system to open an email to ${result.owner} in your mail app. If nothing opened, write to ${result.owner} and ask for ${EDIT_PERMISSION}.`;
+    case "no_mail_app":
+      return `PM couldn't open your mail app. Write to ${result.owner} and ask for ${EDIT_PERMISSION} on “${calendar}”.`;
+    case "no_owner":
+      return "PM can't tell who to ask for this calendar now. If its sharing just changed, refresh the calendar.";
+    case "failed":
+      return `PM couldn't open the email: ${result.message}`;
+    default:
+      return unreachable(result);
+  }
+}
 
 /** The roles whose calendars show an event's details, which a copy is made from: a busy-only
  *  calendar (`freeBusyReader`) shows none. */

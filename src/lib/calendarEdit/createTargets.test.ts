@@ -91,6 +91,7 @@ function overview(over: Partial<CalendarOverview> = {}): CalendarOverview {
     editing: { [ME]: "on", [PAUSED]: "paused", [CONSENT]: "needs_consent" },
     default_length: {},
     auto_meet: {},
+    ask_access: {},
     ...over,
   };
 }

@@ -52,6 +52,7 @@ const ipc = vi.hoisted(() => ({
   getSeriesSummary: vi.fn(),
   eventFlags: vi.fn(),
   openUrl: vi.fn(),
+  requestCalendarAccess: vi.fn(),
   recurrencePresets: vi.fn(),
   describeRecurrence: vi.fn(),
 }));
@@ -141,6 +142,7 @@ const overview: CalendarOverview = {
   editing: { [ME]: "on" },
   default_length: {},
   auto_meet: {},
+  ask_access: {},
 };
 
 const today = dayKey(startOfDay(new Date()));
@@ -1065,5 +1067,96 @@ describe("CalendarView: Duplicate", () => {
     fireEvent.click(chip());
     await screen.findByRole("dialog");
     expect(screen.queryByRole("button", { name: "Duplicate" })).toBeNull();
+  });
+});
+
+// Asking for edit access (#884, C20b): the details of an event on a calendar shared with the user to
+// view only offer to ask its owner, whom the overview names; the email is the backend's, from PM's
+// calendar id alone.
+describe("CalendarView: asking a calendar's owner for edit access", () => {
+  const SHARED = `${ME}:team@group.calendar.google.com`;
+  const shared: CalendarOverview = {
+    ...overview,
+    calendars: [
+      ...overview.calendars,
+      calendar("team@group.calendar.google.com", { name: "Team", access_role: "reader" }),
+    ],
+    ask_access: { [SHARED]: { owner: "boss@x.org", connected: false } },
+  };
+  const chip = () => screen.getByRole("button", { name: /Standup/ });
+
+  it("the popover of an event on a view-only calendar asks its owner", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue(shared);
+    ipc.requestCalendarAccess.mockResolvedValue({ outcome: "opened", owner: "boss@x.org" });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(
+      within(dialog).getByText(
+        /^This calendar is shared with you to view only, so its events can't be changed here\./,
+      ),
+    ).toBeTruthy();
+    await act(async () =>
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Ask boss@x.org for edit access" }),
+      ),
+    );
+    // The calendar's id, and nothing the webview could make up: no address, no link.
+    expect(ipc.requestCalendarAccess).toHaveBeenCalledExactlyOnceWith(SHARED);
+    expect(within(dialog).getByRole("status").textContent).toBe(
+      "PM asked your system to open an email to boss@x.org in your mail app. If nothing opened, write to boss@x.org and ask for “Make changes and see event details”.",
+    );
+  });
+
+  it("no mail app names the calendar the event is on", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue(shared);
+    ipc.requestCalendarAccess.mockResolvedValue({ outcome: "no_mail_app", owner: "boss@x.org" });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    await act(async () =>
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Ask boss@x.org for edit access" }),
+      ),
+    );
+    expect(within(dialog).getByRole("status").textContent).toBe(
+      "PM couldn't open your mail app. Write to boss@x.org and ask for “Make changes and see event details” on “Team”.",
+    );
+  });
+
+  it("a connected owner gets how to share it from there, with this account's address", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue({
+      ...shared,
+      ask_access: { [SHARED]: { owner: "boss@x.org", connected: true } },
+    });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
+    expect(dialog.textContent).toContain(
+      "boss@x.org is connected to PM too: open Google Calendar as boss@x.org and share this calendar with me@x.com, choosing “Make changes and see event details”.",
+    );
+  });
+
+  it("offers nothing on a calendar the overview names no owner for", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue({ ...shared, ask_access: {} });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
+    expect(within(dialog).queryAllByRole("status")).toHaveLength(0);
+  });
+
+  it("offers nothing on a calendar the overview doesn't list", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue({ ...shared, calendars: overview.calendars });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
   });
 });

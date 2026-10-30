@@ -667,6 +667,7 @@ export function QuickCreatePopover({
       // notices (z-[48]), as a modal's scrim is: a notice that never goes would cover Save.
       aria-label="New event"
       tabIndex={-1}
+      data-help="calendar-new-event"
       className="fixed z-50 flex w-[22rem] max-w-[calc(100vw-1rem)] flex-col gap-3 rounded-[var(--radius)] border border-border2 bg-panel p-3 shadow-2xl focus:outline-none"
       style={{
         left: pos?.left ?? anchor.left,

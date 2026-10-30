@@ -87,6 +87,7 @@ function overview(editing: EditingStatus): CalendarOverview {
     editing: { [ID]: editing },
     default_length: {},
     auto_meet: {},
+    ask_access: {},
   };
 }
 
@@ -109,6 +110,16 @@ describe("CalendarConnection editing switch", () => {
     expect(await screen.findByText(`Editing is on for ${EMAIL}.`)).toBeTruthy();
     expect(await screen.findByRole("button", { name: "Turn off editing" })).toBeTruthy();
     expect(setCalendarEditingPaused).not.toHaveBeenCalled();
+  });
+
+  it("says what editing lets PM do, as the rest of #884 built it", async () => {
+    calendarOverview.mockResolvedValue(overview("on"));
+    render(<CalendarConnection provider="google" />);
+    expect(
+      await screen.findByText(
+        "Editing on: PM can create events on this account’s calendars, change, move and delete the events you can edit there, and reply to invitations.",
+      ),
+    ).toBeTruthy();
   });
 
   it("says the account stays read-only when Google's write box was left unticked", async () => {

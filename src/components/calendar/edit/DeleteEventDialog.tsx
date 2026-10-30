@@ -137,6 +137,7 @@ function PlainDelete({
       danger
       confirmDisabled={notice !== null && notify === null}
       initialFocus="cancel"
+      helpId="calendar-delete"
       // Delete is off until answered; were it pressed anyway, the backend asks (R9). Closing
       // clears the event, so the next one asks afresh.
       onConfirm={() =>

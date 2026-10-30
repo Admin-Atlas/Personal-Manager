@@ -15,7 +15,7 @@
 
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Calendar, CalendarEvent, WriteOutcome } from "../../../lib/types";
+import type { AccessAsk, Calendar, CalendarEvent, WriteOutcome } from "../../../lib/types";
 
 const eventFlags = vi.fn();
 const openUrl = vi.fn();
@@ -59,6 +59,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
 
 import {
   CalendarEventPopover,
+  type PopoverAsk,
   type PopoverEditing,
   type PopoverRsvp,
 } from "./CalendarEventPopover";
@@ -1015,5 +1016,164 @@ describe("CalendarEventPopover", () => {
         (globalThis as { ResizeObserver?: unknown }).ResizeObserver = real;
       }
     });
+  });
+});
+
+// Asking a view-only calendar's owner for edit access (#884, C20b): a button after the reason, and a
+// status line under it that is there, empty, from the start (a region that appears with its words
+// isn't announced, critique C2-L2).
+describe("CalendarEventPopover: asking for edit access", () => {
+  const READ_ONLY =
+    "This calendar is shared with you to view only, so its events can't be changed here.";
+  const PERMISSION = "“Make changes and see event details”";
+  const editingWith = (ask: PopoverAsk | null): PopoverEditing => ({
+    canEdit: false,
+    canDelete: false,
+    canDuplicate: false,
+    reason: READ_ONLY,
+    onEdit: () => {},
+    onDelete: () => {},
+    onDuplicate: () => {},
+    ask,
+  });
+  const askOf = (over: Partial<PopoverAsk> = {}): PopoverAsk => ({
+    owner: "boss@x.org",
+    connected: false,
+    own: "me@x.org",
+    calendar: "Team",
+    onAsk: vi.fn(() => Promise.resolve<AccessAsk>({ outcome: "opened", owner: "boss@x.org" })),
+    ...over,
+  });
+  const shown = (ask: PopoverAsk | null, event = calendarEvent()) => (
+    <CalendarEventPopover
+      event={event}
+      anchor={rect(100)}
+      calendar={null}
+      color="#000"
+      milestone={null}
+      onClose={() => {}}
+      editing={editingWith(ask)}
+    />
+  );
+  const button = (view: ReturnType<typeof render>) =>
+    view.getByRole("button", { name: "Ask boss@x.org for edit access" });
+
+  it("a view-only calendar's reason offers Ask {owner} for edit access", () => {
+    const view = render(shown(askOf()));
+    const ask = button(view);
+    // In the reason's own line, after its words.
+    expect(ask.closest("p")?.textContent).toBe(`${READ_ONLY} Ask boss@x.org for edit access`);
+    expect(ask.getAttribute("type")).toBe("button");
+    expect(ask.className).toContain("[overflow-wrap:anywhere]");
+    // Its status line is there already, empty, and wraps a long address too.
+    const status = view.getByRole("status");
+    expect(status.textContent).toBe("");
+    expect(status.className).toContain("[overflow-wrap:anywhere]");
+  });
+
+  it("clicking it asks once and then says the email was opened, naming the owner", async () => {
+    const ask = askOf();
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(ask.onAsk).toHaveBeenCalledOnce();
+    expect(view.getByRole("status").textContent).toBe(
+      `PM asked your system to open an email to boss@x.org in your mail app. If nothing opened, write to boss@x.org and ask for ${PERMISSION}.`,
+    );
+    // The button stays for another try.
+    expect(button(view).getAttribute("aria-disabled")).toBeNull();
+    await act(async () => fireEvent.click(button(view)));
+    expect(ask.onAsk).toHaveBeenCalledTimes(2);
+  });
+
+  it("a second click while asking does nothing", async () => {
+    let answer: (a: AccessAsk) => void = () => {};
+    const ask = askOf({
+      onAsk: vi.fn(() => new Promise<AccessAsk>((r) => (answer = r))),
+    });
+    const view = render(shown(ask));
+    fireEvent.click(button(view));
+    expect(button(view).getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(button(view));
+    expect(ask.onAsk).toHaveBeenCalledOnce();
+    await act(async () => answer({ outcome: "no_owner" }));
+    expect(view.getByRole("status").textContent).toBe(
+      "PM can't tell who to ask for this calendar now. If its sharing just changed, refresh the calendar.",
+    );
+    expect(button(view).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("no mail app says to write to the owner, naming the permission and the calendar", async () => {
+    const ask = askOf({
+      onAsk: () => Promise.resolve<AccessAsk>({ outcome: "no_mail_app", owner: "boss@x.org" }),
+    });
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(view.getByRole("status").textContent).toBe(
+      `PM couldn't open your mail app. Write to boss@x.org and ask for ${PERMISSION} on “Team”.`,
+    );
+  });
+
+  it("an ask the backend refuses says its words", async () => {
+    const ask = askOf({
+      onAsk: () => Promise.reject("PM can only open this email from its main window."),
+    });
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(view.getByRole("status").textContent).toBe(
+      "PM couldn't open the email: PM can only open this email from its main window.",
+    );
+    expect(button(view).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("a connected owner gets the share hint and no button", () => {
+    const view = render(shown(askOf({ connected: true })));
+    expect(view.queryByRole("button", { name: /^Ask / })).toBeNull();
+    expect(view.queryAllByRole("status")).toHaveLength(0);
+    expect(view.getByText(new RegExp(`^${READ_ONLY}`)).textContent).toBe(
+      `${READ_ONLY} boss@x.org is connected to PM too: open Google Calendar as boss@x.org and share this calendar with me@x.org, choosing ${PERMISSION}.`,
+    );
+    // A long address wraps here too.
+    expect(view.getByText(/is connected to PM too/).className).toContain(
+      "[overflow-wrap:anywhere]",
+    );
+    // Without this account's address, "this account".
+    cleanup();
+    const other = render(shown(askOf({ connected: true, own: null })));
+    expect(other.getByRole("dialog").textContent).toContain(
+      "share this calendar with this account, choosing",
+    );
+  });
+
+  it("no ask without one, and the answer goes with the event it was for", async () => {
+    const plain = render(shown(null));
+    expect(plain.getByText(READ_ONLY)).toBeTruthy();
+    expect(plain.queryByRole("button", { name: /^Ask / })).toBeNull();
+    cleanup();
+    // Re-pointed at another event (the keyboard path), the last one's answer never shows.
+    const ask = askOf();
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(view.getByRole("status").textContent).not.toBe("");
+    view.rerender(shown(ask, calendarEvent({ id: "e2" })));
+    expect(view.getByRole("status").textContent).toBe("");
+  });
+
+  // Help mode (C20b §11, critiques C1-L6, C2-L6): the calendar view's panel explains itself,
+  // whatever it offers; Focus › Upcoming's (no `editing`) keeps the help around it.
+  it("carries the event help in the calendar view, and none of its own elsewhere", () => {
+    const view = render(shown(null));
+    expect(view.getByRole("dialog").getAttribute("data-help")).toBe("calendar-event");
+    cleanup();
+    const upcoming = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(upcoming.getByRole("dialog").hasAttribute("data-help")).toBe(false);
   });
 });

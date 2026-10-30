@@ -1114,6 +1114,7 @@ export function EventEditor({
         onClose={requestClose}
         chrome="bar"
         title="Edit event"
+        helpId="calendar-editor"
         // The Calendar row says where it is when it's shown (C18d).
         subtitle={
           calendar && !calendarRow

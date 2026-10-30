@@ -150,6 +150,7 @@ export function SaveChoicesDialog({
       onClose={onClose}
       title={kind === "save" ? "Edit repeating event" : "Delete repeating event"}
       tone={kind === "delete" ? "danger" : "default"}
+      helpId="calendar-choices"
       widthClassName="max-w-md"
       footer={
         <>

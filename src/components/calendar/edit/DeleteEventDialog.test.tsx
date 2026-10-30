@@ -111,6 +111,15 @@ describe("DeleteEventDialog", () => {
     expect(screen.queryByRole("radio")).toBeNull();
   });
 
+  // Help mode (C20b §11, critique C2-M6): a one-off's delete explains itself; there are no
+  // occurrences to choose between.
+  it("carries the delete's help on a one-off", () => {
+    open(oneOff);
+    expect(
+      screen.getByRole("dialog", { name: "Delete this event?" }).getAttribute("data-help"),
+    ).toBe("calendar-delete");
+  });
+
   // C12 §14.3: a one-off you organise with a guest asks whether Google emails the cancellation, in
   // the same dialog; Delete waits for the answer and focus starts on Cancel.
   it("asks a one-off with guests whether to email them, Delete waiting for the answer", () => {

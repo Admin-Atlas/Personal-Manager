@@ -125,6 +125,8 @@ release remain the open post-v1 work.
     Google's clock, never this computer's);
     `calendar_recur/` (repeat rules, pure: read, described, cut for a split; the read and write
     paths share it, and it never lets the `rrule` crate parse or print a rule);
+    `calendar_ask.rs` (whom to ask for edit access to a Google calendar shared to view only, and the
+    email PM opens for the user to send, pure: Google has no API for it);
     `calendar_write/` + `commands/calendar_edit.rs` (Google event writes, fenced off from every
     model path: INVARIANTS.md I-22). Everything fetched is untrusted DATA (rule #6).
   - **Backup** — `backup/`: portable passphrase-encrypted zstd `.pmbackup`; a
