@@ -780,14 +780,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     //
     // A row a delete is hiding takes every copy of its occurrence with it: the same Google event
     // seen through a second connected account is the same event, and showing that copy instead
-    // would look like the delete hadn't happened.
+    // would look like the delete hadn't happened. Not a removal's: it takes one calendar's copy off,
+    // and the organiser's stays (C14 critique C1-M5).
     //
     // A row the user declined is struck through, as Google draws it, only when every copy shown
     // that has their own guest entry says so (`markDeclined`, C14b): the kept copy may be the
     // organiser's, which the reply doesn't change.
     const deleting = new Set(
       events
-        .filter((e) => writes.hiddenIds.has(e.id))
+        .filter((e) => writes.hiddenIds.has(e.id) && !writes.removalIds.has(e.id))
         .map(occurrenceKey)
         .filter((k): k is string => k !== null),
     );
@@ -834,6 +835,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     milestoneEvents,
     pinboardEvents,
     writes.hiddenIds,
+    writes.removalIds,
     writes.twins,
     writes.moves,
     rights,
@@ -980,9 +982,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       startCopy(ev);
     },
     // A reply from each copy of the occurrence the user can send one from (C14b), the copy the
-    // dedup hid included: with both accounts shown, the organiser's copy is the one kept.
+    // dedup hid included: with both accounts shown, the organiser's copy is the one kept. Not a copy
+    // on its way off the calendar: a removal leaves the organiser's showing (C14d).
     rsvp: replyCopies(
-      events,
+      events.filter((e) => !writes.hiddenIds.has(e.id)),
       ev,
       overview?.calendars ?? [],
       (c) => !hidden.has(c.id) && overview?.editing[c.source_id] === "on",

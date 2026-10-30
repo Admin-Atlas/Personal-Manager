@@ -674,12 +674,12 @@ describe("CalendarView: invitations", () => {
     self: true,
   });
   /** Bobby's copy of someone else's invitation, on his main calendar: editable for his own
-   *  settings since C14c, never deleted. */
+   *  settings since C14c, and removable from his calendar since C14d. */
   const invite = (response = "needsAction") =>
     row({
       id: "i1",
       edit_block: null,
-      can_delete: false,
+      can_delete: true,
       can_respond: true,
       organizer_self: false,
       attendees: [own("me@x.com", response)],
@@ -694,6 +694,8 @@ describe("CalendarView: invitations", () => {
       attendees: [own("work", response, true)],
     });
   const chip = () => screen.getByRole("button", { name: /Standup/ });
+  /** The event's chip, and not a notice's Undo, which names the event too. */
+  const EVENT_CHIP = /^(?!Undo).*Standup/;
 
   it("offers Going? from every copy of the occurrence, the one shown first, each named", async () => {
     rows = [invite(), organiser()];
@@ -710,6 +712,79 @@ describe("CalendarView: invitations", () => {
     expect(ipc.respondToCalendarEvent).toHaveBeenCalledWith("i1", "no", null, null);
   });
 
+  // C14 §10.2, §10.4: Remove asks, says who hears, and sends no answer about emails; the row goes
+  // while Undo stands.
+  it("removes an invitation from the popover, after asking", async () => {
+    rows = [invite()];
+    ipc.deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+    });
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    const asked = screen.getByRole("dialog", { name: "Remove “Standup” from your calendar?" });
+    expect(within(asked).queryByRole("radio")).toBeNull();
+    fireEvent.click(within(asked).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(ipc.deleteCalendarEvent).toHaveBeenCalledTimes(1));
+    expect(ipc.deleteCalendarEvent).toHaveBeenCalledWith(
+      "i1",
+      expect.objectContaining({ removal: true }),
+      null,
+      null,
+      null,
+      null,
+    );
+    expect(await screen.findByText("Removing “Standup”.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: EVENT_CHIP })).toBeNull();
+  });
+
+  // C14 critique C1-M5: a removal takes one calendar's copy off. The organiser's copy of the
+  // occurrence is still there in Google, so it shows, where a delete would hide every copy. Its
+  // reply strip no longer offers the copy on its way off the calendar.
+  it("leaves the organiser's copy showing while a removal is held", async () => {
+    rows = [invite(), organiser()];
+    ipc.deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+    });
+    await mount();
+    const { startDelete } = await import("./edit/useEventWrites");
+    await act(() => startDelete(rows[0]));
+    fireEvent.click(screen.getByRole("button", { name: EVENT_CHIP }));
+    expect(screen.getAllByRole("group", { name: /^Going\?/ })).toHaveLength(1);
+    expect(screen.getByRole("group", { name: "Going? Replying for Work." })).toBeTruthy();
+  });
+
+  // The same two rows with a delete: every copy goes, as ever.
+  it("hides every copy while a delete of your own is held", async () => {
+    rows = [organiser(), invite()];
+    ipc.deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+    });
+    await mount();
+    const { startDelete } = await import("./edit/useEventWrites");
+    await act(() => startDelete(rows[0]));
+    expect(screen.queryByRole("button", { name: EVENT_CHIP })).toBeNull();
+  });
+
+  // C20 §0.4 item 11: Google fixes the organiser of a birthday or a Gmail event, so its button
+  // says Delete, whoever's name is on it, and its delete sends no decline.
+  it("a birthday or a Gmail event in someone else's name says Delete", async () => {
+    for (const event_type of ["birthday", "fromGmail"]) {
+      rows = [{ ...invite(), event_type }];
+      await mount();
+      fireEvent.click(chip());
+      expect(await screen.findByRole("button", { name: "Delete" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+      cleanup();
+    }
+  });
+
   it("says under an invitation what the user may still do, and how with editing off", async () => {
     rows = [invite()];
     await mount();
@@ -720,9 +795,10 @@ describe("CalendarView: invitations", () => {
       ),
     ).toBeTruthy();
     expect(screen.getByRole("group", { name: "Going?" })).toBeTruthy();
-    // C14c: Edit, for the user's own settings, and never Delete.
+    // C14c: Edit, for the user's own settings. C14d: Delete is Remove.
     expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove" })).toBeTruthy();
     cleanup();
     ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
     await mount();

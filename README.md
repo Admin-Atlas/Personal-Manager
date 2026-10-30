@@ -83,7 +83,8 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   events you can edit (repeating ones and ones with guests included, asking before Google emails
   anyone), give them a Google Meet call, a formatted description, notifications and a colour,
   duplicate them, move the ones you organise to another calendar you own there, answer
-  invitations, and change what Google allows on birthdays and events from Gmail; on a calendar
+  invitations or remove them from your calendar, and change what Google allows on birthdays and
+  events from Gmail; on a calendar
   shared with you to view only, PM can open an email asking its owner for edit access. Every
   change goes straight to Google, a save never overwrites a field someone changed there in the
   meantime, and a new event whose save loses the connection is looked for in Google before it's

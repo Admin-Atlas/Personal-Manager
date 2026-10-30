@@ -1895,6 +1895,10 @@ export interface SeenSummary {
   end: string | null;
   all_day: boolean;
   location: string | null;
+  /** The row was someone else's ordinary event, so the user was asked to remove it and told the
+   *  organiser hears, rather than asked to delete it (C14d). The delete stops if Google's copy no
+   *  longer says so. */
+  removal: boolean;
 }
 
 /** What may change on one event, field by field, and why the rest can't. */
@@ -2210,6 +2214,8 @@ export interface HeldDeleteInfo {
   seconds_left: number;
   /** The rows a series delete hides while it waits (PM's own row ids). */
   hidden?: string[];
+  /** It takes someone else's event off the user's calendar (C14d), so the notice says "Removing". */
+  removal?: boolean;
 }
 
 /** What asking to delete came to: held for its Undo window (`undo_token` cancels it), or refused.

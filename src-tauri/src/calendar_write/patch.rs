@@ -27,6 +27,7 @@ use super::dto::{
     ColourDraft, EventPatchDraft, NewEventDraft, RemindersDraft, SeenSummary, SeenTimes, TimeDraft,
     Visibility,
 };
+use super::gate;
 use super::time::{self, TimeError};
 use crate::calendar::Reminder;
 use crate::calendar_recur::expand::sync_start;
@@ -912,6 +913,13 @@ pub fn delete_still_matches(seen: &SeenSummary, fresh: &Value) -> DeleteCheck {
     if location.as_deref().unwrap_or("") != seen.location.as_deref().unwrap_or("") {
         changed.push("location".to_string());
     }
+    // Who organises it decides what the user was asked (C14d): Delete with its email question, or
+    // Remove with its "the organiser is told". Changed since, neither answer stands: never a decline
+    // they weren't shown, nor a cancel for everyone. Google's copy goes into the mirror, as for any
+    // change here, so the next try asks the right thing.
+    if gate::removes_copy(now.event_type.as_deref(), now.organizer_self) != seen.removal {
+        changed.push("organizer".to_string());
+    }
     if changed.is_empty() {
         DeleteCheck::Matches
     } else {
@@ -1510,6 +1518,45 @@ mod tests {
             end: Some("2026-10-12T10:00:00Z".into()),
             all_day: false,
             location: Some("High St".into()),
+            removal: false,
+        }
+    }
+
+    /// C14d: what the user was asked goes by who organises it. A delete of what's now someone else's
+    /// event, or a removal of what's now the user's own, stops, and a birthday or a Gmail event is
+    /// never a removal, whoever's name is on it.
+    #[test]
+    fn a_delete_stops_when_who_organises_it_changed() {
+        let organised_by = |email: &str| json!({ "email": email });
+        let theirs = with_key(&fresh(), "organizer", organised_by("boss@example.com"));
+        let removing = SeenSummary {
+            removal: true,
+            ..seen()
+        };
+        assert_eq!(
+            delete_still_matches(&seen(), &theirs),
+            DeleteCheck::Changed(vec!["organizer".into()])
+        );
+        assert_eq!(
+            delete_still_matches(&removing, &fresh()),
+            DeleteCheck::Changed(vec!["organizer".into()])
+        );
+        assert_eq!(
+            delete_still_matches(&removing, &theirs),
+            DeleteCheck::Matches
+        );
+        for kind in ["birthday", "fromGmail"] {
+            let special = with_key(&theirs, "eventType", json!(kind));
+            assert_eq!(
+                delete_still_matches(&seen(), &special),
+                DeleteCheck::Matches,
+                "{kind}"
+            );
+            assert_eq!(
+                delete_still_matches(&removing, &special),
+                DeleteCheck::Changed(vec!["organizer".into()]),
+                "{kind}"
+            );
         }
     }
 

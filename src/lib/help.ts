@@ -271,11 +271,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Move around & choose a view",
     body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Day, Week, Month, Year and Agenda, and the label shows the range you're looking at. + New event (or c) creates an event in Google, on an account with editing turned on, and Refresh reads your calendars again now; everything else here only changes what you see.",
   },
-  // In the calendar view only: Focus › Upcoming's details pop-up keeps `focus-agenda`'s help. Kept
-  // well under the panel's limit, so another of the details' actions fits a sentence (help.test.ts).
+  // In the calendar view only: Focus › Upcoming's details pop-up keeps `focus-agenda`'s help.
   "calendar-event": {
     title: "Event details",
-    body: "An event's details, with its description's formatting from Google (an email link opens your mail app). Edit opens what you can change; Duplicate opens a copy to change before it's created, on any calendar you can create events on; Delete waits a few seconds for Undo (Ctrl+Z, ⌘Z on a Mac). On an invitation, choose Yes, No or Maybe (for a repeating one, this occurrence or all of them) and Google tells the organiser; events you've declined are struck through. A line at the bottom says what can't be changed and why: on a birthday or an event Gmail added, only what Google allows changes. On a calendar shared with you to view only, it offers to ask the owner for edit access when PM knows who owns it: PM opens an email in your mail app for you to send.",
+    body: "An event's details, with its description's formatting from Google (an email link opens your mail app). Edit opens what you can change; Duplicate opens a copy to change before it's created, on any calendar you can create events on; Delete waits a few seconds for Undo (Ctrl+Z, ⌘Z on a Mac). On an invitation, choose Yes, No or Maybe (for a repeating one, this occurrence or all of them) and Google tells the organiser; events you've declined are struck through. Remove takes an invitation off your calendar (a repeating one, all of it), and Google tells the organiser you declined. A line at the bottom says what can't be changed and why: on a birthday or an event Gmail added, only what Google allows changes. On a calendar shared with you to view only, it offers to ask the owner for edit access when PM knows who owns it: PM opens an email in your mail app for you to send.",
   },
   // The description's buttons have their own entry (`calendar-description-format`).
   "calendar-editor": {
@@ -292,10 +291,11 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Which occurrences",
     body: "A change to a repeating event can be for this event only, for this and the following events, or for all of them, as Google Calendar asks; a delete offers the same choices. For a change, this and the following events makes the rest a repeating event of its own in Google, and PM then asks whether to move a milestone already linked to it, dated from that day on, to the new part; for a delete, it ends the repeating event there. PM says what each choice would change before you pick, and a choice it can't make says why: a birthday or an event Gmail added changes this event or all of them, and another calendar takes the whole repeating event. If the change would email guests, PM asks whether to send the email, and nothing is sent until you choose. A delete waits a few seconds for Undo (Ctrl+Z, ⌘Z on a Mac), and doesn't happen if the title, time or place changed in Google.",
   },
-  // The delete of an event that doesn't repeat (a repeating one asks `calendar-choices`).
+  // The delete of an event that doesn't repeat (a repeating one asks `calendar-choices`), and Remove
+  // on an invitation, repeating or not.
   "calendar-delete": {
     title: "Delete an event",
-    body: "Deletes the event from its calendar in Google. If it has guests, PM asks first whether to email them. You can undo it for a few seconds (Ctrl+Z, ⌘Z on a Mac); if you quit PM in that time, nothing is deleted, and it doesn't happen if the title, time or place changed in Google. Deleting a birthday or other special date here doesn't change Google Contacts or your Google Account.",
+    body: "Deletes the event from its calendar in Google. If it has guests, PM asks first whether to email them. You can undo it for a few seconds (Ctrl+Z, ⌘Z on a Mac); if you quit PM in that time, nothing is deleted, and it doesn't happen if the title, time or place changed in Google. Deleting a birthday or other special date here doesn't change Google Contacts or your Google Account. On an invitation it says Remove: that takes it off your calendar (a repeating one, all of it), Google tells the organiser you declined, and the same Undo applies.",
   },
   "calendar-filter": {
     title: "Which calendars show",
@@ -427,7 +427,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-calendar-editing": {
     title: "Calendar editing",
-    body: "Lets PM create events on this Google account's calendars, repeating ones included; change, move and delete the events you can edit there (repeating ones and ones with guests included, and on calendars shared with you that you can edit); put events you organise on another of this account's calendars that you own; reply to invitations and change your own settings on them; and change what Google allows on birthdays and events Gmail added. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
+    body: "Lets PM create events on this Google account's calendars, repeating ones included; change, move and delete the events you can edit there (repeating ones and ones with guests included, and on calendars shared with you that you can edit); put events you organise on another of this account's calendars that you own; reply to invitations, change your own settings on them or remove them; and change what Google allows on birthdays and events Gmail added. Turning it on asks Google for permission: Google lists two things, seeing your calendars and changing their events, and editing needs both ticked. 'Turn off editing' stops PM using that permission straight away, without asking Google, and turning it back on is just as quick. Google keeps the permission until you disconnect the account here (or, while Drive or backups still use the account, until you remove PM at myaccount.google.com/permissions). Connecting the account again asks for reading only, so it turns editing off.",
   },
   "settings-calendar-microsoft": {
     title: "Outlook Calendar",

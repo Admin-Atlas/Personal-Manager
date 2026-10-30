@@ -520,7 +520,9 @@ export function EventEditor({
       self: g.self,
     }));
     const seen = loaded.seen ? { ...loaded.seen, location: loaded.seen.location } : {};
-    return { ...row, ...seen, attendees };
+    // Who organises it too: the footer's Delete or Remove goes by Google's copy, and so must the
+    // question and what it's compared with at the send (C14d).
+    return { ...row, ...seen, attendees, organizer_self: loaded.event.organizer_self };
   };
 
   const requestDelete = () => {
@@ -1236,7 +1238,7 @@ export function EventEditor({
             {perms?.delete && onDelete && (
               <span className={showDuplicate ? undefined : "mr-auto"}>
                 <Button variant="danger" onClick={requestDelete} disabled={saving || mustReopen}>
-                  Delete
+                  {theirs ? "Remove" : "Delete"}
                 </Button>
               </span>
             )}
@@ -1639,14 +1641,14 @@ export function EventEditor({
         open={askDiscard !== null}
         title={
           askDiscard === "delete"
-            ? "Discard your changes and delete?"
+            ? `Discard your changes and ${theirs ? "remove" : "delete"}?`
             : askDiscard === "duplicate"
               ? "Discard your changes and duplicate?"
               : "Discard your changes?"
         }
         confirmLabel={
           askDiscard === "delete"
-            ? "Discard and delete"
+            ? `Discard and ${theirs ? "remove" : "delete"}`
             : askDiscard === "duplicate"
               ? "Discard and duplicate"
               : "Discard"

@@ -37,9 +37,12 @@ import {
   createdText,
   createReasonText,
   createText,
+  deleteChangedText,
   deleteText,
   dragReason,
   duplicable,
+  removesCopy,
+  removeText,
   emailsGuests,
   endsRetry,
   eventRights,
@@ -409,6 +412,47 @@ describe("edit reasons", () => {
     expect(deleteText({ outcome: "ignored_by_google", split: false }, "Standup").text).toMatch(
       /^“Standup” wasn't deleted\./,
     );
+  });
+
+  // C14 §13.4: every answer to a removal speaks of removing, whichever came back.
+  it("speaks of a removal as a removal, naming the event", () => {
+    const said = (outcome: WriteOutcome) => deleteText(outcome, "Dentist", true);
+    expect(said({ outcome: "saved", warnings: [] })).toEqual({
+      tone: "ok",
+      text: "Removed “Dentist” from your calendar.",
+    });
+    expect(said({ outcome: "saved", warnings: ["mirror_refresh_pending"] }).text).toBe(
+      `Removed “Dentist” from your calendar. ${writeWarningText("mirror_refresh_pending", "delete")}`,
+    );
+    expect(said({ outcome: "conflict", fields: ["organizer"] })).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't removed. It changed in Google since you opened it.",
+    });
+    expect(said({ outcome: "busy" }).text).toBe(
+      "“Dentist” wasn't removed. Google is busy right now; try again in a moment.",
+    );
+    expect(said({ outcome: "read_only", reason: "not_organizer" }).text).toMatch(
+      /^“Dentist” wasn't removed\./,
+    );
+    expect(said({ outcome: "needs_choice", scope: true })).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't removed. PM needs to ask you again first. Remove it again.",
+    });
+    expect(said({ outcome: "ignored_by_google", split: false }).text).toBe(
+      "“Dentist” wasn't removed. Google answered as if it removed it, but kept it.",
+    );
+    // An answer that never arrived is never reported as "wasn't removed": it may have been.
+    expect(said({ outcome: "unconfirmed" }).text).toBe(
+      "PM lost touch with Google before it could confirm whether “Dentist” was removed. Refresh the calendar to see.",
+    );
+    expect(said({ outcome: "ambiguous", retry_token: "r" }).text).toBe(
+      "PM lost touch with Google, so it can't tell whether “Dentist” was removed. Refresh the calendar to see.",
+    );
+    expect(deleteChangedText("Dentist", true)).toEqual({
+      tone: "warn",
+      text: "“Dentist” wasn't removed. This repeating event changed since you asked to remove it. Remove it again.",
+    });
+    expect(deleteChangedText("Dentist").text).toMatch(/^“Dentist” wasn't deleted\./);
   });
 
   it("ambiguous has words", () => {
@@ -1497,7 +1541,63 @@ describe("an event's rights in the calendar", () => {
     can_retime: true,
     ...over,
   });
-  const theirs = { organizer_self: false, can_delete: false, can_respond: true };
+  const theirs = { organizer_self: false, can_delete: true, can_respond: true };
+
+  // C14d, C20 §0.4 item 11: Delete says Remove exactly where the list offers it on an ordinary event
+  // someone else organises. A birthday or a Gmail event in someone else's name is deleted; a row the
+  // list won't let go offers neither.
+  it("says Remove only on someone else's ordinary event that can leave the calendar", () => {
+    const on = overview("on");
+    const rows: [string, CalendarEvent, boolean][] = [
+      ["invitation", row(theirs), true],
+      ["kind unset", row({ ...theirs, event_type: null }), true],
+      ["default kind", row({ ...theirs, event_type: "default" }), true],
+      ["your own", row({}), false],
+      ["a birthday", row({ ...theirs, event_type: "birthday" }), false],
+      ["a Gmail event", row({ ...theirs, event_type: "fromGmail" }), false],
+      ["not on its guest list, or locked", row({ ...theirs, can_delete: false }), false],
+      ["focus time", row({ ...theirs, event_type: "focusTime" }), false],
+    ];
+    for (const [name, ev, want] of rows) {
+      expect([name, eventRights(ev, on).removes]).toEqual([name, want]);
+    }
+    expect(eventRights(row(theirs), overview("off")).removes).toBe(false);
+    // The reason nothing can be deleted is the backend's.
+    expect(eventRights(row({ ...theirs, edit_block: "calendar_read_only" }), on).removes).toBe(
+      false,
+    );
+  });
+
+  // A pure copy of the backend's `removes_copy`, read the same way (its own table: gate.rs).
+  it("removesCopy reads who organises it and its kind as the backend does", () => {
+    const rows: [boolean, string | null | undefined, boolean][] = [
+      [false, undefined, true],
+      [false, null, true],
+      [false, "default", true],
+      [true, undefined, false],
+      [true, "default", false],
+      [false, "birthday", false],
+      [false, "fromGmail", false],
+      [false, "focusTime", false],
+      [false, "somethingNew", false],
+      [true, "birthday", false],
+    ];
+    for (const [organizer_self, event_type, want] of rows) {
+      expect([event_type, removesCopy({ organizer_self, event_type })]).toEqual([event_type, want]);
+    }
+    // A row that doesn't say who organises it is no one's to remove.
+    expect(removesCopy({})).toBe(false);
+  });
+
+  // C14 §13.4's words.
+  it("says what removing an invitation does", () => {
+    expect(removeText(false)).toBe(
+      "Google Calendar tells the organiser you declined. You can undo it for a few seconds.",
+    );
+    expect(removeText(true)).toBe(
+      "Google Calendar tells the organiser you declined. This removes every occurrence, as Google Calendar does. You can undo it for a few seconds.",
+    );
+  });
 
   // C18c: any Google event of the ordinary kind whose details the account can read, editing on or
   // not and whoever organises it.
@@ -1526,7 +1626,7 @@ describe("an event's rights in the calendar", () => {
 
   it("offers a drag exactly where the list says the time may change", () => {
     const on = overview("on");
-    const rows: [string, CalendarEvent, CalendarOverview, EventRights][] = [
+    const rows: [string, CalendarEvent, CalendarOverview, Omit<EventRights, "removes">][] = [
       ["one-off", row({}), on, { canEdit: true, canDelete: true, canRetime: true, reason: null }],
       [
         "locked",
@@ -1540,7 +1640,7 @@ describe("an event's rights in the calendar", () => {
         on,
         {
           canEdit: true,
-          canDelete: false,
+          canDelete: true,
           canRetime: false,
           reason: notOrganizerText(true, true),
         },
@@ -1549,7 +1649,7 @@ describe("an event's rights in the calendar", () => {
         "invitation with modify",
         row({ ...theirs, guests_can_modify: true, can_retime: true }),
         on,
-        { canEdit: true, canDelete: false, canRetime: true, reason: A11_NOTE },
+        { canEdit: true, canDelete: true, canRetime: true, reason: A11_NOTE },
       ],
       [
         "editing off",
@@ -1642,7 +1742,11 @@ describe("an event's rights in the calendar", () => {
       ],
     ];
     for (const [name, ev, view, want] of rows) {
-      expect([name, eventRights(ev, view)]).toEqual([name, want]);
+      // Whether its delete says Remove has its own test above.
+      expect([name, eventRights(ev, view)]).toEqual([
+        name,
+        { ...want, removes: expect.any(Boolean) as boolean },
+      ]);
     }
   });
 

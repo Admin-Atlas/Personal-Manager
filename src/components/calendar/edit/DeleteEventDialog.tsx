@@ -13,6 +13,10 @@
 // in this dialog: Delete stays off until Send or Don't send is picked, and the answer goes with the
 // hold, so it's the one sent after the Undo window. A one-off's numbers come from its row, or from
 // the backend when it asked again; a repeating event's rows carry their own.
+//
+// An event someone else organises asks to remove it instead (C14d): it leaves the user's calendar,
+// and Google tells the organiser they declined, so there's no email question. As Google web (Help
+// 37113), a repeating one goes whole: its choices are read only for "All events"'s token.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
@@ -23,12 +27,22 @@ import type {
   SplitAction,
 } from "../../../lib/types";
 import {
+  CALLOUT_TONE,
   deleteText,
+  REMOVE_CHANGED,
+  removesCopy,
+  removeText,
   SPECIAL_DATE_DELETE,
   specialKind,
 } from "../../../lib/calendarEdit/editReasons";
 import { deleteNotice, notifyOf } from "../../../lib/calendarEdit/guests";
-import { isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
+import {
+  isRepeating,
+  pendingOf,
+  rowsOf,
+  warningLines,
+  type Picked,
+} from "../../../lib/calendarEdit/saveChoices";
 import { parseLocal } from "../../../lib/calendar-layout";
 import { formatDateLocal } from "../../../lib/format";
 import { Callout, ConfirmDialog } from "../../ui";
@@ -85,6 +99,18 @@ export function DeleteEventDialog({
         from={from}
         again={again}
         onConfirm={onConfirm}
+        onClose={onClose}
+      />
+    );
+  }
+  // The backend asking about emails (`guests`) means it's the user's own event by now: a delete.
+  if (event && !guests && removesCopy(event)) {
+    return (
+      <RemoveConfirm
+        event={event}
+        repeating={false}
+        token={null}
+        onRemove={() => onConfirm(event, null, null, null)}
         onClose={onClose}
       />
     );
@@ -211,6 +237,7 @@ function RepeatingDelete({
 
   useEffect(() => {
     mounted.current = true;
+    const removal = removesCopy(event);
     // StrictMode runs this twice: the store asks once, and the answer is applied once (so words
     // that arrive after the dialog closed become one notice, not two). `mounted` is the
     // component's, not this run's: StrictMode's first run is cleaned up but the dialog is still up.
@@ -236,7 +263,7 @@ function RepeatingDelete({
           return;
         case "refused":
           // A conflict has already put Google's copy in PM's calendar behind this dialog.
-          setView({ state: "refused", ...deleteText(c.result, title) });
+          setView({ state: "refused", ...deleteText(c.result, title, removal) });
           return;
         case "ready":
           notice.current = said;
@@ -249,7 +276,7 @@ function RepeatingDelete({
     choicesForDelete(event).then(apply, (e: unknown) => {
       if (!mounted.current) return;
       const message = e instanceof Error ? e.message : String(e);
-      setView({ state: "refused", ...deleteText({ outcome: "failed", message }, title) });
+      setView({ state: "refused", ...deleteText({ outcome: "failed", message }, title, removal) });
     });
     return () => {
       mounted.current = false;
@@ -275,6 +302,27 @@ function RepeatingDelete({
     close();
   };
 
+  // Someone else's: the one question, unless a change PM couldn't finish holds it, whose buttons are
+  // the choices dialog's (`pendingOf`).
+  if (removesCopy(event) && !(view.state === "ready" && pendingOf(view.choices))) {
+    const all =
+      view.state === "ready"
+        ? (rowsOf(view.choices, "delete").find((row) => row.scope === "all") ?? null)
+        : null;
+    return (
+      <RemoveConfirm
+        event={event}
+        repeating
+        view={view}
+        token={all?.token ?? null}
+        refused={all && !all.selectable ? all.detail : null}
+        lines={all?.selectable ? warningLines(all, "delete", title) : []}
+        onRemove={(token) => token && onConfirm(event, { scope: "all", token }, null, null)}
+        onClose={close}
+      />
+    );
+  }
+
   const start = parseLocal(event.start, event.all_day);
   return (
     <SaveChoicesDialog
@@ -292,6 +340,79 @@ function RepeatingDelete({
       onSettle={(token, action) => void onSettle(token, action)}
       onClose={close}
     />
+  );
+}
+
+/** "Remove “…” from your calendar?" (C14 §10.4, §13.4). Focus starts on Cancel. Repeating, Remove
+ *  stays off until the plan's token arrives (`view`, `token`): a row refused (`refused`) says why,
+ *  and the plan's warnings (`lines`) show as the choices dialog shows them. */
+function RemoveConfirm({
+  event,
+  repeating,
+  view = null,
+  token,
+  refused = null,
+  lines = [],
+  onRemove,
+  onClose,
+}: {
+  event: CalendarEvent;
+  repeating: boolean;
+  view?: ChoicesView | null;
+  token: string | null;
+  refused?: string | null;
+  lines?: readonly string[];
+  onRemove: (token: string | null) => void;
+  onClose: () => void;
+}) {
+  const title = event.summary.trim() || "(no title)";
+  return (
+    <ConfirmDialog
+      open
+      title={`Remove “${title}” from your calendar?`}
+      confirmLabel="Remove"
+      danger
+      confirmDisabled={repeating && token === null}
+      initialFocus="cancel"
+      helpId="calendar-delete"
+      onConfirm={() => onRemove(token)}
+      onClose={onClose}
+    >
+      <p>{removeText(repeating)}</p>
+      {view?.state === "ready" && view.again && (
+        <Callout tone="warning" size="md" live className="mt-3">
+          {REMOVE_CHANGED} Nothing was removed.
+        </Callout>
+      )}
+      {view?.state === "ready" && view.notice && (
+        <Callout tone="warning" size="md" body="ink" className="mt-3">
+          {view.notice}
+        </Callout>
+      )}
+      {view?.state === "refused" && (
+        <Callout as="p" tone={CALLOUT_TONE[view.tone]} size="md" className="mt-3" live>
+          {view.text}
+        </Callout>
+      )}
+      {refused && (
+        <Callout as="p" tone="warning" size="md" className="mt-3" live>
+          {refused}
+        </Callout>
+      )}
+      {/* Always mounted, so a screen reader hears when the check ends. */}
+      <div role="status">
+        {view?.state === "loading" && (
+          <p className="mt-3 text-xs text-ink4">Checking “{title}” in Google…</p>
+        )}
+        {lines.length > 0 && (
+          <Callout tone="info" size="md" body="ink" live={false} className="mt-3">
+            {lines.map((line) => (
+              <p key={line}>{line}</p>
+            ))}
+          </Callout>
+        )}
+      </div>
+    </ConfirmDialog>
   );
 }
 

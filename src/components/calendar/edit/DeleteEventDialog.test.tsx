@@ -504,3 +504,200 @@ describe("DeleteEventDialog", () => {
     expect(screen.queryByText(/Google Contacts/)).toBeNull();
   });
 });
+
+// Someone else's event (C14 §10.4, §13.4): it asks to remove it, says who hears, and asks nothing
+// about emails; a repeating one goes whole, waiting for the plan's token.
+describe("DeleteEventDialog, an invitation", () => {
+  const invitation: CalendarEvent = { ...oneOff, organizer_self: false };
+  const repeating: CalendarEvent = { ...occurrence, organizer_self: false };
+  const TITLE = "Remove “Gym” from your calendar?";
+  const REFUSED =
+    "Google Calendar removes someone else's repeating event from your calendar all at once, so choose “All events”.";
+  const refused: ScopeRow = { row: "refused", message: REFUSED };
+  const plan = (over: Partial<Extract<SeriesChoices, { outcome: "ready" }>> = {}) =>
+    ready({ this: refused, following: refused, ...over });
+  const remove = () => screen.getByRole<HTMLButtonElement>("button", { name: "Remove" });
+
+  it("asks to remove it, says the organiser will be told, and asks nothing about emails", () => {
+    const { onConfirm, onClose } = open({
+      ...invitation,
+      attendees: [
+        {
+          email: "boss@x.org",
+          name: null,
+          response: "accepted",
+          optional: false,
+          organizer: true,
+          self: false,
+        },
+      ],
+    });
+    const dialog = screen.getByRole("dialog", { name: TITLE });
+    expect(dialog.textContent).toContain(
+      "Google Calendar tells the organiser you declined. You can undo it for a few seconds.",
+    );
+    expect(dialog.getAttribute("data-help")).toBe("calendar-delete");
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(choicesForDelete).not.toHaveBeenCalled();
+    // Focus on Cancel, so Enter can't remove it, however the body grows.
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(document.activeElement).toBe(cancel);
+    expect(cancel.hasAttribute("data-autofocus")).toBe(true);
+    fireEvent.click(remove());
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: invitation.id }),
+      null,
+      null,
+      null,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("a repeating invitation removes all of it and waits for the plan", async () => {
+    let answer: (c: SeriesChoices) => void = () => {};
+    choicesForDelete.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    const { onConfirm } = open(repeating);
+    const dialog = screen.getByRole("dialog", { name: TITLE });
+    expect(dialog.textContent).toContain(
+      "Google Calendar tells the organiser you declined. This removes every occurrence, as Google Calendar does. You can undo it for a few seconds.",
+    );
+    expect(dialog.getAttribute("data-help")).toBe("calendar-delete");
+    expect(dialog.textContent).toContain("Checking “Gym” in Google…");
+    expect(remove().disabled).toBe(true);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
+    await act(async () => answer(plan({ all: offered("the-token") })));
+    expect(dialog.textContent).not.toContain("Checking");
+    expect(remove().disabled).toBe(false);
+    // No occurrences to choose between: it isn't the choices dialog.
+    expect(screen.queryByRole("radio")).toBeNull();
+    fireEvent.click(remove());
+    expect(onConfirm).toHaveBeenCalledWith(
+      repeating,
+      { scope: "all", token: "the-token" },
+      null,
+      null,
+    );
+  });
+
+  it("this and following from the first occurrence doesn't stand in for All events", async () => {
+    choicesForDelete.mockResolvedValue(
+      plan({ following: { row: "as_all", warnings: [], token: "f" }, all: offered("a") }),
+    );
+    const { onConfirm } = open(repeating);
+    await waitFor(() => expect(remove().disabled).toBe(false));
+    fireEvent.click(remove());
+    expect(onConfirm).toHaveBeenCalledWith(repeating, { scope: "all", token: "a" }, null, null);
+  });
+
+  it("a refused All events row says why and keeps Remove off", async () => {
+    const why = "A part PM split off this repeating event is still there.";
+    choicesForDelete.mockResolvedValue(plan({ all: { row: "refused", message: why } }));
+    open(repeating);
+    expect(await screen.findByText(why)).toBeTruthy();
+    expect(remove().disabled).toBe(true);
+  });
+
+  it("says Google changed it, and keeps Remove off", async () => {
+    choicesForDelete.mockResolvedValue({
+      outcome: "refused",
+      result: { outcome: "conflict", fields: ["summary"] },
+    });
+    open(repeating);
+    expect(
+      await screen.findByText(
+        "“Gym” wasn't removed. It changed in Google since you opened it (the title).",
+      ),
+    ).toBeTruthy();
+    expect(remove().disabled).toBe(true);
+  });
+
+  it("says why when the plan can't be read, and keeps Remove off", async () => {
+    choicesForDelete.mockRejectedValue(new Error("no store"));
+    open(repeating);
+    expect(await screen.findByText("“Gym” wasn't removed. no store")).toBeTruthy();
+    expect(remove().disabled).toBe(true);
+  });
+
+  it("says to refresh when PM's calendar says it repeats and Google says it doesn't", async () => {
+    choicesForDelete.mockResolvedValue({ outcome: "not_repeating" });
+    open(repeating);
+    expect(await screen.findByText("Refresh the calendar, then try again.")).toBeTruthy();
+    expect(remove().disabled).toBe(true);
+  });
+
+  it("shows the plan's warning, and says why when asked again", async () => {
+    choicesForDelete.mockResolvedValue(
+      plan({ all: { row: "offered", warnings: [{ warning: "split_sibling" }], token: "a" } }),
+    );
+    open(repeating, { again: true });
+    expect(
+      await screen.findByText(
+        "This repeating event changed since you asked to remove it. Nothing was removed.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText(/Google may delete that part too\./)).toBeTruthy();
+    expect(remove().disabled).toBe(false);
+  });
+
+  it("asks a row that looked like a one-off when forced", async () => {
+    choicesForDelete.mockResolvedValue(plan({ all: offered("a") }));
+    const { onConfirm } = open(invitation, { forceRepeating: true });
+    await waitFor(() => expect(remove().disabled).toBe(false));
+    expect(screen.getByRole("dialog", { name: TITLE }).textContent).toContain("every occurrence");
+    fireEvent.click(remove());
+    expect(onConfirm).toHaveBeenCalledWith(invitation, { scope: "all", token: "a" }, null, null);
+  });
+
+  it("keeps the words said once when closed without removing", async () => {
+    choicesForDelete.mockResolvedValue(plan({ all: offered("a"), notice: NOTICE }));
+    open(repeating);
+    expect(await screen.findByText(NOTICE)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(noteSeriesNotice).toHaveBeenCalledWith(NOTICE);
+  });
+
+  // A change PM couldn't finish holds it: its buttons are the choices dialog's.
+  it("settles an earlier change before removing", async () => {
+    settleSplit.mockResolvedValue(null);
+    choicesForDelete.mockResolvedValue(
+      plan({ all: { row: "pending", token: "s", offers: ["check"], from: "2026-11-02" } }),
+    );
+    const { onClose } = open(repeating);
+    fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(settleSplit).toHaveBeenCalledWith("s", "check", "Gym"));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  // Reopened by the backend with an email question: Google's copy says it's the user's own now.
+  it("asks as a delete when the backend asks about guests", () => {
+    const told: GuestNotice = {
+      updated: 1,
+      invited: 0,
+      removed: 0,
+      told_cancelled: 0,
+      cancelled: true,
+      people: 1,
+      emails: 1,
+      complete: true,
+    };
+    open(invitation, { guests: { notice: told, again: false } });
+    expect(screen.getByRole("dialog", { name: "Delete this event?" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+  });
+
+  // C20 §0.4 item 11: a birthday's or a Gmail event's organiser is Google's: deleted, not removed.
+  it("a birthday or a Gmail event in someone else's name asks to delete it", async () => {
+    for (const event_type of ["birthday", "fromGmail"]) {
+      const { unmount } = open({ ...invitation, event_type });
+      expect(screen.getByRole("dialog", { name: "Delete this event?" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+      unmount();
+      choicesForDelete.mockResolvedValue(ready());
+      const series = open({ ...repeating, event_type });
+      expect(await screen.findByRole("dialog", { name: "Delete repeating event" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
+      series.unmount();
+    }
+  });
+});

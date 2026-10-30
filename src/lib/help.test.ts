@@ -257,8 +257,6 @@ describe("the calendar's help", () => {
     for (const id of CALENDAR_HELP) {
       expect(HELP[id].body.length, id).toBeLessThanOrEqual(1000);
     }
-    // An event's details may gain an action, and its sentence still fits.
-    expect(HELP["calendar-event"].body.length).toBeLessThanOrEqual(810);
   });
 
   it("says nothing the stack made untrue", () => {
@@ -283,8 +281,7 @@ describe("the calendar's help", () => {
   it("promises nothing that isn't built", () => {
     for (const id of CALENDAR_HELP) {
       const body = HELP[id].body;
-      // The details offer no Remove, and the help never says it is complete.
-      expect(body, id).not.toMatch(/\bRemove\b|remove (it )?from (my|your) calendar/);
+      // The help never says it is complete.
       expect(body, id).not.toMatch(/\bfinal\b|\bcomplete\b/i);
     }
   });
@@ -297,6 +294,11 @@ describe("the calendar's help", () => {
     expect(HELP["calendar-event"].body).toMatch(/when PM knows who owns it/);
     // Only what the copy's calendar list offers (C18 critique C2-L7).
     expect(HELP["calendar-event"].body).toMatch(/on any calendar you can create events on/);
+    // Remove, where the button is and where its question is, each saying who hears of it.
+    for (const id of ["calendar-event", "calendar-delete"]) {
+      expect(HELP[id].body, id).toMatch(/off your calendar \(a repeating one, all of it\)/);
+      expect(HELP[id].body, id).toMatch(/Google tells the organiser you declined/);
+    }
     // Its buttons have their own help (`calendar-description-format`, on the toolbar).
     expect(HELP["calendar-editor"].body).toMatch(/format the description with its buttons \(hover/);
     expect(HELP["calendar-editor"].body).toMatch(/Duplicate makes a copy to change/);
