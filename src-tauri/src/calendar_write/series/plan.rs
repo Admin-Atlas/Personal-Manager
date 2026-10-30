@@ -54,7 +54,7 @@
 //!   over: a split's removals wait for its new series, and an occurrence the run couldn't cancel stays.
 //!   Removed rows carry a version floor ([`super::diff::GoneRow`], [`super::diff::floor_of`]).
 
-use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use chrono_tz::Tz;
 use serde_json::{json, Map, Value};
 
@@ -73,8 +73,9 @@ use super::super::call;
 use super::super::description;
 use super::super::dto::{
     CallKind, ColourDraft, EventPatchDraft, GuestNotice, GuestOp, Notify, ReadOnlyReason,
-    SeenSummary,
+    SeenSummary, TimeDraft,
 };
+use super::super::gate::{self, DateSource};
 use super::super::patch::{
     bool_of, build_patch, check_draft_extras, delete_still_matches, drop_other_kind, is_gone,
     reminders_eq, reminders_value, series_patch, update_check, watched, when_eq, PatchError,
@@ -731,9 +732,14 @@ impl SeriesPlan {
         // R9: who hears is the user's to say, and they said it for no one here. A write of only the
         // user's own settings emails nobody, whoever is on the event, so it goes again as any other
         // write would (C14 critique C1-M6: an invitation always has guests).
+        // A birthday or a Gmail event emails nobody whoever is on it (C20 §4.4), so a 412 on one
+        // rebases as any other write would (critique C1-M4).
+        let ordinary =
+            gate::kind_of(fresh.get("eventType").and_then(Value::as_str)) == gate::Kind::Default;
         if step.notify == Notify::None
             && self.chosen != Some(Notify::None)
             && !personal_only(&step.op)
+            && ordinary
             && attendees::reaches_anyone(fresh, &self.own)
         {
             return guests_changed;
@@ -1122,7 +1128,7 @@ fn prepare(
     if let Some(reason) = master.read_only() {
         return Err(NotPlanned::ReadOnly(reason));
     }
-    if master.locked && locks(draft) {
+    if master.locked && locks(draft, gate::kind_of(master.event_type.as_deref())) {
         return Err(NotPlanned::ReadOnly(ReadOnlyReason::Locked));
     }
     if instance.get("recurringEventId").and_then(Value::as_str) != Some(master.id.as_str()) {
@@ -1144,10 +1150,13 @@ fn prepare(
 /// Whether a lock stops `draft` (`None`: a delete), as the gate closes a locked copy's fields
 /// (gate.rs): Google refuses changes to its title, description, place, times and repeat, and its
 /// deletion and guests are undocumented, so closed. Its notifications, colour, busy or free and who
-/// can see it still change (C13 critique C1-M1), so a lock is no reason to refuse those.
-fn locks(draft: Option<&EventPatchDraft>) -> bool {
-    draft.is_none_or(|d| {
-        d.summary.is_some()
+/// can see it still change (C13 critique C1-M1), so a lock is no reason to refuse those. On a
+/// birthday or a Gmail event (`kind`), Google's per-type guide is the more specific rule, as at the
+/// gate: both may be deleted, and a birthday renamed (C20 critique C2-H1).
+fn locks(draft: Option<&EventPatchDraft>, kind: gate::Kind) -> bool {
+    let special = matches!(kind, gate::Kind::SpecialDate | gate::Kind::FromGmail);
+    draft.map_or(!special, |d| {
+        (d.summary.is_some() && kind != gate::Kind::SpecialDate)
             || d.description.is_some()
             || d.location.is_some()
             || d.time.is_some()
@@ -1432,10 +1441,23 @@ fn delete_plan(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let (master, original) = prepare(input, None)?;
+    let kind = gate::kind_of(master.event_type.as_deref());
     // Someone else's repeating event: removing it from the user's calendar is a later layer's
-    // (C14d), so it stays as the gate has it (C14 §9.3).
-    if !master.organizer_self {
+    // (C14d), so it stays as the gate has it (C14 §9.3). Not a birthday's or a Gmail event's, whose
+    // organiser Google fixes and whose own list lets them be deleted (C20 critiques C1-H1, C2-H2).
+    if kind == gate::Kind::Default && !master.organizer_self {
         return Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer));
+    }
+    // A birthday goes for every year at once (`status` isn't on Google's list for it, so one year
+    // can't be cancelled); a Gmail event's occurrence may be cancelled, but never "this and
+    // following", a new event Google won't let PM make for it (C20 §5.4).
+    let later = scope == Scope::Following && !is_first(&master, input.fresh.instance);
+    match kind {
+        gate::Kind::SpecialDate if scope == Scope::This || later => {
+            return Err(SeriesRefusal::SpecialDeleteEveryYear.into())
+        }
+        gate::Kind::FromGmail if later => return Err(SeriesRefusal::SpecialWhole.into()),
+        _ => {}
     }
     let instance = input.fresh.instance.json();
     match delete_still_matches(seen, instance) {
@@ -1837,6 +1859,9 @@ pub fn plan_series_edit(
     notify: Option<Notify>,
 ) -> Result<SeriesPlan, NotPlanned> {
     let mut plan = edit_plan(scope, input, draft, tail_id, notify.unwrap_or(Notify::None))?;
+    // Read once more for a birthday or a Gmail event (C20): what the planners made of the change
+    // is only Google's keys for the kind. An edit's and a drop's plans come here; a delete's never.
+    special_plan_check(input, &plan)?;
     plan.keep_guest_ops(draft.guest_ops());
     plan.settle_notify(input, notify, false);
     Ok(plan)
@@ -1850,6 +1875,9 @@ fn edit_plan(
     notify: Notify,
 ) -> Result<SeriesPlan, NotPlanned> {
     let (master, original) = prepare(input, Some(draft))?;
+    // A birthday's and a Gmail event's own rules, before any planner's refusal could speak for
+    // them (C20 critiques C1-M1, C2-M1).
+    special_check(input, &master, draft, scope)?;
     // Before the guest list's own checks, so a guest change says whose list it is (C14 critique
     // C1-L10).
     invitation_check(input, &master, original, draft, scope)?;
@@ -1932,7 +1960,9 @@ fn invitation_check(
     draft: &EventPatchDraft,
     scope: Scope,
 ) -> Result<(), NotPlanned> {
-    if master.organizer_self {
+    // A birthday's and a Gmail event's organiser is Google's to fix, and their own list is the rule
+    // (`special_check`, C20 §0.4 item 6).
+    if master.organizer_self || gate::kind_of(master.event_type.as_deref()) != gate::Kind::Default {
         return Ok(());
     }
     // From the first occurrence, "this and following" is every occurrence.
@@ -2002,6 +2032,123 @@ fn calendar_check(input: &SeriesInput, master: &Master, scope: Scope) -> Result<
         return Err(SeriesRefusal::NoBase.into());
     }
     Ok(())
+}
+
+/// The one rule Google writes for a birthday: every year, on its day.
+const YEARLY: &str = "RRULE:FREQ=YEARLY";
+
+/// What a change may do to a repeating birthday or Gmail event (C20, Google's per-type list): this
+/// occurrence or all of them, never "this and following" (a new event, which Google won't let PM
+/// make for these kinds); a birthday's date for every year only, never against who owns it, to one
+/// whole day, and never where its repeat would have to change (Google keeps a birthday's rule
+/// itself: `RRULE:FREQ=YEARLY`, or its own 29 February rule). Checked before planning, where a
+/// planner's own refusal of such a move (a rule it can't re-anchor, a year it would lose) would
+/// speak first in other words (C20 critiques C1-M1, C2-M1). Who owns the date is read from the
+/// series' copy, which an "all events" write changes.
+fn special_check(
+    input: &SeriesInput,
+    master: &Master,
+    draft: &EventPatchDraft,
+    scope: Scope,
+) -> Result<(), NotPlanned> {
+    let kind = gate::kind_of(master.event_type.as_deref());
+    if !matches!(kind, gate::Kind::SpecialDate | gate::Kind::FromGmail) {
+        return Ok(());
+    }
+    if scope == Scope::Following && !is_first(master, input.fresh.instance) {
+        return Err(SeriesRefusal::SpecialWhole.into());
+    }
+    let Some(time) = draft
+        .time
+        .as_ref()
+        .filter(|_| kind == gate::Kind::SpecialDate)
+    else {
+        return Ok(());
+    };
+    let refused = |reason| Err(NotPlanned::ReadOnly(reason));
+    match master.date_source {
+        DateSource::Calendar => {}
+        DateSource::Contacts => return refused(ReadOnlyReason::DateFromContacts),
+        DateSource::Profile => return refused(ReadOnlyReason::DateFromProfile),
+        DateSource::Unknown => return refused(ReadOnlyReason::SpecialDateFields),
+    }
+    if scope == Scope::This {
+        return Err(SeriesRefusal::SpecialDateEveryYear.into());
+    }
+    if !time.is_one_whole_day() {
+        return refused(ReadOnlyReason::SpecialDateFields);
+    }
+    let leap = |day: NaiveDate| day.month() == 2 && day.day() == 29;
+    let to_leap = match time {
+        TimeDraft::AllDay { first_day, .. } => {
+            NaiveDate::parse_from_str(first_day, "%Y-%m-%d").is_ok_and(leap)
+        }
+        TimeDraft::Timed { .. } => false,
+    };
+    let from_leap = leap(master.first.day_in(master.start.zone()));
+    if to_leap || from_leap || master.recurrence.iter().any(|l| leap_rule(l)) {
+        return Err(SeriesRefusal::SpecialLeapDay.into());
+    }
+    if !matches!(master.recurrence.as_slice(), [only] if only == YEARLY) {
+        return Err(SeriesRefusal::SpecialDateRule.into());
+    }
+    Ok(())
+}
+
+/// Whether `line` is Google's rule for a birthday on 29 February: every February's last day.
+fn leap_rule(line: &str) -> bool {
+    let Some(rule) = line.strip_prefix("RRULE:") else {
+        return false;
+    };
+    let parts: Vec<&str> = rule.split(';').collect();
+    parts.contains(&"BYMONTH=2") && parts.contains(&"BYMONTHDAY=-1")
+}
+
+/// Every step of a plan for a birthday or a Gmail event is one PATCH of the occurrence ("This
+/// event") or of the repeating event ("All events"), whose body holds only Google's keys for the
+/// kind, a birthday's date as one whole day: the planners' backstop behind the gate and
+/// [`special_check`]. A birthday's rule in a body is refused in its own words: a move that would
+/// carry a year changed or deleted on its own as an EXDATE, say (C20 §5.3). Not a delete's plan (a
+/// Gmail event's "This event" is a cancel), and never the undo bodies, which put back Google's own.
+fn special_plan_check(input: &SeriesInput, plan: &SeriesPlan) -> Result<(), NotPlanned> {
+    let master_json = input.fresh.master.json();
+    let kind = gate::kind_of(master_json.get("eventType").and_then(Value::as_str));
+    let (keys, reason): (&[&str], ReadOnlyReason) = match kind {
+        gate::Kind::SpecialDate => (
+            &["summary", "start", "end", "reminders", "colorId"],
+            ReadOnlyReason::SpecialDateFields,
+        ),
+        gate::Kind::FromGmail => (
+            &["transparency", "visibility", "reminders", "colorId"],
+            ReadOnlyReason::FromGmailFields,
+        ),
+        gate::Kind::Default | gate::Kind::Other => return Ok(()),
+    };
+    for step in &plan.steps {
+        let Op::Patch { body, .. } = &step.op else {
+            return Err(NotPlanned::ReadOnly(reason));
+        };
+        if kind == gate::Kind::SpecialDate && body.contains_key("recurrence") {
+            return Err(SeriesRefusal::SpecialDateRule.into());
+        }
+        if body.keys().any(|k| !keys.contains(&k.as_str())) {
+            return Err(NotPlanned::ReadOnly(reason));
+        }
+        let timed = body.contains_key("start") || body.contains_key("end");
+        if timed && !one_whole_day(body.get("start"), body.get("end")) {
+            return Err(NotPlanned::ReadOnly(reason));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `start` and `end` are both all-day nodes, the end the day after the start: one whole day
+/// as Google writes it.
+fn one_whole_day(start: Option<&Value>, end: Option<&Value>) -> bool {
+    let day = |node: Option<&Value>| {
+        NaiveDate::parse_from_str(node?.get("date")?.as_str()?, "%Y-%m-%d").ok()
+    };
+    matches!((day(start), day(end)), (Some(s), Some(e)) if (e - s).num_days() == 1)
 }
 
 /// "All events" that changes nothing but the calendar (C18e): no write of its own, since the
@@ -7195,6 +7342,463 @@ mod tests {
             event: "abc".into(),
             etag: "\"m1\"".into(),
         }));
+    }
+
+    /// Why a plan was refused, with no plan printed.
+    fn refusal(planned: Result<SeriesPlan, NotPlanned>) -> Option<NotPlanned> {
+        planned.err()
+    }
+
+    fn refused(why: SeriesRefusal) -> Option<NotPlanned> {
+        Some(NotPlanned::Refused(why))
+    }
+
+    fn read_only(reason: ReadOnlyReason) -> Option<NotPlanned> {
+        Some(NotPlanned::ReadOnly(reason))
+    }
+
+    fn map(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    /// A one-day draft on `day`, all day.
+    fn one_day(day: &str) -> EventPatchDraft {
+        EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: day.into(),
+                last_day: day.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The one PATCH a plan sends: on which event, and its body.
+    fn only_patch(plan: &SeriesPlan) -> (&str, &Map<String, Value>) {
+        assert!(plan.steps.len() == 1, "one write");
+        match &plan.steps[0].op {
+            Op::Patch { event, body, .. } => (event.as_str(), body),
+            _ => panic!("not a PATCH"),
+        }
+    }
+
+    fn every_step_emails_nobody(plan: &SeriesPlan) -> bool {
+        plan.steps.iter().all(|s| s.notify == Notify::None) && !plan.needs_notify()
+    }
+
+    /// C20 §5.6: a birthday's name changes for this year or every year, never "this and
+    /// following", and emails nobody.
+    #[test]
+    fn a_special_date_renames_this_year_or_every_year() {
+        let case = Case::new(yearly_master(), yearly_occurrence("2026-05-04"));
+        let this = case.edit(Scope::This, title("Mum (70)")).unwrap();
+        let (event, body) = only_patch(&this);
+        assert!(event == "abc_20260504" && body == &map(json!({ "summary": "Mum (70)" })));
+        assert!(every_step_emails_nobody(&this));
+        let all = case.edit(Scope::All, title("Mother")).unwrap();
+        let (event, body) = only_patch(&all);
+        assert!(event == "abc" && body == &map(json!({ "summary": "Mother" })));
+        assert!(every_step_emails_nobody(&all));
+        let later = Case::new(yearly_master(), yearly_occurrence("2027-05-04"));
+        assert_eq!(
+            refusal(later.edit(Scope::Following, title("Mother"))),
+            refused(SeriesRefusal::SpecialWhole)
+        );
+        // From the first year it's every year.
+        let first = Case::new(yearly_master(), yearly_occurrence("1990-05-04"));
+        let whole = first.edit(Scope::Following, title("Mother")).unwrap();
+        assert!(whole.scope == Scope::All && only_patch(&whole).0 == "abc");
+    }
+
+    /// C20 §5.6: a birthday's day moves for every year, the rule as it is.
+    #[test]
+    fn a_special_dates_day_moves_for_every_year_only() {
+        let case = Case::new(yearly_master(), yearly_occurrence("2026-05-04"));
+        assert_eq!(
+            refusal(case.edit(Scope::This, one_day("2026-06-05"))),
+            refused(SeriesRefusal::SpecialDateEveryYear)
+        );
+        let all = case.edit(Scope::All, one_day("2026-06-05")).unwrap();
+        let (event, body) = only_patch(&all);
+        assert!(event == "abc");
+        assert_eq!(
+            body,
+            &map(json!({ "start": { "date": "1990-06-05" }, "end": { "date": "1990-06-06" } }))
+        );
+        assert!(all.warnings.iter().any(|w| matches!(
+            w,
+            SeriesWarning::RepeatDayChanges { from, to }
+                if *from == day(2026, 5, 4) && *to == day(2026, 6, 5)
+        )));
+        assert!(every_step_emails_nobody(&all));
+        // Never two days, nor a time of day: one whole day, all day (C20 critique C1-M2).
+        let two_days = EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: "2026-06-05".into(),
+                last_day: "2026-06-06".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            refusal(case.edit(Scope::All, two_days)),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        // A time of day would have every year rebuilt timed: refused first, in the same words.
+        assert_eq!(
+            refusal(case.edit(Scope::All, at("10:00", "2026-06-05"))),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+    }
+
+    /// C20 critique C1-M1: a move Google would have to repeat differently is refused before any
+    /// planner speaks, in its own words.
+    #[test]
+    fn a_move_that_would_change_the_repeat_is_refused() {
+        let leap_rule = "RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1";
+        let master_on = |start: &str, end: &str, rule: &str| {
+            let m = with(yearly_master(), "start", json!({ "date": start }));
+            let m = with(m, "end", json!({ "date": end }));
+            with(m, "recurrence", json!([rule]))
+        };
+        let on_28 = |year: &str| yearly_occurrence(&format!("{year}-02-28"));
+        // Google's 29 February rule, its first day the 29th.
+        let leap = Case::new(
+            master_on("1992-02-29", "1992-03-01", leap_rule),
+            on_28("2026"),
+        );
+        assert_eq!(
+            refusal(leap.edit(Scope::All, one_day("2026-03-03"))),
+            refused(SeriesRefusal::SpecialLeapDay)
+        );
+        // That rule alone, on a first day that isn't the 29th.
+        let rule_only = Case::new(
+            master_on("1990-02-28", "1990-03-01", leap_rule),
+            on_28("2026"),
+        );
+        assert_eq!(
+            refusal(rule_only.edit(Scope::All, one_day("2026-03-03"))),
+            refused(SeriesRefusal::SpecialLeapDay)
+        );
+        // A first day on the 29th with the plain rule.
+        let from_29 = Case::new(
+            master_on("1992-02-29", "1992-03-01", "RRULE:FREQ=YEARLY"),
+            on_28("2026"),
+        );
+        assert_eq!(
+            refusal(from_29.edit(Scope::All, one_day("2026-03-03"))),
+            refused(SeriesRefusal::SpecialLeapDay)
+        );
+        // Onto the 29th from a plain yearly date.
+        let plain_year = Case::new(yearly_master(), yearly_occurrence("2028-05-04"));
+        assert_eq!(
+            refusal(plain_year.edit(Scope::All, one_day("2028-02-29"))),
+            refused(SeriesRefusal::SpecialLeapDay)
+        );
+        // A rule with a year left out on its own (an EXDATE line).
+        let exdate = with(
+            yearly_master(),
+            "recurrence",
+            json!(["RRULE:FREQ=YEARLY", "EXDATE;VALUE=DATE:20200504"]),
+        );
+        let excluded = Case::new(exdate, yearly_occurrence("2026-05-04"));
+        assert_eq!(
+            refusal(excluded.edit(Scope::All, one_day("2026-06-05"))),
+            refused(SeriesRefusal::SpecialDateRule)
+        );
+        // Any rule but Google's own for a birthday, though a move would keep it as it is.
+        let other_years = with(
+            yearly_master(),
+            "recurrence",
+            json!(["RRULE:FREQ=YEARLY;INTERVAL=2"]),
+        );
+        let every_other = Case::new(other_years, yearly_occurrence("2026-05-04"));
+        assert_eq!(
+            refusal(every_other.edit(Scope::All, one_day("2026-06-05"))),
+            refused(SeriesRefusal::SpecialDateRule)
+        );
+        // A year deleted on its own, which the move would carry as an EXDATE (the backstop).
+        let gap = Case::new(yearly_master(), yearly_occurrence("2026-05-04"))
+            .exceptions(vec![yearly_cancelled("2020-05-04")]);
+        assert_eq!(
+            refusal(gap.edit(Scope::All, one_day("2026-06-05"))),
+            refused(SeriesRefusal::SpecialDateRule)
+        );
+        // Its name still changes on every one of them.
+        assert!(leap.edit(Scope::All, title("Gran")).is_ok());
+        assert!(excluded.edit(Scope::All, title("Gran")).is_ok());
+    }
+
+    /// C20 §5.6: whoever owns the day is read from the repeating event's own copy, which an "all
+    /// events" write changes, whatever the occurrence's said.
+    #[test]
+    fn a_contacts_date_never_moves_through_all_events() {
+        for (props, reason) in [
+            (
+                json!({ "type": "birthday", "contact": "people/c1" }),
+                ReadOnlyReason::DateFromContacts,
+            ),
+            (json!({ "type": "self" }), ReadOnlyReason::DateFromProfile),
+            (json!("unreadable"), ReadOnlyReason::SpecialDateFields),
+        ] {
+            let master = with(yearly_master(), "birthdayProperties", props);
+            let case = Case::new(master, yearly_occurrence("2026-05-04"));
+            for scope in [Scope::This, Scope::All] {
+                assert_eq!(
+                    refusal(case.edit(scope, one_day("2026-06-05"))),
+                    read_only(reason),
+                    "{scope:?}"
+                );
+            }
+            // Its name is another matter.
+            assert!(case.edit(Scope::All, title("Mother")).is_ok());
+        }
+    }
+
+    /// C20 §5.4 and critiques C1-H1, C2-H2: a birthday is deleted for every year at once, whoever
+    /// organises it, and tells nobody.
+    #[test]
+    fn a_special_date_deletes_every_year_only() {
+        let case = Case::new(yearly_master(), yearly_occurrence("2026-05-04"));
+        assert_eq!(
+            refusal(case.delete(Scope::This)),
+            refused(SeriesRefusal::SpecialDeleteEveryYear)
+        );
+        assert_eq!(
+            refusal(case.delete(Scope::Following)),
+            refused(SeriesRefusal::SpecialDeleteEveryYear)
+        );
+        let theirs = with(yearly_master(), "organizer", json!({ "email": "x@y.org" }));
+        for master in [yearly_master(), theirs] {
+            let case = Case::new(master, yearly_occurrence("2026-05-04"));
+            let all = case.delete(Scope::All).unwrap();
+            assert!(
+                all.steps.len() == 1
+                    && matches!(&all.steps[0].op, Op::Delete { event, .. } if event == "abc")
+            );
+            assert!(every_step_emails_nobody(&all));
+        }
+        // From the first year, "this and following" is every year.
+        let first = Case::new(yearly_master(), yearly_occurrence("1990-05-04"));
+        assert!(first.delete(Scope::Following).unwrap().scope == Scope::All);
+    }
+
+    /// An event Gmail added that repeats (synthetic: Google's are one-offs as far as anyone has
+    /// seen), organised by Google's placeholder, who is on its list too.
+    fn gmail_case(instance: Value) -> Case {
+        let gmail = |event: Value| {
+            let event = with(event, "eventType", json!("fromGmail"));
+            let event = with(
+                event,
+                "organizer",
+                json!({ "email": "unknownorganizer@calendar.google.com" }),
+            );
+            with(
+                event,
+                "attendees",
+                json!([
+                    { "email": CALENDAR, "self": true, "responseStatus": "accepted" },
+                    { "email": "unknownorganizer@calendar.google.com", "organizer": true,
+                      "responseStatus": "accepted" }
+                ]),
+            )
+        };
+        Case::new(gmail(weekly()), gmail(instance))
+    }
+
+    /// C20 §5.6: a Gmail event's own settings, on this occurrence or all of them, emailing nobody
+    /// though its organiser is on the list; never "this and following", nor a field not on Google's
+    /// list for it, which the planners' backstop refuses even where the gate didn't (C1-M3).
+    #[test]
+    fn a_repeating_gmail_event_takes_its_own_settings() {
+        let case = gmail_case(monday_19());
+        let colour = EventPatchDraft {
+            colour: Some(ColourDraft::Colour { id: "5".into() }),
+            ..Default::default()
+        };
+        let all = case.edit(Scope::All, colour.clone()).unwrap();
+        let (event, body) = only_patch(&all);
+        assert!(event == "abc" && body == &map(json!({ "colorId": "5" })));
+        assert!(every_step_emails_nobody(&all));
+        let free = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let this = case.edit(Scope::This, free).unwrap();
+        assert!(only_patch(&this).0 == "abc_20261019T080000Z");
+        let all = case.edit(Scope::All, private()).unwrap();
+        assert!(only_patch(&all).1 == &map(json!({ "visibility": "private" })));
+        assert!(
+            every_step_emails_nobody(&all),
+            "the organiser on its list is no guest"
+        );
+        assert_eq!(
+            refusal(case.edit(Scope::Following, colour)),
+            refused(SeriesRefusal::SpecialWhole)
+        );
+        // The gate refuses a title or a time first; were either to get here, the backstop would,
+        // in the Gmail event's words, never a birthday's.
+        for draft in [title("Flight"), at("10:00", "2026-10-26")] {
+            assert_eq!(
+                refusal(case.edit(Scope::All, draft)),
+                read_only(ReadOnlyReason::FromGmailFields)
+            );
+        }
+        // Deleted on this occurrence (a cancel) or all of them, never from one on; nobody told,
+        // whoever organises it.
+        let this = case.delete(Scope::This).unwrap();
+        assert!(matches!(&this.steps[0].op, Op::Cancel { .. }) && every_step_emails_nobody(&this));
+        let all = case.delete(Scope::All).unwrap();
+        assert!(matches!(&all.steps[0].op, Op::Delete { .. }) && every_step_emails_nobody(&all));
+        assert_eq!(
+            refusal(case.delete(Scope::Following)),
+            refused(SeriesRefusal::SpecialWhole)
+        );
+        // A 412 goes again on Google's copy, as any write emailing nobody would: its organiser on
+        // the list is no guest who changed (C20 critique C1-M4).
+        let plan = case.edit(Scope::All, private()).unwrap();
+        let again = with(case.master.json().clone(), "etag", json!("\"m2\""));
+        assert_eq!(plan.resend(0, &again), Resend::Proceed);
+        // An ordinary event of the user's with that very list is a guest conflict (C12's 412 rule).
+        let mine = |event: &FreshEvent| {
+            let event = with(event.json().clone(), "eventType", json!("default"));
+            with(
+                event,
+                "organizer",
+                json!({ "email": CALENDAR, "self": true }),
+            )
+        };
+        let (ordinary, instance) = (mine(&case.master), mine(&case.instance));
+        let plan = Case::new(ordinary.clone(), instance)
+            .edit(Scope::All, private())
+            .unwrap();
+        let again = with(ordinary, "etag", json!("\"m2\""));
+        assert_eq!(
+            plan.resend(0, &again),
+            Resend::Conflict(vec!["attendees".into()])
+        );
+    }
+
+    /// Who can see it: a change that emails anyone on an ordinary event.
+    fn private() -> EventPatchDraft {
+        EventPatchDraft {
+            visibility: Some(crate::calendar_write::dto::Visibility::Private),
+            ..Default::default()
+        }
+    }
+
+    /// C20 critique C2-H1: on a locked birthday Google's own list still renames and deletes it; the
+    /// lock keeps its day. A locked Gmail event deletes too.
+    #[test]
+    fn a_lock_keeps_a_special_dates_day_but_not_its_name_or_delete() {
+        let locked = with(yearly_master(), "locked", json!(true));
+        let case = Case::new(locked, yearly_occurrence("2026-05-04"));
+        assert!(case.edit(Scope::All, title("Mother")).is_ok());
+        assert!(case.delete(Scope::All).is_ok());
+        assert_eq!(
+            refusal(case.edit(Scope::All, one_day("2026-06-05"))),
+            read_only(ReadOnlyReason::Locked)
+        );
+        let gmail = gmail_case(monday_19());
+        let locked = Case::new(
+            with(gmail.master.json().clone(), "locked", json!(true)),
+            gmail.instance.json().clone(),
+        );
+        assert!(locked.delete(Scope::All).is_ok());
+        assert_eq!(
+            refusal(locked.edit(Scope::All, title("Flight"))),
+            read_only(ReadOnlyReason::Locked)
+        );
+        // An ordinary locked event is still refused its delete.
+        let ordinary = Case::new(with(weekly(), "locked", json!(true)), monday_19());
+        assert_eq!(
+            refusal(ordinary.delete(Scope::All)),
+            read_only(ReadOnlyReason::Locked)
+        );
+    }
+
+    /// C20 §5.3: the planners' backstop. Every step a PATCH, its keys Google's list for the kind,
+    /// a birthday's rule never in it, its date one whole day; nothing for an ordinary event.
+    #[test]
+    fn a_special_plan_sends_only_googles_keys() {
+        let case = Case::new(yearly_master(), yearly_occurrence("2026-05-04"));
+        let input = case.input();
+        let planned = case.edit(Scope::All, title("Mother")).unwrap();
+        assert!(special_plan_check(&input, &planned).is_ok());
+        let with_body = |body: Value| {
+            let mut plan = planned.clone();
+            if let Op::Patch { body: sent, .. } = &mut plan.steps[0].op {
+                *sent = map(body);
+            }
+            special_plan_check(&input, &plan).err()
+        };
+        assert_eq!(
+            with_body(json!({ "location": "Home" })),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        assert_eq!(
+            with_body(json!({ "recurrence": ["RRULE:FREQ=YEARLY;BYMONTH=6"] })),
+            refused(SeriesRefusal::SpecialDateRule)
+        );
+        assert_eq!(
+            with_body(
+                json!({ "start": { "date": "1990-06-05" }, "end": { "date": "1990-06-07" } })
+            ),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        assert_eq!(
+            with_body(json!({ "start": { "date": "1990-06-05" } })),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        assert_eq!(
+            with_body(json!({
+                "start": { "dateTime": "1990-06-05T00:00:00Z" },
+                "end": { "dateTime": "1990-06-06T00:00:00Z" }
+            })),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        assert_eq!(
+            with_body(
+                json!({ "start": { "date": "1990-06-05" }, "end": { "date": "1990-06-06" } })
+            ),
+            None
+        );
+        let mut deleting = planned.clone();
+        deleting.steps[0].op = Op::Delete {
+            calendar: CALENDAR.into(),
+            event: "abc".into(),
+            etag: "\"m1\"".into(),
+        };
+        assert_eq!(
+            special_plan_check(&input, &deleting).err(),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        // A Gmail event's list, whose busy or free a birthday's lacks.
+        let gmail = gmail_case(monday_19());
+        let gmail_input = gmail.input();
+        let mut plan = planned.clone();
+        if let Op::Patch { body, .. } = &mut plan.steps[0].op {
+            *body = map(json!({ "transparency": "transparent" }));
+        }
+        assert!(special_plan_check(&gmail_input, &plan).is_ok());
+        assert_eq!(
+            special_plan_check(&input, &plan).err(),
+            read_only(ReadOnlyReason::SpecialDateFields)
+        );
+        for body in [
+            json!({ "summary": "Flight" }),
+            // A Gmail event's rule is no birthday's: its own words.
+            json!({ "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU"] }),
+        ] {
+            if let Op::Patch { body: sent, .. } = &mut plan.steps[0].op {
+                *sent = map(body);
+            }
+            assert_eq!(
+                special_plan_check(&gmail_input, &plan).err(),
+                read_only(ReadOnlyReason::FromGmailFields)
+            );
+        }
+        // An ordinary event's plan isn't this check's.
+        let ordinary = Case::new(weekly(), monday_19());
+        assert!(special_plan_check(&ordinary.input(), &deleting).is_ok());
     }
 
     /// C14 §9.3: removing someone else's repeating event from the user's calendar is a later

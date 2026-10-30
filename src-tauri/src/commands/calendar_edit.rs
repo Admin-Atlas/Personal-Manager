@@ -345,6 +345,7 @@ fn facts_from_fresh<'a>(
         invited: rsvp::invited(fresh),
         call: call::call_of(fresh).map(|c| c.kind),
         meet_offered: offers_meet(calendar),
+        date_source: gate::date_source_of(fresh),
     }
 }
 
@@ -406,6 +407,9 @@ fn facts_from_row<'a>(row: &'a CalendarEvent, calendar: &'a calendar::Calendar) 
         // The mirror keeps only the call's link; the editor's fresh copy says the rest.
         call: row.conference_url.as_deref().map(call::kind_of_link),
         meet_offered: offers_meet(&calendar.facts),
+        // The mirror doesn't keep who owns a birthday's date, so the list never offers moving one;
+        // the editor's fresh copy says (C20 §0.4 item 5).
+        date_source: gate::DateSource::Unknown,
     }
 }
 
@@ -428,6 +432,8 @@ fn needs_scope(conn: &Connection, row_id: &str) -> Result<bool> {
 fn row_guests(conn: &Connection, row_id: &str, own: &Own) -> Result<Option<GuestNotice>> {
     Ok(calendar::event_by_id(conn, row_id)?
         .filter(|row| row.organizer_self)
+        // A birthday or a Gmail event emails nobody (C20 §4.4): no question to ask before its hold.
+        .filter(|row| gate::kind_of(row.event_type.as_deref()) == gate::Kind::Default)
         .and_then(|row| attendees::row_delete_notice(&row.attendees, own)))
 }
 
@@ -606,7 +612,8 @@ fn guest_for_edit(entry: &Value) -> Option<GuestForEdit> {
 /// read; C13 critique C1-L1) are given only when nothing else the draft touches is closed. A draft
 /// that replaces formatting PM can't edit with plain text reopens that one reason (C19): only the
 /// description, which is checked only when the draft sends one, so the flag on its own reopens
-/// nothing.
+/// nothing. A time is refused where the gate closed it, and on a birthday where it isn't one whole
+/// day ([`gate::time_refusal`], C20).
 fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<ReadOnlyReason> {
     use gate::Field;
     let replaced;
@@ -616,36 +623,42 @@ fn refused_field(perms: &FieldPermissions, draft: &EventPatchDraft) -> Option<Re
     } else {
         perms
     };
-    [
-        // The guest list and what guests may do (C12).
-        (draft.touches_guests() && !perms.guests, Field::Guests),
+    let closed = |touched: bool, open: bool, field: Field| {
+        (touched && !open).then(|| gate::reason_for(perms, field))
+    };
+    // The guest list and what guests may do (C12).
+    closed(draft.touches_guests(), perms.guests, Field::Guests)
         // Its video call (C18): another service's says its own reason.
-        (draft.meet.is_some() && !perms.meet, Field::Meet),
+        .or_else(|| closed(draft.meet.is_some(), perms.meet, Field::Meet))
         // The calendar it's on (C18d): the organiser's words, or the lock's.
-        (draft.calendar.is_some() && !perms.calendar, Field::Calendar),
-        (draft.summary.is_some() && !perms.summary, Field::Summary),
-        (draft.time.is_some() && !perms.time, Field::Time),
+        .or_else(|| closed(draft.calendar.is_some(), perms.calendar, Field::Calendar))
+        .or_else(|| closed(draft.summary.is_some(), perms.summary, Field::Summary))
+        .or_else(|| {
+            draft
+                .time
+                .as_ref()
+                .and_then(|time| gate::time_refusal(perms, time))
+        })
         // How it repeats: closed with the time, and on someone else's event (C14 critique C1-H2).
-        (draft.recurrence.is_some() && !perms.repeat, Field::Repeat),
-        (draft.location.is_some() && !perms.location, Field::Location),
-        (
-            draft.description.is_some() && !perms.description,
-            Field::Description,
-        ),
-        (draft.show_as.is_some() && !perms.show_as, Field::ShowAs),
-        (
-            draft.visibility.is_some() && !perms.visibility,
-            Field::Visibility,
-        ),
-        (draft.colour.is_some() && !perms.colour, Field::Colour),
-        (
-            draft.reminders.is_some() && !perms.reminders,
-            Field::Reminders,
-        ),
-    ]
-    .into_iter()
-    .find(|(closed, _)| *closed)
-    .map(|(_, field)| gate::reason_for(perms, field))
+        .or_else(|| closed(draft.recurrence.is_some(), perms.repeat, Field::Repeat))
+        .or_else(|| closed(draft.location.is_some(), perms.location, Field::Location))
+        .or_else(|| {
+            closed(
+                draft.description.is_some(),
+                perms.description,
+                Field::Description,
+            )
+        })
+        .or_else(|| closed(draft.show_as.is_some(), perms.show_as, Field::ShowAs))
+        .or_else(|| {
+            closed(
+                draft.visibility.is_some(),
+                perms.visibility,
+                Field::Visibility,
+            )
+        })
+        .or_else(|| closed(draft.colour.is_some(), perms.colour, Field::Colour))
+        .or_else(|| closed(draft.reminders.is_some(), perms.reminders, Field::Reminders))
 }
 
 /// Move an editor's base onto Google's copy after a save, for the fields the save sent and no
@@ -1717,6 +1730,11 @@ async fn ready_move<W: Wire, H: Host>(
     }
     let time = time::retime_draft(to, device, unzoned_of(&target.facts), fresh)
         .map_err(|e| failed(e.to_string()))?;
+    // Where it was dropped is the time's own check too: a birthday's is one whole day (C20 critique
+    // C1-M2). Only reads have gone out.
+    if let Some(reason) = gate::time_refusal(&perms, &time) {
+        return Err(WriteOutcome::ReadOnly { reason });
+    }
     let draft = EventPatchDraft {
         time: Some(time),
         ..Default::default()
@@ -5409,6 +5427,10 @@ async fn prepare_change<W: Wire>(
                 Ok(time) => time,
                 Err(e) => return failed(e.to_string()),
             };
+            // A birthday's day is one whole day wherever it's dropped (C20 critique C1-M2).
+            if let Some(reason) = gate::time_refusal(&perms, &time) {
+                return refused(WriteOutcome::ReadOnly { reason });
+            }
             let draft = EventPatchDraft {
                 time: Some(time),
                 ..Default::default()
@@ -9077,10 +9099,12 @@ fn failure_message(verdict: &Verdict) -> String {
 
 fn read_only_message(reason: ReadOnlyReason) -> &'static str {
     // The editor's own reason lines (`reasonText`), so a row of the choices refused for one says
-    // why, as the editor would (C9b-1 critique 2 M4).
+    // why, as the editor would (C9b-1 critique 2 M4): word for word, which a test reads both files
+    // for (`every_reason_reads_as_the_editor_says_it`, C20 §7).
     match reason {
         ReadOnlyReason::NotGoogle => {
-            "This event comes from a calendar PM can only read (a subscription or Outlook)."
+            "This event comes from a calendar PM can only read: a subscription, or an Outlook \
+             calendar."
         }
         ReadOnlyReason::EditingOff => {
             "Editing isn't on for this Google account. Turn it on in Settings › Connectors › \
@@ -9111,8 +9135,25 @@ fn read_only_message(reason: ReadOnlyReason) -> &'static str {
             "This became a repeating event in Google. Refresh, then open one of its occurrences."
         }
         ReadOnlyReason::SpecialType => {
-            "Birthdays, events from Gmail, focus time, out of office and working locations can't \
-             be changed here."
+            "PM can't change focus time, out of office, working locations or other special Google \
+             events."
+        }
+        // Google's `birthday` type holds anniversaries and other dates too (C20 critique C2-L5).
+        ReadOnlyReason::SpecialDateFields => {
+            "On a birthday or other special date, Google lets PM change only its name, \
+             notifications and colour, and its date if it was added in Google Calendar."
+        }
+        ReadOnlyReason::DateFromContacts => {
+            "This date comes from Google Contacts, so change it there."
+        }
+        // On someone else's calendar that you can change, the birthday is theirs (C2-L4).
+        ReadOnlyReason::DateFromProfile => {
+            "This birthday comes from the calendar owner's Google Account, so change its date \
+             there."
+        }
+        ReadOnlyReason::FromGmailFields => {
+            "Gmail added this event, so Google lets PM change only its busy or free, visibility, \
+             notifications and colour, and your reply if you're invited."
         }
         // And its calendar, which Google doesn't say a locked copy may change (C18d).
         ReadOnlyReason::Locked => {
@@ -10010,6 +10051,22 @@ mod tests {
         let mut modifiable = invite.clone();
         modifiable["guestsCanModify"] = json!(true);
         assert!(facts_from_fresh(&modifiable, &facts, EditingStatus::On).guests_can_modify);
+        // C20 §4.3: who owns a birthday's date is the fresh copy's to say; one added in Google
+        // Calendar may move (to one whole day), a contact's may not, whatever the list knew.
+        let contact = json!({
+            "organizer": { "self": true }, "eventType": "birthday",
+            "birthdayProperties": { "type": "birthday", "contact": "people/c1" }
+        });
+        let f = facts_from_fresh(&contact, &facts, EditingStatus::On);
+        assert_eq!(f.date_source, gate::DateSource::Contacts);
+        let perms = gate::edit_rights(&f);
+        assert!(!perms.time && perms.summary && perms.one_day);
+        assert!(perms.reasons.contains(&ReadOnlyReason::DateFromContacts));
+        let mut added = contact.clone();
+        added["birthdayProperties"] = json!({ "type": "birthday" });
+        let f = facts_from_fresh(&added, &facts, EditingStatus::On);
+        assert_eq!(f.date_source, gate::DateSource::Calendar);
+        assert!(gate::edit_rights(&f).time);
         // An occurrence, a one-off, and a one-off Google has since given a rule: only the last is a
         // series itself, with its own reason (C9 design critique 2 M6).
         let mine = || json!({ "organizer": { "self": true }, "eventType": "default" });
@@ -10049,6 +10106,8 @@ mod tests {
             delete: true,
             // No guest list: nothing to reply to.
             respond: false,
+            // Any length: an ordinary event's.
+            one_day: false,
             reasons: Vec::new(),
         };
         assert!(
@@ -10198,6 +10257,7 @@ mod tests {
             invited: false,
             call: None,
             meet_offered: true,
+            date_source: gate::DateSource::Unknown,
         });
         let title = EventPatchDraft {
             summary: Some("x".into()),
@@ -10283,6 +10343,7 @@ mod tests {
             invited: false,
             call: None,
             meet_offered: true,
+            date_source: gate::DateSource::Unknown,
         });
         let notes = EventPatchDraft {
             description: Some("Room 4.12".into()),
@@ -10339,6 +10400,7 @@ mod tests {
                 invited: false,
                 call: None,
                 meet_offered: true,
+                date_source: gate::DateSource::Unknown,
             })
         };
         let colour = EventPatchDraft {
@@ -10611,7 +10673,24 @@ mod tests {
             attendees: vec![guest("Me@x.com", false)],
             ..mine.clone()
         };
-        let rows = [mine.clone(), invite.clone(), alone.clone()];
+        // C20 §4.4: a birthday or a Gmail event emails nobody, whoever its row shows.
+        let gmail = CalendarEvent {
+            id: format!("{cal}:g"),
+            event_type: Some("fromGmail".into()),
+            ..mine.clone()
+        };
+        let dated = CalendarEvent {
+            id: format!("{cal}:d"),
+            event_type: Some("birthday".into()),
+            ..mine.clone()
+        };
+        let rows = [
+            mine.clone(),
+            invite.clone(),
+            alone.clone(),
+            gmail.clone(),
+            dated.clone(),
+        ];
         calendar::replace_events(&conn, cal, &rows, true).unwrap();
         let own = Own::of(&["me@x.com"], &[]);
         let told = GuestNotice {
@@ -10628,6 +10707,8 @@ mod tests {
         );
         assert!(row_guests(&conn, &invite.id, &own).unwrap().is_none());
         assert!(row_guests(&conn, &alone.id, &own).unwrap().is_none());
+        assert!(row_guests(&conn, &gmail.id, &own).unwrap().is_none());
+        assert!(row_guests(&conn, &dated.id, &own).unwrap().is_none());
         assert!(row_guests(&conn, &format!("{cal}:missing"), &own)
             .unwrap()
             .is_none());
@@ -11737,6 +11818,34 @@ mod tests {
             ..invited.clone()
         };
         assert!(facts_from_row(&modifiable, &calendars[0]).guests_can_modify);
+        // C20: a birthday opens Edit and offers Delete, never a drag (the mirror can't say who owns
+        // its date) nor a reply; an event Gmail added, organised by Google's placeholder, the same,
+        // with the reply where the calendar has an entry of its own; focus time stays read-only.
+        let yearly = CalendarEvent {
+            id: format!("{cal}:j_20260504"),
+            series_id: Some("j".into()),
+            recurring: true,
+            all_day: true,
+            event_type: Some("birthday".into()),
+            attendees: vec![me()],
+            ..mine.clone()
+        };
+        assert_eq!(
+            facts_from_row(&yearly, &calendars[0]).date_source,
+            gate::DateSource::Unknown
+        );
+        let gmail = CalendarEvent {
+            id: format!("{cal}:k"),
+            organizer_self: false,
+            event_type: Some("fromGmail".into()),
+            attendees: vec![me()],
+            ..mine.clone()
+        };
+        let focus = CalendarEvent {
+            id: format!("{cal}:l"),
+            event_type: Some("focusTime".into()),
+            ..mine.clone()
+        };
         let rights = |edit_block, can_delete, can_respond, can_retime| ListRights {
             edit_block,
             can_delete,
@@ -11754,6 +11863,9 @@ mod tests {
             no_address,
             locked,
             modifiable,
+            yearly,
+            gmail,
+            focus,
         ];
         // C14c: someone else's event opens in the editor for the user's own settings, and is never
         // deleted from PM (Remove is a later layer's). C16a: a drag only where the gate opens the
@@ -11770,6 +11882,9 @@ mod tests {
             rights(None, false, false, false),
             rights(None, false, true, false),
             rights(None, false, true, true),
+            rights(None, true, false, false),
+            rights(None, true, true, false),
+            rights(Some(ReadOnlyReason::SpecialType), false, false, false),
         ];
         let got = list_rights(&conn, &rows).unwrap();
         assert_eq!(got.len(), want.len());
@@ -13314,6 +13429,20 @@ mod tests {
             )
             .await,
             read_only(ReadOnlyReason::CalendarReadOnly)
+        );
+        // Focus time stays read-only (Q8); a birthday's title is offered (C20,
+        // `special_rows_say_why_following_is_refused`).
+        let focus = with(instance.clone(), "eventType", json!("focusTime"));
+        assert_eq!(
+            refused(
+                only(&focus),
+                &focus,
+                EditingStatus::On,
+                "owner",
+                edit(title("Retro"))
+            )
+            .await,
+            read_only(ReadOnlyReason::SpecialType)
         );
         // Formatting PM can't edit (C19): a bold description is the editor's to change, a table isn't.
         let formatted = with(
@@ -21208,6 +21337,92 @@ mod tests {
         );
     }
 
+    /// Every reason the gate can give, each once, at the place [`reason_place`] names for it.
+    fn every_reason() -> Vec<ReadOnlyReason> {
+        use ReadOnlyReason::*;
+        let list = vec![
+            NotGoogle,
+            EditingOff,
+            CalendarReadOnly,
+            PrivateEvent,
+            NotOrganizer,
+            NotInvited,
+            OrganizerOnlyGuests,
+            BecameRepeating,
+            SpecialType,
+            SpecialDateFields,
+            DateFromContacts,
+            DateFromProfile,
+            FromGmailFields,
+            Locked,
+            UnsupportedFormatting,
+            LabelReadOnly,
+            RemindersUnreadable,
+            OtherCall,
+        ];
+        for (i, reason) in list.iter().enumerate() {
+            assert!(
+                reason_place(*reason) == i,
+                "every_reason lists each reason once, at its own place"
+            );
+        }
+        list
+    }
+
+    /// `reason`'s place in [`every_reason`]. No wildcard: a reason added later fails to compile here
+    /// until it has a place, and so a line in the list (C20 §7, critique C1-L1).
+    fn reason_place(reason: ReadOnlyReason) -> usize {
+        use ReadOnlyReason::*;
+        match reason {
+            NotGoogle => 0,
+            EditingOff => 1,
+            CalendarReadOnly => 2,
+            PrivateEvent => 3,
+            NotOrganizer => 4,
+            NotInvited => 5,
+            OrganizerOnlyGuests => 6,
+            BecameRepeating => 7,
+            SpecialType => 8,
+            SpecialDateFields => 9,
+            DateFromContacts => 10,
+            DateFromProfile => 11,
+            FromGmailFields => 12,
+            Locked => 13,
+            UnsupportedFormatting => 14,
+            LabelReadOnly => 15,
+            RemindersUnreadable => 16,
+            OtherCall => 17,
+        }
+    }
+
+    /// C20 §7 (C9b-1 critique 2 M4): every reason reads in a refused row as the editor says it
+    /// (`reasonText`), word for word. The editor builds each from string literals: the whole of it,
+    /// or, for words that change with context, a literal per sentence (`not_organizer` drops its
+    /// reply where the calendar isn't on the guest list, critique C1-L1), so each is looked for as
+    /// its own quoted literal.
+    #[test]
+    fn every_reason_reads_as_the_editor_says_it() {
+        let editor = include_str!("../../../src/lib/calendarEdit/editReasons.ts");
+        for reason in every_reason() {
+            let words = read_only_message(reason);
+            let literals: Vec<&str> = match reason {
+                ReadOnlyReason::NotOrganizer => {
+                    words.split_inclusive(". ").map(str::trim).collect()
+                }
+                _ => vec![words],
+            };
+            for literal in literals {
+                assert!(
+                    editor.contains(&format!("\"{literal}\"")),
+                    "a reason's words differ between read_only_message and reasonText"
+                );
+            }
+        }
+        // The organiser's two sentences are two: the split itself is checked.
+        let organiser = read_only_message(ReadOnlyReason::NotOrganizer);
+        assert!(organiser.split_inclusive(". ").count() == 2);
+    }
+
     /// No row, banner or settle answer says "series", "split", "instance", "exception" or "master":
     /// every refusal a row can show, nested ones included, and the two banners that said it.
     #[test]
@@ -21325,6 +21540,12 @@ mod tests {
                 // A video call on "this and following" (C18).
                 SeriesRefusal::CallFollowing,
                 SeriesRefusal::Draft(patch::PatchError::MeetUnready),
+                // What a birthday or a Gmail event can't do as a repeating event (C20).
+                SeriesRefusal::SpecialWhole,
+                SeriesRefusal::SpecialDateEveryYear,
+                SeriesRefusal::SpecialLeapDay,
+                SeriesRefusal::SpecialDateRule,
+                SeriesRefusal::SpecialDeleteEveryYear,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -21345,22 +21566,12 @@ mod tests {
                 .map(SeriesRefusal::Spec),
             )
             .collect();
-        let reasons = [
-            ReadOnlyReason::NotGoogle,
-            ReadOnlyReason::EditingOff,
-            ReadOnlyReason::CalendarReadOnly,
-            ReadOnlyReason::PrivateEvent,
-            ReadOnlyReason::NotOrganizer,
-            ReadOnlyReason::NotInvited,
-            ReadOnlyReason::OrganizerOnlyGuests,
-            ReadOnlyReason::BecameRepeating,
-            ReadOnlyReason::SpecialType,
-            ReadOnlyReason::Locked,
-            ReadOnlyReason::UnsupportedFormatting,
-            ReadOnlyReason::OtherCall,
-        ];
         let mut lines: Vec<String> = refusals.iter().map(ToString::to_string).collect();
-        lines.extend(reasons.iter().map(|r| read_only_message(*r).to_string()));
+        lines.extend(
+            every_reason()
+                .iter()
+                .map(|r| read_only_message(*r).to_string()),
+        );
         lines.extend(
             [
                 PUT_BACK,
@@ -21452,6 +21663,11 @@ mod tests {
                 "organizer",
                 // C18: a video call, never Google's word for it.
                 "conference",
+                // C20: a birthday and an event Gmail added, busy or free, in the user's words.
+                "eventtype",
+                "fromgmail",
+                "birthdayproperties",
+                "transparency",
             ] {
                 assert!(!lower.contains(word), "“{line}” says “{word}”");
             }
@@ -21475,7 +21691,7 @@ mod tests {
             assert!(dated.to_string().contains("19-10-2026"));
         }
         // A row refused for a reason says that reason, never just "can't change this event".
-        let reason_lines: Vec<&str> = reasons.iter().map(|r| read_only_message(*r)).collect();
+        let reason_lines: Vec<&str> = every_reason().into_iter().map(read_only_message).collect();
         assert!(reason_lines
             .iter()
             .all(|l| *l != "PM can't change this event."));
@@ -25526,18 +25742,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_reply_from_a_special_event_or_a_read_only_calendar_is_refused() {
-        let birthday = with(invite(), "eventType", json!("birthday"));
-        let host = TestHost::holding(std::slice::from_ref(&birthday));
-        let script = Script::new(vec![Step::get("/events/solo", "", birthday.clone())]);
-        let outcome = reply_on(&host, &script, &birthday, Rsvp::Yes, None, None).await;
-        script.finished();
-        assert!(
-            outcome
-                == WriteOutcome::ReadOnly {
-                    reason: ReadOnlyReason::SpecialType
-                }
-        );
+        // Focus time stays read-only (Q8); a birthday has no guest list to answer from, whatever its
+        // copy holds (C20 §3.3).
+        for (event_type, reason) in [
+            ("focusTime", ReadOnlyReason::SpecialType),
+            ("birthday", ReadOnlyReason::SpecialDateFields),
+        ] {
+            let special = with(invite(), "eventType", json!(event_type));
+            let host = TestHost::holding(std::slice::from_ref(&special));
+            let script = Script::new(vec![Step::get("/events/solo", "", special.clone())]);
+            let outcome = reply_on(&host, &script, &special, Rsvp::Yes, None, None).await;
+            script.finished();
+            assert!(outcome == WriteOutcome::ReadOnly { reason }, "{event_type}");
+        }
         let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
         let mut reader = target(&event);
         reader.facts.access_role = Some("reader".into());
         let script = Script::new(vec![Step::get("/events/solo", "", event)]);
@@ -26260,6 +26479,7 @@ mod tests {
                 invited: true,
                 call: None,
                 meet_offered: true,
+                date_source: gate::DateSource::Unknown,
             })
         };
         let guest = adding_guest("b@x.org");
@@ -26383,6 +26603,7 @@ mod tests {
             invited: false,
             call: None,
             meet_offered: true,
+            date_source: gate::DateSource::Unknown,
         }
     }
 
@@ -31636,5 +31857,328 @@ mod tests {
         for url in [bare, twice] {
             assert!(!dev_allow::permits(Some("x"), both.as_ref(), &url), "{url}");
         }
+    }
+
+    // --- birthdays and events Gmail added (C20) ---
+
+    use crate::calendar_write::series::fixtures::{yearly_master, yearly_occurrence};
+
+    /// The dentist's one-off as Gmail added it: organised by Google's placeholder, who is on its
+    /// list beside the calendar's own entry, as Gmail may send it (C20 critique C1-M3).
+    fn from_gmail() -> Value {
+        let event = with(dentist(), "eventType", json!("fromGmail"));
+        let event = with(
+            event,
+            "organizer",
+            json!({ "email": "unknownorganizer@calendar.google.com" }),
+        );
+        with(
+            event,
+            "attendees",
+            json!([
+                { "email": "me@example.com", "self": true, "responseStatus": "accepted" },
+                { "email": "unknownorganizer@calendar.google.com", "organizer": true,
+                  "responseStatus": "accepted" }
+            ]),
+        )
+    }
+
+    /// An occurrence of [`yearly_master`] as the one-event save reads it ("solo"), its date owned
+    /// as `props` say.
+    fn yearly_solo(props: Value) -> Value {
+        let event = with(yearly_occurrence("2026-05-04"), "id", json!("solo"));
+        let event = with(event, "etag", json!("\"s1\""));
+        with(event, "birthdayProperties", props)
+    }
+
+    /// A one-day draft on `day`, or `last` days.
+    fn days(first: &str, last: &str) -> EventPatchDraft {
+        EventPatchDraft {
+            time: Some(TimeDraft::AllDay {
+                first_day: first.into(),
+                last_day: last.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// C20 §4.5: a Gmail event's own settings go as one PATCH of exactly those keys, nobody asked
+    /// and `none` sent, though Google's placeholder organiser is on its list.
+    #[tokio::test]
+    async fn a_gmail_events_own_settings_save_with_no_email_question() {
+        let event = from_gmail();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let draft = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            visibility: Some(Visibility::Private),
+            colour: Some(crate::calendar_write::dto::ColourDraft::Colour { id: "5".into() }),
+            reminders: Some(RemindersDraft {
+                use_default: false,
+                overrides: vec![calendar::Reminder {
+                    method: "popup".into(),
+                    minutes: 30,
+                }],
+            }),
+            ..Default::default()
+        };
+        let reminders = json!({ "useDefault": false,
+                                "overrides": [{ "method": "popup", "minutes": 30 }] });
+        let (outcome, script, _) = save_one_off(
+            &host,
+            &event,
+            target(&event),
+            &draft,
+            vec![Step::write(
+                Method::Patch,
+                "/events/solo",
+                "\"s1\"",
+                Scripted::Json(written(
+                    &event,
+                    &[
+                        ("transparency", json!("transparent")),
+                        ("visibility", json!("private")),
+                        ("colorId", json!("5")),
+                        ("reminders", reminders),
+                    ],
+                    "\"s2\"",
+                )),
+            )],
+        )
+        .await;
+        script.asked_all();
+        assert!(
+            matches!(outcome, WriteOutcome::Saved { .. }),
+            "saved, nobody asked"
+        );
+        let sent = first_write(&script).body.unwrap();
+        let mut keys: Vec<&str> = sent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["colorId", "reminders", "transparency", "visibility"]);
+    }
+
+    /// C20 §4.5: what isn't on Google's list for a Gmail event is refused in its words, its time
+    /// whether or not it's locked (a lock that closed nothing the kind had open isn't said).
+    #[tokio::test]
+    async fn a_gmail_events_title_and_time_are_refused_with_its_words() {
+        let gmail = from_gmail();
+        let locked = with(from_gmail(), "locked", json!(true));
+        for (event, draft) in [
+            (&gmail, title("Flight")),
+            (&gmail, at("10:00", "2026-10-12")),
+            (&locked, at("10:00", "2026-10-12")),
+            (&locked, title("Flight")),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(event));
+            let (outcome, script, _) =
+                save_one_off(&host, event, target(event), &draft, Vec::new()).await;
+            script.finished();
+            assert!(
+                outcome
+                    == WriteOutcome::ReadOnly {
+                        reason: ReadOnlyReason::FromGmailFields
+                    }
+            );
+        }
+    }
+
+    /// C20 §4.5: whoever owns a birthday's date says so before any choice is asked, only a read
+    /// gone out.
+    #[tokio::test]
+    async fn a_contacts_date_is_refused_before_any_choice() {
+        for (props, reason) in [
+            (
+                json!({ "type": "birthday", "contact": "people/c1" }),
+                ReadOnlyReason::DateFromContacts,
+            ),
+            (json!({ "type": "self" }), ReadOnlyReason::DateFromProfile),
+        ] {
+            let event = yearly_solo(props);
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) = save_one_off(
+                &host,
+                &event,
+                target(&event),
+                &days("2026-06-05", "2026-06-05"),
+                Vec::new(),
+            )
+            .await;
+            script.finished();
+            assert!(outcome == WriteOutcome::ReadOnly { reason });
+        }
+    }
+
+    /// C20 §4.1: a birthday added in Google Calendar takes one whole day, all day; anything else
+    /// is refused in its words before the choice, which one day then gets (it repeats).
+    #[tokio::test]
+    async fn a_special_date_takes_only_one_whole_day() {
+        let event = yearly_solo(json!({ "type": "birthday" }));
+        let refused = WriteOutcome::ReadOnly {
+            reason: ReadOnlyReason::SpecialDateFields,
+        };
+        for (draft, want) in [
+            (days("2026-06-05", "2026-06-06"), &refused),
+            (at("10:00", "2026-06-05"), &refused),
+            (
+                days("2026-06-05", "2026-06-05"),
+                &WriteOutcome::needs_scope(),
+            ),
+            // A rename asks which occurrences, as any repeating event's does.
+            (title("Mother"), &WriteOutcome::needs_scope()),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let (outcome, script, _) =
+                save_one_off(&host, &event, target(&event), &draft, Vec::new()).await;
+            script.finished();
+            assert!(&outcome == want, "refused, or asked which occurrences");
+        }
+    }
+
+    /// C20 §4.5: focus time, out of office and the like stay read-only, whatever the draft.
+    #[tokio::test]
+    async fn a_focus_time_event_stays_read_only() {
+        let event = with(dentist(), "eventType", json!("focusTime"));
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let free = EventPatchDraft {
+            show_as: Some(ShowAs::Free),
+            ..Default::default()
+        };
+        let (outcome, script, _) =
+            save_one_off(&host, &event, target(&event), &free, Vec::new()).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::SpecialType
+                }
+        );
+    }
+
+    /// C20 §4.5 and critique C2-H1: a Gmail event deletes as Google's list allows, locked or not,
+    /// asking nobody and sending `none`, though its organiser is on the list.
+    #[tokio::test]
+    async fn a_gmail_event_deletes_with_no_email_question_locked_or_not() {
+        for event in [from_gmail(), with(from_gmail(), "locked", json!(true))] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", event.clone()),
+                Step::write(
+                    Method::Delete,
+                    "/events/solo",
+                    "\"s1\"",
+                    Scripted::Status(204),
+                ),
+            ]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "deleted, telling nobody");
+        }
+    }
+
+    /// C20 critique C1-M2: a birthday dropped onto two days is refused in its words wherever the
+    /// drop goes: one event, before its PATCH, and an occurrence, before any row.
+    #[tokio::test]
+    async fn a_special_date_dropped_on_two_days_is_refused() {
+        let one_off = json!({
+            "id": "solo", "etag": "\"s1\"", "summary": "Mum", "status": "confirmed",
+            "updated": "2026-10-01T10:00:00.000Z", "organizer": { "self": true },
+            "start": { "date": "2026-05-04" }, "end": { "date": "2026-05-05" },
+            "eventType": "birthday", "birthdayProperties": { "type": "birthday" }
+        });
+        let host = TestHost::holding(std::slice::from_ref(&one_off));
+        let request = drop_on_days(&one_off, "2026-06-05", "2026-06-06");
+        let (outcome, script) = move_one(
+            &host,
+            &one_off,
+            &request,
+            Vec::new(),
+            GuestAnswer::default(),
+        )
+        .await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::SpecialDateFields
+                }
+        );
+        let (series, instance) = (yearly_master(), yearly_occurrence("2027-05-04"));
+        let request = drop_on_days(&instance, "2027-06-05", "2027-06-06");
+        let got = refused(
+            reads(
+                &instance,
+                &series,
+                vec![series.clone()],
+                vec![instance.clone()],
+            ),
+            &instance,
+            EditingStatus::On,
+            "owner",
+            ChoiceRequest::Move(request),
+        )
+        .await;
+        assert_eq!(
+            got,
+            SeriesChoices::Refused {
+                result: WriteOutcome::ReadOnly {
+                    reason: ReadOnlyReason::SpecialDateFields
+                }
+            }
+        );
+    }
+
+    /// C20 §5.6: a birthday's choices offer this year and every year, and say why not this year
+    /// and the ones after it; a date says why it's every year at once.
+    #[tokio::test]
+    async fn special_rows_say_why_following_is_refused() {
+        let (series, instance) = (yearly_master(), yearly_occurrence("2027-05-04"));
+        let opened = Some((&instance, Some(&series)));
+        let whole = ScopeRow::Refused {
+            message: SeriesRefusal::SpecialWhole.to_string(),
+        };
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone()],
+            vec![instance.clone()],
+        ));
+        let (this, following, all) =
+            ask(&script, &instance, edit(title("Mother")), opened, &["abc"]).await;
+        assert!(matches!(this, ScopeRow::Offered { .. }), "this year");
+        assert!(following == whole, "not this one and the ones after it");
+        assert!(matches!(all, ScopeRow::Offered { .. }), "every year");
+        let script = Script::new(reads(
+            &instance,
+            &series,
+            vec![series.clone()],
+            vec![instance.clone()],
+        ));
+        let (this, following, all) = ask(
+            &script,
+            &instance,
+            edit(days("2027-06-05", "2027-06-05")),
+            opened,
+            &["abc"],
+        )
+        .await;
+        assert!(
+            this == ScopeRow::Refused {
+                message: SeriesRefusal::SpecialDateEveryYear.to_string()
+            }
+        );
+        assert!(following == whole);
+        assert!(matches!(all, ScopeRow::Offered { .. }), "every year");
     }
 }

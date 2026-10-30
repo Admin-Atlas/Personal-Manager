@@ -1589,7 +1589,18 @@ export type ReadOnlyReason =
   | "organizer_only_guests"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
+  /** Focus time, out of office, a working location, or a kind of Google event PM doesn't know. */
   | "special_type"
+  /** A birthday or other special date: only its name, notifications, colour and, where it was
+   *  added in Google Calendar, its date may change (C20). */
+  | "special_date_fields"
+  /** A special date linked to a contact: Google Contacts owns its day (C20). */
+  | "date_from_contacts"
+  /** The calendar owner's own birthday: their Google Account owns its day (C20). */
+  | "date_from_profile"
+  /** Gmail added it: only its busy or free, visibility, notifications, colour and the user's reply
+   *  may change (C20). */
+  | "from_gmail_fields"
   | "locked"
   /** The description has formatting PM can't edit, such as a table or coloured text: it stays as
    *  Google holds it unless the user replaces it with plain text (C19). */
@@ -1892,6 +1903,9 @@ export interface FieldPermissions {
   /** The user may reply (Yes, No, Maybe). No field of the editor's: the reply sits apart from
    *  them, and never makes a draft to save (C14). */
   respond: boolean;
+  /** The time may change only to one whole day, all day (a birthday, C20): the When block shows one
+   *  date. Narrows `time`; no field of its own. */
+  one_day: boolean;
   reasons: ReadOnlyReason[];
 }
 

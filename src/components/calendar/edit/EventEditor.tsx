@@ -3,9 +3,10 @@
 
 // The event editor (#884): change one Google event you organise, a repeating one or one with guests
 // included, and invitations: your reply and note, your own notifications, colour and busy or free,
-// and the rest when the organiser lets guests change it (C14c). For an occurrence the choices
-// dialog asks which occurrences first, and a change Google would email guests about asks whether
-// it should. It opens on Google's fresh copy (never the mirror, which clips text), greys out
+// and the rest when the organiser lets guests change it (C14c); birthdays and events Gmail added,
+// as far as Google allows, a birthday's date as one whole day and never with an email question
+// (C20). For an occurrence the choices dialog asks which occurrences first, and a change Google
+// would email guests about asks whether it should. It opens on Google's fresh copy (never the mirror, which clips text), greys out
 // whatever the backend says can't change and says why, and saves only the fields the user changed.
 // If the event changed in Google meanwhile on a field this save also sends, nothing is overwritten:
 // the editor reloads Google's copy, keeps the user's other changes, and names the fields where
@@ -145,6 +146,7 @@ import {
   reasonText,
   rebasedText,
   repeatTheirsText,
+  specialKind,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
 import { createdWhere, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
@@ -395,6 +397,9 @@ export function EventEditor({
 
   // A repeating event: its row says so, or Google sent its series.
   const repeating = rowRepeats || !!loaded?.series;
+  // A birthday or an event Gmail added (C20): Google's own list for its kind, never someone else's
+  // allow-list, and no email question.
+  const special = specialKind(row.event_type) !== null;
   // What the backend is asked of the Repeat row's rule. A one-off's, at its own start: where it
   // really starts, or why it can't be saved, and nothing saves until it has said so. A repeating
   // event's own rule isn't asked (its words came with it); another one is, for its words only, from
@@ -726,14 +731,11 @@ export function EventEditor({
     }
     // Who this would email, counted as the backend counts: asked before anything is sent, as
     // Google's own question is, another calendar telling the guests too. Nobody, and it goes (the
-    // backend has the last word either way).
-    const notice = guestNotice(
-      loaded.base,
-      current,
-      loaded.event.guests_omitted,
-      account,
-      elsewhere,
-    );
+    // backend has the last word either way). A birthday or a Gmail event emails nobody, whoever is
+    // on it (C20 §4.4).
+    const notice = special
+      ? null
+      : guestNotice(loaded.base, current, loaded.event.guests_omitted, account, elsewhere);
     if (notice) setPrompt({ what, picked: null, notice, again: false });
     else await send(what, null, null, null);
   }
@@ -1034,8 +1036,9 @@ export function EventEditor({
     ...(formattingSaid ? [FORMATTING_REASON] : []),
     ...(timeOff && perms?.time ? [NO_ZONE] : []),
   ];
-  // Someone else's event: its reply on top, and how it repeats always theirs (C14c).
-  const theirs = loaded?.event.organizer_self === false;
+  // Someone else's event: its reply on top, and how it repeats always theirs (C14c). Not a Gmail
+  // event's placeholder organiser: Google's list for its kind says what changes (C20).
+  const theirs = !special && loaded?.event.organizer_self === false;
   const heldTimed = loaded?.base.time.kind === "timed" ? loaded.base.time : null;
   const zoneFallback = heldTimed?.start_zone ?? calendar?.time_zone ?? deviceZone;
   const timeEditable = may("time") && !timeOff;
@@ -1237,6 +1240,8 @@ export function EventEditor({
               onSwitchKind={() => zoneFallback && changeKind(zoneFallback)}
               canSwitchKind={!!zoneFallback}
               onPickZone={setZonePick}
+              // A birthday's date is one whole day (C20): one Date field, no All day switch.
+              oneDay={!!perms?.one_day}
               repeat={
                 <RepeatRow
                   value={draft.recurrence}

@@ -19,6 +19,7 @@ use std::fmt;
 use serde_json::{Map, Value};
 
 use super::dto::{GuestNotice, GuestOp, GuestState, NewGuest};
+use super::gate::{kind_of, Kind};
 use crate::calendar::Attendee;
 
 /// The domain Google gives rooms and other bookable resources.
@@ -325,6 +326,14 @@ impl Own {
     }
 }
 
+/// Whether a write to `event` (Google's copy) emails nobody whoever is on it: a birthday has no
+/// guests, and a Gmail event's organiser isn't someone the user invited, so PM never asks about
+/// these and sends `none` (C20 §4.4, critiques C1-M4, C2-M2). One rule for every count built on
+/// [`Reach`]: a save's question, a delete's, a plan's steps, and an Undo's guest check.
+fn emails_nobody(event: &Value) -> bool {
+    kind_of(event.get("eventType").and_then(Value::as_str)) != Kind::Default
+}
+
 /// Who on `list` Google would email: every entry with an address that is neither the user's
 /// (`self`, or one of `own`) nor a room.
 fn recipients(list: Option<&Value>, own: &Own) -> BTreeSet<String> {
@@ -385,8 +394,12 @@ impl Reach {
         }
     }
 
-    /// A PATCH of `body` onto `before`, Google's copy.
+    /// A PATCH of `body` onto `before`, Google's copy. Nobody on a birthday or a Gmail event
+    /// ([`emails_nobody`]).
     pub fn of_patch(before: &Value, body: &Map<String, Value>, own: &Own) -> Reach {
+        if emails_nobody(before) {
+            return Reach::nobody();
+        }
         Reach::patch(before.get("attendees"), omitted(before), body, own)
     }
 
@@ -425,8 +438,12 @@ impl Reach {
         }
     }
 
-    /// A delete (or a cancel) of `event`, Google's copy: everyone on it is told.
+    /// A delete (or a cancel) of `event`, Google's copy: everyone on it is told, but on a birthday
+    /// or a Gmail event nobody ([`emails_nobody`]).
     pub fn of_delete(event: &Value, own: &Own) -> Reach {
+        if emails_nobody(event) {
+            return Reach::nobody();
+        }
         let everyone = recipients(event.get("attendees"), own);
         Reach {
             emails: count(everyone.len()),
@@ -990,6 +1007,49 @@ mod tests {
 
     /// D1-D5: a delete tells every guest but the user and rooms; the mirror's row, which has no room
     /// flag, by the room's address.
+    #[test]
+    fn a_special_kinds_writes_email_nobody_whoever_is_on_it() {
+        // An event Gmail added, organised by Google's placeholder, who is also on its list, and a
+        // birthday Google sent with a guest on it all the same: neither asks, whatever the change.
+        let organiser = json!({ "email": "unknownorganizer@calendar.google.com",
+                                "organizer": true, "responseStatus": "accepted" });
+        let copy = |event_type: Option<&str>| {
+            let mut e = event(&[me(), organiser.clone(), a()]);
+            if let Some(event_type) = event_type {
+                e["eventType"] = json!(event_type);
+            }
+            e["attendeesOmitted"] = json!(true);
+            e
+        };
+        let shared = body(json!({ "visibility": "private", "summary": "Flight" }));
+        for event_type in ["birthday", "fromGmail"] {
+            let e = copy(Some(event_type));
+            let own = Own::of(&[], &[&e]);
+            assert!(
+                notify_required(&e, &shared, &own).is_none(),
+                "{event_type}: a change"
+            );
+            assert!(delete_notice(&e, &own).is_none(), "{event_type}: a delete");
+            assert!(
+                Reach::of_patch(&e, &shared, &own) == Reach::nobody(),
+                "{event_type}: nobody, and every list seen"
+            );
+        }
+        // The same copy as an ordinary event reaches them, absent type or Google's default.
+        for event_type in [None, Some("default")] {
+            let e = copy(event_type);
+            let own = Own::of(&[], &[&e]);
+            assert!(
+                notify_required(&e, &shared, &own).is_some(),
+                "{event_type:?}: a change"
+            );
+            assert!(
+                delete_notice(&e, &own).is_some(),
+                "{event_type:?}: a delete"
+            );
+        }
+    }
+
     #[test]
     fn a_delete_tells_every_guest_but_you_and_rooms() {
         let told = |updated| GuestNotice {

@@ -464,4 +464,34 @@ describe("DeleteEventDialog", () => {
     await act(async () => answer(ready({ notice: NOTICE })));
     expect(noteSeriesNotice).toHaveBeenCalledTimes(1);
   });
+
+  // C20 §6.5: Google's own help says deleting a birthday from Calendar leaves Contacts alone; PM
+  // says so too, for every year (the choices, "This event" refused by the backend) or a one-off.
+  it("deleting a birthday says Google Contacts keeps it", async () => {
+    const contacts = /Deleting it here doesn't change Google Contacts or your Google Account\./;
+    const yearly: CalendarEvent = { ...occurrence, summary: "Mum", event_type: "birthday" };
+    const thisYear: ScopeRow = {
+      row: "refused",
+      message:
+        "PM deletes a birthday or other special date for every year at once: choose “All events”.",
+    };
+    choicesForDelete.mockResolvedValue(ready({ this: thisYear }));
+    const { unmount } = open(yearly);
+    await screen.findByRole("radio", { name: /^All events/ });
+    expect(screen.getByText(contacts)).toBeTruthy();
+    expect(radio(/^This event/).disabled).toBe(true);
+    unmount();
+    open({ ...oneOff, event_type: "birthday" });
+    expect(screen.getByText(contacts)).toBeTruthy();
+  });
+
+  it("a Gmail event's delete says nothing about Contacts", async () => {
+    choicesForDelete.mockResolvedValue(ready());
+    const { unmount } = open({ ...occurrence, event_type: "fromGmail" });
+    await screen.findByRole("radio", { name: /^All events/ });
+    expect(screen.queryByText(/Google Contacts/)).toBeNull();
+    unmount();
+    open({ ...oneOff, event_type: "fromGmail" });
+    expect(screen.queryByText(/Google Contacts/)).toBeNull();
+  });
 });

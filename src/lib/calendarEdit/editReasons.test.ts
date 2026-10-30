@@ -33,11 +33,15 @@ import {
   createReasonText,
   createText,
   deleteText,
+  dragReason,
   duplicable,
   emailsGuests,
   endsRetry,
   eventRights,
   heldCreateText,
+  SPECIAL_DATE_DRAG,
+  specialKind,
+  type SpecialKind,
   moveBackText,
   moveText,
   saveBackText,
@@ -107,6 +111,10 @@ const REASONS: ReadOnlyReason[] = [
   "organizer_only_guests",
   "became_repeating",
   "special_type",
+  "special_date_fields",
+  "date_from_contacts",
+  "date_from_profile",
+  "from_gmail_fields",
   "locked",
   "unsupported_formatting",
   "label_read_only",
@@ -119,6 +127,48 @@ describe("edit reasons", () => {
     const lines = REASONS.map(reasonText);
     for (const line of lines) expect(line).toMatch(/^[A-Z].*\.$/);
     expect(new Set(lines).size).toBe(REASONS.length);
+  });
+
+  // C20: birthdays and Gmail events have Google's own list now; the rest of Google's special kinds
+  // stay read-only, in words that no longer name them. No jargon: never Google's type names.
+  it("words birthdays and Gmail events as Google's lists for them (C20)", () => {
+    const special = reasonText("special_type");
+    expect(special).toBe(
+      "PM can't change focus time, out of office, working locations or other special Google events.",
+    );
+    expect(special).not.toMatch(/birthday|gmail|yet/i);
+    expect(reasonText("special_date_fields")).toBe(
+      "On a birthday or other special date, Google lets PM change only its name, notifications and colour, and its date if it was added in Google Calendar.",
+    );
+    expect(reasonText("date_from_contacts")).toBe(
+      "This date comes from Google Contacts, so change it there.",
+    );
+    expect(reasonText("date_from_profile")).toBe(
+      "This birthday comes from the calendar owner's Google Account, so change its date there.",
+    );
+    expect(reasonText("from_gmail_fields")).toBe(
+      "Gmail added this event, so Google lets PM change only its busy or free, visibility, notifications and colour, and your reply if you're invited.",
+    );
+    for (const line of REASONS.map(reasonText)) {
+      expect(line).not.toMatch(/eventType|fromGmail|birthdayProperties|transparency|series|RSVP/);
+    }
+  });
+
+  // C20 critique C2-L13: a pure copy of the backend's `kind_of`, read the same way.
+  it("specialKind reads Google's types as the backend does", () => {
+    const rows: [string | null | undefined, SpecialKind | null][] = [
+      [null, null],
+      [undefined, null],
+      ["default", null],
+      ["birthday", "special_date"],
+      ["fromGmail", "from_gmail"],
+      ["focusTime", "other"],
+      ["outOfOffice", "other"],
+      ["x", "other"],
+      ["Birthday", "other"],
+      ["", "other"],
+    ];
+    for (const [type, kind] of rows) expect([type, specialKind(type)]).toEqual([type, kind]);
   });
 
   it("words a label and unreadable notifications plainly, as the backend does (C13)", () => {
@@ -1427,10 +1477,61 @@ describe("an event's rights in the calendar", () => {
         { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("editing_off") },
       ],
       [
-        "a birthday",
-        row({ edit_block: "special_type", can_delete: false, can_retime: false }),
+        "focus time",
+        row({
+          event_type: "focusTime",
+          edit_block: "special_type",
+          can_delete: false,
+          can_retime: false,
+        }),
         on,
         { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("special_type") },
+      ],
+      // C20: a birthday offers Edit and Delete, no drag, and says what can change; a Gmail event
+      // says what Google allows on it, whoever organises it; a lock doesn't change either line.
+      [
+        "a birthday",
+        row({ event_type: "birthday", can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("special_date_fields"),
+        },
+      ],
+      [
+        "a locked birthday",
+        row({ event_type: "birthday", locked: true, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("special_date_fields"),
+        },
+      ],
+      [
+        "a Gmail event",
+        row({ ...theirs, event_type: "fromGmail", can_delete: true, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("from_gmail_fields"),
+        },
+      ],
+      [
+        "a locked Gmail event",
+        row({ event_type: "fromGmail", locked: true, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("from_gmail_fields"),
+        },
       ],
       [
         "a subscription",
@@ -1454,6 +1555,31 @@ describe("an event's rights in the calendar", () => {
     for (const [name, ev, view, want] of rows) {
       expect([name, eventRights(ev, view)]).toEqual([name, want]);
     }
+  });
+
+  // C20 critiques C2-M4, C1-L12 (LD14): a refused drag of a birthday says its own line by the
+  // pointer; every other refused drag says the row's line, and one that's allowed says nothing.
+  it("a birthday's refused drag says it can't be dragged, by the pointer", () => {
+    const on = overview("on");
+    const drag = (ev: CalendarEvent, view = on) => dragReason(ev, eventRights(ev, view));
+    expect(SPECIAL_DATE_DRAG).toBe(
+      "Birthdays can't be dragged in PM. Open Edit to change what Google allows.",
+    );
+    const dated = row({ event_type: "birthday", can_retime: false });
+    expect(drag(dated)).toBe(SPECIAL_DATE_DRAG);
+    // Its details keep the line that says what changes (C2-M4).
+    expect(eventRights(dated, on).reason).toBe(reasonText("special_date_fields"));
+    // A Gmail event's drag says the Gmail line; a locked event's, the lock's.
+    const gmail = row({ event_type: "fromGmail", can_retime: false });
+    expect(drag(gmail)).toBe(reasonText("from_gmail_fields"));
+    expect(drag(row({ locked: true, can_retime: false }))).toBe(reasonText("locked"));
+    // Editing off says so, birthday or not. Were the list ever to allow a birthday's drag (it never
+    // knows who owns the date), nothing would refuse it: the row's line stands, unshown.
+    expect(drag(dated, overview("off"))).toBe(reasonText("editing_off"));
+    expect(drag(row({ event_type: "birthday", can_retime: true }))).toBe(
+      reasonText("special_date_fields"),
+    );
+    expect(drag(row({}))).toBeNull();
   });
 
   it("ranks the copy you organise first, then any you can change (C14 §9.5)", () => {

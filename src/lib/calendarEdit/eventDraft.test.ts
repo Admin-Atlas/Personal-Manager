@@ -171,6 +171,7 @@ describe("the event draft", () => {
       calendar: false,
       delete: false,
       respond: false,
+      one_day: false,
       reasons: ["locked"],
     };
     expect(canEdit(perms, "summary")).toBe(false);
@@ -683,6 +684,7 @@ describe("guests in the draft", () => {
       calendar: true,
       delete: true,
       respond: false,
+      one_day: false,
       reasons: [],
     };
     expect(canEdit(perms, "guests")).toBe(false);
@@ -1197,6 +1199,7 @@ describe("notifications and colour in the draft", () => {
       calendar: false,
       delete: false,
       respond: false,
+      one_day: false,
       reasons: ["label_read_only"],
     };
     expect(canEdit(perms, "reminders")).toBe(true);
@@ -1359,6 +1362,7 @@ describe("the video call in the draft", () => {
       calendar: true,
       delete: true,
       respond: false,
+      one_day: false,
       reasons: ["other_call"],
     };
     expect(canEdit(perms, "meet")).toBe(false);

@@ -180,6 +180,7 @@ const ALL: FieldPermissions = {
   calendar: true,
   delete: true,
   respond: false,
+  one_day: false,
   reasons: [],
 };
 
@@ -1748,7 +1749,8 @@ describe("EventEditor, a repeating event", () => {
     await open(vi.fn(), undefined, occurrence);
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByText(/can't be changed here/)).toBeTruthy();
+    // C20: the special kinds PM can't change, in their narrowed words.
+    expect(await screen.findByText(/PM can't change focus time/)).toBeTruthy();
     expect(choicesOpen()).toBeNull();
     expect(saveEdit).not.toHaveBeenCalled();
   });
@@ -3861,5 +3863,171 @@ describe("EventEditor, its calendar", () => {
     await act(async () => {});
     expect(trigger("Personal").disabled).toBe(true);
     expect(screen.getByText(CALENDAR_ALONE)).toBeTruthy();
+  });
+});
+
+// Birthdays and events Gmail added (#884, C20): what Google's list for each kind allows is live, the
+// rest greyed with the kind's line; a birthday's date is one whole day, one Date field; neither asks
+// whether to email anyone.
+describe("EventEditor, a birthday or an event Gmail added", () => {
+  const NONE: FieldPermissions = {
+    summary: false,
+    time: false,
+    repeat: false,
+    location: false,
+    description: false,
+    show_as: false,
+    visibility: false,
+    guests: false,
+    reminders: false,
+    colour: false,
+    meet: false,
+    calendar: false,
+    delete: false,
+    respond: false,
+    one_day: false,
+    reasons: [],
+  };
+  /** A birthday's list (gate.rs `special_rights`): its date open only where Google allows. */
+  const DATED: FieldPermissions = {
+    ...NONE,
+    summary: true,
+    reminders: true,
+    colour: true,
+    delete: true,
+    one_day: true,
+    reasons: ["special_date_fields"],
+  };
+  const GMAIL: FieldPermissions = {
+    ...NONE,
+    show_as: true,
+    visibility: true,
+    reminders: true,
+    colour: true,
+    delete: true,
+    reasons: ["from_gmail_fields"],
+  };
+  const yearly: CalendarEvent = {
+    ...row,
+    summary: "Mum",
+    location: null,
+    event_type: "birthday",
+    all_day: true,
+    start: "2026-05-04",
+    end: "2026-05-05",
+  };
+  const onTheDay = event({
+    summary: "Mum",
+    location: "",
+    time: { kind: "all_day", first_day: "2026-05-04", last_day: "2026-05-04" },
+    start_at: null,
+    end_at: null,
+  });
+  const gmailRow: CalendarEvent = { ...row, event_type: "fromGmail" };
+  const placeholder = "unknownorganizer@calendar.google.com";
+  /** Gmail's event, organised by Google's placeholder, who is on its list with the calendar. */
+  const fromGmail = event({
+    organizer_self: false,
+    organizer_email: placeholder,
+    guests: [
+      {
+        email: placeholder,
+        name: null,
+        response: "accepted",
+        optional: false,
+        organizer: true,
+        self: false,
+        room: false,
+      },
+      {
+        email: "me@x.com",
+        name: null,
+        response: "accepted",
+        optional: false,
+        organizer: false,
+        self: true,
+        room: false,
+      },
+    ],
+  });
+  const disabled = (el: HTMLElement) => (el as HTMLInputElement).disabled;
+
+  it("a birthday from Contacts opens with only its name, notifications and colour live, and both lines, the date's first", async () => {
+    openForEdit.mockResolvedValue(
+      ready(onTheDay, { ...DATED, reasons: ["date_from_contacts", "special_date_fields"] }),
+    );
+    await open(vi.fn(), vi.fn(), yearly);
+    expect(disabled(screen.getByLabelText("Title"))).toBe(false);
+    expect(disabled(screen.getByLabelText("Date"))).toBe(true);
+    expect(disabled(screen.getByLabelText("Location"))).toBe(true);
+    expect(disabled(screen.getByRole("button", { name: "Free" }))).toBe(true);
+    expect(disabled(screen.getByLabelText("Visibility"))).toBe(true);
+    // All day on the calendar's defaults: its notifications open with Change.
+    expect(disabled(screen.getByRole("button", { name: "Change" }))).toBe(false);
+    expect(disabled(screen.getByRole("button", { name: "Colour: Calendar colour" }))).toBe(false);
+    // Repeat is greyed: Google repeats a birthday every year itself.
+    expect(disabled(screen.getByRole("button", { name: /^Repeat: / }))).toBe(true);
+    const contacts = screen.getByText(reasonText("date_from_contacts"));
+    const kind = screen.getByText(reasonText("special_date_fields"));
+    expect(contacts.compareDocumentPosition(kind) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Google lets a birthday be deleted (C20 §0.4 item 1).
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  });
+
+  it("one day shows a single Date field and no All day switch, and a new date moves the last day with it", async () => {
+    openForEdit.mockResolvedValue(ready(onTheDay, { ...DATED, time: true }));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), vi.fn(), yearly);
+    expect(screen.queryByRole("switch", { name: "All day" })).toBeNull();
+    expect(screen.queryByLabelText("First day")).toBeNull();
+    expect(screen.queryByLabelText("Last day")).toBeNull();
+    const date = screen.getByLabelText<HTMLInputElement>("Date");
+    expect(date.disabled).toBe(false);
+    date.focus();
+    fireEvent.change(date, { target: { value: "05-06-2026" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: { kind: "all_day", first_day: "2026-06-05", last_day: "2026-06-05" } },
+      null,
+      "Mum",
+      null,
+      null,
+    );
+  });
+
+  it("an ordinary all-day event keeps its two days and its switch", async () => {
+    openForEdit.mockResolvedValue(ready(onTheDay));
+    await open(vi.fn(), vi.fn(), yearly);
+    expect(screen.getByRole("switch", { name: "All day" })).toBeTruthy();
+    expect(screen.getByLabelText("First day")).toBeTruthy();
+    expect(screen.queryByLabelText("Date")).toBeNull();
+  });
+
+  it("a Gmail event opens with busy or free, visibility, notifications and colour live and the rest greyed", async () => {
+    openForEdit.mockResolvedValue(ready(fromGmail, GMAIL));
+    await open(vi.fn(), vi.fn(), gmailRow);
+    expect(disabled(screen.getByLabelText("Title"))).toBe(true);
+    expect(disabled(screen.getByLabelText("Start time"))).toBe(true);
+    expect(disabled(screen.getByLabelText("Location"))).toBe(true);
+    expect(disabled(screen.getByRole("button", { name: "Free" }))).toBe(false);
+    expect(disabled(screen.getByLabelText("Visibility"))).toBe(false);
+    expect(disabled(screen.getByRole("button", { name: "Add notification" }))).toBe(false);
+    expect(disabled(screen.getByRole("button", { name: "Colour: Calendar colour" }))).toBe(false);
+    expect(screen.getByText(reasonText("from_gmail_fields"))).toBeTruthy();
+    // Google's placeholder organiser is no one whose event this is: nothing says "only they can".
+    expect(screen.queryByText(/Someone else organises/)).toBeNull();
+  });
+
+  it("a Gmail event's visibility saves with no email question, its organiser on the list", async () => {
+    openForEdit.mockResolvedValue(ready(fromGmail, GMAIL));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), vi.fn(), gmailRow);
+    fireEvent.change(screen.getByLabelText("Visibility"), { target: { value: "private" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(screen.queryByRole("dialog", { name: "Send update emails to guests?" })).toBeNull();
+    expect(saveEdit).toHaveBeenCalledWith("s1", { visibility: "private" }, ...UNSCOPED);
   });
 });

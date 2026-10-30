@@ -93,6 +93,7 @@ const ready = (ev: EventForEdit): EditLoad => ({
     repeat: true,
     delete: true,
     respond: false,
+    one_day: false,
     meet: true,
     calendar: true,
     reasons: [],

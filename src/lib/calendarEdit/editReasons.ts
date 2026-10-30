@@ -76,7 +76,17 @@ export function reasonText(reason: ReadOnlyReason): string {
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
-      return "Birthdays, events from Gmail, focus time, out of office and working locations can't be changed here.";
+      return "PM can't change focus time, out of office, working locations or other special Google events.";
+    // Google's `birthday` type holds anniversaries and other dates too (C20 critique C2-L5).
+    case "special_date_fields":
+      return "On a birthday or other special date, Google lets PM change only its name, notifications and colour, and its date if it was added in Google Calendar.";
+    case "date_from_contacts":
+      return "This date comes from Google Contacts, so change it there.";
+    // On someone else's calendar that you can change, the birthday is theirs (C20 critique C2-L4).
+    case "date_from_profile":
+      return "This birthday comes from the calendar owner's Google Account, so change its date there.";
+    case "from_gmail_fields":
+      return "Gmail added this event, so Google lets PM change only its busy or free, visibility, notifications and colour, and your reply if you're invited.";
     // And its calendar, which Google doesn't say a locked copy may change (C18d).
     case "locked":
       return "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.";
@@ -148,16 +158,23 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
   }
   // The gate decides Delete (C14) and a drag (C16 critique C2-M4): a locked copy, whose delete Google
   // doesn't document and whose times it refuses, and an invitation can't be deleted, nor dragged
-  // unless the organiser lets guests change it. A row the list didn't mark gets neither. On an
-  // invitation the line says what stays the organiser's, or Google's warning where they let guests
-  // change it.
-  const reason = ev.locked
-    ? reasonText("locked")
-    : theirs
-      ? ev.guests_can_modify
-        ? A11_NOTE
-        : notOrganizerText(ev.can_respond === true, true)
-      : null;
+  // unless the organiser lets guests change it. A row the list didn't mark gets neither. A birthday
+  // or a Gmail event says what Google lets change on it first, locked or not and whoever organises
+  // it, since Google's list for its kind is the rule (C20 critique C2-H1). On an invitation the line
+  // says what stays the organiser's, or Google's warning where they let guests change it.
+  const kind = specialKind(ev.event_type);
+  const reason =
+    kind === "special_date"
+      ? reasonText("special_date_fields")
+      : kind === "from_gmail"
+        ? reasonText("from_gmail_fields")
+        : ev.locked
+          ? reasonText("locked")
+          : theirs
+            ? ev.guests_can_modify
+              ? A11_NOTE
+              : notOrganizerText(ev.can_respond === true, true)
+            : null;
   return {
     canEdit: true,
     canDelete: ev.can_delete === true,
@@ -165,6 +182,41 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
     reason,
   };
 }
+
+/** Which of Google's special kinds an event is, read as the backend's `kind_of` reads `event_type`
+ *  (a parity test keeps them one): null for an ordinary event, absent or Google's default. */
+export type SpecialKind = "special_date" | "from_gmail" | "other";
+export function specialKind(eventType: string | null | undefined): SpecialKind | null {
+  switch (eventType ?? "default") {
+    case "default":
+      return null;
+    case "birthday":
+      return "special_date";
+    case "fromGmail":
+      return "from_gmail";
+    default:
+      return "other";
+  }
+}
+
+/** By the pointer when a birthday is pressed to drag (C20 critiques C2-M4, C1-L12). Not its
+ *  details' line, whose "its date if it was added in Google Calendar" would read as a drag on
+ *  offer: the calendar can't tell who owns a birthday's date, so none is dragged. */
+export const SPECIAL_DATE_DRAG =
+  "Birthdays can't be dragged in PM. Open Edit to change what Google allows.";
+
+/** What a drag of `ev` that its `rights` refuse says by the pointer (LD14): the row's own line, but
+ *  a birthday's own words. */
+export function dragReason(ev: CalendarEvent, rights: EventRights): string | null {
+  return rights.canEdit && !rights.canRetime && specialKind(ev.event_type) === "special_date"
+    ? SPECIAL_DATE_DRAG
+    : rights.reason;
+}
+
+/** What deleting a birthday or other special date adds (C20 §14.3): Google's own help says the
+ *  same of deleting one from Calendar. */
+export const SPECIAL_DATE_DELETE =
+  "Deleting it here doesn't change Google Contacts or your Google Account.";
 
 /** The roles whose calendars show an event's details, which a copy is made from: a busy-only
  *  calendar (`freeBusyReader`) shows none. */

@@ -375,9 +375,11 @@ export function changeNotice(
 }
 
 /** Who deleting a mirror row would tell: its guests but the user and rooms (by address, since the
- *  mirror has no room flag), when the user organises it; null when nobody. */
+ *  mirror has no room flag), when the user organises it; null when nobody. A birthday or an event
+ *  Gmail added tells nobody, as the backend's `Reach` has it (C20 §4.4): only an ordinary event's
+ *  delete asks. */
 export function deleteNotice(row: CalendarEvent, me: string | null = null): GuestNotice | null {
-  if (!row.organizer_self) return null;
+  if (!row.organizer_self || (row.event_type ?? "default") !== "default") return null;
   const list = (row.attendees ?? []).map((a) => ({
     email: a.email,
     // The organiser of an event the calendar organises is the calendar itself.

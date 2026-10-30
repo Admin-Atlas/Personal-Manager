@@ -486,6 +486,18 @@ describe("who a delete would tell (the backend's D1-D5, from the calendar's row)
     expect(deleteNotice(row([]))).toBeNull();
   });
 
+  // C20 §4.4: a birthday or an event Gmail added tells nobody, whoever its row shows; an ordinary
+  // event's type, absent or Google's default, tells them.
+  it("tells nobody of a birthday or a Gmail event's delete", () => {
+    const guests = [who("me@x.org", true), who("A@x.org")];
+    for (const event_type of ["birthday", "fromGmail"]) {
+      expect(deleteNotice({ ...row(guests), event_type })).toBeNull();
+    }
+    for (const event_type of [null, "default"]) {
+      expect(deleteNotice({ ...row(guests), event_type })).toEqual(cancelled(1));
+    }
+  });
+
   // Not one of the backend's rows. The backend knows the organiser of an event the calendar
   // organises by the calendar's id, which `Own` holds; the mirror row doesn't carry that id, so the
   // editor knows it by the organiser's entry instead. Google marks that entry as the calendar's own

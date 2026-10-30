@@ -89,6 +89,13 @@ pub enum TimeDraft {
     AllDay { first_day: String, last_day: String },
 }
 
+impl TimeDraft {
+    /// One whole day: all day, first and last day the same (what a birthday's date may be, C20).
+    pub fn is_one_whole_day(&self) -> bool {
+        matches!(self, TimeDraft::AllDay { first_day, last_day } if first_day == last_day)
+    }
+}
+
 /// The fields the user touched in the editor. `None` means untouched and is never sent; `Some` of
 /// the value already on the event is dropped too, so nothing Google holds is rewritten for nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,8 +524,19 @@ pub enum ReadOnlyReason {
     OrganizerOnlyGuests,
     /// A one-off in PM that has since become a repeating event in Google: open one of its occurrences.
     BecameRepeating,
-    /// A birthday, a Gmail event, focus time, out of office or a working location.
+    /// Focus time, out of office, a working location, or a kind of Google event PM doesn't know:
+    /// nothing may change (C21 or a card, Q8).
     SpecialType,
+    /// A birthday or other special date: Google lets its name, notifications and colour change,
+    /// and its date when it was added in Google Calendar. Nothing else (C20).
+    SpecialDateFields,
+    /// A special date linked to a contact: Google Contacts owns its day (C20).
+    DateFromContacts,
+    /// The calendar owner's own birthday: their Google Account owns its day (C20).
+    DateFromProfile,
+    /// Gmail added it: Google lets its busy or free, visibility, notifications, colour and the
+    /// user's reply change. Nothing else (C20).
+    FromGmailFields,
     /// Google has locked its title, time, place and description.
     Locked,
     /// The description has formatting PM can't edit, such as a table or coloured text
@@ -563,6 +581,10 @@ pub struct FieldPermissions {
     /// The user may reply (Yes, No, Maybe). Not part of [`Self::any`]: a reply isn't one of the
     /// editor's fields (C14).
     pub respond: bool,
+    /// The time may change only to one whole day, all day (Google: a birthday's "new values need
+    /// to define an all-day event which spans exactly one day", C20). Not part of [`Self::any`]:
+    /// it narrows `time`, it isn't a field.
+    pub one_day: bool,
     /// Every reason something is read-only, most important first. Empty when everything may change.
     pub reasons: Vec<ReadOnlyReason>,
 }
@@ -1115,6 +1137,23 @@ mod tests {
             (
                 ReadOnlyReason::OtherCall,
                 r#"{"outcome":"read_only","reason":"other_call"}"#,
+            ),
+            // C20: a birthday's and a Gmail event's own lists, and who owns a birthday's date.
+            (
+                ReadOnlyReason::SpecialDateFields,
+                r#"{"outcome":"read_only","reason":"special_date_fields"}"#,
+            ),
+            (
+                ReadOnlyReason::DateFromContacts,
+                r#"{"outcome":"read_only","reason":"date_from_contacts"}"#,
+            ),
+            (
+                ReadOnlyReason::DateFromProfile,
+                r#"{"outcome":"read_only","reason":"date_from_profile"}"#,
+            ),
+            (
+                ReadOnlyReason::FromGmailFields,
+                r#"{"outcome":"read_only","reason":"from_gmail_fields"}"#,
             ),
         ] {
             assert_eq!(
@@ -1909,6 +1948,43 @@ mod tests {
         let json = serde_json::to_value(&open).unwrap();
         assert_eq!(json["repeat"], serde_json::json!(true));
         assert_eq!(json["time"], serde_json::json!(false));
+    }
+
+    /// C20: the editor reads `one_day` beside the fields, and it is no field of its own: a birthday
+    /// whose date alone may change to one day is still "the time".
+    #[test]
+    fn one_day_serialises_beside_the_fields() {
+        let json = serde_json::to_value(FieldPermissions::default()).unwrap();
+        assert_eq!(json["one_day"], serde_json::json!(false));
+        let only = FieldPermissions {
+            one_day: true,
+            ..Default::default()
+        };
+        assert!(!only.any(), "one_day narrows the time, it isn't a field");
+        assert_eq!(
+            serde_json::to_value(&only).unwrap()["one_day"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// C20: one whole day is all day, its first and last day the same.
+    #[test]
+    fn one_whole_day_is_all_day_and_one_day() {
+        let all_day = |first: &str, last: &str| TimeDraft::AllDay {
+            first_day: first.into(),
+            last_day: last.into(),
+        };
+        assert!(all_day("2026-05-04", "2026-05-04").is_one_whole_day());
+        assert!(!all_day("2026-05-04", "2026-05-05").is_one_whole_day());
+        let timed = TimeDraft::Timed {
+            start_date: "2026-05-04".into(),
+            start_time: "00:00".into(),
+            start_zone: "Europe/London".into(),
+            end_date: "2026-05-05".into(),
+            end_time: "00:00".into(),
+            end_zone: "Europe/London".into(),
+        };
+        assert!(!timed.is_one_whole_day());
     }
 
     /// C14: the reply control's three words, and its two scopes; "no reply yet", Google's own words

@@ -25,10 +25,93 @@
 //! A description with formatting PM can't write back is read-only (C19, R9: the lift of the old
 //! "formatted" reason); a save the user chose to make plain reopens it
 //! ([`FieldPermissions::replacing_formatting`]).
+//!
+//! Birthdays and events Gmail added (C20) change only what Google's per-type list allows, every
+//! other field starting closed (R9: the lift of their "special kind" reason); other special kinds
+//! stay read-only.
+
+use serde_json::Value;
 
 use crate::calendar_editing::EditingStatus;
 
-use super::dto::{CallKind, FieldPermissions, ListRights, ReadOnlyReason};
+use super::dto::{CallKind, FieldPermissions, ListRights, ReadOnlyReason, TimeDraft};
+
+/// Which of Google's event types PM edits, and by which rule. Read from `eventType`, where absent
+/// means `default` (Google: "This cannot be modified after the event is created"). Named for what
+/// Google lets change rather than for a birthday: CodeQL reads any name like that as private data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// An ordinary event: every rule before C20.
+    Default,
+    /// Google's `birthday` type: a birthday, an anniversary or another special date, all day, every
+    /// year. Its name, notifications and colour may change, and its date when nothing else owns it.
+    SpecialDate,
+    /// Google's `fromGmail` type: Gmail added it. Busy or free, visibility, notifications, colour
+    /// and the user's reply may change.
+    FromGmail,
+    /// Focus time, out of office, working location, or a type Google adds later: read-only
+    /// (`SpecialType`) until their own card (Q8).
+    Other,
+}
+
+/// `eventType` as a [`Kind`]. Unknown types fail closed (`Other`).
+pub fn kind_of(event_type: Option<&str>) -> Kind {
+    match event_type {
+        None | Some("default") => Kind::Default,
+        Some("birthday") => Kind::SpecialDate,
+        Some("fromGmail") => Kind::FromGmail,
+        Some(_) => Kind::Other,
+    }
+}
+
+/// Who owns a special date's day (Google's `birthdayProperties`): only one added in Google Calendar
+/// may move. Google: "Timing details of a birthday event cannot be updated if the event is linked to
+/// a contact, or its type is 'self'."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateSource {
+    /// Added in Google Calendar: no contact, and the type absent or Google's default.
+    Calendar,
+    /// Linked to a contact (an anniversary, a custom or an other date always is): Google Contacts
+    /// owns it.
+    Contacts,
+    /// The calendar owner's own (`self`): their Google Account owns it.
+    Profile,
+    /// Not known: the mirror doesn't keep it, Google sent none, or a type PM doesn't know. The date
+    /// stays.
+    Unknown,
+}
+
+/// The date source of a fresh copy, read from `birthdayProperties` as Google documents it (its
+/// events reference). Meaningful only for [`Kind::SpecialDate`]; pure. Anything PM can't read for
+/// sure is `Unknown`, whose date stays: Google's guide says to "inspect the birthdayProperties
+/// field" on every birthday it returns, so one without it isn't guessed to be the user's own (live
+/// probe G-B0).
+pub fn date_source_of(event: &Value) -> DateSource {
+    let Some(props) = event.get("birthdayProperties").and_then(Value::as_object) else {
+        return DateSource::Unknown;
+    };
+    let kind = match props.get("type") {
+        None => None,
+        Some(Value::String(kind)) => Some(kind.as_str()),
+        Some(_) => return DateSource::Unknown,
+    };
+    if kind == Some("self") {
+        return DateSource::Profile;
+    }
+    match props.get("contact") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(contact)) if !contact.is_empty() => return DateSource::Contacts,
+        Some(Value::String(_)) => {}
+        // A contact PM can't read is no proof there is none (C20 critique C1-L7).
+        Some(_) => return DateSource::Unknown,
+    }
+    match kind {
+        // "Always has a contact" (events reference), whether or not Google sent one.
+        Some("anniversary" | "custom" | "other") => DateSource::Contacts,
+        None | Some("birthday") => DateSource::Calendar,
+        Some(_) => DateSource::Unknown,
+    }
+}
 
 /// Everything the gate needs to know about one event.
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +152,9 @@ pub struct EditFacts<'a> {
     pub call: Option<CallKind>,
     /// The calendar offers Google Meet (its `allowedConferenceSolutionTypes` has `hangoutsMeet`).
     pub meet_offered: bool,
+    /// Who owns a special date's day ([`date_source_of`] on a fresh copy); `Unknown` on the list
+    /// path and for every other kind.
+    pub date_source: DateSource,
 }
 
 /// What may change about the event described by `facts`, and whether the user may reply.
@@ -80,6 +166,21 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
             ..FieldPermissions::none(reason)
         };
     }
+    let kind = kind_of(facts.event_type);
+    let start = match kind {
+        Kind::SpecialDate | Kind::FromGmail => special_rights(facts, kind),
+        // `Other` never gets here (`access_reason` gave `SpecialType`); the arm keeps it total.
+        Kind::Default | Kind::Other => default_rights(facts),
+    };
+    FieldPermissions {
+        respond,
+        ..closing_rules(start, facts, kind)
+    }
+}
+
+/// An ordinary event's starting set: everything on your own event, the user's own settings on
+/// someone else's (C14's allow-list), and the call and the calendar as C18 left them.
+fn default_rights(facts: &EditFacts) -> FieldPermissions {
     let mut perms = FieldPermissions {
         summary: true,
         time: true,
@@ -99,8 +200,10 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         // Another calendar of the same account (C18d): the save checks the one chosen.
         calendar: true,
         delete: true,
-        // A lock is Google's on the shared fields: a reply isn't among them.
-        respond,
+        // A lock is Google's on the shared fields: a reply isn't among them. Set by the caller.
+        respond: false,
+        // Any length of time: only a special date's is held to one day.
+        one_day: false,
         reasons: Vec::new(),
     };
     if !facts.organizer_self {
@@ -137,22 +240,80 @@ pub fn edit_rights(facts: &EditFacts) -> FieldPermissions {
         // event the organiser's reason already says the call is theirs.
         perms.reasons.push(ReadOnlyReason::OtherCall);
     }
+    perms
+}
+
+/// What Google lets change on a birthday or a Gmail event (its event-types guide), and nothing
+/// else. Every field starts closed, so a field a later layer adds stays closed here until it is
+/// listed. Replaces the organiser rule for these kinds: Google fixes their organiser, and their own
+/// list is the rule (R9).
+fn special_rights(facts: &EditFacts, kind: Kind) -> FieldPermissions {
+    let mut perms = FieldPermissions::default();
+    match kind {
+        Kind::SpecialDate => {
+            perms.summary = true;
+            perms.reminders = true;
+            perms.colour = true;
+            perms.delete = true;
+            perms.one_day = true;
+            // Whoever owns the day says so first, the kind's own line after it.
+            match facts.date_source {
+                DateSource::Calendar => perms.time = true,
+                DateSource::Contacts => perms.reasons.push(ReadOnlyReason::DateFromContacts),
+                DateSource::Profile => perms.reasons.push(ReadOnlyReason::DateFromProfile),
+                DateSource::Unknown => {}
+            }
+            perms.reasons.push(ReadOnlyReason::SpecialDateFields);
+        }
+        Kind::FromGmail => {
+            perms.show_as = true;
+            perms.visibility = true;
+            perms.reminders = true;
+            perms.colour = true;
+            perms.delete = true;
+            perms.reasons.push(ReadOnlyReason::FromGmailFields);
+        }
+        // Never reached (see edit_rights); closed if it ever is.
+        Kind::Default | Kind::Other => return FieldPermissions::none(ReadOnlyReason::SpecialType),
+    }
+    perms
+}
+
+/// What closes on top of a starting set, for every kind: Google's lock, formatting PM can't write
+/// back, a label, notifications PM can't read.
+fn closing_rules(mut perms: FieldPermissions, facts: &EditFacts, kind: Kind) -> FieldPermissions {
     if facts.locked {
-        // Google refuses changes to a locked copy's summary, description, location, start, end and
-        // recurrence. Whether it lets the copy be deleted, or its guests change, isn't documented,
-        // so PM offers neither (INFERRED: fails closed, C12 §4.4). Whether it can go to another
-        // calendar isn't documented either, so it stays on its own (C18d, §0.5 row 11). Its
-        // notifications and colour aren't among them, so they stay open (the editing plan's C6 card,
-        // from C13).
-        perms.summary = false;
-        perms.time = false;
-        perms.repeat = false;
-        perms.location = false;
-        perms.description = false;
-        perms.guests = false;
-        perms.calendar = false;
-        perms.delete = false;
-        perms.reasons.push(ReadOnlyReason::Locked);
+        match kind {
+            // Google's per-type guide is the more specific rule here (R9): "Birthday events can be
+            // deleted", "Events from Gmail can be deleted", and a birthday's `summary` is on its
+            // list, while the lock names "summary, description, location, start, end or
+            // recurrence". The rest of the lock binds, and of what these kinds may change it holds
+            // only a birthday's date. Said only when it closed that, so a locked Gmail event reads
+            // the Gmail line (C20 critiques C2-H1, C1-M5).
+            Kind::SpecialDate | Kind::FromGmail => {
+                if perms.time {
+                    perms.time = false;
+                    perms.reasons.push(ReadOnlyReason::Locked);
+                }
+            }
+            // Google refuses changes to a locked copy's summary, description, location, start, end
+            // and recurrence. Whether it lets the copy be deleted, or its guests change, isn't
+            // documented, so PM offers neither (INFERRED: fails closed, C12 §4.4). Whether it can go
+            // to another calendar isn't documented either, so it stays on its own (C18d, §0.5 row
+            // 11). Its notifications and colour aren't among them, so they stay open (the editing
+            // plan's C6 card, from C13).
+            Kind::Default | Kind::Other => {
+                perms.summary = false;
+                perms.time = false;
+                perms.repeat = false;
+                perms.location = false;
+                perms.description = false;
+                perms.guests = false;
+                perms.calendar = false;
+                perms.delete = false;
+                perms.reasons.push(ReadOnlyReason::Locked);
+            }
+        }
     }
     // Only on a description otherwise open, so reopening it for a replace can never undo a lock or
     // the organiser's hold ([`FieldPermissions::replacing_formatting`]).
@@ -227,6 +388,9 @@ const ONE_FIELD: [ReadOnlyReason; 5] = [
 /// field's own. Every refusal says this, so a delete on an event whose organiser lets guests change
 /// it never says "only the organiser can change who's invited" (C14 critique C1-L1).
 pub fn reason_for(perms: &FieldPermissions, field: Field) -> ReadOnlyReason {
+    if let Some(reason) = special_reason(perms, field) {
+        return reason;
+    }
     // The call's own first; under "modify" the organiser's guest reason covers it too (its words
     // name the call, C18).
     let own: &[ReadOnlyReason] = match field {
@@ -253,12 +417,59 @@ pub fn reason_for(perms: &FieldPermissions, field: Field) -> ReadOnlyReason {
         .unwrap_or(ReadOnlyReason::NotOrganizer)
 }
 
+/// The reason a closed `field` gives on a birthday or a Gmail event, read from `perms.reasons`
+/// alone, or `None` for other events (the rules above then apply). Most specific first: whoever
+/// owns the date, then Google's lock, then the field's own (a label, notifications PM can't read),
+/// then the kind's list (C20 §4.1).
+fn special_reason(perms: &FieldPermissions, field: Field) -> Option<ReadOnlyReason> {
+    let kind = [
+        ReadOnlyReason::SpecialDateFields,
+        ReadOnlyReason::FromGmailFields,
+    ]
+    .into_iter()
+    .find(|r| perms.reasons.contains(r))?;
+    let first: &[ReadOnlyReason] = match field {
+        Field::Time => &[
+            ReadOnlyReason::DateFromContacts,
+            ReadOnlyReason::DateFromProfile,
+            ReadOnlyReason::Locked,
+        ],
+        Field::Summary | Field::Delete => &[ReadOnlyReason::Locked],
+        Field::Reminders => &[ReadOnlyReason::RemindersUnreadable],
+        Field::Colour => &[ReadOnlyReason::LabelReadOnly],
+        _ => &[],
+    };
+    Some(
+        first
+            .iter()
+            .copied()
+            .find(|r| perms.reasons.contains(r))
+            .unwrap_or(kind),
+    )
+}
+
+/// Why `time` can't be saved under `perms`, or `None` when it can: a closed time gives its own
+/// reason ([`reason_for`]), and a special date's time that isn't one whole day the kind's words,
+/// which say what its date may be (C20 critiques C1-M2, C2-L7). One helper for every path that
+/// sends a time: a save's fields, a drop, and a drop on an occurrence before it is planned.
+pub fn time_refusal(perms: &FieldPermissions, time: &TimeDraft) -> Option<ReadOnlyReason> {
+    if !perms.time {
+        return Some(reason_for(perms, Field::Time));
+    }
+    (perms.one_day && !time.is_one_whole_day()).then_some(ReadOnlyReason::SpecialDateFields)
+}
+
 /// Why the user can't reply from this copy, or `None` when they can: the reasons nothing at all may
-/// be written from it, then an entry on the guest list. The organiser has one too, and may reply; a
-/// lock doesn't stop it (Google locks the shared fields), and neither does a one-off Google has
-/// since made repeating, which the reply's own read refuses as a save does.
+/// be written from it, then a birthday (Google keeps no guest list on one: `attendees` isn't on its
+/// list), then an entry on the guest list. The organiser has one too, and may reply; a lock doesn't
+/// stop it (Google locks the shared fields), and neither does a one-off Google has since made
+/// repeating, which the reply's own read refuses as a save does. A Gmail event with an entry of the
+/// user's own replies as any invitation does (`attendees` is on its list, C20 §3.3).
 pub fn reply_block(facts: &EditFacts) -> Option<ReadOnlyReason> {
-    access_reason(facts).or((!facts.invited).then_some(ReadOnlyReason::NotInvited))
+    access_reason(facts)
+        .or((kind_of(facts.event_type) == Kind::SpecialDate)
+            .then_some(ReadOnlyReason::SpecialDateFields))
+        .or((!facts.invited).then_some(ReadOnlyReason::NotInvited))
 }
 
 /// Why PM may not create an event with `visibility` on a calendar, or `None` when it may: the account
@@ -287,6 +498,8 @@ pub fn create_block(
         // A create's call is the create command's to check.
         call: None,
         meet_offered: false,
+        // A create is `default` (PM creates no birthday, A16): unused.
+        date_source: DateSource::Unknown,
     })
 }
 
@@ -323,10 +536,10 @@ fn access_reason(facts: &EditFacts) -> Option<ReadOnlyReason> {
         // reader, freeBusyReader, missing, or a role Google adds later.
         _ => return Some(ReadOnlyReason::CalendarReadOnly),
     }
-    match facts.event_type {
-        None | Some("default") => {}
-        // birthday, fromGmail, focusTime, outOfOffice, workingLocation, or a type Google adds later.
-        Some(_) => return Some(ReadOnlyReason::SpecialType),
+    // Focus time, out of office, working location and types Google adds later stay read-only (Q8);
+    // birthdays and Gmail events have Google's own list instead (R9, `special_rights`).
+    if kind_of(facts.event_type) == Kind::Other {
+        return Some(ReadOnlyReason::SpecialType);
     }
     None
 }
@@ -355,6 +568,7 @@ mod tests {
             invited: false,
             call: None,
             meet_offered: true,
+            date_source: DateSource::Unknown,
         }
     }
 
@@ -471,20 +685,7 @@ mod tests {
                 },
                 PrivateEvent,
             ),
-            (
-                EditFacts {
-                    event_type: Some("birthday"),
-                    ..e()
-                },
-                SpecialType,
-            ),
-            (
-                EditFacts {
-                    event_type: Some("fromGmail"),
-                    ..e()
-                },
-                SpecialType,
-            ),
+            // Birthdays and Gmail events are no longer among them: Google's own list (C20).
             (
                 EditFacts {
                     event_type: Some("focusTime"),
@@ -828,11 +1029,41 @@ mod tests {
             (
                 "R4",
                 EditFacts {
-                    event_type: Some("birthday"),
+                    event_type: Some("focusTime"),
                     ..i()
                 },
                 false,
                 Some(SpecialType),
+            ),
+            // C20: a birthday has no guest list to answer from, whatever its copy says; a Gmail
+            // event with an entry of the user's own replies as any invitation does.
+            (
+                "R4a",
+                EditFacts {
+                    event_type: Some("birthday"),
+                    ..i()
+                },
+                false,
+                Some(SpecialDateFields),
+            ),
+            (
+                "R4b",
+                EditFacts {
+                    event_type: Some("fromGmail"),
+                    ..i()
+                },
+                true,
+                None,
+            ),
+            (
+                "R4c",
+                EditFacts {
+                    event_type: Some("fromGmail"),
+                    invited: false,
+                    ..i()
+                },
+                false,
+                Some(NotInvited),
             ),
             (
                 "R5",
@@ -971,11 +1202,25 @@ mod tests {
             ..invitation()
         };
         let special = EditFacts {
-            event_type: Some("birthday"),
+            event_type: Some("focusTime"),
             ..editable()
         };
         let locked = EditFacts {
             locked: true,
+            ..editable()
+        };
+        // C20: the list never knows who owns a birthday's date, so it never offers its drag; a
+        // fresh copy of one added in Google Calendar opens the time (to one whole day, `one_day`).
+        let listed_date = EditFacts {
+            event_type: Some("birthday"),
+            ..editable()
+        };
+        let own_date = EditFacts {
+            date_source: DateSource::Calendar,
+            ..listed_date
+        };
+        let gmail = EditFacts {
+            event_type: Some("fromGmail"),
             ..editable()
         };
         for (row, facts, retime) in [
@@ -984,6 +1229,9 @@ mod tests {
             ("theirs", invitation(), false),
             ("locked", locked, false),
             ("special", special, false),
+            ("listed date", listed_date, false),
+            ("own date", own_date, true),
+            ("gmail", gmail, false),
         ] {
             assert_eq!(list_rights(&facts).can_retime, retime, "{row}");
             assert_eq!(edit_rights(&facts).time, retime, "{row}");
@@ -1059,7 +1307,7 @@ mod tests {
             (
                 "A7",
                 EditFacts {
-                    event_type: Some("birthday"),
+                    event_type: Some("focusTime"),
                     ..i()
                 },
                 [false; 6],
@@ -1276,11 +1524,22 @@ mod tests {
             (
                 "G10",
                 EditFacts {
-                    event_type: Some("birthday"),
+                    event_type: Some("focusTime"),
                     ..editable()
                 },
                 false,
                 vec![SpecialType],
+            ),
+            // C20: a call isn't on a birthday's list, whatever the calendar offers.
+            (
+                "G10a",
+                EditFacts {
+                    event_type: Some("birthday"),
+                    date_source: DateSource::Calendar,
+                    ..editable()
+                },
+                false,
+                vec![SpecialDateFields],
             ),
             (
                 "G11",
@@ -1358,11 +1617,22 @@ mod tests {
             (
                 "T5",
                 EditFacts {
-                    event_type: Some("birthday"),
+                    event_type: Some("focusTime"),
                     ..editable()
                 },
                 false,
                 vec![SpecialType],
+            ),
+            // C20: neither is another calendar on a Gmail event's (`events.move` takes default
+            // events only).
+            (
+                "T5a",
+                EditFacts {
+                    event_type: Some("fromGmail"),
+                    ..editable()
+                },
+                false,
+                vec![FromGmailFields],
             ),
             (
                 "T6",
@@ -1429,6 +1699,543 @@ mod tests {
                 Field::Calendar
             ),
             NotOrganizer
+        );
+    }
+
+    /// C20 §1: Google's names, the absent one its documented default; anything else, a new type
+    /// or another spelling, is read-only.
+    #[test]
+    fn kinds_read_as_google_names_them() {
+        for (event_type, kind) in [
+            (None, Kind::Default),
+            (Some("default"), Kind::Default),
+            (Some("birthday"), Kind::SpecialDate),
+            (Some("fromGmail"), Kind::FromGmail),
+            (Some("focusTime"), Kind::Other),
+            (Some("outOfOffice"), Kind::Other),
+            (Some("workingLocation"), Kind::Other),
+            (Some("somethingNew"), Kind::Other),
+            (Some("Birthday"), Kind::Other),
+            (Some("fromgmail"), Kind::Other),
+        ] {
+            assert_eq!(kind_of(event_type), kind, "{event_type:?}");
+        }
+    }
+
+    /// C20 §1 and critique C1-L7: who owns a special date's day, as Google's events reference
+    /// documents `birthdayProperties`; whatever PM can't read for sure stays put.
+    #[test]
+    fn a_special_dates_source_reads_as_google_documents() {
+        use serde_json::json;
+        let of = |props: Option<Value>| {
+            let mut event = json!({ "eventType": "birthday" });
+            if let Some(props) = props {
+                event["birthdayProperties"] = props;
+            }
+            date_source_of(&event)
+        };
+        let rows: Vec<(&str, Option<Value>, DateSource)> = vec![
+            ("D1", None, DateSource::Unknown),
+            ("D2", Some(json!("x")), DateSource::Unknown),
+            ("D3", Some(json!({})), DateSource::Calendar),
+            (
+                "D4",
+                Some(json!({ "type": "birthday" })),
+                DateSource::Calendar,
+            ),
+            (
+                "D5",
+                Some(json!({ "type": "birthday", "contact": "" })),
+                DateSource::Calendar,
+            ),
+            (
+                "D6",
+                Some(json!({ "type": "birthday", "contact": "people/c1" })),
+                DateSource::Contacts,
+            ),
+            (
+                "D7",
+                Some(json!({ "contact": "people/c1" })),
+                DateSource::Contacts,
+            ),
+            (
+                "D8",
+                Some(json!({ "type": "anniversary", "contact": "people/c1" })),
+                DateSource::Contacts,
+            ),
+            (
+                "D9",
+                Some(
+                    json!({ "type": "custom", "customTypeName": "Name day", "contact": "people/c1" }),
+                ),
+                DateSource::Contacts,
+            ),
+            (
+                "D10",
+                Some(json!({ "type": "other" })),
+                DateSource::Contacts,
+            ),
+            ("D11", Some(json!({ "type": "self" })), DateSource::Profile),
+            (
+                "D12",
+                Some(json!({ "type": "self", "contact": "people/c1" })),
+                DateSource::Profile,
+            ),
+            (
+                "D13",
+                Some(json!({ "type": "newKind" })),
+                DateSource::Unknown,
+            ),
+            ("D14", Some(json!({ "type": 5 })), DateSource::Unknown),
+            ("D15", Some(json!({ "contact": 5 })), DateSource::Unknown),
+            (
+                "D16",
+                Some(json!({ "type": "birthday", "contact": {} })),
+                DateSource::Unknown,
+            ),
+            // A contact Google sent as null is none.
+            (
+                "D17",
+                Some(json!({ "type": "birthday", "contact": null })),
+                DateSource::Calendar,
+            ),
+            ("D18", Some(json!({ "type": null })), DateSource::Unknown),
+        ];
+        for (row, props, want) in rows {
+            assert_eq!(of(props), want, "{row}");
+        }
+    }
+
+    /// A birthday or other special date on your own calendar, as a fresh copy says it: `source`
+    /// owns its day.
+    fn special_date(source: DateSource) -> EditFacts<'static> {
+        EditFacts {
+            event_type: Some("birthday"),
+            date_source: source,
+            ..editable()
+        }
+    }
+
+    /// An event Gmail added to your own calendar, organised by it, the calendar not on its list.
+    fn from_gmail() -> EditFacts<'static> {
+        EditFacts {
+            event_type: Some("fromGmail"),
+            ..editable()
+        }
+    }
+
+    /// C20 §3.4, with the Adopted list's flips (C2-H1, C1-M5: a lock leaves a birthday's name and
+    /// both kinds' delete open, and is said only where it closed something the kind had open).
+    /// `[summary, time, location and description, busy or free, visibility, notifications, colour,
+    /// delete, one_day, reply]`; how it repeats, guests, the call and the calendar are closed on
+    /// every row.
+    #[test]
+    fn the_special_kinds_table() {
+        let s1 = || special_date(DateSource::Calendar);
+        let gmail_invited = || EditFacts {
+            organizer_self: false,
+            invited: true,
+            ..from_gmail()
+        };
+        const NONE: [bool; 10] = [false; 10];
+        let date = |time: bool| {
+            [
+                true, time, false, false, false, true, true, true, true, false,
+            ]
+        };
+        let gmail = |reply: bool| {
+            [
+                false, false, false, true, true, true, true, true, false, reply,
+            ]
+        };
+        type Row = (
+            &'static str,
+            EditFacts<'static>,
+            [bool; 10],
+            Vec<ReadOnlyReason>,
+        );
+        let mut rows: Vec<Row> = vec![
+            ("S1", s1(), date(true), vec![SpecialDateFields]),
+            (
+                "S2",
+                special_date(DateSource::Contacts),
+                date(false),
+                vec![DateFromContacts, SpecialDateFields],
+            ),
+            (
+                "S3",
+                special_date(DateSource::Profile),
+                date(false),
+                vec![DateFromProfile, SpecialDateFields],
+            ),
+            (
+                "S4",
+                special_date(DateSource::Unknown),
+                date(false),
+                vec![SpecialDateFields],
+            ),
+            (
+                "S5",
+                EditFacts {
+                    locked: true,
+                    ..s1()
+                },
+                date(false),
+                vec![SpecialDateFields, Locked],
+            ),
+            // The lock closed nothing a contact's birthday had open: not said.
+            (
+                "S5a",
+                EditFacts {
+                    locked: true,
+                    ..special_date(DateSource::Contacts)
+                },
+                date(false),
+                vec![DateFromContacts, SpecialDateFields],
+            ),
+            (
+                "S6",
+                EditFacts {
+                    organizer_self: false,
+                    ..s1()
+                },
+                date(true),
+                vec![SpecialDateFields],
+            ),
+            (
+                "S7",
+                EditFacts {
+                    invited: true,
+                    ..s1()
+                },
+                date(true),
+                vec![SpecialDateFields],
+            ),
+            ("S8", from_gmail(), gmail(false), vec![FromGmailFields]),
+            ("S9", gmail_invited(), gmail(true), vec![FromGmailFields]),
+            (
+                "S10",
+                EditFacts {
+                    locked: true,
+                    ..from_gmail()
+                },
+                gmail(false),
+                vec![FromGmailFields],
+            ),
+            (
+                "S11",
+                EditFacts {
+                    labelled: true,
+                    ..from_gmail()
+                },
+                [
+                    false, false, false, true, true, true, false, true, false, false,
+                ],
+                vec![FromGmailFields, LabelReadOnly],
+            ),
+            (
+                "S12",
+                EditFacts {
+                    reminders_readable: false,
+                    ..s1()
+                },
+                [
+                    true, true, false, false, false, false, true, true, true, false,
+                ],
+                vec![SpecialDateFields, RemindersUnreadable],
+            ),
+            (
+                "S13",
+                EditFacts {
+                    guests_can_modify: true,
+                    ..gmail_invited()
+                },
+                gmail(true),
+                vec![FromGmailFields],
+            ),
+            (
+                "S15",
+                EditFacts {
+                    access_role: Some("reader"),
+                    ..s1()
+                },
+                NONE,
+                vec![CalendarReadOnly],
+            ),
+            (
+                "S16",
+                EditFacts {
+                    editing: EditingStatus::Off,
+                    ..from_gmail()
+                },
+                NONE,
+                vec![EditingOff],
+            ),
+            (
+                "S17",
+                EditFacts {
+                    access_role: Some("writerWithoutPrivateAccess"),
+                    visibility: Some("private"),
+                    ..s1()
+                },
+                NONE,
+                vec![PrivateEvent],
+            ),
+            // Another service's call is no reason here: the call isn't on the list at all (C18's
+            // push stays the ordinary event's, critique C1-L8).
+            (
+                "S18",
+                EditFacts {
+                    call: Some(CallKind::AddOn),
+                    ..s1()
+                },
+                date(true),
+                vec![SpecialDateFields],
+            ),
+            // Formatting PM can't edit closes nothing more: the description is closed already.
+            (
+                "S19",
+                EditFacts {
+                    unsupported_formatting: true,
+                    ..from_gmail()
+                },
+                gmail(false),
+                vec![FromGmailFields],
+            ),
+        ];
+        for event_type in [
+            "focusTime",
+            "outOfOffice",
+            "workingLocation",
+            "somethingNew",
+        ] {
+            rows.push((
+                "S14",
+                EditFacts {
+                    event_type: Some(event_type),
+                    invited: true,
+                    ..editable()
+                },
+                NONE,
+                vec![SpecialType],
+            ));
+        }
+        for (row, facts, open, reasons) in rows {
+            let p = edit_rights(&facts);
+            let [summary, time, place, show_as, visibility, reminders, colour, delete, one_day, reply] =
+                open;
+            assert_eq!(p.summary, summary, "{row}: title");
+            assert_eq!(p.time, time, "{row}: time");
+            assert_eq!(
+                [p.location, p.description],
+                [place; 2],
+                "{row}: place, description"
+            );
+            assert_eq!(p.show_as, show_as, "{row}: busy or free");
+            assert_eq!(p.visibility, visibility, "{row}: visibility");
+            assert_eq!(p.reminders, reminders, "{row}: notifications");
+            assert_eq!(p.colour, colour, "{row}: colour");
+            assert_eq!(
+                [p.repeat, p.guests, p.meet, p.calendar],
+                [false; 4],
+                "{row}: repeat, guests, call, calendar"
+            );
+            assert_eq!(p.delete, delete, "{row}: delete");
+            assert_eq!(p.one_day, one_day, "{row}: one day");
+            assert_eq!(p.respond, reply, "{row}: reply");
+            assert_eq!(p.reasons, reasons, "{row}: reasons");
+        }
+    }
+
+    /// C20 §3.4: every field named, no `..`, so a field a later layer adds fails to compile here
+    /// until its value on a birthday and a Gmail event is stated (risk 2).
+    #[test]
+    fn every_field_has_a_rule_for_the_special_kinds() {
+        let FieldPermissions {
+            summary,
+            time,
+            repeat,
+            location,
+            description,
+            show_as,
+            visibility,
+            guests,
+            reminders,
+            colour,
+            meet,
+            calendar,
+            delete,
+            respond,
+            one_day,
+            reasons,
+        } = edit_rights(&special_date(DateSource::Calendar));
+        assert!(summary && time && reminders && colour && delete && one_day);
+        assert!(!repeat && !location && !description && !show_as && !visibility && !guests);
+        assert!(!meet && !calendar && !respond);
+        assert_eq!(reasons, vec![SpecialDateFields]);
+        let FieldPermissions {
+            summary,
+            time,
+            repeat,
+            location,
+            description,
+            show_as,
+            visibility,
+            guests,
+            reminders,
+            colour,
+            meet,
+            calendar,
+            delete,
+            respond,
+            one_day,
+            reasons,
+        } = edit_rights(&from_gmail());
+        assert!(show_as && visibility && reminders && colour && delete);
+        assert!(!summary && !time && !repeat && !location && !description && !guests);
+        assert!(!meet && !calendar && !respond && !one_day);
+        assert_eq!(reasons, vec![FromGmailFields]);
+    }
+
+    /// C20 §3.4, critique C1-L10: the list offers what the gate does, field by field.
+    #[test]
+    fn the_list_offers_what_the_gate_does_on_special_kinds() {
+        let listed = list_rights(&special_date(DateSource::Unknown));
+        assert_eq!(listed.edit_block, None, "a birthday opens Edit");
+        assert!(listed.can_delete && !listed.can_respond && !listed.can_retime);
+        let invited = list_rights(&EditFacts {
+            organizer_self: false,
+            invited: true,
+            ..from_gmail()
+        });
+        assert_eq!(invited.edit_block, None);
+        assert!(invited.can_delete && invited.can_respond && !invited.can_retime);
+        let focus = list_rights(&EditFacts {
+            event_type: Some("focusTime"),
+            invited: true,
+            ..editable()
+        });
+        assert_eq!(focus.edit_block, Some(SpecialType));
+        assert!(!focus.can_delete && !focus.can_respond && !focus.can_retime);
+    }
+
+    /// C20 §4.1: on these kinds a refusal names whoever owns the date first, then Google's lock,
+    /// then the field's own reason, then the kind's list.
+    #[test]
+    fn a_special_kinds_refusal_names_the_most_specific_reason() {
+        let rights = |facts: EditFacts| edit_rights(&facts);
+        let contacts = rights(special_date(DateSource::Contacts));
+        assert_eq!(reason_for(&contacts, Field::Time), DateFromContacts);
+        assert_eq!(reason_for(&contacts, Field::Location), SpecialDateFields);
+        let locked_contacts = rights(EditFacts {
+            locked: true,
+            ..special_date(DateSource::Contacts)
+        });
+        assert_eq!(reason_for(&locked_contacts, Field::Time), DateFromContacts);
+        let profile = rights(special_date(DateSource::Profile));
+        assert_eq!(reason_for(&profile, Field::Time), DateFromProfile);
+        let listed = rights(special_date(DateSource::Unknown));
+        assert_eq!(reason_for(&listed, Field::Time), SpecialDateFields);
+        let locked = rights(EditFacts {
+            locked: true,
+            ..special_date(DateSource::Calendar)
+        });
+        assert_eq!(reason_for(&locked, Field::Time), Locked);
+        // The kind's list, for what isn't on it, the lock beside it or not.
+        for field in [
+            Field::Location,
+            Field::Description,
+            Field::Repeat,
+            Field::Guests,
+            Field::Meet,
+            Field::Calendar,
+            Field::ShowAs,
+            Field::Visibility,
+        ] {
+            assert_eq!(reason_for(&locked, field), SpecialDateFields, "{field:?}");
+        }
+        let gmail = rights(from_gmail());
+        for field in [Field::Summary, Field::Time, Field::Repeat, Field::Guests] {
+            assert_eq!(reason_for(&gmail, field), FromGmailFields, "{field:?}");
+        }
+        // A lock that closed nothing the kind had open isn't said, so not given either.
+        let gmail_locked = rights(EditFacts {
+            locked: true,
+            ..from_gmail()
+        });
+        assert_eq!(reason_for(&gmail_locked, Field::Time), FromGmailFields);
+        let labelled = rights(EditFacts {
+            labelled: true,
+            ..from_gmail()
+        });
+        assert_eq!(reason_for(&labelled, Field::Colour), LabelReadOnly);
+        assert_eq!(reason_for(&labelled, Field::Summary), FromGmailFields);
+        let unreadable = rights(EditFacts {
+            reminders_readable: false,
+            ..special_date(DateSource::Calendar)
+        });
+        assert_eq!(
+            reason_for(&unreadable, Field::Reminders),
+            RemindersUnreadable
+        );
+        assert_eq!(reason_for(&unreadable, Field::Location), SpecialDateFields);
+        // Should Google refuse a locked birthday's rename (live probe B10), its title and its delete
+        // close under the lock and say so: the precedence holds for any rights with both reasons.
+        let both = FieldPermissions {
+            reasons: vec![SpecialDateFields, Locked],
+            ..Default::default()
+        };
+        assert_eq!(reason_for(&both, Field::Summary), Locked);
+        assert_eq!(reason_for(&both, Field::Delete), Locked);
+        assert_eq!(reason_for(&both, Field::Location), SpecialDateFields);
+        // Other events keep C14's rules: a guest list's own reason under "modify".
+        let modify = rights(EditFacts {
+            guests_can_modify: true,
+            ..invitation()
+        });
+        assert_eq!(reason_for(&modify, Field::Guests), OrganizerOnlyGuests);
+    }
+
+    /// C20 critiques C1-M2, C2-L7: one helper for every path that sends a time.
+    #[test]
+    fn a_time_is_refused_for_its_reason_or_for_not_being_one_whole_day() {
+        let all_day = |first: &str, last: &str| TimeDraft::AllDay {
+            first_day: first.into(),
+            last_day: last.into(),
+        };
+        let timed = TimeDraft::Timed {
+            start_date: "2026-05-04".into(),
+            start_time: "09:00".into(),
+            start_zone: "Europe/London".into(),
+            end_date: "2026-05-04".into(),
+            end_time: "10:00".into(),
+            end_zone: "Europe/London".into(),
+        };
+        let own = edit_rights(&special_date(DateSource::Calendar));
+        assert_eq!(
+            time_refusal(&own, &all_day("2026-06-05", "2026-06-05")),
+            None
+        );
+        assert_eq!(
+            time_refusal(&own, &all_day("2026-06-05", "2026-06-06")),
+            Some(SpecialDateFields)
+        );
+        assert_eq!(time_refusal(&own, &timed), Some(SpecialDateFields));
+        let contacts = edit_rights(&special_date(DateSource::Contacts));
+        assert_eq!(
+            time_refusal(&contacts, &all_day("2026-06-05", "2026-06-05")),
+            Some(DateFromContacts)
+        );
+        // Any length on an ordinary event.
+        let ordinary = edit_rights(&editable());
+        assert_eq!(
+            time_refusal(&ordinary, &all_day("2026-06-05", "2026-06-07")),
+            None
+        );
+        assert_eq!(time_refusal(&ordinary, &timed), None);
+        assert_eq!(
+            time_refusal(&edit_rights(&invitation()), &timed),
+            Some(NotOrganizer)
         );
     }
 }
