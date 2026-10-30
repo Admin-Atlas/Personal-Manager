@@ -50,6 +50,60 @@ const CALENDAR_WRITES = {
   message: "Calendar edits go only through src/components/calendar/edit/useEventWrites.ts (#884).",
 };
 
+// Nothing in the page parses HTML or writes an HTML string into it (C19, #884; INVARIANTS.md I-23).
+// CodeQL reads each of these as an XSS sink, and its highs block merges. Google's formatted
+// descriptions are read by src/lib/calendarEdit/descriptionTokens.ts and drawn as React elements or
+// DOM nodes made one by one. The selectors catch the computed forms (`el["innerHTML"]`) and an
+// assignment through an object (`Object.assign(el, { innerHTML })`) too.
+const HTML_SINK = "Never parse HTML or write it into the page: see descriptionTokens.ts (C19).";
+const HTML_SINKS = [
+  { selector: "NewExpression[callee.name='DOMParser']", message: HTML_SINK },
+  { selector: "NewExpression[callee.property.name='DOMParser']", message: HTML_SINK },
+  {
+    selector: "MemberExpression[property.name=/^(innerHTML|outerHTML|srcdoc)$/]",
+    message: HTML_SINK,
+  },
+  {
+    selector: "MemberExpression[property.value=/^(innerHTML|outerHTML|srcdoc)$/]",
+    message: HTML_SINK,
+  },
+  { selector: "Property[key.name=/^(innerHTML|outerHTML|srcdoc)$/]", message: HTML_SINK },
+  { selector: "Property[key.value=/^(innerHTML|outerHTML|srcdoc)$/]", message: HTML_SINK },
+  {
+    selector:
+      "CallExpression[callee.property.name=/^(insertAdjacentHTML|createContextualFragment|parseFromString|setHTML|setHTMLUnsafe|parseHTMLUnsafe)$/]",
+    message: HTML_SINK,
+  },
+  {
+    selector:
+      "CallExpression[callee.property.value=/^(insertAdjacentHTML|createContextualFragment|parseFromString|setHTML|setHTMLUnsafe|parseHTMLUnsafe)$/]",
+    message: HTML_SINK,
+  },
+  {
+    selector:
+      "CallExpression[callee.object.name='document'][callee.property.name=/^(write|writeln)$/]",
+    message: HTML_SINK,
+  },
+  {
+    selector: "CallExpression[callee.property.name='setAttribute'][arguments.0.value=/^srcdoc$/i]",
+    message: HTML_SINK,
+  },
+  { selector: "JSXAttribute[name.name=/^(dangerouslySetInnerHTML|srcDoc)$/]", message: HTML_SINK },
+  {
+    selector: "CallExpression[callee.property.name='createElement'][arguments.0.type!='Literal']",
+    message: "createElement takes a literal tag name (CodeQL reads its argument as an XSS sink).",
+  },
+  {
+    selector: "CallExpression[callee.property.name='execCommand'][arguments.0.type!='Literal']",
+    message: "execCommand takes a literal command name.",
+  },
+  {
+    selector:
+      "CallExpression[callee.property.name='execCommand'][arguments.0.value=/^inserthtml$/i]",
+    message: HTML_SINK,
+  },
+];
+
 export default tseslint.config(
   // src-tauri/python is the fetched standalone interpreter (a build artifact, like
   // src-tauri/target) — present only on Windows checkouts and full of vendored JS.
@@ -126,6 +180,16 @@ export default tseslint.config(
       // builtin plugin APIs (api/event, api/app, api/window, api/webview, plugin-*) legitimately
       // cross from ~15 components and must not be caught. ipc.ts itself is exempted below.
       "no-restricted-imports": ["error", { paths: IPC_BOUNDARY, patterns: [CALENDAR_WRITES] }],
+      // The HTML sinks (HTML_SINKS above): nothing in the page parses HTML or writes it in.
+      "no-restricted-syntax": ["error", ...HTML_SINKS],
+    },
+  },
+  // Tests may drive the sinks (a spy on an innerHTML setter, a fixture's markup): they ship nowhere.
+  // A block of its own, so no shipped file (the write hook below included) is ever exempt.
+  {
+    files: ["src/**/*.test.{ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": "off",
     },
   },
   // The calendar editor's hook is the one importer of the calendar write wrappers. A rule's options
