@@ -1565,6 +1565,10 @@ export interface CalendarEvent {
   /** From the unified-view list only, as `can_delete`: whether its start and end may change, the
    *  backend's own rule, so the calendar never offers a drag the move would refuse (C16a). */
   can_retime?: boolean;
+  /** From the listed rows (the unified view's and the agenda's): PM's copy kept only the first
+   *  8,000 characters of the description, so the pop-up says where the rest is (C19). Absent when
+   *  it kept all of it. */
+  description_cut?: boolean;
 }
 
 // --- Calendar editing (#884; mirrors `calendar_write::dto`) ---

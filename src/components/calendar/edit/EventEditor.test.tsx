@@ -94,11 +94,14 @@ vi.mock("./useEventWrites", () => ({
   noteReply: (...a: unknown[]) => noteReply(...a),
 }));
 
-// The repeat menu's two reads, answered as each test says.
+// The repeat menu's two reads, answered as each test says, and the mail app a description's mail
+// link opens.
+const openUrl = vi.fn<(url: string) => Promise<void>>();
 vi.mock("../../../lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   recurrencePresets: (day: string) => recurrencePresets(day),
   describeRecurrence: (rule: RepeatRule, start: RepeatStart) => describeRecurrence(rule, start),
+  openUrl: (url: string) => openUrl(url),
 }));
 
 vi.mock("../../../theme/timezones", async (importOriginal) => ({
@@ -111,7 +114,9 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
-vi.mock("../../../lib/markdown", () => ({
+// The rest of the module is real: the description codec's link rule asks its `safeUrl`.
+vi.mock("../../../lib/markdown", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
   Markdown: ({ children }: { children: string }) => <div>{children}</div>,
 }));
 
@@ -306,24 +311,39 @@ afterEach(() => {
 });
 
 describe("EventEditor", () => {
-  // Google's formatted description shows read-only, as its text: lines where Google breaks them,
-  // escapes decoded once, and nothing of the markup (a script's text included) on screen.
-  it("shows a formatted description as its text", async () => {
+  // Google's formatted description shows read-only, as Google shows it (C19b): bold as bold, a list
+  // as a list, escapes decoded once, and nothing of a script on screen. Its mail link opens the mail
+  // app, and a line under it says so with the address when nothing opens.
+  it("shows a formatted description as Google does", async () => {
     openForEdit.mockResolvedValue(
       ready(
         event({
           description:
-            "<b>Agenda</b><br><ul><li>One &amp; two</li></ul><script>alert(1)</script>&lt;i&gt;",
+            "<b>Agenda</b><br><ul><li>One &amp; two</li></ul><script>alert(1)</script>&lt;i&gt; " +
+            '<a href="mailto:ann@example.com">mail</a>',
           description_html: true,
         }),
       ),
     );
+    openUrl.mockRejectedValue("PM couldn't open your mail app.");
     await open();
-    const text = screen.getByText(
-      (_, el) => el?.tagName === "P" && /Agenda/.test(el.textContent ?? ""),
-    );
-    expect(text.textContent).toBe("Agenda\nOne & two\n<i>");
-    expect(text.querySelector("b, i, script")).toBeNull();
+    const view = document.querySelector(".pm-rich") as HTMLElement;
+    expect(view.querySelector("b")?.textContent).toBe("Agenda");
+    expect(view.querySelector("ul > li")?.textContent).toBe("One & two");
+    expect(view.querySelector("script, i")).toBeNull();
+    expect(view.textContent).toBe("AgendaOne & two<i> mail");
+    // Still read-only: no field to type it into.
+    expect(screen.queryByLabelText("Description")).toBeNull();
+
+    await act(async () => {
+      expect(fireEvent.click(view.querySelector("a")!)).toBe(false);
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com");
+    expect(
+      screen
+        .getByText("PM couldn't open your mail app. The address is ann@example.com.")
+        .getAttribute("role"),
+    ).toBe("status");
   });
 
   it("sends only what changed, then closes and says so, asking no choices of a one-off", async () => {

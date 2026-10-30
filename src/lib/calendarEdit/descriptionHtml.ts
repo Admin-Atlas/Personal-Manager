@@ -4,8 +4,8 @@
 // Google event descriptions as PM reads and writes them (#884, C19). Google's `description` "can
 // contain HTML": its own editor writes bold, italic, underline, lists and links. This is the document
 // model of that formatting; one reader that says both what shows and whether PM can write it back
-// with nothing Google shows lost; the writer; and the comparison that tells an unchanged description
-// from a changed one.
+// with nothing Google shows lost; the writer; the comparison that tells an unchanged description
+// from a changed one; and, for drawing only, the addresses written in a description's words.
 //
 // PM's second sanitising boundary, beside markdown.tsx's, for Google event descriptions only. Nothing
 // here parses HTML with the browser: descriptionTokens.ts reads the characters, and the document is
@@ -50,6 +50,11 @@ export interface ParsedDescription {
   readonly supported: boolean;
   /** Formatted (HTML) rather than plain lines; `looksLikeHtml`. */
   readonly html: boolean;
+  /** It holds an element Google's own editor writes (`EDITABLE_TAGS`), another block (a table, a
+   *  heading), a never-shown element, or a character reference: formatting to draw as such. An address
+   *  in angle brackets alone isn't: Outlook and Teams write links that way into plain text, which
+   *  draws as before (the event pop-up). False for plain lines. */
+  readonly markup: boolean;
 }
 
 /** The tags PM reads and writes; the fixture's `tags`, and Rust's `EDITABLE_TAGS`. */
@@ -73,6 +78,10 @@ export const EDITABLE_TAGS: readonly string[] = [
 /** Deeper than this is never a description someone wrote; it bounds every walk below. */
 export const MAX_DEPTH = 32;
 
+/** The elements that make a description `markup`: Google's own, the line-breaking blocks, and the
+ *  never-shown ones. */
+const MARKUP: ReadonlySet<string> = new Set([...EDITABLE_TAGS, ...BLOCKS, ...HIDDEN]);
+
 // --- telling formatting from plain text ---
 
 /** Whether a description is formatted rather than plain lines: a tag (`<b>`, `</p>`, `<a href=…>`) with
@@ -90,6 +99,14 @@ export function looksLikeHtml(description: string): boolean {
     } else if (c === "&" && isReference(s, i)) {
       return true;
     }
+  }
+  return false;
+}
+
+/** Whether a description holds a character reference, as `looksLikeHtml` reads one. */
+function hasReference(s: string): boolean {
+  for (let at = s.indexOf("&"); at >= 0; at = s.indexOf("&", at + 1)) {
+    if (isReference(s, at)) return true;
   }
   return false;
 }
@@ -156,6 +173,75 @@ const LOCAL = /^[a-z0-9.!#$&'*+=?^_`{|}~-]+$/i;
 /** Labels split by a literal "." their class excludes, so neither pattern can backtrack. */
 const DOMAIN = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
 const WEB = /^[a-z0-9-]+(\.[a-z0-9-]+)+([/?#]\S*)?$/i;
+
+/** Words, or words that are a link, as a description's text is drawn. */
+export interface TextPiece {
+  readonly text: string;
+  /** An address `linkTarget` takes, or null for words. */
+  readonly href: string | null;
+}
+
+/** A description's text with the addresses written in it made links, as Google Calendar draws them:
+ *  runs starting "http://", "https://" or "www.", and "name@example.com" runs. For drawing only,
+ *  never in the model, so a save writes them back as the words they are. One pass: a run ends at
+ *  whitespace, "<", ">" or '"'; an opening bracket or quote before it is left out, and so are
+ *  ".,;:!?", a closing quote, and a ")" or "]" the run doesn't open, after it. What's left is an
+ *  address `linkFromTyped` reads, or stays words. */
+export function textLinks(text: string): TextPiece[] {
+  const pieces: TextPiece[] = [];
+  let words = 0; // where the words no piece holds yet start
+  let at = 0;
+  while (at < text.length) {
+    if (RUN_ENDS.test(text[at])) {
+      at++;
+      continue;
+    }
+    let end = at;
+    while (end < text.length && !RUN_ENDS.test(text[end])) end++;
+    const link = runLink(text, at, end);
+    if (link !== null) {
+      if (link.from > words) pieces.push({ text: text.slice(words, link.from), href: null });
+      pieces.push({ text: text.slice(link.from, link.to), href: link.href });
+      words = link.to;
+    }
+    at = end;
+  }
+  if (words < text.length) pieces.push({ text: text.slice(words), href: null });
+  return pieces;
+}
+const RUN_ENDS = /[\s<>"]/;
+const OPENERS = "(['‘“";
+const TRAILING = ".,;:!?'’”";
+
+/** The link a run of text makes, without the punctuation around it, or null. */
+function runLink(
+  text: string,
+  start: number,
+  end: number,
+): { from: number; to: number; href: string } | null {
+  let from = start;
+  let to = end;
+  while (from < to && OPENERS.includes(text[from])) from++;
+  const run = text.slice(from, to);
+  const head = asciiLower(run.slice(0, 8));
+  const address =
+    head.startsWith("http://") ||
+    head.startsWith("https://") ||
+    head.startsWith("www.") ||
+    run.includes("@");
+  if (!address) return null;
+  // Trimming takes only closing characters off, so whether the run opens a bracket can't change.
+  const opensParen = run.includes("(");
+  const opensBracket = run.includes("[");
+  while (to > from) {
+    const c = text[to - 1];
+    if (TRAILING.includes(c) || (c === ")" && !opensParen) || (c === "]" && !opensBracket)) to--;
+    else break;
+  }
+  // Every address linkFromTyped gives is one linkTarget took.
+  const href = linkFromTyped(text.slice(from, to));
+  return href === null ? null : { from, to, href };
+}
 
 /** No whitespace (Unicode's included) and no control character. */
 function unbroken(s: string): boolean {
@@ -351,6 +437,8 @@ function readElement(name: string, attrs: readonly Attr[]): ElementRead {
 class Reader {
   readonly root: Loose[] = [];
   supported = true;
+  /** It met a `MARKUP` element, start or end. */
+  markup = false;
   /** A `plain` node was made: the marks need redrawing around it. */
   plain = false;
   private readonly stack: Frame[];
@@ -398,9 +486,11 @@ class Reader {
           this.supported = false; // it may be a marker another app reads
           break;
         case "start":
+          if (MARKUP.has(token.name)) this.markup = true;
           this.start(token.name, token.attrs);
           break;
         case "end":
+          if (MARKUP.has(token.name)) this.markup = true;
           this.end(token.name);
           break;
       }
@@ -673,12 +763,18 @@ const sameMarks = (a: readonly Mark[], b: readonly Mark[]) =>
 export function parseDescription(description: string): ParsedDescription {
   if (!looksLikeHtml(description)) {
     const text = description.replace(/\r\n?/g, "\n");
-    return { doc: normalise([{ kind: "text", text }]), supported: true, html: false };
+    return {
+      doc: normalise([{ kind: "text", text }]),
+      supported: true,
+      html: false,
+      markup: false,
+    };
   }
   const reader = new Reader();
   reader.read(tokens(description));
   const doc = normalise(fromLoose(reader.root, reader.plain));
-  return { doc, supported: reader.supported, html: true };
+  const markup = reader.markup || hasReference(description);
+  return { doc, supported: reader.supported, html: true, markup };
 }
 
 // --- normalising ---

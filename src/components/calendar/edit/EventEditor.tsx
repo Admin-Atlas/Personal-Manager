@@ -143,7 +143,7 @@ import {
 } from "../../../lib/calendarEdit/editReasons";
 import { createdWhere, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
-import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
+import { parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
@@ -166,6 +166,8 @@ import {
   ZonePanel,
   type Timed,
 } from "./EventFields";
+import { RichDescription } from "../parts/RichDescription";
+import { useMailLink } from "../parts/useMailLink";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
 import { useRepeatView, type RepeatState } from "./useRepeat";
 import {
@@ -1000,6 +1002,14 @@ export function EventEditor({
     () => (loaded && timed ? endDateMin(loaded.base, timed, loaded.event) : undefined),
     [loaded, timed],
   );
+  // A formatted description shows its formatting, read once per copy of Google's (C19b): Google's
+  // copy as the editor last read it, never the draft.
+  const baseDescription = loaded?.base.description;
+  const shownDescription = useMemo(
+    () => (baseDescription === undefined ? [] : parseDescription(baseDescription).doc),
+    [baseDescription],
+  );
+  const mail = useMailLink(row.id);
   // The Repeat row's words: a repeating event's own rule in the words it came with, any other rule
   // in the backend's. Only a one-off's repeat holds Save (`repeatReady`).
   const series = loaded?.series ?? null;
@@ -1316,8 +1326,12 @@ export function EventEditor({
             {loaded.event.description_html ? (
               <div className="flex flex-col gap-1">
                 <span className="text-sm text-ink2">Description</span>
-                <p className="whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
-                  {descriptionText(draft.description)}
+                {/* A div: the view holds paragraphs and lists (critique C1-L3). */}
+                <div className="rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
+                  <RichDescription doc={shownDescription} onMail={mail.open} />
+                </div>
+                <p role="status" className="text-xs text-st-due">
+                  {mail.failure ?? ""}
                 </p>
               </div>
             ) : (

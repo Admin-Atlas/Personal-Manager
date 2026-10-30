@@ -8,7 +8,9 @@
 // an event the user is invited to (#884, C14b), "Going?" with Yes, No and Maybe. It's an
 // in-place floating panel (the pinboard folder-popup pattern): fixed-position, clamped to the
 // viewport, dismissed by click-outside or Escape. The description is the one piece of untrusted
-// provider text, so it renders ONLY through the sanitising Markdown boundary.
+// provider text, so it renders only through a sanitising boundary: `<Markdown>`, or, for a Google
+// description with formatting, `RichDescription` (C19b). Its mail links open the mail app with the
+// address alone (`useMailLink`), and a link that would open inside PM's own window does nothing.
 //
 // A NON-MODAL dialog, and staying one: it takes initial focus and hands focus back on Escape/Close
 // (`useRestoreFocus`), but no focus trap and no `aria-modal` — the calendar behind it stays live and
@@ -24,8 +26,10 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
   type MutableRefObject,
   type ReactNode,
 } from "react";
@@ -39,6 +43,7 @@ import type {
   WriteOutcome,
 } from "../../../lib/types";
 import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
+import { linkTarget, parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
@@ -46,6 +51,8 @@ import { eventColour } from "../../../theme/eventPalette";
 import { Button, CopyLinkButton, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
 import { RsvpControl } from "../edit/RsvpControl";
+import { RichDescription } from "./RichDescription";
+import { useMailLink } from "./useMailLink";
 import { repeatsText, whenText } from "./whenText";
 
 interface Props {
@@ -113,6 +120,19 @@ function showAsLabel(v: string): string {
       return "Working elsewhere";
     default:
       return "Busy";
+  }
+}
+
+/** Where the rest of a description PM's copy cut short is. */
+function restOfDescription(provider: string | undefined): string {
+  switch (provider) {
+    case "google":
+      return "The rest is in Google Calendar.";
+    case "outlook":
+    case "microsoft":
+      return "The rest is in Outlook.";
+    default:
+      return "The rest is in the calendar it comes from.";
   }
 }
 
@@ -290,6 +310,29 @@ export function CalendarEventPopover({
 
   const attendees = event.attendees ?? [];
 
+  // A Google description draws its formatting when it has some Google writes (C19b, critique C1-H1);
+  // any other keeps the Markdown path, as Outlook's and a feed's always do (DECISIONS 10-10: their
+  // "<https://…>" addresses are links there). Read once per description, not per render.
+  const google = calendar?.provider === "google";
+  const rich = useMemo(() => {
+    if (!google || !event.description) return null;
+    const parsed = parseDescription(event.description);
+    return parsed.markup ? parsed.doc : null;
+  }, [google, event.description]);
+  const mail = useMailLink(event.id);
+  // A Markdown description's mail links open as the formatted view's do (whose own handler has
+  // already taken its own), and a link that would load inside PM's window (a relative one, or one
+  // `safeUrl` emptied) does nothing. Web links are `useExternalLinks`', left to it.
+  const onDescriptionClick = (e: ReactMouseEvent) => {
+    const anchor = e.target instanceof Element ? e.target.closest("a") : null;
+    if (anchor === null || e.defaultPrevented) return;
+    const href = anchor.getAttribute("href") ?? "";
+    if (anchor.target === "_blank" && /^https?:\/\//i.test(href)) return;
+    e.preventDefault();
+    const target = linkTarget(href);
+    if (target !== null && /^mailto:/i.test(target)) mail.open(target);
+  };
+
   // A `role="dialog"` with a blank accessible name is announced as an unnamed dialog, and the
   // heading below would render empty beside it. Every producer of `summary` does already substitute
   // something — Google's parse writes this exact string, the milestone overlay always appends
@@ -413,8 +456,24 @@ export function CalendarEventPopover({
         )}
 
         {event.description && (
-          <div className="pm-event-desc mt-1 border-t border-border pt-2 text-xs text-ink2">
-            <Markdown plainLines>{event.description}</Markdown>
+          // It hears clicks on its links only, which the keyboard sends as links do.
+          <div
+            className="pm-event-desc mt-1 border-t border-border pt-2 text-xs text-ink2"
+            onClick={onDescriptionClick}
+          >
+            {rich !== null ? (
+              <RichDescription doc={rich} onMail={mail.open} />
+            ) : (
+              <Markdown plainLines>{event.description}</Markdown>
+            )}
+            {event.description_cut && (
+              <p className="mt-1 text-ink3">{restOfDescription(calendar?.provider)}</p>
+            )}
+            {/* Always there (empty, it takes no room), so a screen reader hears it when a mail link
+                didn't open; selectable, so the address can be copied. */}
+            <p role="status" className="text-st-due">
+              {mail.failure ?? ""}
+            </p>
           </div>
         )}
 

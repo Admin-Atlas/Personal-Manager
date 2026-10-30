@@ -15,19 +15,25 @@
 
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CalendarEvent, WriteOutcome } from "../../../lib/types";
+import type { Calendar, CalendarEvent, WriteOutcome } from "../../../lib/types";
 
 const eventFlags = vi.fn();
+const openUrl = vi.fn();
 
 vi.mock("../../../lib/ipc", () => ({
   eventFlags: (...a: unknown[]) => eventFlags(...a),
-  openUrl: vi.fn(),
+  openUrl: (...a: unknown[]) => openUrl(...a),
 }));
 
 // The description is untrusted provider text and renders through the real sanitising boundary in the
-// app; here it is stubbed so the test doesn't drag react-markdown in for a fixture with no body.
-vi.mock("../../../lib/markdown", () => ({
-  Markdown: ({ children }: { children: string }) => <div>{children}</div>,
+// app; here the Markdown view is stubbed (its own suites drive it), so a test can see which view drew
+// a description and hand the pop-up the links Markdown would make. The rest of the module is real:
+// the codec's link rule asks its `safeUrl`.
+const plainMarkdown = ({ children }: { children: string }) => <div>{children}</div>;
+const markdownView = vi.fn(plainMarkdown);
+vi.mock("../../../lib/markdown", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  Markdown: (props: { children: string }) => markdownView(props),
 }));
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
@@ -101,7 +107,24 @@ function chip(label: string): HTMLElement {
 
 beforeEach(() => {
   eventFlags.mockResolvedValue([]);
+  openUrl.mockResolvedValue(undefined);
+  markdownView.mockImplementation(plainMarkdown);
 });
+
+/** One of `provider`'s calendars, for the description's view. */
+function calendarOf(provider: string): Calendar {
+  return {
+    id: "c1",
+    source_id: `${provider}:me@example.com`,
+    provider,
+    remote_id: "me@example.com",
+    name: "Me",
+    color: null,
+    selected: true,
+    is_primary: true,
+    quiet: false,
+  } as Calendar;
+}
 
 afterEach(() => {
   cleanup();
@@ -618,6 +641,159 @@ describe("CalendarEventPopover", () => {
         el?.textContent === "Agenda\n1. intro\n2. demo" && el.tagName === "DIV" && !el.className,
     );
     expect(text.closest(".pm-event-desc")).not.toBeNull();
+  });
+
+  describe("a description's formatting (C19b)", () => {
+    /** The pop-up showing `description` on one of `provider`'s calendars. */
+    function shown(
+      description: string,
+      provider: string | null,
+      over: Partial<CalendarEvent> = {},
+    ) {
+      const view = render(
+        <CalendarEventPopover
+          event={calendarEvent({ description, ...over })}
+          anchor={rect(100)}
+          calendar={provider === null ? null : calendarOf(provider)}
+          color="#000"
+          milestone={null}
+          onClose={() => {}}
+        />,
+      );
+      const box = view.container.ownerDocument.querySelector(".pm-event-desc") as HTMLElement;
+      return { ...view, box, rich: box.querySelector(".pm-rich") };
+    }
+
+    it("a_google_description_shows_its_formatting", () => {
+      // Before C19b, Markdown dropped the tags and this was an empty box.
+      const { rich } = shown("<ul><li>One</li><li><b>Two</b></li></ul>", "google");
+      expect(rich).not.toBeNull();
+      expect([...rich!.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["One", "Two"]);
+      expect(rich!.querySelector("li > b")?.textContent).toBe("Two");
+      expect(markdownView).not.toHaveBeenCalled();
+    });
+
+    it("a reference alone is formatting Google wrote", () => {
+      const { rich } = shown("Tom &amp; Jerry", "google");
+      expect(rich?.textContent).toBe("Tom & Jerry");
+    });
+
+    // Outlook's, a feed's, and Google's own plain text keep the Markdown path, whose address links
+    // are what they always were (DECISIONS 10-10).
+    it.each([
+      ["an_outlook_description_keeps_its_address_links", "See <https://zoom.us/j/1>", "microsoft"],
+      ["a feed's formatting", "<b>Agenda</b>", "ics"],
+      ["a calendar PM can't name", "<b>Agenda</b>", null],
+      ["a_plain_google_description_renders_as_before", "Agenda\n1. intro\n**not bold**", "google"],
+      ["Teams' address in angle brackets", "Click here to join<https://example.com/j/1>", "google"],
+      ["a guest's address in angle brackets", "Ann <ann@example.com>", "google"],
+      ["an Outlook element only", "<o:p>Room 4</o:p>", "google"],
+    ])("%s draws through Markdown", (_name, description, provider) => {
+      const { rich } = shown(description, provider);
+      expect(rich).toBeNull();
+      expect(markdownView).toHaveBeenCalledWith({ children: description, plainLines: true });
+    });
+
+    it("a bare address inside bold is a link", () => {
+      const { rich } = shown("<b>Join at https://example.com/j/1</b>", "google");
+      const link = rich?.querySelector("b > a");
+      expect(link?.getAttribute("href")).toBe("https://example.com/j/1");
+      expect(link?.getAttribute("target")).toBe("_blank");
+    });
+
+    it("says where the rest of a cut description is", () => {
+      const rest = (provider: string | null, cut: boolean) => {
+        const { box, unmount } = shown("Long", provider, { description_cut: cut });
+        const said = box.textContent;
+        unmount();
+        return said;
+      };
+      expect(rest("google", true)).toBe("LongThe rest is in Google Calendar.");
+      expect(rest("microsoft", true)).toBe("LongThe rest is in Outlook.");
+      expect(rest("ics", true)).toBe("LongThe rest is in the calendar it comes from.");
+      expect(rest("google", false)).toBe("Long");
+    });
+
+    it("a mail link opens the mail app, and says so with the address when it can't", async () => {
+      openUrl.mockRejectedValue("PM couldn't open your mail app.");
+      const { rich, getByRole } = shown(
+        '<a href="mailto:ann@example.com?subject=Hi">Email us</a>',
+        "google",
+      );
+      expect(getByRole("status").textContent).toBe("");
+      await act(async () => {
+        expect(fireEvent.click(rich!.querySelector("a")!)).toBe(false);
+      });
+      // The whole link goes; the backend keeps the address alone.
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com?subject=Hi");
+      expect(getByRole("status").textContent).toBe(
+        "PM couldn't open your mail app. The address is ann@example.com.",
+      );
+      // A try that works takes the line away.
+      openUrl.mockResolvedValue(undefined);
+      await act(async () => {
+        fireEvent.click(rich!.querySelector("a")!);
+      });
+      expect(getByRole("status").textContent).toBe("");
+    });
+
+    it("a mail link the backend refuses says the backend's words", async () => {
+      openUrl.mockRejectedValue("That doesn't look like an email address.");
+      const { rich, getByRole } = shown('<a href="mailto:a%0Ab@example.com">x</a>', "google");
+      await act(async () => {
+        fireEvent.click(rich!.querySelector("a")!);
+      });
+      expect(getByRole("status").textContent).toBe("That doesn't look like an email address.");
+    });
+
+    it("a line about one event's mail link never shows on the next", async () => {
+      openUrl.mockRejectedValue("PM couldn't open your mail app.");
+      const props = {
+        anchor: rect(100),
+        calendar: calendarOf("google"),
+        color: "#000",
+        milestone: null,
+        onClose: () => {},
+      };
+      const description = '<a href="mailto:ann@example.com">Email us</a>';
+      const { container, getByRole, rerender } = render(
+        <CalendarEventPopover event={calendarEvent({ id: "e1", description })} {...props} />,
+      );
+      await act(async () => {
+        fireEvent.click(container.ownerDocument.querySelector(".pm-rich a")!);
+      });
+      expect(getByRole("status").textContent).not.toBe("");
+      // The keyboard path re-points the mounted panel at another chip.
+      rerender(
+        <CalendarEventPopover event={calendarEvent({ id: "e2", description })} {...props} />,
+      );
+      expect(getByRole("status").textContent).toBe("");
+    });
+
+    it("Markdown's mail links open the same way, and no link loads inside PM's window", async () => {
+      markdownView.mockImplementation(() => (
+        <div>
+          <a href="mailto:ann@example.com">Ann</a>
+          <a href="/somewhere">relative</a>
+          <a href="">emptied</a>
+          <a href="https://example.com" target="_blank" rel="noreferrer">
+            web
+          </a>
+        </div>
+      ));
+      const { box } = shown("Mail Ann <ann@example.com>", "microsoft");
+      const link = (words: string) =>
+        [...box.querySelectorAll("a")].find((a) => a.textContent === words)!;
+      await act(async () => {
+        expect(fireEvent.click(link("Ann"))).toBe(false);
+      });
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com");
+      expect(fireEvent.click(link("relative"))).toBe(false);
+      expect(fireEvent.click(link("emptied"))).toBe(false);
+      // A web link is useExternalLinks' to open, so the pop-up leaves its default alone.
+      expect(fireEvent.click(link("web"))).toBe(true);
+      expect(openUrl).toHaveBeenCalledTimes(1);
+    });
   });
 
   // The call and the event in Google open in the default browser; each link can be copied instead,

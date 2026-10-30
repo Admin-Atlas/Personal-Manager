@@ -90,7 +90,9 @@ release remain the open post-v1 work.
     `src/components/ui/`.
   - Theme + capability state is frontend-only (`src/theme/`, `src/lib/capabilities.tsx`,
     localStorage — never IPC). Ingested Markdown renders ONLY through the sanitizing
-    `src/lib/markdown.tsx` boundary.
+    `src/lib/markdown.tsx` boundary; a Google event's formatted description renders only through
+    `RichDescription` (`src/lib/calendarEdit/descriptionHtml.ts`), and nothing in `src/` parses
+    HTML or writes it into the page (ESLint).
   - `src/lib/help.ts` — help-mode registry (`data-help` id → explanation) + context.
 - **Backend** — `src-tauri/src/` (Rust). Grouped by area; the roadmap board + `docs/` carry
   the living detail. Pure decision functions stay DB/network-free and unit-tested.

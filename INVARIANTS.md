@@ -307,8 +307,11 @@ that *has* a scheme (`is-absolute-url` rejects `//host`), so it never sees one.
 **Co-signers.** Anything added to `REHYPE_PLUGINS` goes *before* `rehypeSanitize`, which stays last.
 Any edit to `safeUrl` keeps the `[/\\][/\\]` guard ahead of every allowance below it. A new surface
 that renders ingested or model-authored content renders it through `<Markdown>` rather than
-reproducing a `urlTransform` of its own. `markdown.test.ts` pins the rule and the `/path`
-counter-case; `markdown.render.test.tsx` pins the resulting `href` and `src` at the DOM, so a
+reproducing a `urlTransform` of its own. The one exception is a Google event's description, which
+renders through `RichDescription` over `descriptionHtml.ts` (C19): it parses nothing as HTML, builds
+React elements from an allow-list, and gives an `href` only to an address `linkTarget` takes
+(absolute http, https or mailto, unchanged by `safeUrl`). `markdown.test.ts` pins the rule and the
+`/path` counter-case; `markdown.render.test.tsx` pins the resulting `href` and `src` at the DOM, so a
 regression is a red test rather than a review miss.
 
 ### I-20 · A re-key carries the vault's owner forward; only a confirmed transfer changes it — **Enforced**

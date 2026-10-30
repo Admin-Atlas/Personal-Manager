@@ -19,6 +19,7 @@ import {
   parseDescription,
   sameDescription,
   serialiseDescription,
+  textLinks,
   type Block,
   type DescDoc,
   type DescNode,
@@ -708,7 +709,8 @@ describe("writing", () => {
     ]) {
       const written = serialiseDescription(doc);
       expect(looksLikeHtml(written)).toBe(true);
-      expect(parseDescription(written)).toEqual({ doc, supported: true, html: true });
+      // Escaped words are references, so the pop-up draws them through the codec too (C19b).
+      expect(parseDescription(written)).toEqual({ doc, supported: true, html: true, markup: true });
     }
     expect(serialiseDescription([t("<b>bold</b>")])).toBe("&lt;b&gt;bold&lt;/b&gt;");
     expect(serialiseDescription([t("a <b"), BR, t("c>")])).toBe("a &lt;b<br>c&gt;");
@@ -775,7 +777,131 @@ describe("comparing", () => {
   });
 });
 
+describe("drawing (C19b)", () => {
+  // Whether the pop-up draws a Google description through the codec, or keeps Markdown (critique
+  // C1-H1): formatting Google writes, a block, a never-shown element, or a reference.
+  it.each([
+    ["<b>Agenda</b>", true],
+    ["<span>x</span>", true],
+    ["a<br>b", true],
+    ["line</p>", true],
+    ["<html-blob>x</html-blob>", true],
+    ["<table><tr><td>a</td></tr></table>", true],
+    ["<h2>Title</h2>", true],
+    ["x<script>alert(1)</script>", true],
+    ["Tom &amp; Jerry", true],
+    ["it&#39;s", true],
+    ["Click here to join<https://example.com/j/1>", false],
+    ["Ann <ann@example.com>", false],
+    ["<o:p>Room 4</o:p>", false],
+    ['<font color="red">x</font>', false],
+    ['<img src="https://example.com/x.png">', false],
+    ["a < b and c > d", false],
+    ["a<!-- note -->b", false],
+    ["", false],
+  ])("markup_is_formatting_google_writes: %j", (description, markup) => {
+    expect(parseDescription(description).markup).toBe(markup);
+  });
+
+  const pieces = (text: string) => textLinks(text).map((p) => (p.href ? [p.text, p.href] : p.text));
+
+  it("addresses_in_the_words_become_links_without_their_punctuation", () => {
+    expect(pieces("See https://example.com/a. Then")).toEqual([
+      "See ",
+      ["https://example.com/a", "https://example.com/a"],
+      ". Then",
+    ]);
+    expect(pieces("mail ann@example.com, or www.example.org!")).toEqual([
+      "mail ",
+      ["ann@example.com", "mailto:ann@example.com"],
+      ", or ",
+      ["www.example.org", "https://www.example.org"],
+      "!",
+    ]);
+    expect(pieces("(https://example.com) [www.example.org]")).toEqual([
+      "(",
+      ["https://example.com", "https://example.com"],
+      ") [",
+      ["www.example.org", "https://www.example.org"],
+      "]",
+    ]);
+    // A bracket the address opens is its own.
+    expect(pieces("https://en.example.org/wiki/Foo_(bar)")).toEqual([
+      ["https://en.example.org/wiki/Foo_(bar)", "https://en.example.org/wiki/Foo_(bar)"],
+    ]);
+    expect(pieces("https://example.com/a[1]")).toEqual([
+      ["https://example.com/a[1]", "https://example.com/a[1]"],
+    ]);
+    expect(pieces("“https://example.com” and 'ann@example.com';")).toEqual([
+      "“",
+      ["https://example.com", "https://example.com"],
+      "” and '",
+      ["ann@example.com", "mailto:ann@example.com"],
+      "';",
+    ]);
+    // A run ends at a space of any kind (a no-break space here), "<", ">" and '"'.
+    const nbsp = String.fromCharCode(0xa0);
+    expect(pieces(`<https://example.com/j/1>"www.example.org"${nbsp}https://example.net`)).toEqual([
+      "<",
+      ["https://example.com/j/1", "https://example.com/j/1"],
+      '>"',
+      ["www.example.org", "https://www.example.org"],
+      `"${nbsp}`,
+      ["https://example.net", "https://example.net"],
+    ]);
+    // Every closing mark goes, and every opening one before.
+    for (const mark of [".", ",", ";", ":", "!", "?", "'", "’", "”", ")", "]"]) {
+      expect(pieces(`http://example.com${mark}`), mark).toEqual([
+        ["http://example.com", "http://example.com"],
+        mark,
+      ]);
+    }
+    for (const mark of ["(", "[", "'", "‘", "“"]) {
+      expect(pieces(`${mark}www.example.org`), mark).toEqual([
+        mark,
+        ["www.example.org", "https://www.example.org"],
+      ]);
+    }
+    expect(pieces("HTTPS://EXAMPLE.COM mailto:ann@example.com?subject=x")).toEqual([
+      ["HTTPS://EXAMPLE.COM", "HTTPS://EXAMPLE.COM"],
+      " ",
+      ["mailto:ann@example.com?subject=x", "mailto:ann@example.com?subject=x"],
+    ]);
+  });
+
+  it.each([
+    "e.g. example.com and notes.txt",
+    "@channel and a@b and @example.com",
+    "https:example.com",
+    "http:/example.com",
+    "javascript:alert('@x.com')",
+    "(javascript:alert(1)//www.example.org)",
+    "wwwexample.org and www-example.org",
+    "plain words only",
+    "",
+  ])("words_that_aren't_an_address_stay_words: %j", (text) => {
+    expect(textLinks(text).every((p) => p.href === null)).toBe(true);
+    expect(
+      textLinks(text)
+        .map((p) => p.text)
+        .join(""),
+    ).toBe(text);
+  });
+});
+
 describe("costs", () => {
+  it.each([
+    ["one run of openers", "(".repeat(200_000) + "https://example.com"],
+    ["one run of closers", "https://example.com" + ")".repeat(200_000)],
+    ["many addresses", " https://example.com/a".repeat(20_000)],
+    ["a long address", "https://example.com/" + "a".repeat(200_000)],
+    ["many at signs", "a@".repeat(100_000)],
+  ])("finding addresses in words is linear: %s", (_name, text) => {
+    const started = performance.now();
+    textLinks(text);
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
   it.each([
     ["nested bold", "<b>".repeat(100_000) + "x"],
     ["paragraphs", "<p>".repeat(100_000)],

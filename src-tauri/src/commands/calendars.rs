@@ -1278,7 +1278,7 @@ pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<Listed
     Ok(rows
         .into_iter()
         .zip(rights)
-        .map(|(event, rights)| ListedEvent { event, rights })
+        .map(|(event, rights)| ListedEvent::new(event, rights))
         .collect())
 }
 
@@ -1291,6 +1291,20 @@ pub struct ListedEvent {
     /// account's real status from `calendar_overview`), beside the row's own fields.
     #[serde(flatten)]
     pub rights: ListRights,
+    /// See [`calendar::description_cut`]. Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub description_cut: bool,
+}
+
+impl ListedEvent {
+    fn new(event: CalendarEvent, rights: ListRights) -> Self {
+        let description_cut = calendar::description_cut(event.description.as_deref());
+        Self {
+            event,
+            rights,
+            description_cut,
+        }
+    }
 }
 
 /// The active PM flags anchored on a calendar event's iCal UID — shown in the event detail popup so a
@@ -1496,21 +1510,21 @@ mod tests {
     /// flat object, never a nested one it would miss.
     #[test]
     fn a_listed_row_carries_its_rights_flat() {
-        let listed = ListedEvent {
-            event: CalendarEvent {
+        let listed = ListedEvent::new(
+            CalendarEvent {
                 id: format!("{CAL}:a"),
                 calendar_id: CAL.into(),
                 summary: "Dentist".into(),
                 start: "2026-10-09T10:00:00Z".into(),
                 ..Default::default()
             },
-            rights: ListRights {
+            ListRights {
                 edit_block: None,
                 can_delete: true,
                 can_respond: false,
                 can_retime: true,
             },
-        };
+        );
         let json = serde_json::to_value(&listed).unwrap();
         assert_eq!(json["summary"], "Dentist");
         assert_eq!(json["edit_block"], serde_json::Value::Null);
@@ -1518,5 +1532,31 @@ mod tests {
         assert_eq!(json["can_respond"], false);
         assert_eq!(json["can_retime"], true);
         assert!(json.get("rights").is_none(), "flat, not nested");
+        assert!(
+            json.get("description_cut").is_none(),
+            "left out when not cut"
+        );
+    }
+
+    /// A description the mirror kept to its cap says so on the calendar view's row, beside the rest
+    /// (C19), for the pop-up's "the rest is in Google Calendar".
+    #[test]
+    fn a_listed_row_says_its_description_was_cut() {
+        let listed = ListedEvent::new(
+            CalendarEvent {
+                id: format!("{CAL}:a"),
+                calendar_id: CAL.into(),
+                description: Some("x".repeat(8000)),
+                ..Default::default()
+            },
+            ListRights {
+                edit_block: None,
+                can_delete: false,
+                can_respond: false,
+                can_retime: false,
+            },
+        );
+        let json = serde_json::to_value(&listed).unwrap();
+        assert_eq!(json["description_cut"], true);
     }
 }

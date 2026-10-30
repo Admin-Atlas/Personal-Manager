@@ -166,6 +166,9 @@ pub struct AgendaEvent {
     /// strikes it through, as Google Calendar draws a declined event (#884, C14b). Said here because
     /// these rows carry no guest list.
     pub declined: bool,
+    /// See [`description_cut`]. Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub description_cut: bool,
 }
 
 /// A calendar as returned by Google's `calendarList`, before PM's selection is applied.
@@ -1897,7 +1900,17 @@ pub fn register_feed_source(conn: &Connection, feed: &IcsFeed) -> Result<()> {
 /// (agenda/briefing/chat) is bounded at the source.
 const MAX_SUMMARY_CHARS: usize = 300;
 const MAX_LOCATION_CHARS: usize = 300;
-const MAX_DESCRIPTION_CHARS: usize = 2000;
+/// Only the event pop-up reads a description, so its cap is the pop-up's: 8,000 characters (C19, Q1;
+/// 2,000 before), since a Google description's formatting counts toward them and a video-call
+/// invitation runs long. The editor always reads the whole description from Google.
+const MAX_DESCRIPTION_CHARS: usize = 8000;
+
+/// Whether the mirror kept only the first [`MAX_DESCRIPTION_CHARS`] characters of a description it
+/// stored, so the pop-up says the rest is in the calendar it came from (C19). Worked out as rows are
+/// listed, nothing stored: a description of exactly the cap reads as cut too.
+pub(crate) fn description_cut(stored: Option<&str>) -> bool {
+    stored.is_some_and(|d| d.chars().count() >= MAX_DESCRIPTION_CHARS)
+}
 
 /// Bound *and* single-line untrusted event text on the way into the mirror. Titles and locations (and
 /// the organiser and repeat summary) are `\n`-joined into the agenda, briefing, and chat, so an
@@ -2045,8 +2058,9 @@ fn events_hash(events: &[CalendarEvent]) -> String {
 /// the fetched events, before they're clipped for storage, so a change to the clipping alone would
 /// otherwise leave every unchanged calendar's rows stored the old way: bumping this makes the next
 /// sync rewrite each calendar once. 2: descriptions keep their line breaks ([`clip_multiline`]), and
-/// titles and places lose U+2028/U+2029 ([`clip`]).
-const MIRROR_FORMAT: &str = "mirror-format:2";
+/// titles and places lose U+2028/U+2029 ([`clip`]). 3: descriptions keep up to 8,000 characters
+/// ([`MAX_DESCRIPTION_CHARS`]), so one cut at 2,000 is stored again, longer.
+const MIRROR_FORMAT: &str = "mirror-format:3";
 
 /// Whether `calendar_id`'s rows were last written by a complete fetch, so a row in them is still on
 /// the calendar. An incomplete fetch only upserts and clears the F-49 hash, so a row it didn't see
@@ -2309,17 +2323,19 @@ fn agenda_query(
         let attendees: Option<String> = r.get(14)?;
         let calendar: Option<String> = r.get(15)?;
         let reply = own_declined(attendees.as_deref(), calendar.as_deref());
+        let description: Option<String> = r.get(3)?;
         let row = AgendaEvent {
             // The v40 detail fields (show_as/attendees/…) are only surfaced by the Calendar tab's
             // event popup via `list_all_events`; the assistant/focus paths this query feeds don't use
             // them, so they default to empty here rather than widening this hot query. The series
             // facts are read: flag detection keys an occurrence by them (flags::occurrence_of). The
             // guest list is read only for the user's own reply, then dropped (`declined`).
+            description_cut: description_cut(description.as_deref()),
             event: CalendarEvent {
                 id: r.get(0)?,
                 calendar_id: r.get(1)?,
                 summary: r.get(2)?,
-                description: r.get(3)?,
+                description,
                 location: r.get(4)?,
                 start: r.get(5)?,
                 end: r.get(6)?,
@@ -2965,11 +2981,46 @@ mod tests {
         );
         assert_eq!(clip_multiline("a\u{2028}b\u{2029}c", 300), "a\nb\nc");
         assert_eq!(
-            clip_multiline(&"a\n".repeat(2000), MAX_DESCRIPTION_CHARS)
+            clip_multiline(&"a\n".repeat(MAX_DESCRIPTION_CHARS), MAX_DESCRIPTION_CHARS)
                 .chars()
                 .count(),
             MAX_DESCRIPTION_CHARS
         );
+        assert_eq!(
+            MAX_DESCRIPTION_CHARS, 8000,
+            "Q1: the pop-up keeps 8,000 characters"
+        );
+    }
+
+    /// A description stored at the cap says so on the listed row, for the pop-up's "the rest is in
+    /// Google Calendar"; a shorter one, or none, leaves the field out of the row altogether.
+    #[test]
+    fn a_description_cut_at_the_cap_says_so_when_listed() {
+        let (_d, conn) = store_with_calendar(true);
+        let mut long = ev("long", "Long", "2026-10-12T09:00:00Z");
+        // Characters, not bytes: "é" is two bytes, so a byte count would call 4,500 of them cut.
+        long.description = Some("é".repeat(MAX_DESCRIPTION_CHARS + 1));
+        let mut short = ev("short", "Short", "2026-10-12T10:00:00Z");
+        short.description = Some("é".repeat(MAX_DESCRIPTION_CHARS - 1));
+        let none = ev("none", "None", "2026-10-12T11:00:00Z");
+        replace_events(&conn, "cal-1", &[long, short, none], true).unwrap();
+        let back = list_all_events(&conn).unwrap();
+        let cut = |id: &str| {
+            let row = back.iter().find(|e| e.id == id).unwrap();
+            description_cut(row.description.as_deref())
+        };
+        assert!(cut("long"), "kept to the cap");
+        assert!(!cut("short"), "one under the cap");
+        assert!(!cut("none"), "no description");
+
+        // The agenda's row (the Focus tab's pop-up) carries it, and leaves it out when false.
+        let rows = agenda_query(&conn, 1, 250, "2026-10-12", "2026-10-12T00:00:00Z").unwrap();
+        let json = |id: &str| {
+            let row = rows.iter().find(|a| a.event.id == id).unwrap();
+            serde_json::to_value(row).unwrap()
+        };
+        assert_eq!(json("long")["description_cut"], true);
+        assert!(json("short").get("description_cut").is_none(), "left out");
     }
 
     /// Stored and read back: the description's lines survive the mirror, while a title or a place
@@ -3000,6 +3051,14 @@ mod tests {
             events_hash(&[]),
             crate::ingest::hex_digest(format!("{MIRROR_FORMAT}\n").as_bytes())
         );
+        // Nor does one stored before descriptions kept 8,000 characters (C19), so a description cut
+        // at 2,000 is stored again, longer, on the next sync.
+        for older in ["mirror-format:2\n"] {
+            assert_ne!(
+                events_hash(&[]),
+                crate::ingest::hex_digest(older.as_bytes())
+            );
+        }
     }
 
     #[test]
