@@ -580,7 +580,16 @@ describe("another calendar (C18d)", () => {
       "PM couldn't ask Google about this event, so its calendar didn't change.",
     ],
     ["PM couldn't change its calendar. Try again.", "PM couldn't change its calendar."],
+    [
+      "This Google account has reached one of Google Calendar's usage limits, so Google isn't taking changes for now. Try again later; the limit usually lifts within a day.",
+      "This Google account has reached one of Google Calendar's usage limits, so Google isn't taking changes for now.",
+    ],
+    ["Google had a problem with this. Try again in a moment.", "Google had a problem with this."],
     // What offers nothing stays whole, and a sentence that isn't an offer isn't mistaken for one.
+    [
+      "Google won't let this account open the event any more.",
+      "Google won't let this account open the event any more.",
+    ],
     ["Google is busy right now.", "Google is busy right now."],
     [
       "Google needs you to sign in to this account again.",

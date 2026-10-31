@@ -328,6 +328,7 @@ describe("tokens", () => {
     ["x </Room 4> y", "</Room 4>"],
     ["x </first.last> y", "</first.last>"],
     ["x </Room\n\n> y", "</Room\n\n>"],
+    ["x </Room A> y", "</Room A>"],
     // A browser reads this name as `br\`, not `br`: no break to lose, and Markdown shows it.
     ["<br\\>after", "<br\\>"],
   ])("words_in_angle_brackets_stay_words: %j", (html, literalText) => {
@@ -354,6 +355,9 @@ describe("tokens", () => {
     ["<style 1>p{}</style>x", "style"],
     ["<td 1>x</td>", "td"],
     ["<hr 1>", "hr"],
+    // Named only as having no content: nothing else makes them elements.
+    ['<img src="a.png";>', "img"],
+    ["<input 1>", "input"],
     ["<o:p>y</o:p>", "o:p"],
     ["<html-blob>y</html-blob>", "html-blob"],
     ["<Room>y</Room>", "room"],

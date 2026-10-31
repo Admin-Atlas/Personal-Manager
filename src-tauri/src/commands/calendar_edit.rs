@@ -2166,9 +2166,13 @@ fn after_field_save(moved: WriteOutcome, mut saved: Vec<WriteWarning>) -> WriteO
 
 /// A calendar change's refusal, as the sentence after "it's still on {calendar}". The fields just
 /// landed, so words that say nothing changed or nothing was sent (a look or a send that never got to
-/// Google) are said of the calendar alone.
+/// Google) are said of the calendar alone. A read Google refuses offers no other go: it's the likely
+/// cause of a re-read failing too, and that holds Save (`notMovedUnreadText`).
 fn transfer_words(outcome: &WriteOutcome) -> String {
     match outcome {
+        WriteOutcome::Failed { message } if message == READ_REFUSED => {
+            "Google won't let this account open the event any more.".into()
+        }
         WriteOutcome::Failed { message } if message == OFFLINE => {
             "PM couldn't reach Google to change its calendar. Try again when you're back online."
                 .into()
@@ -9284,11 +9288,7 @@ async fn get<W: Wire>(wire: &W, calendar: &str, event: &str) -> Fetched {
             Verdict::QuotaExceeded => Fetched::Failed(QUOTA.into()),
             // Refused a read: the calendar was unshared, or the sign-in no longer covers it.
             Verdict::ReadOnly | Verdict::InsufficientScope | Verdict::NotOrganizer => {
-                Fetched::Failed(
-                    "Google won't let this account open the event any more. Refresh the calendar \
-                     and try again."
-                        .into(),
-                )
+                Fetched::Failed(READ_REFUSED.into())
             }
             other => Fetched::Failed(failure_message(&other)),
         },
@@ -9353,6 +9353,10 @@ async fn list_pages<W: Wire>(
         gone: false,
     }
 }
+
+/// Google refused a read of one event ([`get`]).
+const READ_REFUSED: &str = "Google won't let this account open the event any more. Refresh the \
+                            calendar and try again.";
 
 /// The account is over one of Google Calendar's usage limits, which lift on their own, not soon.
 const QUOTA: &str = "This Google account has reached one of Google Calendar's usage limits, so \
@@ -23874,6 +23878,9 @@ mod tests {
             OFFLINE.to_string(),
             NOT_SENT.to_string(),
             format!("{ASK_FAILED}: a cause"),
+            READ_REFUSED.to_string(),
+            QUOTA.to_string(),
+            failure_message(&Verdict::ServerError),
         ]
         .map(|message| WriteOutcome::Failed { message });
         let answers = [
@@ -23931,8 +23938,8 @@ mod tests {
                 "“{message}” has no row in the webview's test of a held save's words"
             );
         }
-        // Six today: the rule above has something to hold.
-        assert_eq!(found, 6);
+        // Eight today: the rule above has something to hold.
+        assert_eq!(found, 8);
     }
 
     /// C19 critique C2-M1: the reason for formatting PM can't edit is the same sentence on both
@@ -31639,6 +31646,11 @@ mod tests {
                     Scripted::Unsent(Unsent::Offline),
                 )],
                 "PM couldn't ask Google about this event, so its calendar didn't change. Try again.",
+            ),
+            // The look refused: no offer of another go, which a held Save would still show.
+            (
+                vec![Step::status("/events/solo", "", 403)],
+                "Google won't let this account open the event any more.",
             ),
             (
                 sent_as(Unsent::Offline),

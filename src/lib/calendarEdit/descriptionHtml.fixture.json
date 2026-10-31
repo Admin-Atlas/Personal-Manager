@@ -967,6 +967,38 @@
       "pm_can_edit": false,
       "supported": false,
       "why": "a name the reader hides stays hidden whatever follows it (review 3)"
+    },
+    {
+      "description": "<Option 2> Thursday 3pm\nOption 3 Friday",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets opening a line, whose name opens a block of HTML to Markdown: the formatted view shows what Markdown drops (review 4)"
+    },
+    {
+      "description": "<Form A, B> please sign\nby Friday",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets opening a line, whose name opens a block of HTML to Markdown: the formatted view shows what Markdown drops (review 4)"
+    },
+    {
+      "description": "x <Option 2> y",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "the same words in a line: Markdown shows them (review 4)"
+    },
+    {
+      "description": "<Option 2 Thursday",
+      "html": false,
+      "markup": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "no \">\", so plain lines, that Markdown still reads as a block of HTML and drops (review 4)"
     }
   ]
 }

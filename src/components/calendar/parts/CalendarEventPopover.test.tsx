@@ -702,6 +702,9 @@ describe("CalendarEventPopover", () => {
       ["<center>Hello</center>", ["Hello"]],
       ["<html><body>Hello there</body></html>", ["Hello there"]],
       ['<font color="red">\nHello\n</font>\nafter', ["Hello", "after"]],
+      // Review round 4: no element, but a line Markdown reads as one and drops.
+      ["<Option 2> Thursday 3pm\nOption 3 Friday", ["<Option 2> Thursday 3pm", "Option 3 Friday"]],
+      ["<Form A, B> please sign\nby Friday", ["<Form A, B> please sign", "by Friday"]],
     ])("a google description of other elements shows its words: %j", (description, words) => {
       const { rich } = shown(description, "google");
       for (const word of words) expect(rich?.textContent).toContain(word);

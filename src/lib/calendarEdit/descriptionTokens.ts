@@ -121,7 +121,8 @@ export const VOID: ReadonlySet<string> = new Set([
 
 /** The names the reader has a rule for, the tags PM writes among them (a test holds `EDITABLE_TAGS`
  *  to it): always elements (`readsAsWords`), as a browser reads them. HTML defines more, but those are
- *  words where Markdown says so: `<Code 1234>`, `<Option 2>`. */
+ *  words where Markdown says so: `<Code 1234>`, `<Option 2>` (`markdownDropsALine` says where the
+ *  formatted view has to show them). */
 export const KNOWN: ReadonlySet<string> = new Set([
   ...HIDDEN,
   ...BLOCKS,
@@ -398,6 +399,53 @@ function readsAsWords(name: string, rest: string, closing: boolean): boolean {
   if (!/^[a-z0-9:-]+$/.test(name)) return true;
   if (BLANK_LINE.test(rest)) return true; // it ends Markdown's paragraph, so no tag holds one
   return closing ? afterGap(rest, 0) !== rest.length : !isTagRest(rest);
+}
+
+/** The names that open a block of HTML in Markdown with nothing more asked of the tag (CommonMark's
+ *  kinds 1 and 6, as PM's renderer has them), so `<Option 2>` opens one where `<Room 4>` doesn't. */
+const MARKDOWN_BLOCK_NAMES: ReadonlySet<string> = new Set(
+  (
+    "address article aside base basefont blockquote body caption center col colgroup dd details " +
+    "dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 " +
+    "head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option " +
+    "p param pre script search section style summary table tbody td textarea tfoot th thead title " +
+    "tr track ul"
+  ).split(" "),
+);
+
+/** What Markdown can read before a line's content: indentation, quote marks and list marks. Loose (a
+ *  "1.5" passes too), as `markdownDropsALine` errs towards the view that shows every word. */
+const isLineMark = (c: string) => " \t>-+*.)".includes(c) || isDigit(c);
+
+/** Whether the "<" at `at` opens a block of HTML to Markdown: a comment, `<?`, `<!` then a letter,
+ *  `<![CDATA[`, or a name above, its end tag too, then a space, a tab, the line's end, ">" or "/>". */
+function opensMarkdownBlock(s: string, at: number): boolean {
+  const after = s[at + 1] ?? "";
+  if (after === "?") return true;
+  if (after === "!") {
+    return (
+      isAlpha(s[at + 2] ?? "") || s.startsWith("--", at + 2) || s.startsWith("[CDATA[", at + 2)
+    );
+  }
+  const nameAt = after === "/" ? at + 2 : at + 1;
+  const end = next(s, nameAt, (c) => !isAlpha(c) && !isDigit(c));
+  if (!MARKDOWN_BLOCK_NAMES.has(asciiLower(s.slice(nameAt, end)))) return false;
+  const c = s[end] ?? "";
+  return c === "" || " \t\n\r>".includes(c) || s.startsWith("/>", end);
+}
+
+/** Whether Markdown drops a line of `description` that a browser shows, so only the formatted view
+ *  keeps its words: `<Option 2> Thursday` opening a line reads as a block of HTML there, gone with the
+ *  words after it, while the reader calls it words (`readsAsWords`), as Markdown does anywhere else on
+ *  a line. Each line is looked at once. */
+export function markdownDropsALine(description: string): boolean {
+  const isLineEnd = (c: string) => c === "\n" || c === "\r";
+  for (let at = 0; at < description.length; at++) {
+    const content = next(description, at, (c) => !isLineMark(c));
+    if (description[content] === "<" && opensMarkdownBlock(description, content)) return true;
+    at = next(description, content, isLineEnd);
+  }
+  return false;
 }
 
 const BLANK_LINE = /\n[ \t]*\n/;

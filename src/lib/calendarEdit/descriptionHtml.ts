@@ -28,6 +28,7 @@ import {
   isDigit,
   isHex,
   isSpace,
+  markdownDropsALine,
   tokens,
   type Attr,
   type Token,
@@ -54,7 +55,8 @@ export interface ParsedDescription {
   readonly html: boolean;
   /** It holds an element (any but a name with a ":", as Outlook's `<o:p>`) or a character reference:
    *  formatting to draw as such. An address in angle brackets alone isn't: Outlook and Teams write
-   *  links that way into plain text, which draws as before (the event pop-up). False for plain lines. */
+   *  links that way into plain text, which draws as before (the event pop-up). So too any line Markdown
+   *  would drop (`markdownDropsALine`), plain lines included: `doc` holds its words. */
   readonly markup: boolean;
 }
 
@@ -86,7 +88,8 @@ export const MAX_DEPTH = 32;
  *  the Markdown path, and nor are other words Markdown shows (`<www.example.com>`, `<Room 4>`,
  *  `<José>`, `<Room A, B>`). A word Markdown reads as a tag and drops (`<Room>`) is dropped here too.
  *  The one way a word goes with the flip is a name the reader knows with something odd after it
- *  (`<Table 4>`), which Markdown shows and a browser draws as that element (`readsAsWords`). */
+ *  (`<Table 4>`), which Markdown shows and a browser draws as that element (`readsAsWords`). Words
+ *  Markdown drops with their line (`<Option 2>` opening one) flip without a tag: `markdownDropsALine`. */
 const isMarkup = (name: string) => !name.includes(":");
 
 // --- telling formatting from plain text ---
@@ -786,13 +789,13 @@ export function parseDescription(description: string): ParsedDescription {
       doc: normalise([{ kind: "text", text }]),
       supported: true,
       html: false,
-      markup: false,
+      markup: markdownDropsALine(description),
     };
   }
   const reader = new Reader();
   reader.read(tokens(description));
   const doc = normalise(fromLoose(reader.root, reader.plain));
-  const markup = reader.markup || hasReference(description);
+  const markup = reader.markup || hasReference(description) || markdownDropsALine(description);
   return { doc, supported: reader.supported, html: true, markup };
 }
 

@@ -946,6 +946,24 @@ describe("drawing (C19b)", () => {
     ["a < b and c > d", false],
     ["a<!-- note -->b", false],
     ["", false],
+    // A line Markdown drops (review round 4); one it shows, the name not followed as it asks, stays.
+    ["<Option 2> Thursday", true],
+    ["<OPTION 2> Thursday", true],
+    ["<Form A, B> please sign", true],
+    ["Options:\r\n<Option 2> Thursday", true],
+    ["Options:\r<Option 2> Thursday", true],
+    ["Options:\n- <Option 2> Thursday", true],
+    ["<Option 2 Thursday", true],
+    ["<!-- note --> Thursday", true],
+    ["x <Option 2> y", false],
+    ["Thursday: <Option 2>", false],
+    ["<Options 2> Thursday", false],
+    ["<Option/B> Thursday", false],
+    ["<Option\fB> Thursday", false],
+    ["<Room A, B> Thursday", false],
+    ["<!> Thursday", false],
+    ["<!1 Thursday", false],
+    ["<1 and 2", false],
   ])("markup_is_formatting_google_writes: %j", (description, markup) => {
     expect(parseDescription(description).markup).toBe(markup);
   });
