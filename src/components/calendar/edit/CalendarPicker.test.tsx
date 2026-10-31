@@ -173,7 +173,9 @@ describe("CalendarPicker", () => {
 
   it("disables a no-private calendar for a private draft", () => {
     const { list } = open({ privateDraft: true });
-    const family = within(list).getByRole("radio", { name: /Family/ }) as HTMLInputElement;
+    const family = within(list).getByRole("radio", {
+      name: "Family, Can't hold private events",
+    }) as HTMLInputElement;
     expect(family.disabled).toBe(true);
     expect(family.closest("label")?.textContent).toContain("Can't hold private events");
     expect(family.closest("label")?.className).not.toContain("text-faint");
@@ -189,8 +191,9 @@ describe("CalendarPicker", () => {
 
   it("a hidden calendar is listed and says so", () => {
     const { list } = open({ hidden: new Set([`${WORK}:work@x.com`]) });
-    const work = within(list).getByRole("radio", { name: /Work/ });
-    expect(work.closest("label")?.textContent).toBe("Workhidden");
+    // What a screen reader hears, its name and its mark apart.
+    expect(within(list).getByRole("radio", { name: "Work, hidden" })).toBeTruthy();
+    expect(within(list).queryByRole("radio", { name: "Workhidden" })).toBeNull();
   });
 
   it("a click picks and closes, focus back on the button; the arrow keys only move the choice", () => {

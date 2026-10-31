@@ -295,6 +295,8 @@ describe("the calendar's help", () => {
     expect(HELP["calendar-view"].body).toMatch(/drag an event to move it/);
     expect(HELP["calendar-event"].body).toMatch(/ask the owner for edit access/);
     expect(HELP["calendar-event"].body).toMatch(/when PM knows who owns it/);
+    // Only what the copy's calendar list offers (C18 critique C2-L7).
+    expect(HELP["calendar-event"].body).toMatch(/on any calendar you can create events on/);
     // Its buttons have their own help (`calendar-description-format`, on the toolbar).
     expect(HELP["calendar-editor"].body).toMatch(/format the description with its buttons \(hover/);
     expect(HELP["calendar-editor"].body).toMatch(/Duplicate makes a copy to change/);

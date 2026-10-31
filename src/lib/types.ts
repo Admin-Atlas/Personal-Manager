@@ -2069,9 +2069,9 @@ export type SeriesScope = "this" | "following" | "all";
  *  title, say), so the event is as Google holds it (C13 review round 1). `kept_own_reply`: a reply
  *  to every occurrence landed, and the occurrences `left_behind` names, answered on their own
  *  before, kept their own answer (C14). `call_pending`: saved, and Google is still making the video
- *  call asked for; `call_failed`: saved, but Google didn't make it (C18). `links_left_behind`: put
- *  on another calendar under a new identity, so a milestone or reminder to prepare linked to the
- *  old one stayed with it (C18d). */
+ *  call asked for; `call_failed`: saved, but Google didn't make it (C18). `links_left_behind`: on
+ *  the other calendar it became a new event in Google, so a milestone or reminder to prepare linked
+ *  to it stays with the old one (C18d). */
 export type WriteWarning =
   | "mirror_refresh_pending"
   | "left_on_old_series"
@@ -2191,7 +2191,16 @@ export type WriteOutcome =
    *  editor reads Google's copy again before anything more is sent. Only a save answers it.
    *  `warnings`: what those changes have to say beside "saved" (a call Google didn't make, say), as
    *  a save's are; left out when nothing. */
-  | { outcome: "not_moved"; message: string; warnings?: WriteWarning[] };
+  | { outcome: "not_moved"; message: string; warnings?: WriteWarning[] }
+  /** A calendar change that landed unseen, found on `calendar` by a Save holding more than Google's
+   *  copy there (review round 1 of PR 1): the session has ended, the event's row is `row_id` now, and
+   *  what the user changed since is still theirs to save. Only a save answers it. */
+  | {
+      outcome: "moved_earlier";
+      row_id: string;
+      calendar: string;
+      warnings?: WriteWarning[];
+    };
 
 /** A delete still waiting out its Undo window, for a webview that reloaded. */
 export interface HeldDeleteInfo {

@@ -2471,8 +2471,21 @@ describe("NewEventEditor opened on a copy (C18c)", () => {
     expect(createEvent.mock.calls[0][1].description).toBe(html);
   });
 
-  // C19d: one PM can't write back shows as Google shows it, with Replace, which is the copy's own.
-  it("a copy's description PM can't edit shows as Google does, with Replace", async () => {
+  // Review round 1 of PR 1: no event exists yet, so nothing goes from Google Calendar and closing
+  // keeps no formatting; the original is never touched, and the question says so.
+  it("Replace on a copy says the original keeps its formatting", () => {
+    open({ copy: copyOf({ description: "<table><tr><td>Room</td></tr></table>" }) });
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    expect(ask.textContent).toContain(
+      "The original keeps its formatting; this copy won't have it.",
+    );
+    expect(ask.textContent).not.toMatch(/goes from Google Calendar/);
+    expect(ask.textContent).not.toMatch(/close the editor to keep it/);
+  });
+
+  // C19d: one PM can't write back shows what PM can of it, with Replace, which is the copy's own.
+  it("a copy's description PM can't edit shows what PM can of it, with Replace", async () => {
     createEvent.mockResolvedValue(saved);
     const html = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
     const { onClose } = open({ copy: copyOf({ description: html }) });

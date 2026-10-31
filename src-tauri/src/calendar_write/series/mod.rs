@@ -690,6 +690,9 @@ pub enum SeriesRefusal {
     /// A birthday's date moved where its repeat would have to change: a rule other than Google's
     /// plain yearly one, or a year changed or deleted on its own (C20 §5.3).
     SpecialDateRule,
+    /// One year of a birthday, moved on its own in Google, put back on its day: "All events" has
+    /// nothing to move and "This event" won't change one year, so only Google Calendar can.
+    SpecialYearAlone,
     /// A birthday deleted for one year, or from one year on: it goes for every year at once (C20
     /// §5.4).
     SpecialDeleteEveryYear,
@@ -901,6 +904,11 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "PM can't move this date, because Google would need to repeat it differently (for \
                  example, one of its years was changed or deleted on its own)."
+            ),
+            SeriesRefusal::SpecialYearAlone => write!(
+                f,
+                "This year was moved on its own, and PM can't put one year back on its day. Change \
+                 it in Google Calendar."
             ),
             SeriesRefusal::SpecialDeleteEveryYear => write!(
                 f,

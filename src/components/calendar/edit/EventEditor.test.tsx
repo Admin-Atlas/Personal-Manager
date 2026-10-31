@@ -335,10 +335,10 @@ afterEach(() => {
 });
 
 describe("EventEditor", () => {
-  // A description PM can't write back shows read-only, as Google shows it (C19b): bold as bold, a
+  // A description PM can't write back shows read-only, what PM can of it (C19b): bold as bold, a
   // list as a list, escapes decoded once, and nothing of a script on screen. Its mail link opens the
   // mail app, and a line under it says so with the address when nothing opens.
-  it("shows a formatted description as Google does", async () => {
+  it("shows what PM can of a formatted description", async () => {
     openForEdit.mockResolvedValue(
       ready(
         event({
@@ -1220,7 +1220,7 @@ describe("EventEditor", () => {
     );
   });
 
-  // The backend refuses a table (C19c); PM shows it as Google does and offers to replace it. The
+  // The backend refuses a table (C19c); PM shows what it can of it and offers to replace it. The
   // save then says it's the user's choice (`replace_formatting`), which alone reopens it.
   it("a_description_pm_cant_edit_shows_with_replace", async () => {
     const table = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
@@ -3617,11 +3617,12 @@ describe("EventEditor, its calendar", () => {
     overview = BOTH,
     on: Calendar = PERSONAL,
     onClose = vi.fn(),
+    over: Partial<CalendarEvent> = {},
   ) {
     openForEdit.mockResolvedValue(ready(ev, permissions));
     render(
       <EventEditor
-        row={{ ...row, calendar_id: on.id }}
+        row={{ ...row, calendar_id: on.id, ...over }}
         calendar={on}
         account="me@x.com"
         suggestions={NO_SUGGESTIONS}
@@ -3644,7 +3645,7 @@ describe("EventEditor, its calendar", () => {
   function pick(from: string, to: string) {
     fireEvent.click(trigger(from));
     const list = screen.getByRole("group", { name: "Calendars this event can go on" });
-    const name = new RegExp(`^${to}(hidden)?$`);
+    const name = new RegExp(`^${to}(, hidden)?$`);
     fireEvent.click(within(list).getByRole("radio", { name }), { detail: 1 });
   }
   const DUPLICATE_WORDS =
@@ -3659,7 +3660,7 @@ describe("EventEditor, its calendar", () => {
     const list = within(screen.getByRole("group", { name: "Calendars this event can go on" }));
     expect(list.getAllByRole("radio").map((r) => r.closest("label")?.textContent)).toEqual([
       "Personal",
-      "Quiethidden",
+      "Quiet, hidden",
       "Side",
     ]);
     expect(list.queryByRole("radio", { name: "Shared" })).toBeNull();
@@ -3822,6 +3823,118 @@ describe("EventEditor, its calendar", () => {
       null,
       null,
     );
+  });
+
+  // Review round 1 of PR 1: a calendar change whose answer was lost had landed, and the title was
+  // changed before Save was pressed again. The title is never dropped: the editor goes on from the
+  // row the event has now, on Google's copy there, and the next Save sends the title alone.
+  const MOVED = `${SIDE.id}:e1`;
+  const movedEarlier: WriteOutcome = {
+    outcome: "moved_earlier",
+    row_id: MOVED,
+    calendar: SIDE.id,
+  };
+  const STILL_TO_SAVE =
+    "It's already on Side: the calendar change landed earlier. Your other changes aren't saved yet: press Save to send them.";
+
+  it("a calendar change that had landed goes on from there, the later changes kept", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "unconfirmed" });
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/PM lost touch with Google/);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    saveEdit.mockResolvedValueOnce(movedEarlier);
+    // Google's copy there, under a new session: the title isn't on it.
+    openForEdit.mockResolvedValue(ready(event(), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(STILL_TO_SAVE)).toBeTruthy();
+    expect(openForEdit).toHaveBeenLastCalledWith(MOVED);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(trigger("Side")).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    // Leaving now loses the title, and the calendar stays changed: said so, not "nothing saved".
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(
+      await screen.findByText(
+        "The event is on Side already. Only what you’ve changed since is discarded.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Nothing has been saved to Google yet.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    // The title alone, on the new session; no calendar change is left to make.
+    saveEdit.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { summary: "Retro" },
+      null,
+      "Retro",
+      null,
+      null,
+    );
+    // What it's saved as is the row it has now, so an Undo names that one.
+    expect(noteSaved.mock.lastCall?.[6]).toEqual({ rowId: MOVED, sent: null });
+  });
+
+  it("a calendar change that had landed says why when the copy there can't be read", async () => {
+    saveEdit.mockResolvedValueOnce(movedEarlier);
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockRejectedValueOnce(new Error("That event is no longer in PM's calendar."));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(
+        "It's already on Side: the calendar change landed earlier. PM couldn't read it there, so your other changes aren't saved. Close this and open the event again to make them.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/no longer in PM's calendar/)).toBeNull();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+  });
+
+  it("a calendar change that had landed says nothing's left when Google's copy holds it all", async () => {
+    saveEdit.mockResolvedValueOnce(movedEarlier);
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText("It's already on Side: the calendar change landed earlier."),
+    ).toBeTruthy();
+    expect(screen.queryByText(STILL_TO_SAVE)).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // The choices of a repeating event find the same: there's nothing left to choose.
+  it("the choices finding a calendar change that had landed go on from there too", async () => {
+    choicesForEdit.mockResolvedValue({ outcome: "refused", result: movedEarlier });
+    const repeats = { series_id: "abc", recurring: true };
+    const onClose = await openOn(event(), ALL, BOTH, PERSONAL, vi.fn(), repeats);
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event(), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(STILL_TO_SAVE)).toBeTruthy();
+    expect(openForEdit).toHaveBeenLastCalledWith(MOVED);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("the choices finding all of a save landed close on it, saying where it is", async () => {
+    const landed: WriteOutcome = { outcome: "saved", warnings: [], calendar: SIDE.id };
+    choicesForEdit.mockResolvedValue({ outcome: "refused", result: landed });
+    const repeats = { series_id: "abc", recurring: true };
+    const onClose = await openOn(event(), ALL, BOTH, PERSONAL, vi.fn(), repeats);
+    pick("Personal", "Side");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(noteSaved.mock.lastCall?.[1]).toEqual(landed);
+    expect(noteSaved.mock.lastCall?.[7]).toEqual({ to: "Side", from: "Personal" });
+    expect(saveEdit).not.toHaveBeenCalled();
   });
 
   // Review round 1 of PR 1: the fields landed, so a read after that fails never takes the place of

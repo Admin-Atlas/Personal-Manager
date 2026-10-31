@@ -1932,8 +1932,9 @@ fn clip(s: &str, max: usize) -> String {
         .collect()
 }
 
-/// U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR.
-fn is_line_separator(c: char) -> bool {
+/// U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR: they break a line without being control
+/// characters (`calendar_ask`'s one-line name uses it too).
+pub(crate) fn is_line_separator(c: char) -> bool {
     matches!(c, '\u{2028}' | '\u{2029}')
 }
 

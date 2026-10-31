@@ -378,6 +378,12 @@ fn classify_source_ref(external_ref: &str) -> SourceRefKind {
     }
 }
 
+/// What a reveal that failed says. By the error's kind only, as [`open_failed`]: a launcher's message
+/// repeats its command line, and here that's the local file's path.
+fn reveal_failed(app: &str, kind: std::io::ErrorKind) -> Error {
+    Error::Other(format!("Couldn't open {app} ({kind:?})."))
+}
+
 /// Reveal a local file in the OS file manager, SELECTING it (not opening it — that would launch the
 /// file's default app). The path is validated to exist and passed as a single non-shell argument, so a
 /// stored path can't inject further arguments. Local-only; the http(s) guard covers web links elsewhere.
@@ -393,7 +399,7 @@ fn reveal_in_file_manager(path: &str) -> Result<()> {
         std::process::Command::new("explorer")
             .arg(format!("/select,{}", p.display()))
             .spawn()
-            .map_err(|e| Error::Other(format!("Couldn't open the file manager: {e}")))?;
+            .map_err(|e| reveal_failed("the file manager", e.kind()))?;
         return Ok(());
     }
     #[cfg(target_os = "macos")]
@@ -402,15 +408,14 @@ fn reveal_in_file_manager(path: &str) -> Result<()> {
             .arg("-R")
             .arg(p)
             .spawn()
-            .map_err(|e| Error::Other(format!("Couldn't open Finder: {e}")))?;
+            .map_err(|e| reveal_failed("Finder", e.kind()))?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         // No portable "select the file" on Linux; open the containing folder instead.
         let dir = p.parent().unwrap_or(p);
-        open::that(dir)
-            .map_err(|e| Error::Other(format!("Couldn't open the file manager: {e}")))?;
+        open::that(dir).map_err(|e| reveal_failed("the file manager", e.kind()))?;
         return Ok(());
     }
     #[allow(unreachable_code)]
@@ -680,6 +685,16 @@ mod tests {
         assert_eq!(
             open_failed("https://example.com/secret", kind).to_string(),
             "Couldn't open the link (NotFound)."
+        );
+    }
+
+    /// A reveal that failed says which app, never the launcher's message, which repeats the path.
+    #[test]
+    fn a_reveal_that_failed_names_no_path() {
+        let launch = std::io::Error::new(std::io::ErrorKind::NotFound, "gio open /home/me/tax.pdf");
+        assert_eq!(
+            reveal_failed("the file manager", launch.kind()).to_string(),
+            "Couldn't open the file manager (NotFound)."
         );
     }
 }

@@ -1896,7 +1896,7 @@ fn edit_plan(
     let (master, original) = prepare(input, Some(draft))?;
     // A birthday's and a Gmail event's own rules, before any planner's refusal could speak for
     // them (C20 critiques C1-M1, C2-M1).
-    special_check(input, &master, draft, scope)?;
+    special_check(input, &master, original, draft, scope)?;
     // Before the guest list's own checks, so a guest change says whose list it is (C14 critique
     // C1-L10).
     invitation_check(input, &master, original, draft, scope)?;
@@ -2063,16 +2063,27 @@ const YEARLY: &str = "RRULE:FREQ=YEARLY";
 /// itself: `RRULE:FREQ=YEARLY`, or its own 29 February rule). Checked before planning, where a
 /// planner's own refusal of such a move (a rule it can't re-anchor, a year it would lose) would
 /// speak first in other words (C20 critiques C1-M1, C2-M1). Who owns the date is read from the
-/// series' copy, which an "all events" write changes.
+/// series' copy, which an "all events" write changes. A year moved on its own and put back on its
+/// day has one answer on every row: no row can do it, and each would send the user to another.
 fn special_check(
     input: &SeriesInput,
     master: &Master,
+    original: Point,
     draft: &EventPatchDraft,
     scope: Scope,
 ) -> Result<(), NotPlanned> {
     let kind = gate::kind_of(master.event_type.as_deref());
     if !matches!(kind, gate::Kind::SpecialDate | gate::Kind::FromGmail) {
         return Ok(());
+    }
+    if kind == gate::Kind::SpecialDate
+        && matches!(master.date_source, DateSource::Calendar)
+        && draft
+            .time
+            .as_ref()
+            .is_some_and(|time| back_on_its_day(time, input.fresh.instance.json(), original))
+    {
+        return Err(SeriesRefusal::SpecialYearAlone.into());
     }
     if scope == Scope::Following && !is_first(master, input.fresh.instance) {
         return Err(SeriesRefusal::SpecialWhole.into());
@@ -2112,6 +2123,18 @@ fn special_check(
         return Err(SeriesRefusal::SpecialDateRule.into());
     }
     Ok(())
+}
+
+/// Whether `time` puts an occurrence Google holds on another day, moved on its own, back on the one
+/// whole day the series gives it: nothing for "All events" to move, and one year "This event" won't
+/// change on a birthday.
+fn back_on_its_day(time: &TimeDraft, instance: &Value, original: Point) -> bool {
+    let (TimeDraft::AllDay { first_day, .. }, Point::Day(own)) = (time, original) else {
+        return false;
+    };
+    time.is_one_whole_day()
+        && NaiveDate::parse_from_str(first_day, "%Y-%m-%d").is_ok_and(|day| day == own)
+        && point_of(instance.get("start")) != Some(original)
 }
 
 /// Whether `line` is Google's rule for a birthday on 29 February: every February's last day.
@@ -2317,20 +2340,7 @@ impl SeriesPlan {
         // (C18d), "at least" where an occurrence may have guests of its own.
         if self.changes_calendar() {
             let master_json = input.fresh.master.json();
-            let sent = self
-                .steps
-                .iter()
-                .find_map(|s| match &s.op {
-                    Op::Patch { event, body, .. }
-                        if master_json.get("id").and_then(Value::as_str)
-                            == Some(event.as_str()) =>
-                    {
-                        Some(body.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let moved = Reach::of_transfer(master_json, &sent, &own);
+            let moved = self.reach_of_transfer(master_json, &own);
             all = all.merge(if own_lists(input, master_json) {
                 moved.short()
             } else {
@@ -2340,6 +2350,29 @@ impl SeriesPlan {
         self.guests = all.cancelling(deletes).notice();
         self.chosen = chosen;
         self.own = own;
+    }
+
+    /// Who a calendar change tells once this plan's writes have landed on `master_json`, the series
+    /// as planned: the guests the one question counted for it.
+    fn reach_of_transfer(&self, master_json: &Value, own: &Own) -> Reach {
+        let sent = self
+            .steps
+            .iter()
+            .find_map(|s| match &s.op {
+                Op::Patch { event, body, .. }
+                    if master_json.get("id").and_then(Value::as_str) == Some(event.as_str()) =>
+                {
+                    Some(body.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        Reach::of_transfer(master_json, &sent, own)
+    }
+
+    /// [`Self::reach_of_transfer`], with the addresses the plan counted guests without.
+    pub fn transfer_reach(&self, master_json: &Value) -> Reach {
+        self.reach_of_transfer(master_json, &self.own)
     }
 
     /// Keep `ops`, the draft's guest changes, on each write whose body sends a guest list: every such
@@ -7540,6 +7573,35 @@ mod tests {
         assert_eq!(
             refusal(gap.edit(Scope::All, one_day("2026-06-05"))),
             refused(SeriesRefusal::SpecialDateRule)
+        );
+        // A year moved on its own, put back on its day: every row says the one thing that works,
+        // and none sends the user to another (“This event” to “All events” and back).
+        let moved = with(
+            with(
+                yearly_occurrence("2026-05-04"),
+                "start",
+                json!({ "date": "2026-06-05" }),
+            ),
+            "end",
+            json!({ "date": "2026-06-06" }),
+        );
+        let moved_year = Case::new(yearly_master(), moved);
+        for scope in [Scope::This, Scope::Following, Scope::All] {
+            assert_eq!(
+                refusal(moved_year.edit(scope, one_day("2026-05-04"))),
+                refused(SeriesRefusal::SpecialYearAlone)
+            );
+        }
+        assert!(
+            SeriesRefusal::SpecialYearAlone
+                .to_string()
+                .contains("in Google Calendar"),
+            "it says where that year can change"
+        );
+        // Another day for it is still the rest of the rules' to answer.
+        assert_eq!(
+            refusal(moved_year.edit(Scope::This, one_day("2026-07-05"))),
+            refused(SeriesRefusal::SpecialDateEveryYear)
         );
         // Its name still changes on every one of them.
         assert!(leap.edit(Scope::All, title("Gran")).is_ok());

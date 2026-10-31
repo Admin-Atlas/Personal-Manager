@@ -734,6 +734,16 @@ pub enum WriteOutcome {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<WriteWarning>,
     },
+    /// A calendar change that landed unseen was found on `calendar` by a Save that holds more than
+    /// Google's copy there does: the user changed fields after the lost answer. None of them were
+    /// sent. The session has ended; the editor opens `row_id`, the row on that calendar, keeps the
+    /// user's changes on it, and they go with the next Save. `warnings`: what the landing says.
+    MovedEarlier {
+        row_id: String,
+        calendar: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<WriteWarning>,
+    },
 }
 
 impl WriteOutcome {
@@ -1298,6 +1308,15 @@ mod tests {
                     warnings: vec![WriteWarning::CallFailed],
                 },
                 r#"{"outcome":"not_moved","message":"x","warnings":["call_failed"]}"#,
+            ),
+            // A calendar change found landed earlier, with more for the next Save to send.
+            (
+                WriteOutcome::MovedEarlier {
+                    row_id: "cal2:solo".into(),
+                    calendar: "cal2".into(),
+                    warnings: Vec::new(),
+                },
+                r#"{"outcome":"moved_earlier","row_id":"cal2:solo","calendar":"cal2"}"#,
             ),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),
             (WriteOutcome::Gone, r#"{"outcome":"gone"}"#),

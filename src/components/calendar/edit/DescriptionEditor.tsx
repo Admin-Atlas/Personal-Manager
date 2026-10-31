@@ -20,8 +20,8 @@
 // window on it, editable or not: a click on one does nothing, and Ctrl+click (⌘ on a Mac) opens a
 // web or email address, as the formatted view does.
 //
-// `DescriptionView` is a description shown as Google shows it, where the editor can't or may not
-// change it, with "Replace with plain text…" when the editor offers it.
+// `DescriptionView` shows what PM can of a description (a table, a colour as their words), where
+// the editor can't or may not change it, with "Replace with plain text…" when the editor offers it.
 
 import {
   useEffect,
@@ -570,8 +570,9 @@ export function DescriptionEditor({
   );
 }
 
-/** A description where the editor can't or may not change it, as Google shows it: Google's copy as
- *  the editor last read it, never the draft. "Replace with plain text…" when `onReplace` is given. */
+/** A description where the editor can't or may not change it, showing what PM can of it: Google's
+ *  copy as the editor last read it, never the draft. "Replace with plain text…" when `onReplace` is
+ *  given. */
 export function DescriptionView({
   doc,
   labelledBy,
@@ -609,13 +610,16 @@ export function DescriptionView({
 
 /** "Replace with plain text…" asked: nested inside the editor's dialog, so Escape closes only it.
  *  Google never asks this (it edits any description); PM keeps formatting it can't write back unless
- *  the user chooses to let it go (plan R9). */
+ *  the user chooses to let it go (plan R9). `copy`: it's about a Duplicate, where no event exists yet
+ *  and the original is never touched, so nothing goes from Google Calendar. */
 export function ReplaceQuestion({
   open,
+  copy = false,
   onReplace,
   onKeep,
 }: {
   open: boolean;
+  copy?: boolean;
   onReplace: () => void;
   onKeep: () => void;
 }) {
@@ -628,9 +632,10 @@ export function ReplaceQuestion({
       onConfirm={onReplace}
       onClose={onKeep}
     >
-      PM keeps the words, line breaks and lists, and writes each link's address after its words. The
-      formatting goes from Google Calendar when you save; until then, Cancel or close the editor to
-      keep it.
+      PM keeps the words, line breaks and lists, and writes each link's address after its words.{" "}
+      {copy
+        ? "The original keeps its formatting; this copy won't have it."
+        : "The formatting goes from Google Calendar when you save; until then, Cancel or close the editor to keep it."}
     </ConfirmDialog>
   );
 }

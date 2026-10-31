@@ -57,7 +57,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
-import { JOIN_FAILED } from "../../../lib/calendarEdit/editReasons";
+import { JOIN_FAILED, OPEN_FAILED } from "../../../lib/calendarEdit/editReasons";
 import {
   CalendarEventPopover,
   type PopoverAsk,
@@ -902,6 +902,30 @@ describe("CalendarEventPopover", () => {
     expect(queryByText(JOIN_FAILED)).toBeNull();
   });
 
+  // Review round 1 of PR 1: "Open in Google Calendar" that didn't open says so too, as Join does.
+  it("Open in Google Calendar that didn't open says so", async () => {
+    openUrl.mockRejectedValueOnce("Couldn't open the link (NotFound).");
+    const page = "https://www.google.com/calendar/event?eid=abc";
+    const popover = (id: string) => (
+      <CalendarEventPopover
+        event={calendarEvent({ id, html_link: page })}
+        anchor={rect(100)}
+        calendar={calendarOf("google")}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />
+    );
+    const { getByRole, findByText, queryByText, rerender } = render(popover("e1"));
+    // Its status line is there before anything fails, empty.
+    expect(getByRole("status").textContent).toBe("");
+    fireEvent.click(getByRole("button", { name: "Open in Google Calendar" }));
+    expect(openUrl).toHaveBeenCalledWith(page);
+    expect((await findByText(OPEN_FAILED)).getAttribute("role")).toBe("status");
+    rerender(popover("e2"));
+    expect(queryByText(OPEN_FAILED)).toBeNull();
+  });
+
   it("offers no link to copy when the event has none", () => {
     const { queryByRole } = render(
       <CalendarEventPopover
@@ -1156,6 +1180,25 @@ describe("CalendarEventPopover: asking for edit access", () => {
     expect(button(view).getAttribute("aria-disabled")).toBeNull();
     await act(async () => fireEvent.click(button(view)));
     expect(ask.onAsk).toHaveBeenCalledTimes(2);
+  });
+
+  // Review round 1 of PR 1: a second try that ends the same way is said again. The line empties
+  // while it asks, so the live region's words change and the retry is seen to happen.
+  it("a second try empties the status line while it asks", async () => {
+    let answer: (a: AccessAsk) => void = () => {};
+    const ask = askOf({
+      onAsk: vi.fn(() => new Promise<AccessAsk>((r) => (answer = r))),
+    });
+    const view = render(shown(ask));
+    const noMail: AccessAsk = { outcome: "no_mail_app", owner: "boss@x.org" };
+    const words = `PM couldn't open your mail app. Write to boss@x.org and ask for ${PERMISSION} on “Team”.`;
+    fireEvent.click(button(view));
+    await act(async () => answer(noMail));
+    expect(view.getByRole("status").textContent).toBe(words);
+    fireEvent.click(button(view));
+    expect(view.getByRole("status").textContent).toBe("");
+    await act(async () => answer(noMail));
+    expect(view.getByRole("status").textContent).toBe(words);
   });
 
   it("a second click while asking does nothing", async () => {

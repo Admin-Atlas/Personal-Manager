@@ -1416,6 +1416,8 @@ struct Ready {
     notify: Notify,
     guests: Option<GuestNotice>,
     repeats: Option<SeriesStart>,
+    /// Who the calendar change in the same Save tells, as its question counted them.
+    transfer: Option<attendees::Reach>,
 }
 
 /// A one-event write Google holds as sent, read from its answer (or the look after one that never
@@ -1437,6 +1439,17 @@ async fn send_one<W: Wire, H: Host>(
     one: &OneWrite<'_, W, H>,
     basis: &Basis<'_>,
     answer: &GuestAnswer,
+) -> (WriteOutcome, Option<Landed>) {
+    send_counting(one, basis, answer, &mut None).await
+}
+
+/// [`send_one`], leaving in `transfer` who the question counted for a calendar change in the same
+/// Save ([`Ready::transfer`], of the last round sent), for that change to compare Google's copy with.
+async fn send_counting<W: Wire, H: Host>(
+    one: &OneWrite<'_, W, H>,
+    basis: &Basis<'_>,
+    answer: &GuestAnswer,
+    transfer: &mut Option<attendees::Reach>,
 ) -> (WriteOutcome, Option<Landed>) {
     let (wire, host, target) = (one.wire, one.host, one.target);
     let session = basis.session();
@@ -1464,6 +1477,7 @@ async fn send_one<W: Wire, H: Host>(
             Ok(ready) => ready,
             Err(outcome) => return (outcome, None),
         };
+        transfer.clone_from(&ready.transfer);
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
             let message =
                 "Google sent this event without a version stamp, so PM won't change it.".into();
@@ -1700,10 +1714,12 @@ async fn ready_save<W: Wire, H: Host>(
     let own = own_of(target, &[fresh]);
     let reach = attendees::Reach::of_patch(fresh, &body, &own);
     let guests = reach.notice();
-    let asked_about = match draft.calendar {
-        Some(_) => reach
-            .merge(attendees::Reach::of_transfer(fresh, &body, &own))
-            .notice(),
+    let transfer = draft
+        .calendar
+        .as_ref()
+        .map(|_| attendees::Reach::of_transfer(fresh, &body, &own));
+    let asked_about = match &transfer {
+        Some(told) => reach.merge(told.clone()).notice(),
         None => guests.clone(),
     };
     let chosen = answer.for_write(asked_about)?;
@@ -1717,6 +1733,7 @@ async fn ready_save<W: Wire, H: Host>(
         notify,
         guests,
         repeats,
+        transfer,
     })
 }
 
@@ -1780,6 +1797,7 @@ async fn ready_move<W: Wire, H: Host>(
         notify,
         guests,
         repeats: None,
+        transfer: None,
     })
 }
 
@@ -1826,6 +1844,7 @@ fn ready_undo<W: Wire, H: Host>(
         notify: record.notify,
         guests,
         repeats: None,
+        transfer: None,
     })
 }
 
@@ -1887,6 +1906,10 @@ const TRANSFER_LOST: &str =
 /// (critique C1-L7).
 const TRANSFER_UNREACHABLE: &str = "Google couldn't find that calendar, or PM can't write to it, \
                                     so the event is still on its calendar.";
+/// Someone on the event now whom the Send answer wasn't given for (R9): nothing sent, and the next
+/// Save asks with the new numbers.
+const TRANSFER_GUESTS_CHANGED: &str = "Its guests changed in Google just now, so PM didn't change \
+                                       its calendar. Save again to answer for them.";
 /// The calendar chosen isn't in PM any more (critique C1-L8): an answer, not a command error.
 const TRANSFER_DISCONNECTED: &str = "That calendar is no longer connected.";
 /// A new repeat and a calendar change in one Save (critique C2-H1). Google web takes both at once;
@@ -1976,7 +1999,8 @@ async fn save_and_transfer<W: Wire, H: Host>(
         open,
         draft,
     };
-    match send_one(&one, &basis, answer).await.0 {
+    let mut told = None;
+    match send_counting(&one, &basis, answer, &mut told).await.0 {
         WriteOutcome::Saved { warnings, .. } => {
             // What the user saw is what the save landed: the session moved onto it.
             let landed = open_session(host.edit(), session)
@@ -1984,7 +2008,10 @@ async fn save_and_transfer<W: Wire, H: Host>(
                 .flatten()
                 .and_then(|now| seen_of(&open.target.calendar_id, &now.base));
             // The round's question counted the change, so no answer means it reaches nobody.
-            let decided = TransferNotify::Decided(answer.notify.unwrap_or(Notify::None));
+            let decided = TransferNotify::Decided {
+                chosen: answer.notify.unwrap_or(Notify::None),
+                told,
+            };
             let moved =
                 transfer_one(&one, dest, landed.as_ref(), &open.base, decided, session).await;
             after_field_save(moved, warnings)
@@ -2002,8 +2029,8 @@ async fn save_and_transfer<W: Wire, H: Host>(
             .await
         }
         // Gone from its own calendar: so is an earlier calendar change that landed unseen, and a
-        // Save after one sends its fields again.
-        WriteOutcome::Gone => landed_unseen(&one, dest, &open.base, session)
+        // Save after one holds its fields again, and any changed since.
+        WriteOutcome::Gone => landed_unseen(&one, dest, &open.base, session, Some(draft))
             .await
             .unwrap_or(WriteOutcome::Gone),
         // Refused, a conflict, or a question: nothing went to another calendar.
@@ -2035,24 +2062,59 @@ async fn gone_look<W: Wire>(wire: &W, dest: &CalendarTarget, event: &str) -> OnD
 /// unseen can read just so (the words after a lost answer say to try again, and what Google's source
 /// answers after one is live probe L-T6's), so `dest` is looked at before "deleted" is said: its own
 /// copy lands as the change it is, with `opened`, the copy the editor opened, standing for the one
-/// on its own calendar. A look that fails is PM not knowing. `None`: it's gone.
+/// on its own calendar. `draft`, a Save's fields, may hold what the copy there doesn't
+/// ([`with_what_is_left`]). A look that fails is PM not knowing. `None`: it's gone.
 async fn landed_unseen<W: Wire, H: Host>(
     one: &OneWrite<'_, W, H>,
     dest: &CalendarTarget,
     opened: &Value,
     session: &str,
+    draft: Option<&EventPatchDraft>,
 ) -> Option<WriteOutcome> {
     match gone_look(one.wire, dest, &one.target.remote_event).await {
-        OnDest::Own(there) => Some(land_transferred(
-            one.host,
-            one.target,
-            dest,
-            opened,
-            &there,
-            Some(session),
-        )),
+        OnDest::Own(there) => {
+            let landed =
+                land_transferred(one.host, one.target, dest, opened, &there, Some(session));
+            Some(match draft {
+                Some(draft) => {
+                    with_what_is_left(landed, draft, Some(&there), dest, &one.target.remote_event)
+                }
+                None => landed,
+            })
+        }
         OnDest::Not => None,
         OnDest::Unread => Some(WriteOutcome::Unconfirmed),
+    }
+}
+
+/// A calendar change found landed earlier, with `draft` the Save that found it. Fields the user
+/// changed after the lost answer are on no copy of Google's, and a Save never drops them silently:
+/// where `copy`, Google's on `dest`, doesn't hold everything `draft` says (no copy read: PM can't
+/// say it does), the outcome is [`WriteOutcome::MovedEarlier`] on the row for `event` there, and
+/// the editor keeps them for the next Save. Nothing is sent from here: the copy on `dest` is new to
+/// the user, and a guest question or a conflict is the next Save's, on that copy. Otherwise `landed`.
+fn with_what_is_left(
+    landed: WriteOutcome,
+    draft: &EventPatchDraft,
+    copy: Option<&Value>,
+    dest: &CalendarTarget,
+    event: &str,
+) -> WriteOutcome {
+    let left = draft.names_fields()
+        && copy.is_none_or(|copy| {
+            patch::build_patch(copy, draft).map_or(true, |body| !body.is_empty())
+        });
+    match landed {
+        WriteOutcome::Saved {
+            warnings,
+            calendar: Some(calendar),
+            ..
+        } if left => WriteOutcome::MovedEarlier {
+            row_id: format!("{}:{event}", dest.calendar_id),
+            calendar,
+            warnings,
+        },
+        landed => landed,
     }
 }
 
@@ -2118,7 +2180,28 @@ fn transfer_words(outcome: &WriteOutcome) -> String {
 /// the field changes in the same Save, whose question counted the guests it tells.
 enum TransferNotify<'a> {
     Ask(&'a GuestAnswer),
-    Decided(Notify),
+    /// `told`: who the question counted the change as telling, once the fields it went with landed.
+    Decided {
+        chosen: Notify,
+        told: Option<attendees::Reach>,
+    },
+}
+
+/// What a calendar change sends once its Send / Don't send was given in the same Save (§8.8), the
+/// event now reaching `reach` and the answer counting `told`: nothing to send where nobody's told or
+/// the answer was Don't send; the answer while everyone on it now was counted; and someone added
+/// since (the field save's wait for a call leaves seconds for it) is asked about first, never emailed
+/// unseen (R9), as every other path treats a changed reach. `None`: don't send it.
+fn transfer_answer(
+    reach: &attendees::Reach,
+    chosen: Notify,
+    told: Option<&attendees::Reach>,
+) -> Option<Notify> {
+    if reach.notice().is_none() || chosen == Notify::None {
+        return Some(Notify::None);
+    }
+    told.is_some_and(|told| reach.within(told))
+        .then_some(chosen)
 }
 
 /// Google's copy on a calendar is that calendar's own event: its organiser is the calendar it was
@@ -2149,7 +2232,7 @@ async fn transfer_one<W: Wire, H: Host>(
     let fresh = match get(wire, &target.remote_calendar, &target.remote_event).await {
         Fetched::Event(fresh) => fresh,
         Fetched::Gone => {
-            return match landed_unseen(one, dest, opened, session).await {
+            return match landed_unseen(one, dest, opened, session, None).await {
                 Some(found) => found,
                 None => land_gone(host, target, None),
             }
@@ -2159,7 +2242,7 @@ async fn transfer_one<W: Wire, H: Host>(
         Fetched::Failed(message) => return WriteOutcome::Failed { message },
     };
     if patch::is_gone(&fresh) {
-        return match landed_unseen(one, dest, opened, session).await {
+        return match landed_unseen(one, dest, opened, session, None).await {
             Some(found) => found,
             None => land_gone(host, target, Some(&fresh)),
         };
@@ -2198,14 +2281,22 @@ async fn transfer_one<W: Wire, H: Host>(
     }
     // R9/R7: who it would email, asked for or already answered; nobody, and it's `none`.
     let own = own_of(target, &[&fresh]);
-    let guests = attendees::Reach::of_transfer(&fresh, &serde_json::Map::new(), &own).notice();
+    let reach = attendees::Reach::of_transfer(&fresh, &serde_json::Map::new(), &own);
     let notify = match answer {
-        TransferNotify::Ask(answer) => match answer.for_write(guests) {
+        TransferNotify::Ask(answer) => match answer.for_write(reach.notice()) {
             Ok(notify) => notify,
             Err(ask) => return ask,
         },
-        TransferNotify::Decided(chosen) if guests.is_some() => chosen,
-        TransferNotify::Decided(_) => Notify::None,
+        TransferNotify::Decided { chosen, told } => {
+            match transfer_answer(&reach, chosen, told.as_ref()) {
+                Some(notify) => notify,
+                None => {
+                    return WriteOutcome::Failed {
+                        message: TRANSFER_GUESTS_CHANGED.into(),
+                    }
+                }
+            }
+        }
     };
     let request = plan::transfer_event(
         &target.remote_calendar,
@@ -2481,8 +2572,10 @@ async fn save_then_transfer<W: Wire, H: Host>(
     session: &str,
     chosen: Option<Notify>,
 ) -> WriteOutcome {
+    // Who the one question counted the calendar change as telling.
+    let told = plan.transfer_reach(planning.series.master_fresh.json());
     if plan.steps.is_empty() {
-        return transfer_series(ctx, dest, planning, &[], chosen).await;
+        return transfer_series(ctx, dest, planning, &[], chosen, &told).await;
     }
     // What the field changes write, which the calendar change's own check leaves to their run.
     let written: Vec<String> = plan
@@ -2496,7 +2589,7 @@ async fn save_then_transfer<W: Wire, H: Host>(
         .collect();
     match send_series(ctx, mirror, planning, plan, Landing::Edit { session }).await {
         WriteOutcome::Saved { warnings, .. } => {
-            let moved = transfer_series(ctx, dest, planning, &written, chosen).await;
+            let moved = transfer_series(ctx, dest, planning, &written, chosen, &told).await;
             after_field_save(moved, warnings)
         }
         // Refused, held, or not known: nothing went to another calendar.
@@ -2509,15 +2602,16 @@ async fn save_then_transfer<W: Wire, H: Host>(
 /// the claims on the series and the row, and has refused a change PM is still holding. Reads the
 /// series fresh; checks it may go, and that it's still as planned on its title, start and rule (A8),
 /// leaving out `written`, what the same Save's field changes just wrote; looks on `dest`; sends with
-/// `chosen` where it reaches anyone (the plan's question counted it); lands. An answer PM can't
-/// trust is looked up on both calendars, never sent again, and a series that reads as gone is looked
-/// up on `dest` before it's said to be ([`landed_unseen`]'s reason).
+/// `chosen` where it reaches anyone (the plan's question counted `told`, [`transfer_answer`]); lands.
+/// An answer PM can't trust is looked up on both calendars, never sent again, and a series that reads
+/// as gone is looked up on `dest` before it's said to be ([`landed_unseen`]'s reason).
 async fn transfer_series<W: Wire, H: Host>(
     ctx: &SeriesWrite<'_, W, H>,
     dest: &CalendarTarget,
     planning: &Planning,
     written: &[String],
     chosen: Option<Notify>,
+    told: &attendees::Reach,
 ) -> WriteOutcome {
     let (wire, host, target) = (ctx.wire, ctx.host, ctx.target);
     let master = &planning.series.master;
@@ -2578,9 +2672,10 @@ async fn transfer_series<W: Wire, H: Host>(
     // R7: the answer goes only where the change reaches someone; the plan's question asked it.
     let own = own_of(target, &[&fresh]);
     let reach = attendees::Reach::of_transfer(&fresh, &serde_json::Map::new(), &own);
-    let notify = match reach.notice() {
-        Some(_) => chosen.unwrap_or(Notify::None),
-        None => Notify::None,
+    let Some(notify) = transfer_answer(&reach, chosen.unwrap_or(Notify::None), Some(told)) else {
+        return WriteOutcome::Failed {
+            message: TRANSFER_GUESTS_CHANGED.into(),
+        };
     };
     let request = plan::transfer_event(
         &target.remote_calendar,
@@ -2666,13 +2761,16 @@ async fn series_on_dest<W: Wire, H: Host>(
 
 /// The occurrence of a repeating event an editor opened (`opened`), or its series, reads as gone with
 /// `dest` chosen: [`landed_unseen`] for the series, on its own id. No plan was read, so its rows go
-/// no older than Google's copy on `dest`, which is the change's own time. `None`: it's gone.
+/// no older than Google's copy on `dest`, which is the change's own time. `draft`, the Save's or the
+/// choices' fields, is compared with the occurrence's own copy there ([`with_what_is_left`]).
+/// `None`: it's gone.
 async fn series_landed_unseen<W: Wire, H: Host>(
     wire: &W,
     host: &H,
     target: &Target,
     dest: &CalendarTarget,
     opened: &Value,
+    draft: &EventPatchDraft,
 ) -> Option<WriteOutcome> {
     let series = opened
         .get("recurringEventId")
@@ -2692,7 +2790,18 @@ async fn series_landed_unseen<W: Wire, H: Host>(
                     false
                 }
             };
-            Some(series_on_dest(wire, host, dest, off, opened, &there).await)
+            let landed = series_on_dest(wire, host, dest, off, opened, &there).await;
+            // The occurrence's own copy: a series' times and fields aren't each occurrence's.
+            let event = target.remote_event.as_str();
+            let copy = if draft.names_fields() {
+                match get(wire, &dest.remote_calendar, event).await {
+                    Fetched::Event(copy) if !patch::is_gone(&copy) => Some(copy),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            Some(with_what_is_left(landed, draft, copy.as_ref(), dest, event))
         }
         OnDest::Not => None,
         OnDest::Unread => Some(WriteOutcome::Unconfirmed),
@@ -5274,14 +5383,16 @@ async fn choices<W: Wire, H: Host>(
         // With a calendar chosen, an earlier change that landed unseen reads so too: then there's
         // nothing left to choose, and the editor closes on it.
         Prepared::Gone(_) | Prepared::Refused(WriteOutcome::Gone) => {
-            let found = match (dest, opened) {
-                (Some(dest), Some((base, _))) => {
-                    series_landed_unseen(wire, host, target, dest, base).await
+            let found = match (dest, opened, request) {
+                (Some(dest), Some((base, _)), ChoiceRequest::Edit { draft, .. }) => {
+                    series_landed_unseen(wire, host, target, dest, base, draft).await
                 }
                 _ => None,
             };
-            if let (Some(WriteOutcome::Saved { .. }), ChoiceRequest::Edit { session, .. }) =
-                (&found, request)
+            if let (
+                Some(WriteOutcome::Saved { .. } | WriteOutcome::MovedEarlier { .. }),
+                ChoiceRequest::Edit { session, .. },
+            ) = (&found, request)
             {
                 end_session(host.edit(), session);
             }
@@ -5937,8 +6048,11 @@ async fn prepared_for<W: Wire, H: Host>(
         prepared,
         Prepared::Gone(_) | Prepared::Refused(WriteOutcome::Gone)
     ) {
-        if let (Some(dest), Some((base, _))) = (ctx.dest, opened) {
-            let found = series_landed_unseen(ctx.wire, ctx.host, ctx.target, dest, base).await;
+        if let (Some(dest), Some((base, _)), ChoiceRequest::Edit { draft, .. }) =
+            (ctx.dest, opened, request)
+        {
+            let found =
+                series_landed_unseen(ctx.wire, ctx.host, ctx.target, dest, base, draft).await;
             if let Some(found) = found {
                 return Err(found);
             }
@@ -6061,7 +6175,10 @@ async fn save_series<W: Wire, H: Host>(
             Ok(prepared) => prepared,
             Err(outcome) => {
                 // Only a calendar change that landed unseen saves from here: its session is done.
-                if matches!(outcome, WriteOutcome::Saved { .. }) {
+                if matches!(
+                    outcome,
+                    WriteOutcome::Saved { .. } | WriteOutcome::MovedEarlier { .. }
+                ) {
                     end_session(ctx.host.edit(), session);
                 }
                 return outcome;
@@ -8149,7 +8266,8 @@ fn still_held(edit: &CalendarEditState, token: &str, outcome: WriteOutcome) -> W
         // Only creating an event answers this, and only an editor's calendar change that one; a
         // settle never does.
         | WriteOutcome::Ambiguous { .. }
-        | WriteOutcome::NotMoved { .. } => return outcome,
+        | WriteOutcome::NotMoved { .. }
+        | WriteOutcome::MovedEarlier { .. } => return outcome,
     };
     let Some((offers, from, emails)) = edit.held_split(token) else {
         return outcome;
@@ -21782,6 +21900,7 @@ mod tests {
                 SeriesRefusal::SpecialDateEveryYear,
                 SeriesRefusal::SpecialLeapDay,
                 SeriesRefusal::SpecialDateRule,
+                SeriesRefusal::SpecialYearAlone,
                 SeriesRefusal::SpecialDeleteEveryYear,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
@@ -31479,41 +31598,78 @@ mod tests {
             ..to_second()
         };
         let there = || on_second(Step::get("/events/solo", "", on_second_copy(&event)));
-        let cases: Vec<(&str, EventPatchDraft, Step)> = vec![
+        // The first Save's title landed too: the copy there holds all of this one.
+        let held = with(on_second_copy(&event), "summary", json!("Retro"));
+        let there_titled = || on_second(Step::get("/events/solo", "", held.clone()));
+        // The title was changed after the lost answer: it's on no copy of Google's, so it stays the
+        // editor's to send, on the row the event has now, with nothing sent here.
+        let moved_earlier = WriteOutcome::MovedEarlier {
+            row_id: "cal2:solo".into(),
+            calendar: "cal2".into(),
+            warnings: Vec::new(),
+        };
+        let on_it = now_on_second(Vec::new());
+        let cases: Vec<(&str, EventPatchDraft, Step, Step, &WriteOutcome)> = vec![
             (
                 "alone, 404",
                 to_second(),
                 Step::status("/events/solo", "", 404),
+                there(),
+                &on_it,
             ),
             (
                 "alone, cancelled",
                 to_second(),
                 Step::get("/events/solo", "", cancelled.clone()),
+                there(),
+                &on_it,
             ),
             (
-                "fields, 404",
+                "fields held, 404",
                 titled.clone(),
                 Step::status("/events/solo", "", 404),
+                there_titled(),
+                &on_it,
             ),
             (
-                "fields, cancelled",
+                "fields held, cancelled",
                 titled.clone(),
                 Step::get("/events/solo", "", cancelled.clone()),
+                there_titled(),
+                &on_it,
+            ),
+            (
+                "fields changed since, 404",
+                titled.clone(),
+                Step::status("/events/solo", "", 404),
+                there(),
+                &moved_earlier,
+            ),
+            (
+                "fields changed since, cancelled",
+                titled.clone(),
+                Step::get("/events/solo", "", cancelled.clone()),
+                there(),
+                &moved_earlier,
             ),
         ];
-        for (case, draft, source) in cases {
+        for (case, draft, source, look, expected) in cases {
             let host = host_with_second(std::slice::from_ref(&event));
             let (outcome, script, session) = save_to_second(
                 &host,
                 &event,
                 draft,
                 GuestAnswer::default(),
-                vec![source, there()],
+                vec![source, look],
             )
             .await;
             script.asked_all();
-            assert!(outcome == now_on_second(Vec::new()), "{case}");
+            assert!(outcome == *expected, "{case}");
             assert_eq!(transfers(&script), 0, "{case}");
+            assert!(
+                script.sent().iter().all(|r| r.method == Method::Get),
+                "{case}: only looks"
+            );
             let row = |id: &str| {
                 host.with_conn(|conn| calendar::event_by_id(conn, id))
                     .unwrap()
@@ -31881,7 +32037,7 @@ mod tests {
         let (outcome, script, _) = save_series_to_second(
             &host,
             (&series, &instance),
-            draft,
+            draft.clone(),
             Scope::All,
             Some(Notify::All),
             steps,
@@ -31900,6 +32056,38 @@ mod tests {
         assert!(series_on(&host, "cal2")
             .iter()
             .all(|r| r.summary == "Retro"));
+        // Someone added after the PATCH: nothing goes under an answer given for other numbers.
+        let added = guests_on_it(retitled_series.clone(), &["g@example.org", "h@example.org"]);
+        let host = host_with_second(&october);
+        let mut steps = series_reads();
+        steps.extend([
+            Step {
+                query: "sendUpdates=all",
+                ..series_patch(Scripted::Json(retitled_series.clone()))
+            },
+            refetch_read(Scripted::Json(page(retitled_october.clone(), None))),
+            Step::get("/events/abc", "", added),
+            on_second(Step::status("/events/abc", "", 404)),
+        ]);
+        let (outcome, script, _) = save_series_to_second(
+            &host,
+            (&series, &instance),
+            draft,
+            Scope::All,
+            Some(Notify::All),
+            steps,
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(transfers(&script), 0);
+        assert!(
+            outcome
+                == WriteOutcome::NotMoved {
+                    message: TRANSFER_GUESTS_CHANGED.into(),
+                    warnings: Vec::new(),
+                },
+            "the guests changed, and it says so"
+        );
     }
 
     /// §9.2's backstops: "This event", and "This and following" past the first occurrence, are
@@ -32278,6 +32466,84 @@ mod tests {
             assert!(series_on(&host, "cal").is_empty());
             assert_eq!(series_on(&host, "cal2").len(), 3);
             assert!(open_session(&host.edit, &session).unwrap().is_none());
+            // A title changed after the lost answer: its own occurrence there doesn't hold it, so
+            // it stays the editor's to send, on the row the occurrence has now. Nothing is sent.
+            let titled = EventPatchDraft {
+                summary: Some("Retro".into()),
+                ..to_second()
+            };
+            let its_copy = on_second(Step::get(occurrence, "", on_second_copy(&instance)));
+            let earlier = WriteOutcome::MovedEarlier {
+                row_id: "cal2:abc_20261019T080000Z".into(),
+                calendar: "cal2".into(),
+                warnings: Vec::new(),
+            };
+            let host = host_with_second(&october());
+            let (outcome, script, session) = save_series_to_second(
+                &host,
+                (&series, &instance),
+                titled.clone(),
+                Scope::All,
+                None,
+                vec![source(), there(), listed_on_second(&october()), its_copy],
+            )
+            .await;
+            script.asked_all();
+            assert_eq!(transfers(&script), 0);
+            assert!(outcome == earlier, "the save");
+            assert_eq!(series_on(&host, "cal2").len(), 3);
+            assert!(open_session(&host.edit, &session).unwrap().is_none());
+            // The choices say the same, and end the session too. A copy that can't be read can't
+            // say it holds the title, so the title is kept.
+            let host = host_with_second(&october());
+            let (session, open) = open_in(&host, &instance, &series);
+            let request = ChoiceRequest::Edit {
+                session: session.clone(),
+                draft: Box::new(normalised(titled.clone(), &open)),
+            };
+            let script = Script::new(vec![
+                source(),
+                there(),
+                listed_on_second(&october()),
+                on_second(Step::status(occurrence, "", 503)),
+            ]);
+            let got = choices(
+                &script,
+                &*host,
+                &target(&instance),
+                EditingStatus::On,
+                &mirror(&["abc"]),
+                &request,
+                Some(open.opened()),
+                Some(&second()),
+            )
+            .await;
+            script.asked_all();
+            assert_eq!(transfers(&script), 0);
+            assert!(matches!(
+                &got,
+                SeriesChoices::Refused { result } if *result == earlier
+            ));
+            assert!(open_session(&host.edit, &session).unwrap().is_none());
+            // The occurrence there holds the title too: the first Save's landed, and it closes.
+            let host = host_with_second(&october());
+            let held = with(on_second_copy(&instance), "summary", json!("Retro"));
+            let (outcome, script, _) = save_series_to_second(
+                &host,
+                (&series, &instance),
+                titled,
+                Scope::All,
+                None,
+                vec![
+                    source(),
+                    there(),
+                    listed_on_second(&october()),
+                    on_second(Step::get(occurrence, "", held)),
+                ],
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == now_on_second(Vec::new()), "all of it there");
         }
         // Its series gone while the occurrence still reads live: the same look.
         let host = host_with_second(&october());
@@ -32670,6 +32936,95 @@ mod tests {
             ],
         )
         .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()));
+    }
+
+    /// Someone added between the field save and the calendar change: Send was given for other
+    /// numbers, so nothing goes (R9), and the next Save asks. Don't send, or the guests the question
+    /// counted, goes on.
+    #[tokio::test]
+    async fn a_guest_added_after_the_field_save_stops_a_send_of_the_calendar_change() {
+        let event = with_a_guest(dentist());
+        let retitled = written(&event, &[("summary", json!("Retro"))], "\"s2\"");
+        let added = with(
+            retitled.clone(),
+            "attendees",
+            json!([
+                { "email": "me@example.com", "self": true, "organizer": true,
+                  "responseStatus": "accepted" },
+                { "email": "a@x.org", "responseStatus": "accepted" },
+                { "email": "c@x.org", "responseStatus": "needsAction" }
+            ]),
+        );
+        let asked = GuestNotice {
+            emails: 2,
+            ..one_updated()
+        };
+        let draft = || EventPatchDraft {
+            summary: Some("Retro".into()),
+            ..to_second()
+        };
+        let until_the_look = |query: &'static str, now: &Value| {
+            vec![
+                Step::get("/events/solo", "", event.clone()),
+                told(
+                    Method::Patch,
+                    "/events/solo",
+                    "\"s1\"",
+                    query,
+                    Scripted::Json(retitled.clone()),
+                ),
+                Step::get("/events/solo", "", now.clone()),
+                on_second(Step::status("/events/solo", "", 404)),
+            ]
+        };
+        // Send, with someone new: not moved, in words that say why.
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, session) = save_to_second(
+            &host,
+            &event,
+            draft(),
+            answered(Notify::All, asked.clone()),
+            until_the_look("sendUpdates=all", &added),
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(transfers(&script), 0);
+        assert!(
+            outcome
+                == WriteOutcome::NotMoved {
+                    message: TRANSFER_GUESTS_CHANGED.into(),
+                    warnings: Vec::new(),
+                }
+        );
+        assert!(open_session(&host.edit, &session).unwrap().is_some());
+        // Don't send emails nobody, so it goes.
+        let host = host_with_second(std::slice::from_ref(&event));
+        let mut steps = until_the_look("sendUpdates=none", &added);
+        steps.push(transfer_step(
+            "sendUpdates=none",
+            Scripted::Json(on_second_copy(&added)),
+        ));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            draft(),
+            answered(Notify::None, asked.clone()),
+            steps,
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == now_on_second(Vec::new()));
+        // The guests the question counted: Send goes.
+        let host = host_with_second(std::slice::from_ref(&event));
+        let mut steps = until_the_look("sendUpdates=all", &retitled);
+        steps.push(transfer_step(
+            "sendUpdates=all",
+            Scripted::Json(on_second_copy(&retitled)),
+        ));
+        let (outcome, script, _) =
+            save_to_second(&host, &event, draft(), answered(Notify::All, asked), steps).await;
         script.asked_all();
         assert!(outcome == now_on_second(Vec::new()));
     }

@@ -516,7 +516,10 @@ class Reader {
     while (this.stack.length > 1) this.pop(); // closed, as browsers close them
   }
 
-  private text(text: string): void {
+  private text(words: string): void {
+    // The tokenizer reads a raw carriage return as a line feed, so one here was written as a
+    // reference ("&#13;"), which browsers draw as a space. Only ever shown: that text is ✗.
+    const text = words.replace(/\r/g, " ");
     const into = this.top.into;
     const owed = this.cellGap && !isSpace(text[0] ?? "");
     this.cellGap = false;

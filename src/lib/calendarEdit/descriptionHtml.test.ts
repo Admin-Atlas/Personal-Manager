@@ -349,6 +349,12 @@ describe("reading", () => {
     },
   );
 
+  // Review round 1 of PR 1: display only, the read-only view draws it as a browser does.
+  it("a_carriage_return_written_as_a_reference_shows_as_a_space", () => {
+    expect(read("<b>a&#13;b</b>").doc).toEqual([b(t("a b"))]);
+    expect(read("a&#xD;b").doc).toEqual([t("a b")]);
+  });
+
   it("raw_newlines_are_lines_except_between_blocks", () => {
     // Shown as Google is thought to show them, but not written back until E11-1's H9 says so.
     expect(read("<b>a</b>\nb")).toEqual({ doc: [b(t("a")), BR, t("b")], supported: false });

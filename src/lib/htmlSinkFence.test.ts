@@ -51,6 +51,11 @@ describe("the HTML sink fence", { timeout: 60_000 }, () => {
     "document.createRange().createContextualFragment(s);",
     "document.write(s);",
     "document.writeln(s);",
+    "el.ownerDocument.write(s);",
+    "const doc = el.ownerDocument; doc.write(s);",
+    "window.document.write(s);",
+    'document["write"](s);',
+    'document["writeln"](s);',
     "(el as unknown as { setHTMLUnsafe(x: string): void }).setHTMLUnsafe(s);",
     "(document.querySelector('iframe') as HTMLIFrameElement).srcdoc = s;",
     'el.setAttribute("srcdoc", s);',
@@ -65,6 +70,10 @@ describe("the HTML sink fence", { timeout: 60_000 }, () => {
   it.each([
     "export const A = () => <div dangerouslySetInnerHTML={{ __html: s }} />;",
     "export const B = () => <iframe srcDoc={s} />;",
+    "export const C = () => <div {...{ dangerouslySetInnerHTML: { __html: s } }} />;",
+    "export const D = () => <iframe {...{ srcDoc: s }} />;",
+    'export const E = () => <div {...{ "dangerouslySetInnerHTML": { __html: s } }} />;',
+    'React.createElement("div", { dangerouslySetInnerHTML: { __html: s } });',
   ])("refuses %j in a component", async (code) => {
     expect(
       await refusals(code, "src/components/calendar/parts/CalendarEventPopover.tsx"),

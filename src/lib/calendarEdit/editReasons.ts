@@ -146,8 +146,10 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
   const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
   // Someone else's event says what the user may still do from this copy: reply when it's on the
   // guest list, which the strip above the line offers, their own settings, and how when editing is
-  // off (C14b, C14c).
-  const theirs = ev.organizer_self === false;
+  // off (C14b, C14c). A special kind is never "someone else's": Google's list for its kind replaces
+  // the organiser rule, and a Gmail event's organiser is Google's placeholder (C20a deviation 5).
+  const kind = specialKind(ev.event_type);
+  const theirs = kind === null && ev.organizer_self === false;
   if (ev.edit_block === "not_organizer") {
     return none(notOrganizerText(ev.can_respond === true, on));
   }
@@ -164,7 +166,6 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
   // or a Gmail event says what Google lets change on it first, locked or not and whoever organises
   // it, since Google's list for its kind is the rule (C20 critique C2-H1). On an invitation the line
   // says what stays the organiser's, or Google's warning where they let guests change it.
-  const kind = specialKind(ev.event_type);
   const reason =
     kind === "special_date"
       ? reasonText("special_date_fields")
@@ -209,7 +210,10 @@ export const SPECIAL_DATE_DRAG =
 
 /** What a drag of `ev` that its `rights` refuse says by the pointer (LD14): the row's own line, but
  *  a birthday's own words. */
-export function dragReason(ev: CalendarEvent, rights: EventRights): string | null {
+export function dragReason(
+  ev: CalendarEvent,
+  rights: Pick<EventRights, "canEdit" | "canRetime" | "reason">,
+): string | null {
   return rights.canEdit && !rights.canRetime && specialKind(ev.event_type) === "special_date"
     ? SPECIAL_DATE_DRAG
     : rights.reason;
@@ -466,9 +470,9 @@ export function writeWarningText(
       return "Google is still making the video call; its link shows after a later refresh.";
     case "call_failed":
       return "Google didn't make the video call. Add it again from Edit, or in Google Calendar.";
-    // Raised only when something linked to the old identity (critique C2-L15).
+    // Raised only when something was linked to the old event (critique C2-L15).
     case "links_left_behind":
-      return `On ${calendar || "its new calendar"} Google gave it a new identity, so a milestone or reminder to prepare linked to it stayed with the old one.`;
+      return `On ${calendar || "its new calendar"} it became a new event in Google, so the milestone or reminder to prepare linked to it stays with the old one.`;
     default:
       return unreachable(warning);
   }
@@ -650,6 +654,8 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
       return { tone: "error", text: outcome.message };
     case "not_moved":
       return { tone: "warn", text: notMovedText(outcome.message, null, outcome.warnings) };
+    case "moved_earlier":
+      return { tone: "warn", text: movedEarlierText(null, outcome.warnings) };
     default:
       return unreachable(outcome);
   }
@@ -689,6 +695,45 @@ export function notMovedText(
   return [`Your other changes are saved, but ${still}.`, message, ...said].join(" ");
 }
 
+/** A calendar change PM lost the answer to had landed, found by a Save with more to send
+ *  (`moved_earlier`): where the event is, and what the landing has to say. */
+function movedEarlierHead(calendar: string | null, warnings: readonly WriteWarning[]): string[] {
+  const on = calendar ? `It's already on ${calendar}` : "It's already on the calendar you chose";
+  return [`${on}: the calendar change landed earlier.`, ...warningWords(warnings).words];
+}
+
+/** `moved_earlier`, the event read again there: the user's changes are still in the editor, and go
+ *  with the next Save. */
+export function movedEarlierText(
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  return [
+    ...movedEarlierHead(calendar, warnings),
+    "Your other changes aren't saved yet: press Save to send them.",
+  ].join(" ");
+}
+
+/** `moved_earlier` where Google's copy there already holds all the user changed. */
+export function movedEarlierHeldText(
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  return movedEarlierHead(calendar, warnings).join(" ");
+}
+
+/** `moved_earlier` and PM couldn't read the event there: the session has ended, so nothing more can
+ *  be saved from this editor. */
+export function movedEarlierUnreadText(
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  return [
+    ...movedEarlierHead(calendar, warnings),
+    "PM couldn't read it there, so your other changes aren't saved. Close this and open the event again to make them.",
+  ].join(" ");
+}
+
 /** After a save whose calendar change alone didn't land (C18d), PM couldn't read the event again:
  *  said after what the save came to, never the read's own words, which can say nothing changed. */
 export const NOT_MOVED_UNREAD =
@@ -696,6 +741,10 @@ export const NOT_MOVED_UNREAD =
 
 /** Join on a video call when the browser didn't open: the link can still be copied beside it. */
 export const JOIN_FAILED = "PM couldn't open the call in your browser. Use Copy link instead.";
+
+/** The details' "Open in Google Calendar" (or Outlook, or the calendar's own) when the browser
+ *  didn't open: the event's link can still be copied beside it, as Join's can. */
+export const OPEN_FAILED = "PM couldn't open this event in your browser. Use Copy link instead.";
 
 /** The editor's Power-depth line: the fields changed, and the calendar when another is chosen
  *  (C18d), which isn't a field. */
@@ -783,9 +832,11 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       };
     case "failed":
       return notDeleted(outcome.message);
-    // Only an editor's save answers this; a delete never does, so it says what it carries.
+    // Only an editor's save answers these; a delete never does, so it says what it carries.
     case "not_moved":
       return notDeleted(outcome.message);
+    case "moved_earlier":
+      return notDeleted(movedEarlierHeldText(null, outcome.warnings));
     default:
       return unreachable(outcome);
   }
@@ -840,6 +891,7 @@ export function replyText(
     case "split_removed":
     case "ambiguous":
     case "not_moved":
+    case "moved_earlier":
       return { tone: "error", text: "Your reply wasn't sent." };
     default:
       return unreachable(outcome);
@@ -943,8 +995,8 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
         tone: "warn",
         text: `${t}: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.`,
       };
-    // `ambiguous` and `not_moved` are listed for completeness: only creating an event, or an
-    // editor's save, answers them; a settle never does.
+    // `ambiguous`, `not_moved` and `moved_earlier` are listed for completeness: only creating an
+    // event, or an editor's save, answers them; a settle never does.
     case "no_change":
     case "needs_choice":
     case "ignored_by_google":
@@ -955,6 +1007,7 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
     case "unconfirmed":
     case "ambiguous":
     case "not_moved":
+    case "moved_earlier":
     case "failed": {
       const said = outcomeText(result);
       return { tone: said.tone, text: `${t}: ${said.text}` };
@@ -1109,6 +1162,7 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
     case "partial_split":
     case "split_removed":
     case "not_moved":
+    case "moved_earlier":
       return notBack("Edit it again instead.", "warn");
     case "failed":
       return notBack(outcome.message);
@@ -1124,7 +1178,7 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
  *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1), and
  *  the video call asked for last (C18). A milestone that stayed has a notice of its own, naming it.
  *  `warn`: the user should look, and nothing says to edit it again here; a call still being made
- *  isn't one, since the next refresh shows it. Links left with an old identity (C18d) close it,
+ *  isn't one, since the next refresh shows it. Links left with the old event (C18d) close it,
  *  `calendar` naming where the event went. */
 function savedWarnings(
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
@@ -1245,9 +1299,11 @@ export function moveText(
       return notMoved("PM removed the new part of an earlier change instead.", "warn");
     case "failed":
       return notMoved(outcome.message);
-    // Only an editor's save answers this; a drag never does, so it says what it carries.
+    // Only an editor's save answers these; a drag never does, so it says what it carries.
     case "not_moved":
       return notMoved(outcome.message);
+    case "moved_earlier":
+      return notMoved(movedEarlierHeldText(null, outcome.warnings));
     default:
       return unreachable(outcome);
   }
@@ -1299,6 +1355,7 @@ export function moveBackText(outcome: WriteOutcome, title: string): { tone: Tone
     case "partial_split":
     case "split_removed":
     case "not_moved":
+    case "moved_earlier":
       return notBack("Drag it back, or change it in Edit.", "warn");
     case "failed":
       return notBack(outcome.message);
@@ -1497,6 +1554,7 @@ export function createText(
     case "split_removed":
     case "conflict":
     case "not_moved":
+    case "moved_earlier":
     case "unconfirmed": {
       const said = outcomeText(outcome);
       return notMade(said.text, said.tone);

@@ -69,7 +69,7 @@
 // says so.
 //
 // Its description (C19d) is formatted in place, with Google Calendar's buttons. One with formatting
-// PM can't write back (a table, a colour) shows as Google shows it, with "Replace with plain text…",
+// PM can't write back (a table, a colour) shows what PM can of it, with "Replace with plain text…",
 // and only a save after that choice may replace it. A description is compared by what it shows, so
 // one only opened is never sent.
 
@@ -139,6 +139,9 @@ import {
   changedText,
   earlierChangeText,
   loadText,
+  movedEarlierHeldText,
+  movedEarlierText,
+  movedEarlierUnreadText,
   NOT_MOVED_UNREAD,
   notMovedText,
   notOrganizerText,
@@ -290,8 +293,8 @@ export const UNREADABLE_REPEAT = "PM couldn't read how this repeats, so it can't
 const FORMATTING_REASON = reasonText("unsupported_formatting");
 
 export function EventEditor({
-  row,
-  calendar,
+  row: opened,
+  calendar: openedCalendar,
   account,
   suggestions,
   milestone,
@@ -307,6 +310,12 @@ export function EventEditor({
 }: Props) {
   const { showPower } = useDepth();
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
+  // Where a calendar change that landed earlier put it (`moved_earlier`): the editor goes on there,
+  // on the row it has now, with the user's changes.
+  const [movedTo, setMovedTo] = useState<{ id: string; calendar_id: string } | null>(null);
+  const row = useMemo(() => (movedTo ? { ...opened, ...movedTo } : opened), [opened, movedTo]);
+  const calendar =
+    (movedTo && overview?.calendars.find((c) => c.id === movedTo.calendar_id)) || openedCalendar;
   // The row is the safer sign of a repeating event: the series is null when Google's copy of it
   // couldn't be read.
   const rowRepeats = isRepeating(row);
@@ -426,7 +435,8 @@ export function EventEditor({
 
   useEffect(() => {
     let alive = true;
-    openForEdit(row.id)
+    // The row it was opened on: going on elsewhere (`movedTo`) keeps the draft, and reads for itself.
+    openForEdit(opened.id)
       .then((load) => {
         if (!alive) return;
         if (load.outcome !== "ready") {
@@ -451,7 +461,7 @@ export function EventEditor({
     return () => {
       alive = false;
     };
-  }, [row.id, rowRepeats]);
+  }, [opened.id, rowRepeats]);
 
   /** Commit whatever the focused field holds, so the draft read next is the one on screen. */
   function commitFocused() {
@@ -587,16 +597,26 @@ export function EventEditor({
    *  save whose calendar change alone didn't land (`saved`, C18d), the fields are Google's already,
    *  so `head` says it all unless Google's copy differs from the draft somewhere. A read that fails
    *  then never takes `head`'s place: the fields did land, and the read's own words can say nothing
-   *  changed, or that the event is gone when the save gave its occurrences new ids. */
-  async function rebaseAfterConflict(head: string, saved = false) {
+   *  changed, or that the event is gone when the save gave its occurrences new ids. `moved`: a
+   *  calendar change that landed earlier, read on the row it has there, its words for a read that
+   *  fails and for a draft with nothing left to send. */
+  async function rebaseAfterConflict(
+    head: string,
+    saved = false,
+    moved: { id: string; unread: string; held: string } | null = null,
+  ) {
     if (!loaded || !draftRef.current) return;
     const unread = (text: string) =>
       setBanner(
-        saved ? { tone: "warn", text: `${head} ${NOT_MOVED_UNREAD}` } : { tone: "error", text },
+        moved
+          ? { tone: "warn", text: moved.unread }
+          : saved
+            ? { tone: "warn", text: `${head} ${NOT_MOVED_UNREAD}` }
+            : { tone: "error", text },
       );
     let fresh: EditLoad;
     try {
-      fresh = await openForEdit(row.id);
+      fresh = await openForEdit(moved?.id ?? row.id);
     } catch (e) {
       // A conflict means nothing was written, so that save isn't in doubt.
       unread(message(e));
@@ -652,9 +672,27 @@ export function EventEditor({
       setReplaced(false);
     }
     const kept = saved && r.overwritten.length === 0 && r.lost_guests.length === 0;
+    const held = moved && kept && changedFields(r.base, next).length === 0;
     setBanner({
       tone: "warn",
-      text: kept ? head : rebasedText(head, r.overwritten, r.lost_guests),
+      text: held ? moved.held : kept ? head : rebasedText(head, r.overwritten, r.lost_guests),
+    });
+  }
+
+  /** A calendar change that landed earlier, found by this Save with more to send (`moved_earlier`):
+   *  nothing of the draft went, and its session has ended. The editor goes on on the row the event
+   *  has now, Google's copy there its new base and the user's changes unsaved on it, as a conflict
+   *  leaves them, and the next Save sends them. */
+  async function goOnWhereItLanded(outcome: Extract<WriteOutcome, { outcome: "moved_earlier" }>) {
+    const name = calendarName(outcome.calendar);
+    setMovedTo({ id: outcome.row_id, calendar_id: outcome.calendar });
+    setCalendarId(outcome.calendar);
+    setUncertain(false);
+    setPartlySaved(false);
+    await rebaseAfterConflict(movedEarlierText(name, outcome.warnings), true, {
+      id: outcome.row_id,
+      unread: movedEarlierUnreadText(name, outcome.warnings),
+      held: movedEarlierHeldText(name, outcome.warnings),
     });
   }
 
@@ -834,6 +872,33 @@ export function EventEditor({
           await rebaseFromChoices(outcomeText(c.result).text);
           return;
         }
+        // A calendar change that landed unseen, found by the choices: there's nothing left to
+        // choose. All of the draft is in Google's copy there, and the editor closes on it; or there's
+        // more to send, from the row it has now.
+        if (c.result.outcome === "saved") {
+          noteSaved(
+            what.title,
+            c.result,
+            null,
+            what.from,
+            false,
+            false,
+            undefined,
+            movedOf(c.result),
+          );
+          onClose();
+          return;
+        }
+        if (c.result.outcome === "moved_earlier") {
+          setSaving(true);
+          try {
+            await goOnWhereItLanded(c.result);
+          } finally {
+            setSaving(false);
+            refocusSave();
+          }
+          return;
+        }
         setBanner(outcomeText(c.result));
         refocusSave();
         return;
@@ -882,6 +947,15 @@ export function EventEditor({
 
   /** Send the save, for `picked` when the choices were asked, with Send or Don't send (`notify`)
    *  for the numbers `asked` when the save would email guests, and act on what came back. */
+  /** Where a save put the event, for its notice: the backend's to say, from Google's answer (C18d). */
+  const movedOf = (outcome: Extract<WriteOutcome, { outcome: "saved" }>) =>
+    outcome.calendar
+      ? {
+          to: calendarName(outcome.calendar) ?? "the calendar you chose",
+          from: calendar?.name ?? "its calendar",
+        }
+      : null;
+
   async function send(
     what: Omit<Asking, "view">,
     picked: Picked | null,
@@ -916,12 +990,7 @@ export function EventEditor({
             what.changes.recurrence?.kind === "once",
             picked?.asAll ?? false,
             { rowId: row.id, sent: notify },
-            outcome.calendar
-              ? {
-                  to: calendarName(outcome.calendar) ?? "the calendar you chose",
-                  from: calendar?.name ?? "its calendar",
-                }
-              : null,
+            movedOf(outcome),
           );
           stayOpen = false;
           onClose();
@@ -985,6 +1054,9 @@ export function EventEditor({
             true,
           );
           return;
+        case "moved_earlier":
+          await goOnWhereItLanded(outcome);
+          return;
         // `ambiguous`: only creating an event answers it, never a save; read as a save it would be
         // unconfirmed.
         case "unconfirmed":
@@ -1027,8 +1099,8 @@ export function EventEditor({
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
   // The description (C19d): edited in place, formatting and all, unless it has formatting PM can't
   // write back. The backend says so of what it can tell (a table, a heading); the webview's reading
-  // is stricter (a link it can't open, a colour), and says so itself. Either way it shows as Google
-  // shows it (Google's copy as the editor last read it, never the draft), with "Replace with plain
+  // is stricter (a link it can't open, a colour), and says so itself. Either way it shows what PM
+  // can of it (Google's copy as the editor last read it, never the draft), with "Replace with plain
   // text…", until the user replaces it.
   const baseDescription = loaded?.base.description;
   const shownDescription = useMemo(
@@ -1581,9 +1653,11 @@ export function EventEditor({
       >
         {uncertain
           ? "PM couldn't confirm whether your last save reached Google. Refresh the calendar to check."
-          : partlySaved
-            ? "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded."
-            : "Nothing has been saved to Google yet."}
+          : movedTo
+            ? `The event is on ${calendar?.name ?? "the calendar you chose"} already. Only what you’ve changed since is discarded.`
+            : partlySaved
+              ? "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded."
+              : "Nothing has been saved to Google yet."}
       </ConfirmDialog>
     </>
   );

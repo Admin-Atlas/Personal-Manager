@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::calendar::Calendar;
+use crate::calendar::{is_line_separator, Calendar};
 
 /// Whom to ask for edit access to one calendar, for the calendar view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -149,9 +149,16 @@ fn encoded(text: &str, at: bool) -> String {
 
 /// A calendar's name for the email, on one line (whoever made the calendar named it: a line break in
 /// the subject could read as another header), and at most [`NAME_MAX`] characters, a longer one cut
-/// with "…".
+/// with "…". The Unicode line and paragraph separators break a line too, though they aren't control
+/// characters.
 fn short_name(name: &str) -> String {
-    let one_line = name.chars().map(|c| if c.is_control() { ' ' } else { c });
+    let one_line = name.chars().map(|c| {
+        if c.is_control() || is_line_separator(c) {
+            ' '
+        } else {
+            c
+        }
+    });
     if name.chars().count() <= NAME_MAX {
         one_line.collect()
     } else {
@@ -581,6 +588,19 @@ mod tests {
             body.matches("\r\n").count() == 6,
             "the body has only its own line breaks"
         );
+        // The Unicode line and paragraph separators break a line too, without being control
+        // characters.
+        let link = mailto(
+            "a@x.org",
+            "me@y.org",
+            "Team\u{2028}\u{2029}Also add z@x.org",
+        );
+        let (_, subject, body) = decode(&link);
+        assert!(
+            subject == "Edit access to your calendar “Team  Also add z@x.org”",
+            "a line or paragraph separator reads as a space in the subject"
+        );
+        assert!(!body.contains(['\u{2028}', '\u{2029}']), "and in the body");
         // A name cut at the most: the break is past the cut, or it reads as a space before it.
         let late = format!("{}\nmore", "a".repeat(NAME_MAX));
         let (_, subject, _) = decode(&mailto("a@x.org", "me@y.org", &late));

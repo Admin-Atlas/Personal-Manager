@@ -50,6 +50,7 @@ import {
   askLabel,
   askText,
   JOIN_FAILED,
+  OPEN_FAILED,
 } from "../../../lib/calendarEdit/editReasons";
 import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
 import { linkTarget, parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
@@ -196,6 +197,9 @@ function AskLine({ reason, ask }: { reason: string; ask: PopoverAsk }) {
     // aria-disabled, not disabled, so focus stays on the button while it waits.
     if (asking) return;
     setAsking(true);
+    // Emptied first, as the mail links' line is: a second try that ends the same way is said again
+    // (a live region whose words don't change announces nothing) and is seen to have happened.
+    setSaid("");
     // Anything the command refuses with comes back as the backend's own words.
     void ask
       .onAsk()
@@ -402,6 +406,13 @@ export function CalendarEventPopover({
     const on = event.id;
     openUrl(link).catch(() => setJoinFailed(on));
   };
+  // "Open in Google Calendar" likewise, said under the actions.
+  const [openFailed, setOpenFailed] = useState<string | null>(null);
+  const openSource = (link: string) => {
+    setOpenFailed(null);
+    const on = event.id;
+    openUrl(link).catch(() => setOpenFailed(on));
+  };
   // A Markdown description's mail links open as the formatted view's do (whose own handler has
   // already taken its own), and a link that would load inside PM's window (a relative one, or one
   // `safeUrl` emptied) does nothing. Web links are `useExternalLinks`', left to it.
@@ -602,7 +613,7 @@ export function CalendarEventPopover({
       <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2.5">
         {event.html_link && (
           <>
-            <Button variant="secondary" size="sm" onClick={() => void openUrl(event.html_link!)}>
+            <Button variant="secondary" size="sm" onClick={() => openSource(event.html_link!)}>
               {sourceLabel(calendar?.provider)}
             </Button>
             <CopyLinkButton url={event.html_link} to="this event" />
@@ -663,6 +674,15 @@ export function CalendarEventPopover({
           </Button>
         )}
       </div>
+      {/* Always there with the link (empty, it takes no room), so a screen reader hears it. */}
+      {event.html_link && (
+        <p
+          role="status"
+          className={`px-3 text-xs text-st-due${openFailed === event.id ? " pb-2.5" : ""}`}
+        >
+          {openFailed === event.id ? OPEN_FAILED : ""}
+        </p>
+      )}
       {editing?.reason && (
         <div className="border-t border-border px-3 py-2 text-[0.6875rem] leading-relaxed text-ink4">
           {editing.ask && !editing.ask.connected ? (

@@ -54,7 +54,7 @@
 // Duplicate makes none; its description is copied unchanged.
 //
 // The description is formatted with Google Calendar's buttons, as when editing (C19d). A copy's
-// description with formatting PM can't write back shows as Google shows it, with "Replace with plain
+// description with formatting PM can't write back shows what PM can of it, with "Replace with plain
 // text…", and is created exactly as Google holds it unless replaced.
 
 import {
@@ -298,7 +298,7 @@ export function NewEventEditor({
   // A copy's word that the original's call isn't copied: under the row until it's pressed.
   const [copyCallNote, setCopyCallNote] = useState<string | null>(copyOf?.callNote ?? null);
   // A copy's description as Google holds it (the copy's seed, never the draft), C19d: one with
-  // formatting PM can't write back shows as Google shows it, with "Replace with plain text…", and
+  // formatting PM can't write back shows what PM can of it, with "Replace with plain text…", and
   // goes to Google unchanged unless replaced. A new event sends whatever the draft holds, so the
   // replacement is the draft's alone: nothing else needs telling.
   const copiedDescription = useMemo(
@@ -1010,7 +1010,7 @@ export function NewEventEditor({
             </span>
             {copiedDescription && !copiedDescription.supported && !replaced ? (
               // A copy's description PM can't write back goes as Google holds it, formatting kept
-              // (C18 critique C2-L12), shown as Google shows it until the user replaces it.
+              // (C18 critique C2-L12), showing what PM can of it until the user replaces it.
               <>
                 <DescriptionView
                   doc={copiedDescription.doc}
@@ -1082,6 +1082,7 @@ export function NewEventEditor({
         {/* "Replace with plain text…", nested the same way. */}
         <ReplaceQuestion
           open={askReplace}
+          copy
           onKeep={() => setAskReplace(false)}
           onReplace={() => {
             setAskReplace(false);

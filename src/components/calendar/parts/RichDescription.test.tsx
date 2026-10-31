@@ -52,6 +52,14 @@ describe("RichDescription", () => {
     expect(link?.textContent).toBe("site");
   });
 
+  // Review round 1 of PR 1: a carriage return written as a reference draws as a browser draws it, a
+  // space and not a line.
+  it("draws a decoded carriage return as a space", () => {
+    const view = draw("<b>a&#13;b</b>");
+    expect(view.querySelector("br")).toBeNull();
+    expect(view.querySelector("b")?.textContent).toBe("a b");
+  });
+
   it.each([
     ["a script", "<b>a</b><script>alert(1)</script>"],
     ["an image that runs code", '<b>a</b><img src=x onerror="alert(1)">'],

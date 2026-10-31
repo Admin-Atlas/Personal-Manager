@@ -397,9 +397,11 @@ An inert parse is still a parse, and the next "quick" `innerHTML` for formatting
 
 **Co-signers.** A new reader of formatted text extends the tokenizer and draws React elements or
 nodes made one by one, never a parse. A new sink the rule doesn't name gets a selector in
-`HTML_SINKS` and a case in the fence test. A link drawn from a description carries only an address
-`descriptionHtml.ts`'s `linkTarget` takes (absolute http, https or mailto, unchanged by `markdown.tsx`'s
-`safeUrl`, I-19), never a string the user is still typing.
+`HTML_SINKS` and a case in the fence test. A link the drawn view (`RichDescription`) makes carries only
+an address `descriptionHtml.ts`'s `linkTarget` takes (absolute http, https or mailto, unchanged by
+`markdown.tsx`'s `safeUrl`, I-19). The editor's box also holds a phone number `keptLink` keeps, so the
+link survives a save, and its click guard never opens one. Neither ever draws a string the user is
+still typing.
 
 ---
 

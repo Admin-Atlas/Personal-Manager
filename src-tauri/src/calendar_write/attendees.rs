@@ -480,6 +480,12 @@ impl Reach {
         }
     }
 
+    /// Whether an answer given for `asked` covers this: nobody it reaches that `asked` didn't count
+    /// (someone gone since is simply not told), and no list cut short that `asked` read whole.
+    pub fn within(&self, asked: &Reach) -> bool {
+        self.reached.is_subset(&asked.reached) && (self.complete || !asked.complete)
+    }
+
     /// A new event whose body is `body`: everyone on it is invited.
     pub fn of_insert(body: &Map<String, Value>, own: &Own) -> Reach {
         let everyone = recipients(body.get("attendees"), own);

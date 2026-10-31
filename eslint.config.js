@@ -67,8 +67,14 @@ const HTML_SINKS = [
     selector: "MemberExpression[property.value=/^(innerHTML|outerHTML|srcdoc)$/]",
     message: HTML_SINK,
   },
-  { selector: "Property[key.name=/^(innerHTML|outerHTML|srcdoc)$/]", message: HTML_SINK },
-  { selector: "Property[key.value=/^(innerHTML|outerHTML|srcdoc)$/]", message: HTML_SINK },
+  {
+    selector: "Property[key.name=/^(innerHTML|outerHTML|srcdoc|srcDoc|dangerouslySetInnerHTML)$/]",
+    message: HTML_SINK,
+  },
+  {
+    selector: "Property[key.value=/^(innerHTML|outerHTML|srcdoc|srcDoc|dangerouslySetInnerHTML)$/]",
+    message: HTML_SINK,
+  },
   {
     selector:
       "CallExpression[callee.property.name=/^(insertAdjacentHTML|createContextualFragment|parseFromString|setHTML|setHTMLUnsafe|parseHTMLUnsafe)$/]",
@@ -79,11 +85,9 @@ const HTML_SINKS = [
       "CallExpression[callee.property.value=/^(insertAdjacentHTML|createContextualFragment|parseFromString|setHTML|setHTMLUnsafe|parseHTMLUnsafe)$/]",
     message: HTML_SINK,
   },
-  {
-    selector:
-      "CallExpression[callee.object.name='document'][callee.property.name=/^(write|writeln)$/]",
-    message: HTML_SINK,
-  },
+  // On any object: `box.ownerDocument.write(s)`, an alias of the document, `window.document`.
+  { selector: "CallExpression[callee.property.name=/^(write|writeln)$/]", message: HTML_SINK },
+  { selector: "CallExpression[callee.property.value=/^(write|writeln)$/]", message: HTML_SINK },
   {
     selector: "CallExpression[callee.property.name='setAttribute'][arguments.0.value=/^srcdoc$/i]",
     message: HTML_SINK,

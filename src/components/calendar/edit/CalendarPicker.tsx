@@ -187,10 +187,16 @@ export function CalendarPicker({
                   />
                   <SourceDot color={colorOf(id)} shapeIndex={shapeOf(id)} />
                   <span className="truncate">{t.calendar.name}</span>
-                  {hidden.has(id) && <span className="ml-auto text-xs text-ink4">hidden</span>}
+                  {/* The marks are part of the radio's name: the comma, heard and not seen, keeps
+                      them apart from the calendar's own. */}
+                  {hidden.has(id) && (
+                    <span className="ml-auto text-xs text-ink4">
+                      <span className="sr-only">,</span> hidden
+                    </span>
+                  )}
                   {noPrivate && (
                     <span className="ml-auto shrink-0 text-xs text-ink4">
-                      Can't hold private events
+                      <span className="sr-only">,</span> Can't hold private events
                     </span>
                   )}
                 </label>

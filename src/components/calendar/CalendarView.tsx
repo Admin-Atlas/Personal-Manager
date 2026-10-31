@@ -33,13 +33,7 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import {
-  askOwnerFor,
-  copyRank,
-  dragReason,
-  duplicable,
-  eventRights,
-} from "../../lib/calendarEdit/editReasons";
+import { askOwnerFor, copyRank, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
@@ -1073,15 +1067,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [writes.moves],
   );
   const capability = useCallback(
-    (ev: CalendarEvent) => {
-      const r = rights(ev);
-      // A birthday says by the pointer that it can't be dragged, in words of its own (C20).
-      return dragCapability(ev, {
-        rights: { canRetime: r.canRetime, reason: dragReason(ev, r) },
+    (ev: CalendarEvent) =>
+      // `dragCapability` says a birthday's own line by the pointer (C20, `dragReason`).
+      dragCapability(ev, {
+        rights: rights(ev),
         pending: movingIds.has(ev.id),
         zoneKnown: deviceTimeZoneOrNull() !== null,
-      });
-    },
+      }),
     [rights, movingIds],
   );
   const shownById = useMemo(() => new Map(shownEvents.map((e) => [e.id, e])), [shownEvents]);

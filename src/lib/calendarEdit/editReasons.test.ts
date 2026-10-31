@@ -463,7 +463,7 @@ describe("a write's warnings", () => {
     }
     // C18d: it names the calendar the event went to, when it's known.
     expect(writeWarningText("links_left_behind", "save", undefined, "Work")).toBe(
-      "On Work Google gave it a new identity, so a milestone or reminder to prepare linked to it stayed with the old one.",
+      "On Work it became a new event in Google, so the milestone or reminder to prepare linked to it stays with the old one.",
     );
     expect(writeWarningText("mirror_refresh_pending", "save")).toBe(
       "PM's calendar will show it after the next refresh.",
@@ -510,7 +510,7 @@ describe("another calendar (C18d)", () => {
       tone: "ok",
       text: "“Dentist” is now on Work. To put it back, open it and choose Home.",
     });
-    // Links left with the old identity: said, naming the calendar, and worth a look.
+    // Links left with the old event: said, naming the calendar, and worth a look.
     expect(
       savedNotice(
         "Dentist",
@@ -524,7 +524,7 @@ describe("another calendar (C18d)", () => {
       ),
     ).toEqual({
       tone: "warn",
-      text: "“Dentist” is now on Work. On Work Google gave it a new identity, so a milestone or reminder to prepare linked to it stayed with the old one. To put it back, open it and choose Home.",
+      text: "“Dentist” is now on Work. On Work it became a new event in Google, so the milestone or reminder to prepare linked to it stays with the old one. To put it back, open it and choose Home.",
     });
     // No calendar change: a save's own words, as before.
     expect(savedNotice("Dentist", { outcome: "saved", warnings: [] }, null).text).toBe(
@@ -1498,6 +1498,14 @@ describe("an event's rights in the calendar", () => {
       [
         "editing off",
         row({}),
+        overview("off"),
+        { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("editing_off") },
+      ],
+      // A Gmail event's organiser is Google's placeholder: editing off says the editing-off line,
+      // never "Someone else organises this event" (C20a deviation 5, live row G1).
+      [
+        "a Gmail event, editing off",
+        row({ ...theirs, event_type: "fromGmail", can_delete: true, can_retime: false }),
         overview("off"),
         { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("editing_off") },
       ],

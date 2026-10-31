@@ -55,7 +55,7 @@ const HOLIDAY = row({ id: "a1", summary: "Holiday", start: D1, end: D2, all_day:
 
 const canMove = (ev: CalendarEvent): DragCapability =>
   dragCapability(ev, {
-    rights: { canRetime: true, reason: null },
+    rights: { canEdit: true, canRetime: true, reason: null },
     pending: false,
     zoneKnown: true,
   });
@@ -726,7 +726,7 @@ describe("useCalendarGesture: presses it leaves alone", () => {
     const { onCommit, announce } = mount({
       capability: (ev) =>
         dragCapability(ev, {
-          rights: { canRetime: false, reason },
+          rights: { canEdit: true, canRetime: false, reason },
           pending: false,
           zoneKnown: true,
         }),

@@ -66,6 +66,7 @@ import {
   type Timing,
   type WallPoint,
 } from "./calendarDrag";
+import { SPECIAL_DATE_DRAG } from "./calendarEdit/editReasons";
 import type { CalendarEvent, GuestNotice } from "./types";
 
 afterEach(() => {
@@ -833,7 +834,7 @@ describe("helpers", () => {
 
 describe("dragCapability", () => {
   const ctx = (over: Partial<CapabilityContext> = {}): CapabilityContext => ({
-    rights: { canRetime: true, reason: null },
+    rights: { canEdit: true, canRetime: true, reason: null },
     pending: false,
     zoneKnown: true,
     ...over,
@@ -851,9 +852,8 @@ describe("dragCapability", () => {
     expect(dragCapability(row({ calendar_id: MILESTONE_CALENDAR_ID }), ctx())).toEqual(none(null));
     expect(dragCapability(row({ id: DRAFT_EVENT_ID }), ctx())).toEqual(none(null));
     expect(dragCapability(row(), ctx({ pending: true }))).toEqual(none(SAVING));
-    expect(dragCapability(row(), ctx({ rights: { canRetime: false, reason: THEIRS } }))).toEqual(
-      none(THEIRS),
-    );
+    const refused = { canEdit: true, canRetime: false, reason: THEIRS };
+    expect(dragCapability(row(), ctx({ rights: refused }))).toEqual(none(THEIRS));
     expect(dragCapability(row({ end: null }), ctx())).toEqual(none(NO_END));
     expect(dragCapability(row(), ctx({ zoneKnown: false }))).toEqual(none(NO_ZONE));
     expect(
@@ -873,12 +873,33 @@ describe("dragCapability", () => {
     expect(dragCapability(overlay, ctx({ pending: true }))).toEqual(none(null));
     const all = ctx({
       pending: true,
-      rights: { canRetime: false, reason: THEIRS },
+      rights: { canEdit: true, canRetime: false, reason: THEIRS },
       zoneKnown: false,
     });
     expect(dragCapability(row({ end: null }), all)).toEqual(none(SAVING));
     expect(dragCapability(row({ end: null }), { ...all, pending: false })).toEqual(none(THEIRS));
     expect(dragCapability(row({ end: null }), ctx({ zoneKnown: false }))).toEqual(none(NO_END));
+  });
+
+  // C20 critiques C2-M4, C1-L12 (LD14): a refused drag of a birthday says its own line by the
+  // pointer, not its details' line, which reads as a drag on offer. The rule lives here, so the
+  // view can only hand in the row's rights.
+  it("a birthday's refused drag says it can't be dragged", () => {
+    const details = "Only its notifications can change, and its date if it was added in Google.";
+    const birthday = row({ event_type: "birthday" });
+    expect(
+      dragCapability(
+        birthday,
+        ctx({ rights: { canEdit: true, canRetime: false, reason: details } }),
+      ),
+    ).toEqual(none(SPECIAL_DATE_DRAG));
+    // Editing off (no Edit) keeps the row's line.
+    expect(
+      dragCapability(
+        birthday,
+        ctx({ rights: { canEdit: false, canRetime: false, reason: "off" } }),
+      ),
+    ).toEqual(none("off"));
   });
 });
 

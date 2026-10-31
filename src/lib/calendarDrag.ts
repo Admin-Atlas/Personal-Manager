@@ -23,6 +23,7 @@ import {
   minutesFromLocalMidnight,
   parseLocal,
 } from "./calendar-layout";
+import { dragReason, type EventRights } from "./calendarEdit/editReasons";
 import { DEFAULT_LENGTH_MS } from "./calendarEdit/eventDraft";
 import { isRepeating } from "./calendarEdit/saveChoices";
 import { formatDateOnly, pad2 } from "./format";
@@ -757,7 +758,8 @@ function monthSlot(g: MonthGeom, t: Timing): Box | null {
 
 /** What may change an event's time, from the view (`eventRights`, C16a). */
 export interface CapabilityContext {
-  rights: { canRetime: boolean; reason: string | null };
+  /** The row's rights as `eventRights` gives them; a refused drag says `dragReason`'s line. */
+  rights: Pick<EventRights, "canEdit" | "canRetime" | "reason">;
   /** A move of it is being asked about or saved. */
   pending: boolean;
   /** The device's zone is known (a timed event can't be moved without it). */
@@ -777,7 +779,8 @@ export function dragCapability(ev: CalendarEvent, ctx: CapabilityContext): DragC
   // A milestone, a pinboard entry or the new event's draft: no drag, and nothing to explain.
   if (isOverlayEvent(ev) || isDraftEvent(ev)) return nothing(null);
   if (ctx.pending) return nothing(SAVING);
-  if (!ctx.rights.canRetime) return nothing(ctx.rights.reason);
+  // A birthday says by the pointer that it can't be dragged, in words of its own (C20, LD14).
+  if (!ctx.rights.canRetime) return nothing(dragReason(ev, ctx.rights));
   const t = timingOf(ev);
   if (!t) return nothing(NO_END);
   if (t.kind === "timed") {
