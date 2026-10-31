@@ -424,6 +424,10 @@ describe("edit reasons", () => {
     expect(said({ outcome: "saved", warnings: ["mirror_refresh_pending"] }).text).toBe(
       `Removed “Dentist” from your calendar. ${writeWarningText("mirror_refresh_pending", "delete")}`,
     );
+    // Where the question named the calendar, the notice does too.
+    expect(deleteText({ outcome: "saved", warnings: [] }, "Dentist", true, "Boss").text).toBe(
+      "Removed “Dentist” from Boss.",
+    );
     expect(said({ outcome: "conflict", fields: ["organizer"] })).toEqual({
       tone: "warn",
       text: "“Dentist” wasn't removed. It changed in Google since you opened it.",
@@ -1596,6 +1600,14 @@ describe("an event's rights in the calendar", () => {
     );
     expect(removeText(true)).toBe(
       "Google Calendar tells the organiser you declined. This removes every occurrence, as Google Calendar does. You can undo it for a few seconds.",
+    );
+    // A calendar named: its guest entry is what declines.
+    expect(removeText(false, "Boss")).toBe(
+      "Google Calendar tells the organiser Boss declined. You can undo it for a few seconds.",
+    );
+    // Split earlier: "every occurrence" would promise what PM can't.
+    expect(removeText(true, null, true)).toBe(
+      "Google Calendar tells the organiser you declined. This removes every occurrence of this part. You can undo it for a few seconds.",
     );
   });
 

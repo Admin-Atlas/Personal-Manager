@@ -36,7 +36,7 @@ import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types
 import { askOwnerFor, copyRank, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
-import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
+import { markDeclined, myReply, removingFrom, replyCopies } from "../../lib/calendarEdit/rsvp";
 import { isRepeating } from "../../lib/calendarEdit/saveChoices";
 import {
   accountLength,
@@ -891,6 +891,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // dialogs (the editor among them) itself; the popover isn't one.
   const deleteDialog = useDeleteDialog(popoverOpen);
   const confirmDelete = deleteDialog.asked?.event ?? null;
+  // The calendar Remove names, by the rows on screen: a copy on a hidden calendar, or one on its
+  // way off, isn't another copy to tell it from.
+  const removeFrom = confirmDelete
+    ? removingFrom(
+        events.filter((e) => !hidden.has(e.calendar_id) && !writes.hiddenIds.has(e.id)),
+        confirmDelete,
+        overview?.calendars ?? [],
+      )
+    : null;
   // People already in the user's Google and Outlook calendars, for the editors' guest box (an event's
   // and a new one's): worked out here, over the rows this view holds, so no contacts are read (C12;
   // never a subscription's).
@@ -1551,11 +1560,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         }
         when={confirmDelete ? whenText(confirmDelete) : ""}
         from={confirmDelete ? accountOf(confirmDelete) : null}
+        removeFrom={removeFrom}
         again={deleteDialog.asked?.reask?.again ?? false}
         forceRepeating={!!deleteDialog.asked?.reask}
         guests={deleteDialog.asked?.guests ?? null}
         onClose={deleteDialog.close}
-        onConfirm={deleteDialog.confirm}
+        onConfirm={(event, picked, notify, asked) =>
+          deleteDialog.confirm(event, picked, notify, asked, removeFrom)
+        }
       />
       <WriteNotices
         notices={writes.notices}

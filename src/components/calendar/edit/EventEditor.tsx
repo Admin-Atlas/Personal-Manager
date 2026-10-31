@@ -161,7 +161,13 @@ import {
   sameDescription,
 } from "../../../lib/calendarEdit/descriptionHtml";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
-import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
+import {
+  guestsWithReply,
+  replyHeld,
+  replyStanding,
+  withReply,
+  type ReplyStanding,
+} from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
@@ -343,6 +349,9 @@ export function EventEditor({
   // An earlier save's other changes landed and its calendar change didn't (C18d): they're in Google
   // already, so discarding loses only the calendar change and what was changed since.
   const [partlySaved, setPartlySaved] = useState(false);
+  // A reply from "Going?" goes at once, apart from the draft, so discarding the draft doesn't touch
+  // it, and the discard question says so.
+  const [replied, setReplied] = useState<ReplyStanding>(null);
   // A save landed something and Google's copy couldn't be read afterwards: the session has moved on,
   // and a repeating event's occurrences may have new ids, so this editor sends nothing more (a Save
   // on the old row can read as the event deleted). Closing and opening it again is what's left.
@@ -553,6 +562,7 @@ export function EventEditor({
     scope: RsvpScope | null,
   ): Promise<WriteOutcome> {
     const outcome = await respond(row.id, reply, note, scope);
+    setReplied((was) => replyStanding(was, outcome));
     if (replyHeld(outcome, scope, loaded !== null ? firstDay(loaded.base.time) : null)) {
       const own = calendar?.remote_id ?? null;
       setLoaded((l) => (l ? { ...l, event: withReply(l.event, reply, note, own) } : l));
@@ -1666,11 +1676,15 @@ export function EventEditor({
       >
         {uncertain
           ? "PM couldn't confirm whether your last save reached Google. Refresh the calendar to check."
-          : movedTo
-            ? `The event is on ${calendar?.name ?? "the calendar you chose"} already. Only what you’ve changed since is discarded.`
-            : partlySaved
-              ? "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded."
-              : "Nothing has been saved to Google yet."}
+          : replied === "unconfirmed"
+            ? "PM couldn't confirm whether your reply reached Google. Refresh the calendar to check."
+            : movedTo
+              ? `The event is on ${calendar?.name ?? "the calendar you chose"} already. Only what you’ve changed since is discarded.`
+              : partlySaved
+                ? "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded."
+                : replied === "sent"
+                  ? "Your reply is already with Google. Only your other changes are discarded."
+                  : "Nothing has been saved to Google yet."}
       </ConfirmDialog>
     </>
   );

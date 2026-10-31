@@ -18,6 +18,7 @@ import type {
   CalendarAccount,
   CalendarEvent,
   CalendarOverview,
+  DeleteSettled,
   EditLoad,
   EventForEdit,
   GuestForEdit,
@@ -738,6 +739,59 @@ describe("CalendarView: invitations", () => {
     );
     expect(await screen.findByText("Removing “Standup”.")).toBeTruthy();
     expect(screen.queryByRole("button", { name: EVENT_CHIP })).toBeNull();
+  });
+
+  // A calendar shared with the user is the guest: it declines, not "you". Its question and its
+  // notice say so, as the reply strip does.
+  it("names a calendar that isn't the account's main one when removing from it", async () => {
+    rows = [{ ...invite(), calendar_id: WORK_CAL }];
+    ipc.deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+    });
+    let settle: (settled: DeleteSettled) => void = () => {};
+    ipc.onCalendarDeleteSettled.mockImplementation((cb: (settled: DeleteSettled) => void) => {
+      settle = cb;
+      return Promise.resolve(() => {});
+    });
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    const asked = screen.getByRole("dialog", { name: "Remove “Standup” from Work?" });
+    expect(asked.textContent).toContain("Google Calendar tells the organiser Work declined.");
+    fireEvent.click(within(asked).getByRole("button", { name: "Remove" }));
+    expect(await screen.findByText("Removing “Standup”.")).toBeTruthy();
+    act(() =>
+      settle({
+        undo_token: "t1",
+        event_id: "i1",
+        result: { outcome: "saved", warnings: [] },
+      }),
+    );
+    expect(await screen.findByText("Removed “Standup” from Work.")).toBeTruthy();
+  });
+
+  // Two invited copies: Remove acts on the kept one and the other stays, so it says which, even on
+  // a main calendar. A copy on a hidden calendar isn't there to tell it from (L-I4's setup).
+  it("names the calendar when another copy of the occurrence is on screen", async () => {
+    rows = [invite(), { ...invite(), id: "i2", calendar_id: WORK_CAL }];
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    const asked = screen.getByRole("dialog", { name: "Remove “Standup” from Personal?" });
+    expect(asked.textContent).toContain("Google Calendar tells the organiser Personal declined.");
+  });
+
+  it("keeps “your calendar” when the other copy is on a hidden calendar", async () => {
+    env.hidden = new Set([WORK_CAL]);
+    rows = [invite(), organiser()];
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    expect(
+      screen.getByRole("dialog", { name: "Remove “Standup” from your calendar?" }),
+    ).toBeTruthy();
   });
 
   // C14 critique C1-M5: a removal takes one calendar's copy off. The organiser's copy of the

@@ -16,7 +16,9 @@
 //
 // An event someone else organises asks to remove it instead (C14d): it leaves the user's calendar,
 // and Google tells the organiser they declined, so there's no email question. As Google web (Help
-// 37113), a repeating one goes whole: its choices are read only for "All events"'s token.
+// 37113), a repeating one goes whole: its choices are read only for "All events"'s token. Where it
+// matters whose guest entry declines, the question names the calendar (`removeFrom`), as the reply
+// strip does; Google's own label is "Remove from this calendar".
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
@@ -59,6 +61,8 @@ interface Props {
   /** The account the delete goes through: who Google sends guests' emails from, and never counted
    *  as a guest. */
   from?: string | null;
+  /** The calendar Remove must name (`removingFrom`); null: "your calendar". */
+  removeFrom?: string | null;
   /** Re-asked after a delete answered that the plan changed since the choice: the dialog says so. */
   again?: boolean;
   /** Re-asked because the backend wants the occurrences chosen, though the row looked like a
@@ -83,6 +87,7 @@ export function DeleteEventDialog({
   calendarName,
   when,
   from = null,
+  removeFrom = null,
   again = false,
   forceRepeating = false,
   guests = null,
@@ -97,17 +102,19 @@ export function DeleteEventDialog({
         calendarName={calendarName}
         when={when}
         from={from}
+        removeFrom={removeFrom}
         again={again}
         onConfirm={onConfirm}
         onClose={onClose}
       />
     );
   }
-  // The backend asking about emails (`guests`) means it's the user's own event by now: a delete.
-  if (event && !guests && removesCopy(event)) {
+  // A removal is never asked about emails, whatever PM's row says (`delete_guests`).
+  if (event && removesCopy(event)) {
     return (
       <RemoveConfirm
         event={event}
+        calendar={removeFrom}
         repeating={false}
         token={null}
         onRemove={() => onConfirm(event, null, null, null)}
@@ -214,6 +221,7 @@ function RepeatingDelete({
   calendarName,
   when,
   from,
+  removeFrom,
   again,
   onConfirm,
   onClose,
@@ -222,6 +230,7 @@ function RepeatingDelete({
   calendarName: string | null;
   when: string;
   from: string | null;
+  removeFrom: string | null;
   again: boolean;
   onConfirm: Props["onConfirm"];
   onClose: () => void;
@@ -312,11 +321,13 @@ function RepeatingDelete({
     return (
       <RemoveConfirm
         event={event}
+        calendar={removeFrom}
         repeating
+        split={all?.warnings.some((w) => w.warning === "split_sibling") ?? false}
         view={view}
         token={all?.token ?? null}
         refused={all && !all.selectable ? all.detail : null}
-        lines={all?.selectable ? warningLines(all, "delete", title) : []}
+        lines={all?.selectable ? warningLines(all, "remove", title) : []}
         onRemove={(token) => token && onConfirm(event, { scope: "all", token }, null, null)}
         onClose={close}
       />
@@ -343,12 +354,15 @@ function RepeatingDelete({
   );
 }
 
-/** "Remove “…” from your calendar?" (C14 §10.4, §13.4). Focus starts on Cancel. Repeating, Remove
- *  stays off until the plan's token arrives (`view`, `token`): a row refused (`refused`) says why,
- *  and the plan's warnings (`lines`) show as the choices dialog shows them. */
+/** "Remove “…” from your calendar?" (C14 §10.4, §13.4), or from `calendar` when it must be named.
+ *  Focus starts on Cancel. Repeating, Remove stays off until the plan's token arrives (`view`,
+ *  `token`): a row refused (`refused`) says why, and the plan's warnings (`lines`) show as the
+ *  choices dialog shows them. `split`: the plan says it was split earlier. */
 function RemoveConfirm({
   event,
+  calendar,
   repeating,
+  split = false,
   view = null,
   token,
   refused = null,
@@ -357,7 +371,9 @@ function RemoveConfirm({
   onClose,
 }: {
   event: CalendarEvent;
+  calendar: string | null;
   repeating: boolean;
+  split?: boolean;
   view?: ChoicesView | null;
   token: string | null;
   refused?: string | null;
@@ -369,7 +385,7 @@ function RemoveConfirm({
   return (
     <ConfirmDialog
       open
-      title={`Remove “${title}” from your calendar?`}
+      title={`Remove “${title}” from ${calendar ?? "your calendar"}?`}
       confirmLabel="Remove"
       danger
       confirmDisabled={repeating && token === null}
@@ -378,7 +394,7 @@ function RemoveConfirm({
       onConfirm={() => onRemove(token)}
       onClose={onClose}
     >
-      <p>{removeText(repeating)}</p>
+      <p>{removeText(repeating, calendar, split)}</p>
       {view?.state === "ready" && view.again && (
         <Callout tone="warning" size="md" live className="mt-3">
           {REMOVE_CHANGED} Nothing was removed.
@@ -399,11 +415,13 @@ function RemoveConfirm({
           {refused}
         </Callout>
       )}
-      {/* Always mounted, so a screen reader hears when the check ends. */}
+      {/* Always mounted, so a screen reader hears when the check ends: it was there from the first
+          render, so "Checking" isn't announced, and its going says nothing. Remove turning on does. */}
       <div role="status">
         {view?.state === "loading" && (
           <p className="mt-3 text-xs text-ink4">Checking “{title}” in Google…</p>
         )}
+        {token !== null && <p className="sr-only">You can remove it now.</p>}
         {lines.length > 0 && (
           <Callout tone="info" size="md" body="ink" live={false} className="mt-3">
             {lines.map((line) => (

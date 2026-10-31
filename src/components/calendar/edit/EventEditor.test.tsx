@@ -3406,6 +3406,49 @@ describe("EventEditor, an invitation", () => {
     expect(screen.queryByRole("dialog", { name: /^Discard your changes/ })).toBeNull();
   });
 
+  // A reply goes at once, apart from the draft: the discard question never says nothing went.
+  describe("the discard question after a reply", () => {
+    const NOTHING = "Nothing has been saved to Google yet.";
+    const WITH_GOOGLE = "Your reply is already with Google. Only your other changes are discarded.";
+    const UNKNOWN =
+      "PM couldn't confirm whether your reply reached Google. Refresh the calendar to check.";
+    const after = async (outcome: WriteOutcome | null) => {
+      openForEdit.mockResolvedValue(ready(invitation(), { ...THEIRS, summary: true }));
+      await open(vi.fn(), vi.fn(), row, work);
+      if (outcome) {
+        respond.mockResolvedValue(outcome);
+        fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+        await waitFor(() => expect(respond).toHaveBeenCalled());
+        await screen.findByRole("button", { name: "Yes" });
+      }
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Changed" } });
+      fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+      await screen.findByText("Discard your changes and remove?");
+    };
+
+    it("says nothing has gone when no reply did", async () => {
+      await after(null);
+      expect(screen.getByText(NOTHING)).toBeTruthy();
+    });
+
+    it("says the reply is with Google once it is", async () => {
+      await after(saved);
+      expect(await screen.findByText(WITH_GOOGLE)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    it("says PM can't tell when the reply came back unconfirmed", async () => {
+      await after({ outcome: "unconfirmed" });
+      expect(await screen.findByText(UNKNOWN)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    it("a refused reply sent nothing", async () => {
+      await after({ outcome: "busy" });
+      expect(await screen.findByText(NOTHING)).toBeTruthy();
+    });
+  });
+
   it("after a reply the guest list shows it, and Yes stays pressed", async () => {
     openForEdit.mockResolvedValue(ready(invitation(), THEIRS));
     respond.mockResolvedValue(saved);

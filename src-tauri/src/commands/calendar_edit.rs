@@ -437,6 +437,21 @@ fn row_guests(conn: &Connection, row_id: &str, own: &Own) -> Result<Option<Guest
         .and_then(|row| attendees::row_delete_notice(&row.attendees, own)))
 }
 
+/// Who to ask about before a delete's hold, for the row the user clicked. Asked as Remove, the answer
+/// could never be used, whatever the mirror's row says: at the send `delete_still_matches` stops it if
+/// Google says the event is the user's own, which is what the notice then tells them (C14d).
+fn delete_guests(
+    conn: &Connection,
+    row_id: &str,
+    own: &Own,
+    seen: &SeenSummary,
+) -> Result<Option<GuestNotice>> {
+    if seen.removal {
+        return Ok(None);
+    }
+    row_guests(conn, row_id, own)
+}
+
 /// The calendar's own addresses for `target`: its id and the account it's read with, and what
 /// `events` (Google's copies) mark as the user's. Never a guest Google emails (C12).
 fn own_of(target: &Target, events: &[&Value]) -> Own {
@@ -3693,7 +3708,7 @@ pub async fn delete_calendar_event(
             Ok(target) => {
                 let editing_choice = calendar_editing::choice(&conn, &target.email)?;
                 let in_series = needs_scope(&conn, &event_id)?;
-                let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;
+                let guests = delete_guests(&conn, &event_id, &own_of(&target, &[]), &seen)?;
                 (target, editing_choice, in_series, guests)
             }
             Err(reason) => return refused(WriteOutcome::ReadOnly { reason }),
@@ -3979,10 +3994,18 @@ async fn send_delete<W: Wire, H: Host>(
                 Err(ask) => return land_fresh(host, target, &fresh, ask),
             }
         };
+        // Someone else's event isn't deleted, only taken off this calendar: the words go by what the
+        // user asked for (C14 §13.4).
+        let (verb, done) = if seen.removal {
+            ("remove", "removed")
+        } else {
+            ("delete", "deleted")
+        };
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
             return WriteOutcome::Failed {
-                message: "Google sent this event without a version stamp, so PM won't delete it."
-                    .into(),
+                message: format!(
+                    "Google sent this event without a version stamp, so PM won't {verb} it."
+                ),
             };
         };
         let request =
@@ -3996,9 +4019,10 @@ async fn send_delete<W: Wire, H: Host>(
                 return match still_there(wire, target).await {
                     Some(false) => land_deleted(host, target, &fresh),
                     Some(true) => WriteOutcome::Failed {
-                        message: "PM lost touch with Google, and the event is still there. \
-                                  Nothing was deleted; try again."
-                            .into(),
+                        message: format!(
+                            "PM lost touch with Google, and the event is still there. \
+                             Nothing was {done}; try again."
+                        ),
                     },
                     None => WriteOutcome::Unconfirmed,
                 }
@@ -11102,6 +11126,23 @@ mod tests {
         assert!(row_guests(&conn, &format!("{cal}:missing"), &own)
             .unwrap()
             .is_none());
+        // C14d: the row the user clicked said someone else's, though the mirror's says their own and
+        // has a guest: asked as Remove, nothing is asked, and the send's check speaks (below, in
+        // `a_delete_stops_when_who_organises_it_changed_since_it_was_asked`). Asked as Delete, it is.
+        let seen = |removal| SeenSummary {
+            summary: "Mine".into(),
+            start: mine.start.clone(),
+            end: None,
+            all_day: false,
+            location: None,
+            removal,
+        };
+        assert!(delete_guests(&conn, &mine.id, &own, &seen(true))
+            .unwrap()
+            .is_none());
+        assert!(delete_guests(&conn, &mine.id, &own, &seen(false))
+            .unwrap()
+            .is_some());
     }
 
     /// C12 §5.1: the delete shell asks about the row's guests before it holds anything, when nobody
@@ -11119,9 +11160,9 @@ mod tests {
             .expect("the delete command");
         let shell = &shipped[start..];
         let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
-        assert!(
-            shell.contains("let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;")
-        );
+        assert!(shell.contains(
+            "let guests = delete_guests(&conn, &event_id, &own_of(&target, &[]), &seen)?;"
+        ));
         let ask = shell
             .find("if let Err(ask) = answer.before_hold(guests) {\n        return refused(ask);")
             .expect("asked before the hold");
@@ -27006,6 +27047,66 @@ mod tests {
             .await;
             script.finished();
             assert!(outcome == WriteOutcome::ReadOnly { reason });
+        }
+    }
+
+    /// C14 §13.4: nothing of the organiser's is deleted by a removal, so its failures never say so.
+    /// A delete of your own keeps its words (`an_unscoped_delete_looks_after_a_lost_answer…`).
+    #[tokio::test]
+    async fn a_removals_failures_speak_of_removing() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let lost = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            delete_solo(
+                "\"s1\"",
+                "sendUpdates=all",
+                Scripted::Lost { retried: true },
+            ),
+            Step::get("/events/solo", "", event.clone()),
+        ]);
+        let outcome = send_delete(
+            &lost,
+            &*host,
+            &target(&event),
+            &seen,
+            &GuestAnswer::default(),
+        )
+        .await;
+        lost.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: "PM lost touch with Google, and the event is still there. \
+                              Nothing was removed; try again."
+                        .into(),
+                }
+        );
+        for (event, verb) in [(invite(), "remove"), (dentist(), "delete")] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let mut stampless = event.clone();
+            stampless.as_object_mut().unwrap().remove("etag");
+            let script = Script::new(vec![Step::get("/events/solo", "", stampless)]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.asked_all();
+            assert!(
+                outcome
+                    == WriteOutcome::Failed {
+                        message: format!(
+                            "Google sent this event without a version stamp, so PM won't {verb} it."
+                        ),
+                    },
+                "{verb}"
+            );
         }
     }
 

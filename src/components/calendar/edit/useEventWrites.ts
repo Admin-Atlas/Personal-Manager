@@ -178,6 +178,8 @@ interface HeldDelete {
   /** It takes someone else's event off the user's calendar (C14d): its notices say so, and it hides
    *  its own rows only, never other copies of the occurrence: the organiser's copy stays. */
   removal: boolean;
+  /** Where a removal's settled notice says it went from, when it isn't "your calendar". */
+  place?: string;
   /** The row the user asked to delete, so the dialog can ask again with it when Google's copy has
    *  guests to tell (C12 critique C1-H2). Unknown for a delete picked up after a reload. */
   event?: CalendarEvent;
@@ -394,7 +396,7 @@ function settle(settled: DeleteSettled) {
     dismissNotice(held.noticeId);
     return;
   }
-  put({ id: held.noticeId, ...deleteText(result, held.summary, held.removal) });
+  put({ id: held.noticeId, ...deleteText(result, held.summary, held.removal, held.place) });
 }
 
 /** Hear how held deletes end, and pick up any still waiting (a reload emptied this store; the backend
@@ -418,6 +420,8 @@ export function watchHeldDeletes() {
           summary: w.summary,
           noticeId: nextNotice++,
           removal: w.removal === true,
+          // A reload forgot which calendar was named, so nothing here claims it was the user's.
+          place: "its calendar",
         };
         update({ held: [...state.held, held] });
         showHeld(held, w.seconds_left);
@@ -439,12 +443,14 @@ export interface DeleteReask {
  *  window; hidden meanwhile are the row and every row a delete of several occurrences reaches.
  *  `{ ask }`: the backend wants the occurrences chosen, or chosen again (`ask` null), or whether
  *  Google emails the guests (`ask`, its numbers; R9), and nothing was held or said: the caller asks.
- *  Whether Google emails the guests is never asked by reopening the occurrences (C12). */
+ *  Whether Google emails the guests is never asked by reopening the occurrences (C12). `removeFrom`:
+ *  the calendar a removal's question named (`removingFrom`), which its notice names too. */
 export async function startDelete(
   event: CalendarEvent,
   picked: Picked | null = null,
   notify: Notify | null = null,
   asked: GuestNotice | null = null,
+  removeFrom: string | null = null,
 ): Promise<"held" | DeleteReask | "refused"> {
   watchHeldDeletes();
   stripUndo(event.id);
@@ -489,6 +495,7 @@ export async function startDelete(
       summary: event.summary,
       noticeId: nextNotice++,
       removal,
+      place: removeFrom ?? undefined,
       event,
     };
     update({ held: [...state.held, held] });
@@ -1609,10 +1616,11 @@ export function useDeleteDialog(openElsewhere: () => boolean) {
       picked: Picked | null,
       notify: Notify | null = null,
       asked: GuestNotice | null = null,
+      removeFrom: string | null = null,
     ) => {
       const was = open.current;
       setAsked(null);
-      void startDelete(event, picked, notify, asked).then((r) => {
+      void startDelete(event, picked, notify, asked, removeFrom).then((r) => {
         if (r === "held" || r === "refused") return;
         // Asked once already (a reopened dialog), or nowhere to ask: said instead, so nothing
         // loops. Occurrences chosen: their token binds who the delete tells, so a guests ask

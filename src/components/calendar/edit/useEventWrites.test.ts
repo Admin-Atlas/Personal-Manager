@@ -418,7 +418,16 @@ describe("a held delete", () => {
       });
       expect(hook.result.current.removalIds.has(event.id)).toBe(true);
       act(() => settledHandler!(settled({ outcome: "saved", warnings: [] })));
-      expect(hook.result.current.notices[0].text).toBe("Removed “Dentist” from your calendar.");
+      // The reload forgot which calendar was named, so nothing claims it was the user's.
+      expect(hook.result.current.notices[0].text).toBe("Removed “Dentist” from its calendar.");
+    });
+
+    it("names the calendar the question named", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation, null, null, null, "Boss"));
+      act(() => settledHandler!(settled({ outcome: "saved", warnings: [] })));
+      expect(hook.result.current.notices[0].text).toBe("Removed “Dentist” from Boss.");
     });
 
     it("says it wasn't removed when refused before its hold, or when asking fails", async () => {

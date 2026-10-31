@@ -201,10 +201,20 @@ export function removesCopy(ev: Pick<CalendarEvent, "organizer_self" | "event_ty
 
 /** The question before a removal (C14 §13.4). Google web, Help 37113: "After you remove an event,
  *  Calendar tells the event organizer you decline the event"; for someone else's repeating event it
- *  offers no per-occurrence choices. */
-export function removeText(repeating: boolean): string {
-  const every = repeating ? " This removes every occurrence, as Google Calendar does." : "";
-  return `Google Calendar tells the organiser you declined.${every} You can undo it for a few seconds.`;
+ *  offers no per-occurrence choices. `calendar`: the calendar whose guest entry declines, when it
+ *  must be named (`removingFrom`). `split`: the plan says the repeating event was split earlier, so
+ *  PM can't promise it all goes: the plan's own warning says what may stay. */
+export function removeText(
+  repeating: boolean,
+  calendar: string | null = null,
+  split = false,
+): string {
+  const every = !repeating
+    ? ""
+    : split
+      ? " This removes every occurrence of this part."
+      : " This removes every occurrence, as Google Calendar does.";
+  return `Google Calendar tells the organiser ${calendar ?? "you"} declined.${every} You can undo it for a few seconds.`;
 }
 
 /** Which of Google's special kinds an event is, read as the backend's `kind_of` reads `event_type`
@@ -795,11 +805,12 @@ export function changedText(fields: readonly EditorField[], calendar: boolean): 
 
 /** What a delete of the event called `title` came to, as one sentence naming it. A delete that
  *  lands reports `saved`; one that found the event already gone has what it wanted. `removal`: it
- *  was Remove on someone else's event, so it speaks of removing (C14 §13.4). */
+ *  was Remove on someone else's event, so it speaks of removing (C14 §13.4); `place`, where from. */
 export function deleteText(
   outcome: WriteOutcome,
   title: string,
   removal = false,
+  place = "your calendar",
 ): { tone: Tone; text: string } {
   const t = `“${title.trim() || "(no title)"}”`;
   const done = removal ? "removed" : "deleted";
@@ -820,7 +831,7 @@ export function deleteText(
         const pending = outcome.warnings.includes("mirror_refresh_pending")
           ? ` ${writeWarningText("mirror_refresh_pending", "delete")}`
           : "";
-        return { tone: "ok", text: `Removed ${t} from your calendar.${pending}` };
+        return { tone: "ok", text: `Removed ${t} from ${place}.${pending}` };
       }
       return {
         tone: "ok",

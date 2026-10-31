@@ -9,7 +9,7 @@
 // One with guests asks whether Google emails them, Delete waiting for the answer (C12).
 
 import { StrictMode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CalendarEvent,
@@ -70,6 +70,7 @@ function open(
     again?: boolean;
     forceRepeating?: boolean;
     from?: string;
+    removeFrom?: string;
     guests?: { notice: GuestNotice; again: boolean };
   } = {},
 ) {
@@ -565,10 +566,15 @@ describe("DeleteEventDialog, an invitation", () => {
     expect(dialog.getAttribute("data-help")).toBe("calendar-delete");
     expect(dialog.textContent).toContain("Checking “Gym” in Google…");
     expect(remove().disabled).toBe(true);
+    expect(screen.queryByText("You can remove it now.")).toBeNull();
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
     await act(async () => answer(plan({ all: offered("the-token") })));
     expect(dialog.textContent).not.toContain("Checking");
     expect(remove().disabled).toBe(false);
+    // "Checking" going says nothing, so the status region says Remove is on (focus stays on Cancel).
+    const said = screen.getByText("You can remove it now.");
+    expect(said.className).toContain("sr-only");
+    expect(said.closest("[role=status]")).toBe(within(dialog).getByRole("status"));
     // No occurrences to choose between: it isn't the choices dialog.
     expect(screen.queryByRole("radio")).toBeNull();
     fireEvent.click(remove());
@@ -596,6 +602,41 @@ describe("DeleteEventDialog, an invitation", () => {
     open(repeating);
     expect(await screen.findByText(why)).toBeTruthy();
     expect(remove().disabled).toBe(true);
+    expect(screen.queryByText("You can remove it now.")).toBeNull();
+  });
+
+  // Whose guest entry declines, where "your calendar" and "you" wouldn't say: the strip's own names.
+  it("names the calendar in the question and in what the organiser hears", async () => {
+    const { unmount } = open(invitation, { removeFrom: "Boss" });
+    const asked = screen.getByRole("dialog", { name: "Remove “Gym” from Boss?" });
+    expect(asked.textContent).toContain(
+      "Google Calendar tells the organiser Boss declined. You can undo it for a few seconds.",
+    );
+    expect(asked.textContent).not.toContain("you declined");
+    unmount();
+    choicesForDelete.mockResolvedValue(plan({ all: offered("a") }));
+    open(repeating, { removeFrom: "Boss" });
+    expect(screen.getByRole("dialog", { name: "Remove “Gym” from Boss?" }).textContent).toContain(
+      "Google Calendar tells the organiser Boss declined. This removes every occurrence",
+    );
+    await waitFor(() => expect(remove().disabled).toBe(false));
+  });
+
+  it("promises every occurrence only where the plan doesn't say it was split", async () => {
+    choicesForDelete.mockResolvedValue(
+      plan({ all: { row: "offered", warnings: [{ warning: "split_sibling" }], token: "a" } }),
+    );
+    open(repeating);
+    await waitFor(() => expect(remove().disabled).toBe(false));
+    const dialog = screen.getByRole("dialog", { name: TITLE });
+    expect(dialog.textContent).toContain("This removes every occurrence of this part.");
+    expect(dialog.textContent).not.toContain("as Google Calendar does");
+    expect(dialog.textContent).not.toContain("delete");
+    expect(
+      screen.getByText(
+        /Google may remove that part too\. If it stays, you can remove it the same way\./,
+      ),
+    ).toBeTruthy();
   });
 
   it("says Google changed it, and keeps Remove off", async () => {
@@ -636,7 +677,7 @@ describe("DeleteEventDialog, an invitation", () => {
         "This repeating event changed since you asked to remove it. Nothing was removed.",
       ),
     ).toBeTruthy();
-    expect(screen.getByText(/Google may delete that part too\./)).toBeTruthy();
+    expect(screen.getByText(/Google may remove that part too\./)).toBeTruthy();
     expect(remove().disabled).toBe(false);
   });
 
@@ -667,23 +708,6 @@ describe("DeleteEventDialog, an invitation", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
     await waitFor(() => expect(settleSplit).toHaveBeenCalledWith("s", "check", "Gym"));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-  });
-
-  // Reopened by the backend with an email question: Google's copy says it's the user's own now.
-  it("asks as a delete when the backend asks about guests", () => {
-    const told: GuestNotice = {
-      updated: 1,
-      invited: 0,
-      removed: 0,
-      told_cancelled: 0,
-      cancelled: true,
-      people: 1,
-      emails: 1,
-      complete: true,
-    };
-    open(invitation, { guests: { notice: told, again: false } });
-    expect(screen.getByRole("dialog", { name: "Delete this event?" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
   });
 
   // C20 §0.4 item 11: a birthday's or a Gmail event's organiser is Google's: deleted, not removed.
