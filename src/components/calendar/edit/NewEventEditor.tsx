@@ -69,6 +69,7 @@ import {
 import { flushSync } from "react-dom";
 import type { CalendarOverview, GuestNotice, Notify, WriteOutcome } from "../../../lib/types";
 import {
+  COPY_CALL_OFF_NOTE,
   NEW_EVENT_BASE,
   NO_BAD_DATES,
   changedFields,
@@ -274,10 +275,17 @@ export function NewEventEditor({
       newEventLength(seed) ??
       lengthFor(overview, targetById(targets, startCalendar)),
   );
-  // Whether the user has changed the time: until then, another calendar brings its own length.
-  const timeTouched = useRef(handover?.timeTouched ?? false);
-  // Whether the user has picked Show as: until then, it follows the kind (all day free).
-  const showAsTouched = useRef(handover?.showAsTouched ?? false);
+  // Whether the user has changed the time: until then, another calendar brings its own length. A
+  // copy's time is the original's, as Google holds it (C18 §7.1), so it starts as changed: another
+  // calendar never makes it the account's default length.
+  const timeTouched = useRef(handover?.timeTouched ?? copyOf !== undefined);
+  // Whether the user has picked Show as: until then, it follows the kind (all day free). A copy's is
+  // the original's, so it starts as picked, and all day and back keeps it, as editing the original
+  // would.
+  const showAsTouched = useRef(handover?.showAsTouched ?? copyOf !== undefined);
+  // The draft's defaults are the ones a kind switch put there, untouched since: switching back puts
+  // the seed's list back (`remindersAfterKindSwitch`). Only a copy's seed has a list of its own.
+  const kindResetRef = useRef(false);
   // Whether the user has pressed the video-call row (here or in quick create): until then, it
   // follows Google's setting and the guest list (`meetDefault`). A copy starts as pressed: Google's
   // Duplicate ignores the setting (Workspace admin help 9898950).
@@ -525,9 +533,10 @@ export function NewEventEditor({
   function changeKind(zone: string) {
     const was = draftRef.current;
     const switched = switchNewKind(was, seed, zone, lengthRef.current, showAsTouched.current);
-    // The seed is on the calendar's defaults (`newEventSeed`), so defaults on the draft stay the
-    // defaults whoever put them there: no switch's reset to remember.
-    const r = remindersAfterKindSwitch(seed, switched, true, false);
+    // A new event's seed is on the calendar's defaults (`newEventSeed`); a copy's has the original's
+    // list, which switching back puts back, as the event editor does.
+    const r = remindersAfterKindSwitch(seed, switched, true, kindResetRef.current);
+    kindResetRef.current = r.reset;
     changeTime(r.draft);
     setRemindersNote(r.note);
   }
@@ -819,7 +828,7 @@ export function NewEventEditor({
               targets={targets}
               value={calendarId}
               onChange={pickCalendar}
-              privateDraft={draft.visibility === "private"}
+              privateDraft={draft.visibility === "private" || draft.visibility === "confidential"}
               hidden={hidden}
               colorOf={colorOf}
               shapeOf={shapeOf}
@@ -933,7 +942,10 @@ export function NewEventEditor({
             value={draft.meet}
             offered={meetOffered(target)}
             disabled={locked}
-            note={meetNote ?? copyCallNote}
+            // A copy's note asks for a new call only where there's one to add.
+            note={
+              meetNote ?? (copyCallNote && !meetOffered(target) ? COPY_CALL_OFF_NOTE : copyCallNote)
+            }
             onChange={(meet) => {
               meetTouched.current = true;
               setMeetNote(null);
@@ -964,6 +976,7 @@ export function NewEventEditor({
             }
             onChange={(reminders) => {
               setRemindersNote(null);
+              kindResetRef.current = false;
               setDraft({ ...draftRef.current, reminders });
             }}
             onInvalid={(bad) => {
@@ -1037,6 +1050,10 @@ export function NewEventEditor({
               disabled={locked}
               onChange={(visibility) => setDraft({ ...draft, visibility })}
               privateOff={noPrivate}
+              // Only a copy of an event that has Google's older choice holds it (C18c).
+              confidential={
+                seed.visibility === "confidential" || draft.visibility === "confidential"
+              }
             />
           </div>
 

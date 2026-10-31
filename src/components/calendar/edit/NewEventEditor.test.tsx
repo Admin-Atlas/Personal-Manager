@@ -38,6 +38,7 @@ import type {
 import { CREATE_LOST } from "../../../lib/calendarEdit/editReasons";
 import {
   COPY_CALL_NOTE,
+  COPY_CALL_OFF_NOTE,
   toNewEvent,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
@@ -2396,6 +2397,63 @@ describe("NewEventEditor opened on a copy (C18c)", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(createEvent.mock.calls[0][0]).toBe(WORK_CAL);
     expect(createEvent.mock.calls[0][1].summary).toBe("Retro");
+  });
+
+  // Review round 1 of PR 1: a copy's time is the original's (C18 §7.1), never the default length of
+  // the account whose calendar is picked.
+  it("a copy keeps its own end on another calendar, and back", async () => {
+    createEvent.mockResolvedValue(saved);
+    const time = { ...seed.time, end_time: "12:00" } as EditorFields["time"];
+    const { onClose } = open({ copy: copyOf({ time }) });
+    const end = () => screen.getByLabelText<HTMLSelectElement>("End time");
+    expect(end().value).toBe("12:00");
+    pickCalendar("Personal", "Work");
+    expect(end().value).toBe("12:00");
+    pickCalendar("Work", "Personal");
+    expect(end().value).toBe("12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].time).toMatchObject({ end_time: "12:00" });
+  });
+
+  // Review round 1 of PR 1: all day and back puts the copy's own notifications and busy or free
+  // back, as the event editor does with the original's.
+  it("a copy's notifications and busy or free come back after All day and back", async () => {
+    createEvent.mockResolvedValue(saved);
+    const reminders = { use_default: false, overrides: [{ method: "popup", minutes: 10 }] };
+    const copy = copyOf({ reminders, show_as: "free" });
+    const { onClose } = open({ copy });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByRole("textbox", { name: "How many: 10 minutes before" })).toBeTruthy();
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    const sent = createEvent.mock.calls[0][1];
+    expect(sent.reminders).toEqual(toNewEvent(copy.fields).reminders);
+    expect(sent.show_as).toBe("free");
+  });
+
+  // Review round 1 of PR 1: Google's older choice shows as what's sent, never as the first option.
+  it("a confidential copy shows Confidential", () => {
+    open({ copy: copyOf({ visibility: "confidential" }) });
+    expect(screen.getByLabelText<HTMLSelectElement>("Visibility").value).toBe("confidential");
+    cleanup();
+    open({ copy: copyOf() });
+    const options = [...screen.getByLabelText<HTMLSelectElement>("Visibility").options];
+    expect(options.some((o) => o.value === "confidential")).toBe(false);
+  });
+
+  // Review round 1 of PR 1: a calendar without Meet has no Add to press, so the note doesn't ask.
+  it("a copy's call note asks for a new call only where Meet is offered", () => {
+    open({ overview: meetOverview(), copy: copyOf({}, { callNote: COPY_CALL_NOTE }) });
+    expect(within(videoCall()).getByText(COPY_CALL_NOTE)).toBeTruthy();
+    pickCalendar("Personal", "Family");
+    expect(within(videoCall()).getByText(COPY_CALL_OFF_NOTE)).toBeTruthy();
+    expect(within(videoCall()).queryByText(COPY_CALL_NOTE)).toBeNull();
+    expect(within(videoCall()).queryByRole("button")).toBeNull();
+    pickCalendar("Family", "Personal");
+    expect(within(videoCall()).getByText(COPY_CALL_NOTE)).toBeTruthy();
   });
 
   // Critique C2-L12: a formatted description goes as Google holds it. Formatting PM writes back is

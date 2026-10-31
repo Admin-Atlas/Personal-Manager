@@ -1424,7 +1424,7 @@ describe("seedDuplicate", () => {
       color_id: "4",
       guests_can_modify: true,
     };
-    const copy = seedDuplicate(original, null, false);
+    const copy = seedDuplicate(original, null, false, "owner");
     expect(copy.fields).toEqual({ ...seedDraft(original), organizer_email: null });
     expect(copy.fields.summary).toBe("Dentist");
     expect(copy.fields.meet).toBe(false);
@@ -1439,28 +1439,40 @@ describe("seedDuplicate", () => {
       join: "https://x",
       state: "ready" as const,
     };
-    const withCall = seedDuplicate({ ...event, call: meet }, null, false);
+    const withCall = seedDuplicate({ ...event, call: meet }, null, false, "owner");
     expect(withCall.fields.meet).toBe(false);
     expect(withCall.callNote).toBe(COPY_CALL_NOTE);
     expect(withCall.notes).toEqual([]);
-    const other = seedDuplicate({ ...event, call: { ...meet, kind: "add_on" } }, null, false);
+    const other = seedDuplicate(
+      { ...event, call: { ...meet, kind: "add_on" } },
+      null,
+      false,
+      "owner",
+    );
     expect(other.callNote).toBe(COPY_CALL_NOTE);
+    // A call being made is one; a request Google failed made none, so there's nothing to not copy.
+    const making = { ...meet, join: null, state: "pending" as const };
+    expect(seedDuplicate({ ...event, call: making }, null, false, "owner").callNote).toBe(
+      COPY_CALL_NOTE,
+    );
+    const failed = { ...meet, join: null, state: "failed" as const };
+    expect(seedDuplicate({ ...event, call: failed }, null, false, "owner").callNote).toBeNull();
     // Critique C2-L12 (C19 critique C2-H1): as Google holds it, formatting PM can edit or not, with
     // no note; the editor decides how it shows.
     for (const html of ["<b>Bring</b> the form", "<table><tr><td>Room</td></tr></table>"]) {
-      const formatted = seedDuplicate({ ...event, description: html }, null, false);
+      const formatted = seedDuplicate({ ...event, description: html }, null, false, "owner");
       expect(formatted.fields.description).toBe(html);
       expect(formatted.notes).toEqual([]);
     }
-    expect(seedDuplicate({ ...event, attachments: ["a.pdf"] }, null, false).notes).toEqual([
-      COPY_ATTACHMENTS_NOTE,
-    ]);
+    expect(seedDuplicate({ ...event, attachments: ["a.pdf"] }, null, false, "owner").notes).toEqual(
+      [COPY_ATTACHMENTS_NOTE],
+    );
   });
 
   it("keeps an organised event's guests, all but the user, none of them the organiser", () => {
     const room = guest("room@resource.calendar.google.com", { room: true, response: null });
     const opt = guest("b@x.org", { optional: true, response: "declined" });
-    const copy = seedDuplicate({ ...event, guests: [ME, A, opt, room] }, null, false);
+    const copy = seedDuplicate({ ...event, guests: [ME, A, opt, room] }, null, false, "owner");
     expect(copy.fields.guests).toEqual([
       { ...A, response: null },
       { ...opt, response: null },
@@ -1469,7 +1481,12 @@ describe("seedDuplicate", () => {
     expect(copy.fields.guests.some((g) => g.organizer || g.self)).toBe(false);
     expect(copy.notes).toEqual([]);
     // Google cut the list short: only those PM saw.
-    const omitted = seedDuplicate({ ...event, guests: [ME, A], guests_omitted: true }, null, false);
+    const omitted = seedDuplicate(
+      { ...event, guests: [ME, A], guests_omitted: true },
+      null,
+      false,
+      "owner",
+    );
     expect(omitted.notes).toEqual([COPY_OMITTED_NOTE]);
     // What it sends: who and whether optional, nobody's reply.
     expect(toNewEvent(copy.fields).guests).toEqual([
@@ -1488,12 +1505,35 @@ describe("seedDuplicate", () => {
       { ...event, organizer_self: false, organizer_email: "o@y.org", guests: [organiser, me, A] },
       null,
       false,
+      "owner",
     );
     expect(copy.fields.guests).toEqual([]);
     expect(copy.notes).toEqual([COPY_GUESTS_NOTE]);
     // Nobody but the user on it: nothing to say.
-    const alone = seedDuplicate({ ...event, organizer_self: false, guests: [me] }, null, false);
+    const alone = seedDuplicate(
+      { ...event, organizer_self: false, guests: [me] },
+      null,
+      false,
+      "owner",
+    );
     expect(alone.notes).toEqual([]);
+  });
+
+  // Review round 1 of PR 1: Google's organizer.self means the calendar it's read from organises it.
+  // On a colleague's calendar shared to view, that's their meeting: its copy invites nobody either.
+  it("a copy from a calendar the user can't change starts with no guests, though it organises it", () => {
+    const ana = guest("ana@y.org", { self: true, organizer: true });
+    const theirs = { ...event, organizer_self: true, guests: [ana, A] };
+    for (const role of ["reader", "freeBusyReader", null]) {
+      const copy = seedDuplicate(theirs, null, false, role);
+      expect(copy.fields.guests, String(role)).toEqual([]);
+      expect(copy.notes, String(role)).toEqual([COPY_GUESTS_NOTE]);
+    }
+    for (const role of ["owner", "writer", "writerWithoutPrivateAccess"]) {
+      expect(seedDuplicate(theirs, null, false, role).fields.guests, role).toEqual([
+        { ...A, response: null },
+      ]);
+    }
   });
 
   // Critiques C1-M4, C2-M6: an occurrence's copy is a one-off at that occurrence's time.
@@ -1502,7 +1542,7 @@ describe("seedDuplicate", () => {
       ...event,
       time: timed("2026-10-19", "11:00", "2026-10-19", "12:00"),
     };
-    const copy = seedDuplicate(occurrence, series(WEEKLY), true);
+    const copy = seedDuplicate(occurrence, series(WEEKLY), true, "owner");
     expect(copy.fields.recurrence).toEqual({ kind: "once" });
     expect(copy.fields.time).toEqual(timed("2026-10-19", "11:00", "2026-10-19", "12:00"));
     expect(copy.notes).toEqual([
@@ -1510,15 +1550,17 @@ describe("seedDuplicate", () => {
     ]);
     expect(copyRepeatNote("Weekly on Monday")).toBe(copy.notes[0]);
     // A rule PM can only show, or a series it couldn't read: the same one-off.
-    expect(seedDuplicate(occurrence, series(null), true).fields.recurrence).toEqual({
+    expect(seedDuplicate(occurrence, series(null), true, "owner").fields.recurrence).toEqual({
       kind: "once",
     });
-    expect(seedDuplicate(occurrence, null, true).notes).toEqual([
+    expect(seedDuplicate(occurrence, null, true, "owner").notes).toEqual([
       "The original repeats; the copy doesn't. Choose Repeat to set it.",
     ]);
     // A series read, whatever the row said, is one.
-    expect(seedDuplicate(occurrence, series(WEEKLY), false).notes).toEqual([copy.notes[0]]);
-    expect(seedDuplicate(occurrence, null, false).notes).toEqual([]);
+    expect(seedDuplicate(occurrence, series(WEEKLY), false, "owner").notes).toEqual([
+      copy.notes[0],
+    ]);
+    expect(seedDuplicate(occurrence, null, false, "owner").notes).toEqual([]);
   });
 
   it("toNewEvent of a copy has only a new event's keys", () => {
@@ -1526,6 +1568,7 @@ describe("seedDuplicate", () => {
       { ...event, attachments: ["a.pdf"], label_id: "l1", call: null, guests: [ME, A] },
       null,
       false,
+      "owner",
     );
     expect(Object.keys(toNewEvent(copy.fields)).sort()).toEqual([
       "colour",

@@ -2188,8 +2188,10 @@ export type WriteOutcome =
   | { outcome: "ambiguous"; retry_token: string }
   | { outcome: "failed"; message: string }
   /** The other changes in a save landed and the calendar change didn't, for `message` (C18d): the
-   *  editor reads Google's copy again before anything more is sent. Only a save answers it. */
-  | { outcome: "not_moved"; message: string };
+   *  editor reads Google's copy again before anything more is sent. Only a save answers it.
+   *  `warnings`: what those changes have to say beside "saved" (a call Google didn't make, say), as
+   *  a save's are; left out when nothing. */
+  | { outcome: "not_moved"; message: string; warnings?: WriteWarning[] };
 
 /** A delete still waiting out its Undo window, for a webview that reloaded. */
 export interface HeldDeleteInfo {

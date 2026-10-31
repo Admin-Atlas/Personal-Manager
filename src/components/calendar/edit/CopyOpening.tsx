@@ -16,6 +16,9 @@ import { openForEdit } from "./useEventWrites";
 interface Props {
   /** The row the user chose to duplicate. */
   row: CalendarEvent;
+  /** Its calendar's access role, null when PM no longer has the calendar: whether an event that
+   *  calendar organises is the user's own to copy guests and all (`seedDuplicate`). */
+  role: string | null;
   /** Google's copy read: the new event's fields and what the copy leaves out. */
   onReady: (copy: EventCopy) => void;
   onClose: () => void;
@@ -23,16 +26,18 @@ interface Props {
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-export function CopyOpening({ row, onReady, onClose }: Props) {
+export function CopyOpening({ row, role, onReady, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const title = row.summary.trim() || "(no title)";
   // The row is the safer sign of a repeating event: the series is null when Google's copy of it
   // couldn't be read.
   const repeating = isRepeating(row);
-  // The latest `onReady`: a new one from the parent's render is no reason to read Google again.
+  // The latest `onReady` and role: a new render of the parent's is no reason to read Google again.
   const ready = useRef(onReady);
+  const roleRef = useRef(role);
   useEffect(() => {
     ready.current = onReady;
+    roleRef.current = role;
   });
 
   useEffect(() => {
@@ -44,7 +49,7 @@ export function CopyOpening({ row, onReady, onClose }: Props) {
           setError(loadText(load));
           return;
         }
-        ready.current(seedDuplicate(load.event, load.series, repeating));
+        ready.current(seedDuplicate(load.event, load.series, repeating, roleRef.current));
       })
       .catch((e) => {
         if (alive) setError(message(e));

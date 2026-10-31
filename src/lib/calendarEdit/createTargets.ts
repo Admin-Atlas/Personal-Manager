@@ -16,7 +16,7 @@ import type {
 } from "../types";
 import { formatDateLocal } from "../format";
 import { wallInstant } from "../wallTime";
-import { DEFAULT_LENGTH_MS, type GuestDraft } from "./eventDraft";
+import { DEFAULT_LENGTH_MS, type GuestDraft, WRITABLE_ROLES } from "./eventDraft";
 import type { CreatedWhere } from "./editReasons";
 import { changeNotice, sameAddress } from "./guests";
 
@@ -35,9 +35,6 @@ export interface CreateTargets {
   /** Google accounts whose calendars aren't offered because editing isn't on, with their status. */
   off: { account: CalendarAccount; status: EditingStatus }[];
 }
-
-/** The roles that may add events: the backend's `create_block` refuses every other. */
-const WRITABLE_ROLES: readonly string[] = ["owner", "writer", "writerWithoutPrivateAccess"];
 
 /** Every calendar a new event may go to, and the Google accounts that have editing off. */
 export function createTargets(overview: CalendarOverview): CreateTargets {

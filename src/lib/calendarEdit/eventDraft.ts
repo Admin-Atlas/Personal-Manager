@@ -1002,6 +1002,8 @@ export interface EventCopy {
 /** Google's own Duplicate makes no video call ("no video conferencing by default", Workspace admin
  *  help 9898950): one click adds a new one. */
 export const COPY_CALL_NOTE = "The video call isn't copied. Add a new one if you need it.";
+/** `COPY_CALL_NOTE` on a calendar that offers no Meet: there's nothing to add. */
+export const COPY_CALL_OFF_NOTE = "The video call isn't copied.";
 export const COPY_ATTACHMENTS_NOTE = "Attachments aren't copied: PM can't add attachments yet.";
 export const COPY_GUESTS_NOTE =
   "The original's guests aren't copied. Add them if this is a meeting.";
@@ -1017,25 +1019,35 @@ export const copyRepeatNote = (repeats: string | null): string =>
 export const copyMilestoneNote = (label: string): string =>
   `The “${label}” milestone stays linked to the original.`;
 
+/** The calendar roles that may add and change events: the backend's `create_block` refuses every
+ *  other. */
+export const WRITABLE_ROLES: readonly string[] = ["owner", "writer", "writerWithoutPrivateAccess"];
+
 /** A new event's fields copied from `event` (Google's fresh copy of the row the user chose) and, for
  *  an occurrence, its repeating event's `series` (`repeating`: the row is one, though PM may not
  *  have read its series), as Google's Duplicate makes a copy. The title, time, place, description
  *  (unchanged, formatted or not, with no note: C18 critique C2-L12, C19 critique C2-H1), busy or
- *  free, visibility, notifications, colour and guest permissions are the original's. A copy of an event the user organises keeps its guests, all but
- *  the user's own entry, none of them the organiser, with no replies; a copy of an invitation starts
- *  with none, since "Don't send" may still put it on their calendars (C18 critique C2-M7, probe
- *  L-CP5). An occurrence's copy starts as a one-off at that occurrence's time (critiques C1-M4,
- *  C2-M6: a copied rule's count would start again, and a moved occurrence's copy would jump to the
- *  rule's day; probe L-CP3). Never a video call, never attachments. */
+ *  free, visibility, notifications, colour and guest permissions are the original's. A copy of an
+ *  event the user organises keeps its guests, all but the user's own entry, none of them the
+ *  organiser, with no replies; a copy of an invitation starts with none, since "Don't send" may
+ *  still put it on their calendars (C18 critique C2-M7, probe L-CP5). Google's `organizer_self`
+ *  means the calendar it's read from organises it, so it's the user's own only where `role`, that
+ *  calendar's access role, lets them change its events: on a colleague's calendar shared to view, it
+ *  is the colleague's meeting, and its copy starts with none too. An occurrence's copy starts as a
+ *  one-off at that occurrence's time (critiques C1-M4, C2-M6: a copied rule's count would start
+ *  again, and a moved occurrence's copy would jump to the rule's day; probe L-CP3). Never a video
+ *  call, never attachments; the note that the call isn't copied is for a call Google made or is
+ *  making, never a request it failed, which made none. */
 export function seedDuplicate(
   event: EventForEdit,
   series: SeriesInfo | null,
   repeating: boolean,
+  role: string | null,
 ): EventCopy {
   const notes: string[] = [];
   const others = event.guests.filter((g) => !g.self);
   let guests: GuestDraft[] = [];
-  if (!event.organizer_self) {
+  if (!event.organizer_self || role === null || !WRITABLE_ROLES.includes(role)) {
     if (others.length > 0) notes.push(COPY_GUESTS_NOTE);
   } else {
     guests = others.map((g) => ({ ...g, organizer: false, response: null }));
@@ -1046,7 +1058,7 @@ export function seedDuplicate(
   return {
     fields: { ...seedDraft(event), guests, meet: false, organizer_email: null },
     notes,
-    callNote: event.call !== null ? COPY_CALL_NOTE : null,
+    callNote: event.call !== null && event.call.state !== "failed" ? COPY_CALL_NOTE : null,
   };
 }
 

@@ -109,9 +109,11 @@ vi.mock("../../../theme/timezones", async (importOriginal) => ({
   deviceTimeZoneOrNull: () => deviceZone,
 }));
 
+// Standard depth unless a test says Power.
+let depth = "standard";
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  useTheme: () => ({ system: "slate", depth: "standard" }),
+  useTheme: () => ({ system: "slate", depth }),
 }));
 
 // The rest of the module is real: the description codec's link rule asks its `safeUrl`.
@@ -125,6 +127,7 @@ import {
   A11_NOTE,
   CALENDAR_ALONE,
   CALENDAR_WHOLE,
+  NOT_MOVED_UNREAD,
   reasonText,
   savedNotice,
 } from "../../../lib/calendarEdit/editReasons";
@@ -321,6 +324,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   deviceZone = "Europe/London";
+  depth = "standard";
   recurrencePresets.mockImplementation(async (day) => presetsFor(day));
   describeRecurrence.mockImplementation(async (_rule, start) => readyAt(start));
 });
@@ -706,6 +710,40 @@ describe("EventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
     fireEvent.click(await screen.findByRole("button", { name: "Discard and duplicate" }));
     expect(onDuplicate).toHaveBeenCalledWith(row);
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  // Review round 1 of PR 1: text that never reached the draft is lost by Duplicate and Delete too,
+  // so they ask as closing does.
+  it("Duplicate and Delete ask first when only an address it couldn't read stands", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onDuplicate = vi.fn();
+    const onDelete = vi.fn();
+    render(
+      <EventEditor
+        row={row}
+        calendar={null}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        {...NO_CALENDARS}
+        onClose={vi.fn()}
+        onDelete={onDelete}
+        onDuplicate={onDuplicate}
+        canDuplicate
+      />,
+    );
+    await screen.findByLabelText("Title");
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    box.focus();
+    fireEvent.change(box, { target: { value: "bob@" } });
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    expect(await screen.findByText("Discard your changes and duplicate?")).toBeTruthy();
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(await screen.findByText("Discard your changes and delete?")).toBeTruthy();
     expect(onDelete).not.toHaveBeenCalled();
   });
 
@@ -3744,6 +3782,74 @@ describe("EventEditor, its calendar", () => {
       null,
       null,
     );
+  });
+
+  // Review round 1 of PR 1: the fields landed, so a read after that fails never takes the place of
+  // saying so (the read's own words can say nothing changed, or that the event is gone when the
+  // save gave its occurrences new ids), and what the fields had to say beside "saved" is said too.
+  it("not moved still says what saved when Google's copy can't be read again", async () => {
+    const head =
+      "Your other changes are saved, but it's still on Personal. Google is busy right now. Google didn't make the video call. Add it again from Edit, or in Google Calendar.";
+    const reads: (() => void)[] = [
+      () =>
+        openForEdit.mockRejectedValueOnce(new Error("That event is no longer in PM's calendar.")),
+      () =>
+        openForEdit.mockResolvedValueOnce({
+          outcome: "failed",
+          message:
+            "PM couldn't reach Google. Nothing was changed; try again when you're back online.",
+        }),
+      () => openForEdit.mockResolvedValueOnce({ outcome: "gone" }),
+    ];
+    for (const read of reads) {
+      saveEdit.mockResolvedValueOnce({
+        outcome: "not_moved",
+        message: "Google is busy right now.",
+        warnings: ["call_failed"],
+      });
+      const onClose = await openOn();
+      pick("Personal", "Side");
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+      read();
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(await screen.findByText(`${head} ${NOT_MOVED_UNREAD}`)).toBeTruthy();
+      expect(screen.queryByText(/Nothing was changed|no longer in/)).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+      cleanup();
+    }
+  });
+
+  // Review round 1 of PR 1: after not moved, the other changes are in Google: discarding loses only
+  // the calendar change and what was changed since, never "nothing has been saved".
+  it("discarding after not moved says the other changes are already saved", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Nothing has been saved to Google yet.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  // Review round 1 of PR 1: at Power depth, another calendar chosen is a change the line names.
+  it("the Power-depth line counts the calendar chosen", async () => {
+    depth = "power";
+    await openOn();
+    expect(screen.getByText("No changes yet")).toBeTruthy();
+    pick("Personal", "Side");
+    expect(screen.getByText("Changed: calendar")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    expect(screen.getByText("Changed: title and calendar")).toBeTruthy();
   });
 
   // C19d: the replacement landed with the other changes, so the choice is spent. A description

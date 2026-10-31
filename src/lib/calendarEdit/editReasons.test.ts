@@ -28,6 +28,7 @@ import {
   CALENDAR_ALONE,
   CALENDAR_WHOLE,
   calendarRowText,
+  changedText,
   CALLOUT_TONE,
   CREATE_CHANGED,
   CREATE_LOST,
@@ -569,6 +570,26 @@ describe("another calendar (C18d)", () => {
     expect(moveBackText(notMoved, "Gym").text.length).toBeGreaterThan(0);
     expect(settleText(notMoved, "Gym").text).toMatch(/^“Gym”: /);
     expect(createText(notMoved, "Gym", false).text.length).toBeGreaterThan(0);
+    // Review round 1 of PR 1: what the fields had to say beside "saved" is said too, never dropped.
+    expect(
+      outcomeText({
+        outcome: "not_moved",
+        message: "Try again.",
+        warnings: ["call_failed", "partly_applied"],
+      }).text,
+    ).toBe(
+      "Your other changes are saved, but its calendar didn't change. Try again. Google didn't keep all of your changes, so check the event. Google didn't make the video call. Add it again from Edit, or in Google Calendar.",
+    );
+    expect(notMovedText("Try again.", "Home", ["call_pending"])).toBe(
+      "Your other changes are saved, but it's still on Home. Try again. Google is still making the video call; its link shows after a later refresh.",
+    );
+  });
+
+  // Review round 1 of PR 1: the editor's Power-depth line names another calendar chosen.
+  it("names the calendar among the changes", () => {
+    expect(changedText([], true)).toBe("calendar");
+    expect(changedText(["summary", "time"], true)).toBe("title, time and calendar");
+    expect(changedText(["summary"], false)).toBe("title");
   });
 
   it("says under the Calendar row whose calendars are listed, and Duplicate only where it helps", () => {

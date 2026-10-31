@@ -10,9 +10,10 @@
 // Quick create's size (`compact`, C18b) is one pressed-or-not button, "Google Meet", where the
 // calendar offers it: a new event has no call to show yet.
 
-import { useId, useLayoutEffect, useRef, type ReactNode } from "react";
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { CallForEdit } from "../../../lib/types";
 import { openUrl } from "../../../lib/ipc";
+import { JOIN_FAILED } from "../../../lib/calendarEdit/editReasons";
 import { Button, CopyLinkButton } from "../../ui";
 
 interface Props {
@@ -93,6 +94,12 @@ function MeetRow({ call, value, offered, disabled = false, onChange, note }: Pro
     pressed.current = true;
     onChange(meet);
   };
+  // Join pressed and the browser didn't open: said under the row, Copy link being beside it.
+  const [joinFailed, setJoinFailed] = useState(false);
+  const openCall = (link: string) => {
+    setJoinFailed(false);
+    openUrl(link).catch(() => setJoinFailed(true));
+  };
 
   const meet = call?.kind === "meet" ? call : null;
   // Another service's call, Google's old Hangouts or a bare link: shown and kept (`other_call`).
@@ -107,7 +114,7 @@ function MeetRow({ call, value, offered, disabled = false, onChange, note }: Pro
 
   const join = (label: string, link: string) => (
     <span className="flex min-w-0 flex-wrap items-center gap-2">
-      <Button variant="secondary" size="sm" onClick={() => void openUrl(link)}>
+      <Button variant="secondary" size="sm" onClick={() => openCall(link)}>
         {label}
       </Button>
       {/* For joining from another browser, or sending the link on. */}
@@ -203,6 +210,10 @@ function MeetRow({ call, value, offered, disabled = false, onChange, note }: Pro
         {status}
       </p>
       {body}
+      {/* Always there (empty, it takes no room), so a screen reader hears it when Join fails. */}
+      <p role="status" className="text-xs text-st-due">
+        {joinFailed ? JOIN_FAILED : ""}
+      </p>
       {note && <p className="text-xs text-ink3">{note}</p>}
     </div>
   );

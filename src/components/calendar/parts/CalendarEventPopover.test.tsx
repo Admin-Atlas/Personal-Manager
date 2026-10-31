@@ -57,6 +57,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
+import { JOIN_FAILED } from "../../../lib/calendarEdit/editReasons";
 import {
   CalendarEventPopover,
   type PopoverAsk,
@@ -827,6 +828,30 @@ describe("CalendarEventPopover", () => {
     } finally {
       Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
     }
+  });
+
+  // Review round 1 of PR 1: Join the call that didn't open says so, pointing to Copy link, and only
+  // for the event it was pressed on.
+  it("Join the call that didn't open says so", async () => {
+    openUrl.mockRejectedValueOnce("Couldn't open the link (NotFound).");
+    const call = "https://meet.google.com/abc-defg-hij";
+    const popover = (id: string) => (
+      <CalendarEventPopover
+        event={calendarEvent({ id, conference_url: call })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />
+    );
+    const { getByRole, findByText, queryByText, rerender } = render(popover("e1"));
+    expect(queryByText(JOIN_FAILED)).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Join the call →" }));
+    expect(openUrl).toHaveBeenCalledWith(call);
+    expect((await findByText(JOIN_FAILED)).getAttribute("role")).toBe("status");
+    rerender(popover("e2"));
+    expect(queryByText(JOIN_FAILED)).toBeNull();
   });
 
   it("offers no link to copy when the event has none", () => {

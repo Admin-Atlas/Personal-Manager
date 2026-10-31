@@ -20,6 +20,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
 }));
 
 import type { CallForEdit } from "../../../lib/types";
+import { JOIN_FAILED } from "../../../lib/calendarEdit/editReasons";
 import { MeetField } from "./MeetField";
 
 afterEach(() => {
@@ -157,6 +158,20 @@ describe("MeetField", () => {
     render(<Row call={zoom} />);
     fireEvent.click(button("Join"));
     expect(openUrl).toHaveBeenLastCalledWith("https://zoom.us/j/987");
+  });
+
+  // Review round 1 of PR 1: a browser that didn't open is said under the row, pointing to Copy link
+  // beside Join, and pressing Join again clears it until the answer comes.
+  it("Join that didn't open says so", async () => {
+    openUrl.mockRejectedValueOnce("Couldn't open the link (NotFound).");
+    render(<Row call={meet()} value />);
+    expect(within(group()).queryByText(JOIN_FAILED)).toBeNull();
+    fireEvent.click(button("Join with Google Meet"));
+    expect(await within(group()).findByText(JOIN_FAILED)).toBeTruthy();
+    expect(within(group()).getByText(JOIN_FAILED).getAttribute("role")).toBe("status");
+    openUrl.mockResolvedValueOnce(undefined);
+    fireEvent.click(button("Join with Google Meet"));
+    expect(within(group()).queryByText(JOIN_FAILED)).toBeNull();
   });
 
   // Critique C2-M1: a guest, or anyone on another service's call, can still join.

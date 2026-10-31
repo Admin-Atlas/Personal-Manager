@@ -8,7 +8,7 @@
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CalendarEvent, EditLoad, EventForEdit } from "../../../lib/types";
+import type { CalendarEvent, EditLoad, EventForEdit, GuestForEdit } from "../../../lib/types";
 
 const openForEdit = vi.hoisted(() => vi.fn<(id: string) => Promise<EditLoad>>());
 vi.mock("./useEventWrites", () => ({ openForEdit: (id: string) => openForEdit(id) }));
@@ -18,7 +18,11 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", mode: "dark", accent: "mono", depth: "standard" }),
 }));
 
-import { COPY_CALL_NOTE, seedDuplicate } from "../../../lib/calendarEdit/eventDraft";
+import {
+  COPY_CALL_NOTE,
+  COPY_GUESTS_NOTE,
+  seedDuplicate,
+} from "../../../lib/calendarEdit/eventDraft";
 import { CopyOpening } from "./CopyOpening";
 
 afterEach(() => {
@@ -106,24 +110,49 @@ describe("CopyOpening", () => {
   it("reads the original once and hands its copy on", async () => {
     openForEdit.mockResolvedValue(ready(event));
     const onReady = vi.fn();
-    const { rerender } = render(<CopyOpening row={row()} onReady={onReady} onClose={() => {}} />);
+    const { rerender } = render(
+      <CopyOpening row={row()} role="owner" onReady={onReady} onClose={() => {}} />,
+    );
     expect(screen.getByRole("dialog", { name: "Duplicate event" })).toBeTruthy();
     expect(screen.getByText("Copying “Retro” from Google…")).toBeTruthy();
     await act(async () => {});
     expect(openForEdit.mock.calls).toEqual([[`${CAL}:e1`]]);
     expect(onReady).toHaveBeenCalledOnce();
-    expect(onReady).toHaveBeenCalledWith(seedDuplicate(event, null, false));
+    expect(onReady).toHaveBeenCalledWith(seedDuplicate(event, null, false, "owner"));
     expect(onReady.mock.calls[0][0].callNote).toBe(COPY_CALL_NOTE);
     // A new render from the calendar reads nothing more.
-    rerender(<CopyOpening row={row()} onReady={vi.fn()} onClose={() => {}} />);
+    rerender(<CopyOpening row={row()} role="owner" onReady={vi.fn()} onClose={() => {}} />);
     await act(async () => {});
     expect(openForEdit).toHaveBeenCalledOnce();
+  });
+
+  // Review round 1 of PR 1: an event the calendar organises is the user's own only where they can
+  // change that calendar's events; a colleague's, shared to view, keeps none of its guests.
+  it("a copy from a calendar shared to view keeps none of its guests", async () => {
+    const guest = { name: null, response: null, optional: false, room: false };
+    const guests: GuestForEdit[] = [
+      { ...guest, email: "ana@y.org", response: "accepted", organizer: true, self: true },
+      { ...guest, email: "b@x.org", organizer: false, self: false },
+    ];
+    openForEdit.mockResolvedValue(ready({ ...event, guests }));
+    const onReady = vi.fn();
+    render(<CopyOpening row={row()} role="reader" onReady={onReady} onClose={() => {}} />);
+    await act(async () => {});
+    expect(onReady.mock.calls[0][0].fields.guests).toEqual([]);
+    expect(onReady.mock.calls[0][0].notes).toEqual([COPY_GUESTS_NOTE]);
   });
 
   it("an occurrence's copy says the original repeats", async () => {
     openForEdit.mockResolvedValue(ready(event));
     const onReady = vi.fn();
-    render(<CopyOpening row={row({ recurring: true })} onReady={onReady} onClose={() => {}} />);
+    render(
+      <CopyOpening
+        row={row({ recurring: true })}
+        role="owner"
+        onReady={onReady}
+        onClose={() => {}}
+      />,
+    );
     await act(async () => {});
     expect(onReady.mock.calls[0][0].notes).toEqual([
       "The original repeats; the copy doesn't. Choose Repeat to set it.",
@@ -134,7 +163,7 @@ describe("CopyOpening", () => {
     openForEdit.mockResolvedValue({ outcome: "gone" });
     const onReady = vi.fn();
     const onClose = vi.fn();
-    render(<CopyOpening row={row()} onReady={onReady} onClose={onClose} />);
+    render(<CopyOpening row={row()} role="owner" onReady={onReady} onClose={onClose} />);
     await act(async () => {});
     expect(onReady).not.toHaveBeenCalled();
     expect(screen.getByText(/deleted/i)).toBeTruthy();
@@ -147,7 +176,7 @@ describe("CopyOpening", () => {
 
   it("a read that fails says why", async () => {
     openForEdit.mockRejectedValue(new Error("PM couldn't reach Google."));
-    render(<CopyOpening row={row()} onReady={vi.fn()} onClose={() => {}} />);
+    render(<CopyOpening row={row()} role="owner" onReady={vi.fn()} onClose={() => {}} />);
     await act(async () => {});
     expect(screen.getByText("PM couldn't reach Google.")).toBeTruthy();
   });
@@ -157,7 +186,9 @@ describe("CopyOpening", () => {
     openForEdit.mockReturnValue(new Promise((resolve) => (answer = resolve)));
     const onReady = vi.fn();
     const onClose = vi.fn();
-    const { unmount } = render(<CopyOpening row={row()} onReady={onReady} onClose={onClose} />);
+    const { unmount } = render(
+      <CopyOpening row={row()} role="owner" onReady={onReady} onClose={onClose} />,
+    );
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     expect(onClose).toHaveBeenCalled();
     unmount();

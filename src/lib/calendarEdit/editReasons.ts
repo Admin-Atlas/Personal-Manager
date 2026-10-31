@@ -649,7 +649,7 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
     case "failed":
       return { tone: "error", text: outcome.message };
     case "not_moved":
-      return { tone: "warn", text: notMovedText(outcome.message, null) };
+      return { tone: "warn", text: notMovedText(outcome.message, null, outcome.warnings) };
     default:
       return unreachable(outcome);
   }
@@ -676,10 +676,31 @@ export function calendarRowText(account: string, otherAccounts: boolean): string
 }
 
 /** A save whose other changes landed and whose calendar change didn't (C18d), `calendar` being the
- *  name of the one it's still on, when known. The message is the backend's, a sentence. */
-export function notMovedText(message: string, calendar: string | null): string {
+ *  name of the one it's still on, when known. The message is the backend's, a sentence. What those
+ *  changes had to say beside "saved" (`warnings`: a call Google didn't make, say) follows it, in a
+ *  save's words. */
+export function notMovedText(
+  message: string,
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
   const still = calendar ? `it's still on ${calendar}` : "its calendar didn't change";
-  return `Your other changes are saved, but ${still}. ${message}`;
+  const said = warningWords(warnings).words;
+  return [`Your other changes are saved, but ${still}.`, message, ...said].join(" ");
+}
+
+/** After a save whose calendar change alone didn't land (C18d), PM couldn't read the event again:
+ *  said after what the save came to, never the read's own words, which can say nothing changed. */
+export const NOT_MOVED_UNREAD =
+  "PM couldn't read the event again afterwards, so close it and open it again before changing anything more.";
+
+/** Join on a video call when the browser didn't open: the link can still be copied beside it. */
+export const JOIN_FAILED = "PM couldn't open the call in your browser. Use Copy link instead.";
+
+/** The editor's Power-depth line: the fields changed, and the calendar when another is chosen
+ *  (C18d), which isn't a field. */
+export function changedText(fields: readonly EditorField[], calendar: boolean): string {
+  return listWords([...fields.map(fieldLabel), ...(calendar ? ["calendar"] : [])]);
 }
 
 /** What a delete of the event called `title` came to, as one sentence naming it. A delete that
@@ -1112,18 +1133,30 @@ function savedWarnings(
   words: string[];
   warn: boolean;
 } {
-  const partly = outcome.warnings.includes("partly_applied");
-  const outside = outcome.warnings.includes("outside_mirror");
-  const pending = outcome.warnings.includes("mirror_refresh_pending");
-  const left = outcome.warnings.includes("left_on_old_series");
-  const callPending = outcome.warnings.includes("call_pending");
-  const callFailed = outcome.warnings.includes("call_failed");
-  const links = outcome.warnings.includes("links_left_behind");
+  return warningWords(outcome.warnings, outcome.left_behind, calendar);
+}
+
+/** `savedWarnings` of a save's `warnings` alone: a "not moved" says them too (C18d). */
+function warningWords(
+  warnings: readonly WriteWarning[],
+  leftBehind?: readonly string[],
+  calendar: string | null = null,
+): {
+  words: string[];
+  warn: boolean;
+} {
+  const partly = warnings.includes("partly_applied");
+  const outside = warnings.includes("outside_mirror");
+  const pending = warnings.includes("mirror_refresh_pending");
+  const left = warnings.includes("left_on_old_series");
+  const callPending = warnings.includes("call_pending");
+  const callFailed = warnings.includes("call_failed");
+  const links = warnings.includes("links_left_behind");
   const words: string[] = [];
   if (partly) words.push(writeWarningText("partly_applied", "save"));
   if (outside) words.push(writeWarningText("outside_mirror", "save"));
   if (pending) words.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
-  if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
+  if (left) words.push(writeWarningText("left_on_old_series", "save", leftBehind));
   if (callPending) words.push(writeWarningText("call_pending", "save"));
   if (callFailed) words.push(writeWarningText("call_failed", "save"));
   if (links) words.push(writeWarningText("links_left_behind", "save", undefined, calendar));

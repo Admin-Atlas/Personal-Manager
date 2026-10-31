@@ -727,9 +727,12 @@ pub enum WriteOutcome {
     /// The new part of a change PM couldn't finish was removed: the repeating event is as it was.
     SplitRemoved,
     /// The other changes in this save landed, and the calendar change didn't, for `message` (C18d).
-    /// The editor reads Google's copy again before anything more is sent.
+    /// The editor reads Google's copy again before anything more is sent. `warnings`: what those
+    /// changes have to say beside "saved" (a call Google didn't make, say); left out when nothing.
     NotMoved {
         message: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<WriteWarning>,
     },
 }
 
@@ -1285,8 +1288,16 @@ mod tests {
             (
                 WriteOutcome::NotMoved {
                     message: "x".into(),
+                    warnings: Vec::new(),
                 },
                 r#"{"outcome":"not_moved","message":"x"}"#,
+            ),
+            (
+                WriteOutcome::NotMoved {
+                    message: "x".into(),
+                    warnings: vec![WriteWarning::CallFailed],
+                },
+                r#"{"outcome":"not_moved","message":"x","warnings":["call_failed"]}"#,
             ),
             (WriteOutcome::NoChange, r#"{"outcome":"no_change"}"#),
             (WriteOutcome::Gone, r#"{"outcome":"gone"}"#),

@@ -20,13 +20,15 @@ import type {
   CalendarOverview,
   EditLoad,
   EventForEdit,
+  GuestForEdit,
   GuestNotice,
   Milestone,
+  NewEventDraft,
   WriteOutcome,
 } from "../../lib/types";
 import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-layout";
 import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
-import { COPY_CALL_NOTE } from "../../lib/calendarEdit/eventDraft";
+import { COPY_CALL_OFF_NOTE } from "../../lib/calendarEdit/eventDraft";
 import { formatDateLocal, pad2 } from "../../lib/format";
 
 const ipc = vi.hoisted(() => ({
@@ -1031,7 +1033,8 @@ describe("CalendarView: Duplicate", () => {
     expect(
       within(editor).getByText("The “Plant bulbs” milestone stays linked to the original."),
     ).toBeTruthy();
-    expect(within(editor).getByText(COPY_CALL_NOTE)).toBeTruthy();
+    // Personal offers no Meet here, so the note asks for no new call (review round 1 of PR 1).
+    expect(within(editor).getByText(COPY_CALL_OFF_NOTE)).toBeTruthy();
     expect(within(editor).getByLabelText<HTMLInputElement>("Title").value).toBe("Standup");
     // On the original's calendar, which takes new events.
     expect(within(editor).getByRole("button", { name: "Calendar: Personal" })).toBeTruthy();
@@ -1067,6 +1070,48 @@ describe("CalendarView: Duplicate", () => {
     fireEvent.click(chip());
     await screen.findByRole("dialog");
     expect(screen.queryByRole("button", { name: "Duplicate" })).toBeNull();
+  });
+
+  // Critique C1-L9, review round 1 of PR 1: a copy that starts on a calendar other than the
+  // original's (its account has editing off) never invites that calendar to its own event: the
+  // calendar organises it.
+  it("a copy started on another account's calendar leaves that calendar off its guests", async () => {
+    const OTHER = "gcal:other@x.com";
+    const theirs: CalendarOverview = {
+      ...overview,
+      accounts: [...overview.accounts, { ...account, id: OTHER, email: "other@x.com" }],
+      calendars: [
+        ...overview.calendars,
+        {
+          ...calendar("other@x.com", { name: "Other", is_primary: true }),
+          id: `${OTHER}:other@x.com`,
+          source_id: OTHER,
+        },
+      ],
+      editing: { [ME]: "off", [OTHER]: "on" },
+    };
+    const guest = { name: null, response: null, optional: false, room: false };
+    const guests: GuestForEdit[] = [
+      { ...guest, email: "me@x.com", organizer: true, self: true },
+      { ...guest, email: "other@x.com", organizer: false, self: false },
+      { ...guest, email: "b@x.org", organizer: false, self: false },
+    ];
+    ipc.calendarOverview.mockResolvedValue(theirs);
+    ipc.getCalendarEventForEdit.mockResolvedValue({ ...load, event: { ...original, guests } });
+    ipc.createCalendarEvent.mockResolvedValue({ outcome: "saved", warnings: [] });
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate" }));
+    const editor = await screen.findByRole("dialog", { name: "New event" });
+    expect(within(editor).getByRole("button", { name: "Calendar: Other" })).toBeTruthy();
+    fireEvent.click(within(editor).getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send invitation emails to guests?" });
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(ipc.createCalendarEvent).toHaveBeenCalled());
+    const [on, sent] = ipc.createCalendarEvent.mock.calls[0] as [string, NewEventDraft];
+    expect(on).toBe(`${OTHER}:other@x.com`);
+    expect(sent.guests).toEqual([{ email: "b@x.org", optional: false }]);
   });
 });
 

@@ -1488,6 +1488,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       {copying && (
         <CopyOpening
           row={copying}
+          role={overview?.calendars.find((c) => c.id === copying.calendar_id)?.access_role ?? null}
           onReady={(copy) => onCopyReady(copying, copy)}
           onClose={() => setCopying(null)}
         />

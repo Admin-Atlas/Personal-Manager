@@ -45,7 +45,12 @@ import type {
   RsvpScope,
   WriteOutcome,
 } from "../../../lib/types";
-import { askConnectedText, askLabel, askText } from "../../../lib/calendarEdit/editReasons";
+import {
+  askConnectedText,
+  askLabel,
+  askText,
+  JOIN_FAILED,
+} from "../../../lib/calendarEdit/editReasons";
 import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
 import { linkTarget, parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
 import { eventFlags, openUrl } from "../../../lib/ipc";
@@ -389,6 +394,14 @@ export function CalendarEventPopover({
     return parsed.markup ? parsed.doc : null;
   }, [google, event.description]);
   const mail = useMailLink(event.id);
+  // Join the call pressed and the browser didn't open: said under it, for this event only (a
+  // re-pointed pop-up never shows another's), Copy link being beside it.
+  const [joinFailed, setJoinFailed] = useState<string | null>(null);
+  const joinCall = (link: string) => {
+    setJoinFailed(null);
+    const on = event.id;
+    openUrl(link).catch(() => setJoinFailed(on));
+  };
   // A Markdown description's mail links open as the formatted view's do (whose own handler has
   // already taken its own), and a link that would load inside PM's window (a relative one, or one
   // `safeUrl` emptied) does nothing. Web links are `useExternalLinks`', left to it.
@@ -492,7 +505,7 @@ export function CalendarEventPopover({
             <span className="flex min-w-0 items-center gap-2">
               <button
                 type="button"
-                onClick={() => void openUrl(event.conference_url!)}
+                onClick={() => joinCall(event.conference_url!)}
                 className="truncate text-left text-accent-text hover:brightness-110"
               >
                 Join the call →
@@ -505,6 +518,10 @@ export function CalendarEventPopover({
                 className="shrink-0"
               />
             </span>
+            {/* Always there (empty, it takes no room), so a screen reader hears it. */}
+            <p role="status" className="text-st-due">
+              {joinFailed === event.id ? JOIN_FAILED : ""}
+            </p>
           </Field>
         )}
 

@@ -136,9 +136,10 @@ import {
   CALENDAR_WHOLE,
   calendarRowText,
   CALLOUT_TONE,
+  changedText,
   earlierChangeText,
-  listFields,
   loadText,
+  NOT_MOVED_UNREAD,
   notMovedText,
   notOrganizerText,
   outcomeText,
@@ -326,6 +327,9 @@ export function EventEditor({
   const [saving, setSaving] = useState(false);
   // An earlier save's answer never came: it may be in Google already.
   const [uncertain, setUncertain] = useState(false);
+  // An earlier save's other changes landed and its calendar change didn't (C18d): they're in Google
+  // already, so discarding loses only the calendar change and what was changed since.
+  const [partlySaved, setPartlySaved] = useState(false);
   const [askDiscard, setAskDiscard] = useState<"close" | "delete" | "duplicate" | null>(null);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
   // The choices dialog for a repeating event (null = closed).
@@ -466,19 +470,20 @@ export function EventEditor({
     !!draftRef.current &&
     (changedFields(loaded.base, draftRef.current).length > 0 || moving());
 
+  /** Whether leaving the editor (closing, Delete, Duplicate) loses something, so it asks first: a
+   *  changed draft, or text in the guest box that isn't an address, a date a field couldn't read or
+   *  a notification row that can't be committed, which never reached the draft. */
+  const unsaved = () =>
+    isDirty() ||
+    hasBadDate(badDatesRef.current) ||
+    badGuestRef.current !== null ||
+    badRemindersRef.current;
+
   const requestClose = () => {
     if (saving || promptRef.current) return;
     commitFocused();
-    // Text in the guest box that isn't an address, or a notification row that can't be
-    // committed, never reached the draft: it would be lost too.
-    if (
-      isDirty() ||
-      hasBadDate(badDatesRef.current) ||
-      badGuestRef.current !== null ||
-      badRemindersRef.current
-    ) {
-      setAskDiscard("close");
-    } else onClose();
+    if (unsaved()) setAskDiscard("close");
+    else onClose();
   };
 
   /** The row a delete from here compares: what the editor showed, not a possibly older mirror row,
@@ -500,7 +505,7 @@ export function EventEditor({
   const requestDelete = () => {
     if (!onDelete || saving || promptRef.current) return;
     commitFocused();
-    if (isDirty()) setAskDiscard("delete");
+    if (unsaved()) setAskDiscard("delete");
     else onDelete(deleteRow());
   };
 
@@ -509,7 +514,7 @@ export function EventEditor({
   const requestDuplicate = () => {
     if (!onDuplicate || saving || promptRef.current) return;
     commitFocused();
-    if (isDirty()) setAskDiscard("duplicate");
+    if (unsaved()) setAskDiscard("duplicate");
     else onDuplicate(row);
   };
 
@@ -576,19 +581,25 @@ export function EventEditor({
 
   /** Google changed the event on a field this save sends: take its copy, keep the rest. After a
    *  save whose calendar change alone didn't land (`saved`, C18d), the fields are Google's already,
-   *  so `head` says it all unless Google's copy differs from the draft somewhere. */
+   *  so `head` says it all unless Google's copy differs from the draft somewhere. A read that fails
+   *  then never takes `head`'s place: the fields did land, and the read's own words can say nothing
+   *  changed, or that the event is gone when the save gave its occurrences new ids. */
   async function rebaseAfterConflict(head: string, saved = false) {
     if (!loaded || !draftRef.current) return;
+    const unread = (text: string) =>
+      setBanner(
+        saved ? { tone: "warn", text: `${head} ${NOT_MOVED_UNREAD}` } : { tone: "error", text },
+      );
     let fresh: EditLoad;
     try {
       fresh = await openForEdit(row.id);
     } catch (e) {
-      // A conflict means nothing was written, so this save isn't in doubt.
-      setBanner({ tone: "error", text: message(e) });
+      // A conflict means nothing was written, so that save isn't in doubt.
+      unread(message(e));
       return;
     }
     if (fresh.outcome !== "ready") {
-      setBanner({ tone: "error", text: loadText(fresh) });
+      unread(loadText(fresh));
       return;
     }
     const seed = repeatSeed(fresh.series, rowRepeats || !!fresh.series);
@@ -958,7 +969,11 @@ export function EventEditor({
         // The other changes landed and the calendar change didn't (C18d): Google's copy is read
         // again (the session moved on), the calendar chosen kept, so Save tries it alone.
         case "not_moved":
-          await rebaseAfterConflict(notMovedText(outcome.message, calendar?.name ?? null), true);
+          setPartlySaved(true);
+          await rebaseAfterConflict(
+            notMovedText(outcome.message, calendar?.name ?? null, outcome.warnings),
+            true,
+          );
           return;
         // `ambiguous`: only creating an event answers it, never a save; read as a save it would be
         // unconfirmed.
@@ -1042,7 +1057,10 @@ export function EventEditor({
   const heldTimed = loaded?.base.time.kind === "timed" ? loaded.base.time : null;
   const zoneFallback = heldTimed?.start_zone ?? calendar?.time_zone ?? deviceZone;
   const timeEditable = may("time") && !timeOff;
-  const dirty = loaded && draft ? changedFields(loaded.base, draft).length > 0 : false;
+  // Another calendar chosen is a change too (C18d), though not a field.
+  const calendarMoved = calendarId !== row.calendar_id;
+  const changed = loaded && draft ? changedFields(loaded.base, draft) : [];
+  const dirty = changed.length > 0 || calendarMoved;
   const timed = draft?.time.kind === "timed" ? draft.time : null;
   // The End list resolves every quarter hour, so it's worked out once per time change.
   const endChoices = useMemo(
@@ -1085,7 +1103,6 @@ export function EventEditor({
     !!ownAccount &&
     ownAccount.targets.length > 1 &&
     ownAccount.targets.some((t) => t.calendar.id === row.calendar_id);
-  const calendarMoved = calendarId !== row.calendar_id;
   // One at a time, as the backend takes them (critique C2-H1): a new repeat holds the calendar,
   // and another calendar holds the repeat.
   const repeatChanged =
@@ -1460,9 +1477,7 @@ export function EventEditor({
                 {row.uid && <div className="break-all">UID: {row.uid}</div>}
                 {row.updated && <div>Updated: {row.updated}</div>}
                 <div>
-                  {dirty
-                    ? `Changed: ${listFields(changedFields(loaded.base, draft))}`
-                    : "No changes yet"}
+                  {dirty ? `Changed: ${changedText(changed, calendarMoved)}` : "No changes yet"}
                 </div>
               </div>
             )}
@@ -1556,7 +1571,9 @@ export function EventEditor({
       >
         {uncertain
           ? "PM couldn't confirm whether your last save reached Google. Refresh the calendar to check."
-          : "Nothing has been saved to Google yet."}
+          : partlySaved
+            ? "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded."
+            : "Nothing has been saved to Google yet."}
       </ConfirmDialog>
     </>
   );
