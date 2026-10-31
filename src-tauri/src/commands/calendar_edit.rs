@@ -5646,7 +5646,15 @@ fn plan_scope(
         let refused = |why| Planned::Planned(Err(NotPlanned::Refused(why)));
         match planning.series.parts {
             Parts::Overlap(day) => return refused(SeriesRefusal::SplitOverlap(day)),
-            Parts::Unread => return refused(SeriesRefusal::PartsUnread),
+            // A removal has no "this occurrence" to fall back on.
+            Parts::Unread => {
+                let removal = matches!(request, ChoiceRequest::Delete { seen, .. } if seen.removal);
+                return refused(if removal {
+                    SeriesRefusal::RemovePartsUnread
+                } else {
+                    SeriesRefusal::PartsUnread
+                });
+            }
             Parts::Clear => {}
         }
     }
@@ -21997,6 +22005,7 @@ mod tests {
                 SeriesRefusal::SpecialDeleteEveryYear,
                 // Removing someone else's repeating event (C14d).
                 SeriesRefusal::RemoveEveryOccurrence,
+                SeriesRefusal::RemovePartsUnread,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -27249,6 +27258,40 @@ mod tests {
         assert!(this == refused, "this occurrence");
         assert!(following == refused, "this and following");
         assert!(matches!(all, ScopeRow::Offered { guests: None, .. }));
+    }
+
+    /// A listing of split parts Google didn't answer, on an invitation nobody split: "All events"
+    /// says PM couldn't check, in Remove's words, and offers nothing, so no question says it was
+    /// split, or promises every occurrence.
+    #[tokio::test]
+    async fn a_removal_is_refused_when_the_listing_of_its_parts_fails() {
+        let instance = monday_invite();
+        let delete = || ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(instance.clone())),
+        };
+        let failed = Script::new(vec![
+            instance_read(&instance),
+            Step::get("/events/abc", "", weekly_invite()),
+            Step::get(
+                "/events",
+                "iCalUID=abc%40google.com",
+                page(vec![weekly_invite()], None),
+            ),
+            window_read(vec![instance.clone()]),
+            Step::status("/events", "privateExtendedProperty=pmSplitOf%3Dabc", 403),
+        ]);
+        let (.., all) = ask(&failed, &instance, delete(), None, &["abc"]).await;
+        failed.asked_all();
+        let refused = ScopeRow::Refused {
+            message: SeriesRefusal::RemovePartsUnread.to_string(),
+        };
+        assert!(all == refused, "All events");
+        assert_eq!(
+            SeriesRefusal::RemovePartsUnread.to_string(),
+            "PM couldn't check for a new part an earlier “this and following” change made of this \
+             repeating event, so it won't remove it now. Try again in a moment."
+        );
     }
 
     /// The reads and writes of removing the repeating invitation from Monday 19-10: the plan before

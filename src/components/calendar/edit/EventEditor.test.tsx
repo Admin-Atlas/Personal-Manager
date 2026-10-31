@@ -3437,6 +3437,23 @@ describe("EventEditor, an invitation", () => {
       expect(screen.queryByText(NOTHING)).toBeNull();
     });
 
+    // Google answered 200 and PM read back less: what the backend's `land_reply` says then.
+    it("says PM can't tell when the guest list came back shorter after the reply", async () => {
+      await after({
+        outcome: "failed",
+        message:
+          "The event's guest list came back shorter after your reply. Check its guests in Google Calendar.",
+      });
+      expect(await screen.findByText(UNKNOWN)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    it("says PM can't tell when the copy read back doesn't hold the reply", async () => {
+      await after({ outcome: "ignored_by_google", split: false });
+      expect(await screen.findByText(UNKNOWN)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
     it("says PM can't tell when the reply came back unconfirmed", async () => {
       await after({ outcome: "unconfirmed" });
       expect(await screen.findByText(UNKNOWN)).toBeTruthy();

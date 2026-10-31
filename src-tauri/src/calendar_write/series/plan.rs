@@ -1518,10 +1518,12 @@ fn delete_plan(
     }
     let master_json = input.fresh.master.json();
     let mut warnings = Vec::new();
-    // A removal's question says "every occurrence" unless told otherwise, so a later part PM can't
-    // rule out (one it couldn't read) says so too, where a delete of your own goes by `sibling`.
+    // A removal's question says "every occurrence" unless told otherwise, so a later part PM knows
+    // of says so too, where a delete of your own goes by `sibling`. Never `Unread`, which says nothing
+    // was split: `plan_scope` has refused a listing that didn't finish (`RemovePartsUnread`).
     let removal = gate::removes_copy(master.event_type.as_deref(), master.organizer_self);
-    if (input.sibling || (removal && input.later != LaterPart::None)) && scope != Scope::This {
+    let known_part = removal && matches!(input.later, LaterPart::At(_) | LaterPart::Through(_));
+    if (input.sibling || known_part) && scope != Scope::This {
         warnings.push(SeriesWarning::SplitSibling);
     }
     // Every arm that deletes the whole series comes through here.
@@ -8046,20 +8048,22 @@ mod tests {
         }
     }
 
-    /// A removal can't promise every occurrence when another part of the series is about: Google's
-    /// part, or a later part PM can't place. It says so, and goes by the part it was asked about;
-    /// what Google does with the other is L-I4's (I4-8). A delete of your own goes by `sibling`
-    /// alone, as it did.
+    /// A removal can't promise every occurrence when another part of the series is about: it says
+    /// so, and goes by the part it was asked about; what Google does with the other is L-I4's (I4-8).
+    /// A later part PM couldn't read isn't one it knows of, so never said as fact: `plan_scope`
+    /// refuses that listing first (`a_removal_is_refused_when_the_listing_of_its_parts_fails`). A
+    /// delete of your own goes by `sibling` alone, as it did.
     #[test]
     fn a_removal_warns_when_another_part_may_stay() {
         let warned = |case: &Case| case.delete(Scope::All).unwrap().warnings;
         assert_eq!(warned(&invitation(false)), []);
+        let unread = Case {
+            later: LaterPart::Unread,
+            ..invitation(false)
+        };
+        assert_eq!(warned(&unread), []);
         let day = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
-        for later in [
-            LaterPart::Unread,
-            LaterPart::At(Point::Day(day)),
-            LaterPart::Through(day),
-        ] {
+        for later in [LaterPart::At(Point::Day(day)), LaterPart::Through(day)] {
             let case = Case {
                 later,
                 ..invitation(false)

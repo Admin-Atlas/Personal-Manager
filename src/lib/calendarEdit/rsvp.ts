@@ -257,13 +257,17 @@ export function removingFrom(
 export type ReplyStanding = "sent" | "unconfirmed" | null;
 
 /** `standing` after a reply came to `outcome`. A definite refusal sent nothing, so it changes
- *  nothing: an earlier reply is still with Google, or still in doubt. */
+ *  nothing: an earlier reply is still with Google, or still in doubt. `failed` and
+ *  `ignored_by_google` aren't that: Google may have answered 200 before PM read back a shorter guest
+ *  list, or a copy without the reply, and `failed`'s words are all that tell its cases apart. */
 export function replyStanding(standing: ReplyStanding, outcome: WriteOutcome): ReplyStanding {
   switch (outcome.outcome) {
     case "saved":
     case "no_change":
       return "sent";
     case "unconfirmed":
+    case "failed":
+    case "ignored_by_google":
       return "unconfirmed";
     default:
       return standing;

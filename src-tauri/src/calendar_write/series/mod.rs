@@ -703,6 +703,8 @@ pub enum SeriesRefusal {
     /// Someone else's repeating event removed for one occurrence, or from one occurrence on: it
     /// leaves the user's calendar whole, as Google web takes it (C14 §10.3).
     RemoveEveryOccurrence,
+    /// [`SeriesRefusal::PartsUnread`] on a removal, which has no one occurrence to fall back on.
+    RemovePartsUnread,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -926,6 +928,11 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "Google Calendar removes someone else's repeating event from your calendar all at \
                  once, so choose “All events”."
+            ),
+            SeriesRefusal::RemovePartsUnread => write!(
+                f,
+                "PM couldn't check for a new part an earlier “this and following” change made of \
+                 this repeating event, so it won't remove it now. Try again in a moment."
             ),
         }
     }

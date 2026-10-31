@@ -783,6 +783,23 @@ describe("CalendarView: invitations", () => {
     expect(asked.textContent).toContain("Google Calendar tells the organiser Personal declined.");
   });
 
+  it("keeps “your calendar” when the other copy is on its way off", async () => {
+    rows = [invite(), { ...invite(), id: "i2", calendar_id: WORK_CAL }];
+    ipc.deleteCalendarEvent.mockResolvedValue({
+      outcome: "held",
+      undo_token: "t1",
+      undo_seconds: 8,
+    });
+    await mount();
+    const { startDelete } = await import("./edit/useEventWrites");
+    await act(() => startDelete(rows[1]));
+    fireEvent.click(screen.getByRole("button", { name: EVENT_CHIP }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    expect(
+      screen.getByRole("dialog", { name: "Remove “Standup” from your calendar?" }),
+    ).toBeTruthy();
+  });
+
   it("keeps “your calendar” when the other copy is on a hidden calendar", async () => {
     env.hidden = new Set([WORK_CAL]);
     rows = [invite(), organiser()];

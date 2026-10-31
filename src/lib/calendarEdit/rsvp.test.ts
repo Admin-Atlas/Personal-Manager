@@ -280,18 +280,35 @@ describe("the copies a reply can come from (C14b)", () => {
 describe("what the discard question says of the replies sent (C14d review)", () => {
   const saved: WriteOutcome = { outcome: "saved", warnings: [] };
   const lost: WriteOutcome = { outcome: "unconfirmed" };
-  const refused: WriteOutcome = { outcome: "failed", message: "no" };
+  const refused: WriteOutcome = { outcome: "busy" };
 
   it("goes by the last reply that went, and a refusal changes nothing", () => {
     expect(replyStanding(null, saved)).toBe("sent");
     expect(replyStanding(null, { outcome: "no_change" })).toBe("sent");
     expect(replyStanding(null, lost)).toBe("unconfirmed");
-    expect(replyStanding(null, refused)).toBeNull();
-    expect(replyStanding(null, { outcome: "busy" })).toBeNull();
+    const refusals: WriteOutcome[] = [
+      refused,
+      { outcome: "read_only", reason: "not_organizer" },
+      { outcome: "reauth" },
+      { outcome: "conflict", fields: [] },
+      { outcome: "needs_choice", scope: true },
+      { outcome: "gone" },
+    ];
+    for (const refusal of refusals) expect(replyStanding(null, refusal)).toBeNull();
     expect(replyStanding("sent", refused)).toBe("sent");
     expect(replyStanding("unconfirmed", refused)).toBe("unconfirmed");
     expect(replyStanding("sent", lost)).toBe("unconfirmed");
     expect(replyStanding("unconfirmed", saved)).toBe("sent");
+  });
+
+  // Google may hold the reply: PM read back a shorter guest list, or a copy without it.
+  it("never reads a reply that may have landed as one that didn't", () => {
+    const failed: WriteOutcome = { outcome: "failed", message: "anything" };
+    const ignored: WriteOutcome = { outcome: "ignored_by_google", split: false };
+    for (const outcome of [failed, ignored]) {
+      expect(replyStanding(null, outcome)).toBe("unconfirmed");
+      expect(replyStanding("sent", outcome)).toBe("unconfirmed");
+    }
   });
 });
 
