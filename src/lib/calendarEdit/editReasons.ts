@@ -125,6 +125,8 @@ export function notOrganizerText(canReply: boolean, editingOn: boolean): string 
 export interface EventRights {
   canEdit: boolean;
   canDelete: boolean;
+  /** Its delete is "Remove": it takes the user's copy off their calendar (C14d). */
+  removes: boolean;
   /** Its start and end may change (a drag, a resize). */
   canRetime: boolean;
   reason: string | null;
@@ -139,6 +141,7 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
   const none = (reason: string | null): EventRights => ({
     canEdit: false,
     canDelete: false,
+    removes: false,
     canRetime: false,
     reason,
   });
@@ -161,8 +164,9 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
     );
   }
   // The gate decides Delete (C14) and a drag (C16 critique C2-M4): a locked copy, whose delete Google
-  // doesn't document and whose times it refuses, and an invitation can't be deleted, nor dragged
-  // unless the organiser lets guests change it. A row the list didn't mark gets neither. A birthday
+  // doesn't document and whose times it refuses, can't be deleted; an invitation is removed where
+  // its calendar is on the guest list (C14d), and isn't dragged unless the organiser lets guests
+  // change it. A row the list didn't mark gets neither. A birthday
   // or a Gmail event says what Google lets change on it first, locked or not and whoever organises
   // it, since Google's list for its kind is the rule (C20 critique C2-H1). On an invitation the line
   // says what stays the organiser's, or Google's warning where they let guests change it.
@@ -178,12 +182,39 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
               ? A11_NOTE
               : notOrganizerText(ev.can_respond === true, true)
             : null;
+  const canDelete = ev.can_delete === true;
   return {
     canEdit: true,
-    canDelete: ev.can_delete === true,
+    canDelete,
+    removes: canDelete && removesCopy(ev),
     canRetime: ev.can_retime === true,
     reason,
   };
+}
+
+/** Whether a delete of `ev` only takes it off the user's calendar ("Remove", C14d), as the backend's
+ *  `removes_copy` reads it: an ordinary event someone else organises. Never a birthday or a Gmail
+ *  event, whose organiser Google fixes and whose delete emails nobody (C20 §0.4 item 11). */
+export function removesCopy(ev: Pick<CalendarEvent, "organizer_self" | "event_type">): boolean {
+  return ev.organizer_self === false && specialKind(ev.event_type) === null;
+}
+
+/** The question before a removal (C14 §13.4). Google web, Help 37113: "After you remove an event,
+ *  Calendar tells the event organizer you decline the event"; for someone else's repeating event it
+ *  offers no per-occurrence choices. `calendar`: the calendar whose guest entry declines, when it
+ *  must be named (`removingFrom`). `split`: the plan says the repeating event was split earlier, so
+ *  PM can't promise it all goes: the plan's own warning says what may stay. */
+export function removeText(
+  repeating: boolean,
+  calendar: string | null = null,
+  split = false,
+): string {
+  const every = !repeating
+    ? ""
+    : split
+      ? " This removes every occurrence of this part."
+      : " This removes every occurrence, as Google Calendar does.";
+  return `Google Calendar tells the organiser ${calendar ?? "you"} declined.${every} You can undo it for a few seconds.`;
 }
 
 /** Which of Google's special kinds an event is, read as the backend's `kind_of` reads `event_type`
@@ -773,12 +804,19 @@ export function changedText(fields: readonly EditorField[], calendar: boolean): 
 }
 
 /** What a delete of the event called `title` came to, as one sentence naming it. A delete that
- *  lands reports `saved`; one that found the event already gone has what it wanted. */
-export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; text: string } {
+ *  lands reports `saved`; one that found the event already gone has what it wanted. `removal`: it
+ *  was Remove on someone else's event, so it speaks of removing (C14 §13.4); `place`, where from. */
+export function deleteText(
+  outcome: WriteOutcome,
+  title: string,
+  removal = false,
+  place = "your calendar",
+): { tone: Tone; text: string } {
   const t = `“${title.trim() || "(no title)"}”`;
+  const done = removal ? "removed" : "deleted";
   const notDeleted = (why: string, tone: Tone = "error") => ({
     tone,
-    text: `${t} wasn't deleted. ${why}`,
+    text: `${t} wasn't ${done}. ${why}`,
   });
   switch (outcome.outcome) {
     case "saved":
@@ -788,6 +826,12 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
           tone: "warn",
           text: `Deleted ${t} from that day on. ${writeWarningText("left_on_old_series", "delete", outcome.left_behind)}`,
         };
+      }
+      if (removal) {
+        const pending = outcome.warnings.includes("mirror_refresh_pending")
+          ? ` ${writeWarningText("mirror_refresh_pending", "delete")}`
+          : "";
+        return { tone: "ok", text: `Removed ${t} from ${place}.${pending}` };
       }
       return {
         tone: "ok",
@@ -817,13 +861,16 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
         );
       }
       // Also a delete sent with no choice that the backend wants one for: a held delete can't
-      // reopen the dialog seconds later, so the user deletes again and chooses then.
+      // reopen the dialog seconds later, so the user deletes again and chooses then. A removal has
+      // no occurrences to choose from, only the question to answer again.
       return notDeleted(
-        "PM needs to ask which occurrences first. Delete it again to choose.",
+        removal
+          ? "PM needs to ask you again first. Remove it again."
+          : "PM needs to ask which occurrences first. Delete it again to choose.",
         "warn",
       );
     case "ignored_by_google":
-      return notDeleted("Google answered as if it deleted it, but kept it.", "warn");
+      return notDeleted(`Google answered as if it ${done} it, but kept it.`, "warn");
     case "partial_split":
       return notDeleted(earlierChangeText(outcome.offers, outcome.from, outcome.emails), "warn");
     case "split_removed":
@@ -842,13 +889,13 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
     case "unconfirmed":
       return {
         tone: "warn",
-        text: `PM lost touch with Google before it could confirm whether ${t} was deleted. Refresh the calendar to see.`,
+        text: `PM lost touch with Google before it could confirm whether ${t} was ${done}. Refresh the calendar to see.`,
       };
     // Only creating an event answers this; a delete never does, so it says only what's known.
     case "ambiguous":
       return {
         tone: "warn",
-        text: `PM lost touch with Google, so it can't tell whether ${t} was deleted. Refresh the calendar to see.`,
+        text: `PM lost touch with Google, so it can't tell whether ${t} was ${done}. Refresh the calendar to see.`,
       };
     case "failed":
       return notDeleted(outcome.message);
@@ -954,13 +1001,19 @@ export function replyNoticeText(
 }
 
 /** A delete of chosen occurrences that the plan changed under again, after the dialog reopened
- *  once (or with something else open by then): the user deletes again and chooses then. */
-export function deleteChangedText(title: string): { tone: Tone; text: string } {
+ *  once (or with something else open by then): the user deletes again and chooses then. `removal`:
+ *  it was Remove, with no occurrences to choose. */
+export function deleteChangedText(title: string, removal = false): { tone: Tone; text: string } {
   return {
     tone: "warn",
-    text: `${quote(title)} wasn't deleted. This repeating event changed since you chose which occurrences to delete. Delete it again to choose.`,
+    text: removal
+      ? `${quote(title)} wasn't removed. ${REMOVE_CHANGED} Remove it again.`
+      : `${quote(title)} wasn't deleted. This repeating event changed since you chose which occurrences to delete. Delete it again to choose.`,
   };
 }
+
+/** A removal of a repeating event whose plan changed between the question and the send (C14d). */
+export const REMOVE_CHANGED = "This repeating event changed since you asked to remove it.";
 
 const quote = (title: string) => `“${title.trim() || "(no title)"}”`;
 

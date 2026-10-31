@@ -245,6 +245,7 @@ const ready = (ev: EventForEdit, permissions = ALL, session = "s1"): EditLoad =>
     end: "2026-10-12T09:00:00Z",
     all_day: false,
     location: ev.location,
+    removal: false,
   },
   series: null,
 });
@@ -3298,7 +3299,7 @@ describe("EventEditor, an invitation", () => {
     description: false,
     visibility: false,
     guests: false,
-    delete: false,
+    delete: true,
     respond: true,
     reasons: ["not_organizer"],
   };
@@ -3307,7 +3308,7 @@ describe("EventEditor, an invitation", () => {
     ...ALL,
     repeat: false,
     guests: false,
-    delete: false,
+    delete: true,
     respond: true,
     reasons: ["organizer_only_guests"],
   };
@@ -3348,8 +3349,33 @@ describe("EventEditor, an invitation", () => {
     expect(
       screen.getByText("Someone else organises this event, so only they can make it repeat."),
     ).toBeTruthy();
-    // No Google warning without "modify event", and no Delete (Remove is a later layer's).
+    // No Google warning without "modify event"; Delete is Remove here.
     expect(screen.queryByText(/lets guests change this event/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove" })).toBeTruthy();
+  });
+
+  // C14 §10.4: Remove from the editor hands on the row with who organises it as Google's copy says,
+  // so the question and the send go by what the footer said; unsaved changes are asked about first,
+  // in Remove's words.
+  it("removes what the editor showed, asking first when there are unsaved changes", async () => {
+    openForEdit.mockResolvedValue(ready(invitation(), { ...THEIRS, summary: true }));
+    const onDelete = vi.fn();
+    await open(vi.fn(), onDelete, { ...row, organizer_self: true }, work);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(await screen.findByText("Discard your changes and remove?")).toBeTruthy();
+    expect(onDelete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard and remove" }));
+    expect(onDelete).toHaveBeenCalledWith(expect.objectContaining({ organizer_self: false }));
+  });
+
+  it("a locked invitation or one not on its guest list offers no Remove", async () => {
+    openForEdit.mockResolvedValue(
+      ready(invitation(), { ...THEIRS, delete: false, reasons: ["not_organizer", "locked"] }),
+    );
+    await open(vi.fn(), vi.fn(), row, work);
+    expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
@@ -3378,6 +3404,66 @@ describe("EventEditor, an invitation", () => {
     expect(onClose).toHaveBeenCalled();
     expect(saveEdit).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog", { name: /^Discard your changes/ })).toBeNull();
+  });
+
+  // A reply goes at once, apart from the draft: the discard question never says nothing went.
+  describe("the discard question after a reply", () => {
+    const NOTHING = "Nothing has been saved to Google yet.";
+    const WITH_GOOGLE = "Your reply is already with Google. Only your other changes are discarded.";
+    const UNKNOWN =
+      "PM couldn't confirm whether your reply reached Google. Refresh the calendar to check.";
+    const after = async (outcome: WriteOutcome | null) => {
+      openForEdit.mockResolvedValue(ready(invitation(), { ...THEIRS, summary: true }));
+      await open(vi.fn(), vi.fn(), row, work);
+      if (outcome) {
+        respond.mockResolvedValue(outcome);
+        fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+        await waitFor(() => expect(respond).toHaveBeenCalled());
+        await screen.findByRole("button", { name: "Yes" });
+      }
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Changed" } });
+      fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+      await screen.findByText("Discard your changes and remove?");
+    };
+
+    it("says nothing has gone when no reply did", async () => {
+      await after(null);
+      expect(screen.getByText(NOTHING)).toBeTruthy();
+    });
+
+    it("says the reply is with Google once it is", async () => {
+      await after(saved);
+      expect(await screen.findByText(WITH_GOOGLE)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    // Google answered 200 and PM read back less: what the backend's `land_reply` says then.
+    it("says PM can't tell when the guest list came back shorter after the reply", async () => {
+      await after({
+        outcome: "failed",
+        message:
+          "The event's guest list came back shorter after your reply. Check its guests in Google Calendar.",
+      });
+      expect(await screen.findByText(UNKNOWN)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    it("says PM can't tell when the copy read back doesn't hold the reply", async () => {
+      await after({ outcome: "ignored_by_google", split: false });
+      expect(await screen.findByText(UNKNOWN)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    it("says PM can't tell when the reply came back unconfirmed", async () => {
+      await after({ outcome: "unconfirmed" });
+      expect(await screen.findByText(UNKNOWN)).toBeTruthy();
+      expect(screen.queryByText(NOTHING)).toBeNull();
+    });
+
+    it("a refused reply sent nothing", async () => {
+      await after({ outcome: "busy" });
+      expect(await screen.findByText(NOTHING)).toBeTruthy();
+    });
   });
 
   it("after a reply the guest list shows it, and Yes stays pressed", async () => {
@@ -4371,8 +4457,9 @@ describe("EventEditor, a birthday or an event Gmail added", () => {
     const contacts = screen.getByText(reasonText("date_from_contacts"));
     const kind = screen.getByText(reasonText("special_date_fields"));
     expect(contacts.compareDocumentPosition(kind) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // Google lets a birthday be deleted (C20 §0.4 item 1).
+    // Google lets a birthday be deleted (C20 §0.4 item 1), and it's never Remove (§0.4 item 11).
     expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
   });
 
   it("one day shows a single Date field and no All day switch, and a new date moves the last day with it", async () => {
@@ -4417,8 +4504,11 @@ describe("EventEditor, a birthday or an event Gmail added", () => {
     expect(disabled(screen.getByRole("button", { name: "Add notification" }))).toBe(false);
     expect(disabled(screen.getByRole("button", { name: "Colour: Calendar colour" }))).toBe(false);
     expect(screen.getByText(reasonText("from_gmail_fields"))).toBeTruthy();
-    // Google's placeholder organiser is no one whose event this is: nothing says "only they can".
+    // Google's placeholder organiser is no one whose event this is: nothing says "only they can",
+    // and its delete is a delete, with no decline (C20 §0.4 item 11).
     expect(screen.queryByText(/Someone else organises/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove" })).toBeNull();
   });
 
   it("a Gmail event's visibility saves with no email question, its organiser on the list", async () => {

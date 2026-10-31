@@ -581,6 +581,34 @@ describe("CalendarEventPopover", () => {
     expect(getByText("Someone else organises this event.")).toBeTruthy();
   });
 
+  // C14 §10.4: the same button and the same call, by another name where it's someone else's event.
+  it("an invitation's button says Remove", () => {
+    const onDelete = vi.fn();
+    const { getByRole, queryByRole } = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+        editing={{
+          canEdit: true,
+          canDelete: true,
+          removes: true,
+          canDuplicate: false,
+          reason: null,
+          onEdit: () => {},
+          onDelete,
+          onDuplicate: () => {},
+        }}
+      />,
+    );
+    expect(queryByRole("button", { name: "Delete" })).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Remove" }));
+    expect(onDelete).toHaveBeenCalledOnce();
+  });
+
   // C18c: Duplicate sits before Edit, taking the push to the right from whichever came first.
   it("Duplicate shows only when offered and calls onDuplicate", () => {
     const onDuplicate = vi.fn();

@@ -117,7 +117,7 @@ describe("CalendarConnection editing switch", () => {
     render(<CalendarConnection provider="google" />);
     expect(
       await screen.findByText(
-        "Editing on: PM can create events on this account’s calendars, change, move and delete the events you can edit there, and reply to invitations.",
+        "Editing on: PM can create events on this account’s calendars, change, move and delete the events you can edit there, and reply to invitations or remove them.",
       ),
     ).toBeTruthy();
   });

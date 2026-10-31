@@ -25,8 +25,10 @@ import {
   myReply,
   NOTE_MAX,
   noteLength,
+  removingFrom,
   replyCopies,
   replyHeld,
+  replyStanding,
   RSVP_CHOICES,
   rsvpLabel,
   tidyNote,
@@ -254,6 +256,59 @@ describe("the copies a reply can come from (C14b)", () => {
     expect(ids(replyCopies([occurrence, other], occurrence, calendars, all))).toEqual([
       ["e1", null],
     ]);
+  });
+
+  // C14d: as the strip says whose reply it is. Any other copy on screen counts, whether or not it
+  // can be replied from, since it stays there under the notice.
+  it("names the calendar Remove acts on only where it matters", () => {
+    const shown = row({});
+    const named = (rows: CalendarEvent[], ev = shown) => removingFrom(rows, ev, calendars);
+    expect(named([shown])).toBeNull();
+    const onWork = row({ calendar_id: "work" });
+    expect(named([onWork], onWork)).toBe("Work");
+    expect(named([shown, row({ id: "e2", calendar_id: "work" })])).toBe("me");
+    expect(named([shown, row({ id: "e2", calendar_id: "work", can_respond: false })])).toBe("me");
+    // Not another copy: another occurrence, or no iCal UID to tell.
+    expect(named([shown, row({ id: "e2", start: "2026-10-19T09:00:00Z" })])).toBeNull();
+    const noUid = row({ uid: null });
+    expect(named([noUid, row({ id: "e2", uid: null })], noUid)).toBeNull();
+    // No calendar to name.
+    expect(named([row({ calendar_id: "gone" })], row({ calendar_id: "gone" }))).toBeNull();
+  });
+});
+
+describe("what the discard question says of the replies sent (C14d review)", () => {
+  const saved: WriteOutcome = { outcome: "saved", warnings: [] };
+  const lost: WriteOutcome = { outcome: "unconfirmed" };
+  const refused: WriteOutcome = { outcome: "busy" };
+
+  it("goes by the last reply that went, and a refusal changes nothing", () => {
+    expect(replyStanding(null, saved)).toBe("sent");
+    expect(replyStanding(null, { outcome: "no_change" })).toBe("sent");
+    expect(replyStanding(null, lost)).toBe("unconfirmed");
+    const refusals: WriteOutcome[] = [
+      refused,
+      { outcome: "read_only", reason: "not_organizer" },
+      { outcome: "reauth" },
+      { outcome: "conflict", fields: [] },
+      { outcome: "needs_choice", scope: true },
+      { outcome: "gone" },
+    ];
+    for (const refusal of refusals) expect(replyStanding(null, refusal)).toBeNull();
+    expect(replyStanding("sent", refused)).toBe("sent");
+    expect(replyStanding("unconfirmed", refused)).toBe("unconfirmed");
+    expect(replyStanding("sent", lost)).toBe("unconfirmed");
+    expect(replyStanding("unconfirmed", saved)).toBe("sent");
+  });
+
+  // Google may hold the reply: PM read back a shorter guest list, or a copy without it.
+  it("never reads a reply that may have landed as one that didn't", () => {
+    const failed: WriteOutcome = { outcome: "failed", message: "anything" };
+    const ignored: WriteOutcome = { outcome: "ignored_by_google", split: false };
+    for (const outcome of [failed, ignored]) {
+      expect(replyStanding(null, outcome)).toBe("unconfirmed");
+      expect(replyStanding("sent", outcome)).toBe("unconfirmed");
+    }
   });
 });
 

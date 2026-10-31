@@ -427,14 +427,29 @@ fn needs_scope(conn: &Connection, row_id: &str) -> Result<bool> {
 }
 
 /// Who a delete of the mirror row `row_id` would tell, when the user organises it: asked before the
-/// hold rather than 8 s later (R9, C12 §5.1). A row someone else organises isn't asked about here:
-/// the gate refuses it at the send.
+/// hold rather than 8 s later (R9, C12 §5.1). A row someone else organises asks nothing: its removal
+/// tells the organiser alone (C14d).
 fn row_guests(conn: &Connection, row_id: &str, own: &Own) -> Result<Option<GuestNotice>> {
     Ok(calendar::event_by_id(conn, row_id)?
         .filter(|row| row.organizer_self)
         // A birthday or a Gmail event emails nobody (C20 §4.4): no question to ask before its hold.
         .filter(|row| gate::kind_of(row.event_type.as_deref()) == gate::Kind::Default)
         .and_then(|row| attendees::row_delete_notice(&row.attendees, own)))
+}
+
+/// Who to ask about before a delete's hold, for the row the user clicked. Asked as Remove, the answer
+/// could never be used, whatever the mirror's row says: at the send `delete_still_matches` stops it if
+/// Google says the event is the user's own, which is what the notice then tells them (C14d).
+fn delete_guests(
+    conn: &Connection,
+    row_id: &str,
+    own: &Own,
+    seen: &SeenSummary,
+) -> Result<Option<GuestNotice>> {
+    if seen.removal {
+        return Ok(None);
+    }
+    row_guests(conn, row_id, own)
 }
 
 /// The calendar's own addresses for `target`: its id and the account it's read with, and what
@@ -898,6 +913,7 @@ fn seen_of(calendar_id: &str, fresh: &Value) -> Option<SeenSummary> {
         end: row.end,
         all_day: row.all_day,
         location: row.location.as_deref().map(calendar::mirrored_location),
+        removal: gate::removes_copy(row.event_type.as_deref(), row.organizer_self),
     })
 }
 
@@ -3666,7 +3682,8 @@ impl<W: Wire> Wire for Posts<'_, W> {
 ///
 /// `notify`: Send / Don't send for a delete Google would tell guests about, and `asked` the numbers
 /// the question showed (R9, C12). Both are kept with the hold, so the answer given before the Undo
-/// window is the one sent after it, and only for the guests Google's copy has then.
+/// window is the one sent after it, and only for the guests Google's copy has then. Someone else's
+/// event (`seen.removal`) leaves the user's calendar with neither: Google tells the organiser (C14d).
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn delete_calendar_event(
@@ -3691,7 +3708,7 @@ pub async fn delete_calendar_event(
             Ok(target) => {
                 let editing_choice = calendar_editing::choice(&conn, &target.email)?;
                 let in_series = needs_scope(&conn, &event_id)?;
-                let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;
+                let guests = delete_guests(&conn, &event_id, &own_of(&target, &[]), &seen)?;
                 (target, editing_choice, in_series, guests)
             }
             Err(reason) => return refused(WriteOutcome::ReadOnly { reason }),
@@ -3749,6 +3766,7 @@ pub async fn delete_calendar_event(
         &event_id,
         &seen.summary,
         Vec::new(),
+        seen.removal,
         Instant::now() + UNDO,
     )?;
     let (task_app, token) = (app.clone(), undo_token.clone());
@@ -3822,6 +3840,8 @@ struct Held {
     summary: String,
     /// The rows it hides (a series delete), for a reloaded webview.
     hidden: Vec<String>,
+    /// It takes someone else's event off the user's calendar (C14d), for a reloaded webview's words.
+    removal: bool,
     until: Instant,
 }
 
@@ -3834,6 +3854,7 @@ impl HeldDeletes {
         event_id: &str,
         summary: &str,
         hidden: Vec<String>,
+        removal: bool,
         until: Instant,
     ) -> Result<tokio::sync::oneshot::Receiver<()>> {
         let (undo, rx) = tokio::sync::oneshot::channel();
@@ -3847,6 +3868,7 @@ impl HeldDeletes {
                     event_id: event_id.to_string(),
                     summary: summary.to_string(),
                     hidden,
+                    removal,
                     until,
                 },
             );
@@ -3893,6 +3915,7 @@ impl HeldDeletes {
                 summary: h.summary.clone(),
                 seconds_left: h.until.saturating_duration_since(now).as_secs(),
                 hidden: h.hidden.clone(),
+                removal: h.removal,
             })
             .collect()
     }
@@ -3915,7 +3938,8 @@ pub fn list_held_deletes(app: AppHandle, window: tauri::Window) -> Result<Vec<He
 
 /// Send a held delete: a fresh copy, the gate, the "is it still what you saw" rule, the guests it
 /// would tell, then a DELETE guarded by the etag. Editing is read again here, since it may have been
-/// turned off while the delete waited.
+/// turned off while the delete waited. On someone else's event it is a removal (C14d): a reply "No"
+/// that only the organiser hears of, so no guests are counted and nothing is asked (Q6).
 async fn send_delete<W: Wire, H: Host>(
     wire: &W,
     host: &H,
@@ -3960,16 +3984,28 @@ async fn send_delete<W: Wire, H: Host>(
         }
         // R9 again on Google's copy now: guests may have been added during the hold. Asked, Google's
         // copy goes into the mirror, so a delete started again asks about them before its hold (C12
-        // critique C1-H2).
-        let notify =
+        // critique C1-H2). A removal asks nothing: it tells the organiser alone, and the check above
+        // has found Google's copy is still someone else's, as the user was told.
+        let notify = if seen.removal {
+            gate::REMOVAL_NOTIFY
+        } else {
             match answer.for_write(attendees::delete_notice(&fresh, &own_of(target, &[&fresh]))) {
                 Ok(notify) => notify,
                 Err(ask) => return land_fresh(host, target, &fresh, ask),
-            };
+            }
+        };
+        // Someone else's event isn't deleted, only taken off this calendar: the words go by what the
+        // user asked for (C14 §13.4).
+        let (verb, done) = if seen.removal {
+            ("remove", "removed")
+        } else {
+            ("delete", "deleted")
+        };
         let Some(etag) = fresh.get("etag").and_then(Value::as_str) else {
             return WriteOutcome::Failed {
-                message: "Google sent this event without a version stamp, so PM won't delete it."
-                    .into(),
+                message: format!(
+                    "Google sent this event without a version stamp, so PM won't {verb} it."
+                ),
             };
         };
         let request =
@@ -3983,9 +4019,10 @@ async fn send_delete<W: Wire, H: Host>(
                 return match still_there(wire, target).await {
                     Some(false) => land_deleted(host, target, &fresh),
                     Some(true) => WriteOutcome::Failed {
-                        message: "PM lost touch with Google, and the event is still there. \
-                                  Nothing was deleted; try again."
-                            .into(),
+                        message: format!(
+                            "PM lost touch with Google, and the event is still there. \
+                             Nothing was {done}; try again."
+                        ),
                     },
                     None => WriteOutcome::Unconfirmed,
                 }
@@ -5609,7 +5646,15 @@ fn plan_scope(
         let refused = |why| Planned::Planned(Err(NotPlanned::Refused(why)));
         match planning.series.parts {
             Parts::Overlap(day) => return refused(SeriesRefusal::SplitOverlap(day)),
-            Parts::Unread => return refused(SeriesRefusal::PartsUnread),
+            // A removal has no "this occurrence" to fall back on.
+            Parts::Unread => {
+                let removal = matches!(request, ChoiceRequest::Delete { seen, .. } if seen.removal);
+                return refused(if removal {
+                    SeriesRefusal::RemovePartsUnread
+                } else {
+                    SeriesRefusal::PartsUnread
+                });
+            }
             Parts::Clear => {}
         }
     }
@@ -7101,6 +7146,7 @@ async fn start_series_delete(
         &event_id,
         &seen.summary,
         held.hidden.clone(),
+        seen.removal,
         Instant::now() + UNDO,
     )?;
     let hidden = held.hidden.clone();
@@ -10264,13 +10310,15 @@ mod tests {
         let held = HeldDeletes::default();
         let until = Instant::now() + UNDO;
         let mut undone = held
-            .hold("a", "cal:a", "Dentist", Vec::new(), until)
+            .hold("a", "cal:a", "Dentist", Vec::new(), false, until)
             .unwrap();
         assert!(held.cancel("a"), "still waiting, so undone");
         assert!(undone.try_recv().is_ok(), "the waiting task hears it");
         assert!(!held.take("a"), "so the wait's end doesn't send it");
 
-        let _rx = held.hold("b", "cal:b", "Gym", Vec::new(), until).unwrap();
+        let _rx = held
+            .hold("b", "cal:b", "Gym", Vec::new(), false, until)
+            .unwrap();
         assert!(held.take("b"), "the wait ended first: it goes to Google");
         assert!(!held.cancel("b"), "too late to undo");
 
@@ -10295,6 +10343,7 @@ mod tests {
                     "cal:e",
                     "Event",
                     Vec::new(),
+                    false,
                     now + Duration::from_millis(i as u64 * 10),
                 )
                 .unwrap()
@@ -10310,9 +10359,11 @@ mod tests {
         let held = HeldDeletes::default();
         let until = Instant::now() + UNDO;
         let mut a = held
-            .hold("a", "cal:a", "Dentist", Vec::new(), until)
+            .hold("a", "cal:a", "Dentist", Vec::new(), false, until)
             .unwrap();
-        let _b = held.hold("b", "cal:b", "Gym", Vec::new(), until).unwrap();
+        let _b = held
+            .hold("b", "cal:b", "Gym", Vec::new(), false, until)
+            .unwrap();
         assert_eq!(held.list().len(), 2);
         let listed = held
             .list()
@@ -10415,9 +10466,10 @@ mod tests {
         assert!(f.invited);
         // Absent, Google's `guestsCanModify` is false.
         assert!(!f.guests_can_modify);
-        // C14c: an invitation's own settings are editable, so nothing blocks the editor.
+        // C14c: an invitation's own settings are editable, so nothing blocks the editor. C14d: its
+        // delete is Remove.
         assert_eq!(gate::list_rights(&f).edit_block, None);
-        assert!(gate::list_rights(&f).can_respond && !gate::list_rights(&f).can_delete);
+        assert!(gate::list_rights(&f).can_respond && gate::list_rights(&f).can_delete);
         let mut modifiable = invite.clone();
         modifiable["guestsCanModify"] = json!(true);
         assert!(facts_from_fresh(&modifiable, &facts, EditingStatus::On).guests_can_modify);
@@ -11082,6 +11134,23 @@ mod tests {
         assert!(row_guests(&conn, &format!("{cal}:missing"), &own)
             .unwrap()
             .is_none());
+        // C14d: the row the user clicked said someone else's, though the mirror's says their own and
+        // has a guest: asked as Remove, nothing is asked, and the send's check speaks (below, in
+        // `a_delete_stops_when_who_organises_it_changed_since_it_was_asked`). Asked as Delete, it is.
+        let seen = |removal| SeenSummary {
+            summary: "Mine".into(),
+            start: mine.start.clone(),
+            end: None,
+            all_day: false,
+            location: None,
+            removal,
+        };
+        assert!(delete_guests(&conn, &mine.id, &own, &seen(true))
+            .unwrap()
+            .is_none());
+        assert!(delete_guests(&conn, &mine.id, &own, &seen(false))
+            .unwrap()
+            .is_some());
     }
 
     /// C12 §5.1: the delete shell asks about the row's guests before it holds anything, when nobody
@@ -11099,9 +11168,9 @@ mod tests {
             .expect("the delete command");
         let shell = &shipped[start..];
         let shell = &shell[..shell.find("\n}\n").unwrap_or(shell.len())];
-        assert!(
-            shell.contains("let guests = row_guests(&conn, &event_id, &own_of(&target, &[]))?;")
-        );
+        assert!(shell.contains(
+            "let guests = delete_guests(&conn, &event_id, &own_of(&target, &[]), &seen)?;"
+        ));
         let ask = shell
             .find("if let Err(ask) = answer.before_hold(guests) {\n        return refused(ask);")
             .expect("asked before the hold");
@@ -11831,11 +11900,12 @@ mod tests {
             .into_iter()
             .map(|r| (r.edit_block, r.can_delete))
             .collect();
-        // C14c: an invitation's own settings are editable too, but it is never deleted from PM.
+        // C14c: an invitation's own settings are editable too. C14d: the calendar is on its guest
+        // list, so it can be taken off the calendar, which the list marks as Delete.
         assert_eq!(
             blocks,
-            vec![(None, true), (None, false)],
-            "the list: editable either way, Delete only when it's yours"
+            vec![(None, true), (None, true)],
+            "the list: editable either way, and each can leave the calendar"
         );
         let facts = CalendarFacts {
             access_role: Some("owner".into()),
@@ -12237,9 +12307,10 @@ mod tests {
             gmail,
             focus,
         ];
-        // C14c: someone else's event opens in the editor for the user's own settings, and is never
-        // deleted from PM (Remove is a later layer's). C16a: a drag only where the gate opens the
-        // time: never on someone else's event unless they let guests change it, nor a locked copy.
+        // C14c: someone else's event opens in the editor for the user's own settings. C14d: it can
+        // leave the user's calendar only where the calendar is on its guest list, and not locked.
+        // C16a: a drag only where the gate opens the time: never on someone else's event unless they
+        // let guests change it, nor a locked copy.
         let want = vec![
             rights(None, true, false, true),
             rights(None, false, false, false),
@@ -12248,10 +12319,10 @@ mod tests {
             rights(None, true, false, true),
             // Yours, with your own entry: the organiser may reply too.
             rights(None, true, true, true),
-            rights(None, false, true, false),
+            rights(None, true, true, false),
             rights(None, false, false, false),
             rights(None, false, true, false),
-            rights(None, false, true, true),
+            rights(None, true, true, true),
             rights(None, true, false, false),
             rights(None, true, true, false),
             rights(Some(ReadOnlyReason::SpecialType), false, false, false),
@@ -19324,10 +19395,12 @@ mod tests {
                 "cal:a",
                 "Standup",
                 hidden.clone(),
+                false,
                 Instant::now() + UNDO,
             )
             .unwrap();
         assert_eq!(held.list()[0].hidden, hidden);
+        assert!(!held.list()[0].removal);
         assert!(held.cancel("t"));
         assert!(!held.take("t"), "undone, so never sent");
     }
@@ -19575,6 +19648,7 @@ mod tests {
                     &target.row_id,
                     "Standup",
                     Vec::new(),
+                    false,
                     Instant::now() + UNDO,
                 )
                 .unwrap()
@@ -21929,6 +22003,9 @@ mod tests {
                 SeriesRefusal::SpecialDateRule,
                 SeriesRefusal::SpecialYearAlone,
                 SeriesRefusal::SpecialDeleteEveryYear,
+                // Removing someone else's repeating event (C14d).
+                SeriesRefusal::RemoveEveryOccurrence,
+                SeriesRefusal::RemovePartsUnread,
             ])
             // Every repeat the editor can't save, as a row repeats it (C11 §9.8).
             .chain(
@@ -26640,7 +26717,7 @@ mod tests {
         );
         assert!(!event.organizer_self);
         assert!(permissions.respond && permissions.show_as && permissions.colour);
-        assert!(!permissions.summary && !permissions.guests && !permissions.delete);
+        assert!(!permissions.summary && !permissions.guests && permissions.delete);
         assert!(!permissions.repeat);
         // The dentist you organise, with nobody invited: no reply to give.
         let script = Script::new(Vec::new());
@@ -26894,14 +26971,173 @@ mod tests {
         );
     }
 
-    /// C14 §9.2: an invitation isn't deleted from PM until Remove (a later layer): a delete that
-    /// reached its send is refused with the organiser's reason, never the guest list's (critique
-    /// C1-L1), and nothing is deleted.
+    /// A DELETE of the dentist at `etag`, telling Google `query`, answered `answer`.
+    fn delete_solo(etag: &str, query: &'static str, answer: Scripted) -> Step {
+        told(Method::Delete, "/events/solo", etag, query, answer)
+    }
+
+    /// C14 §10.2: removing an invitation is a reply "No" that only the organiser hears of, so it goes
+    /// out with `sendUpdates=all` with no answer given and none asked for, whoever else is on it, and
+    /// the row leaves PM's calendar.
     #[tokio::test]
-    async fn an_invitation_cant_be_deleted_until_remove() {
+    async fn removing_an_invitation_tells_the_organiser() {
         for event in [invite(), modifiable_invite()] {
             let host = TestHost::holding(std::slice::from_ref(&event));
             let seen = seen_by_user(&fresh_event(event.clone()));
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", event.clone()),
+                delete_solo("\"s1\"", "sendUpdates=all", Scripted::Status(204)),
+            ]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved());
+            let row = host
+                .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
+                .unwrap();
+            assert!(row.is_none(), "off PM's calendar too");
+        }
+    }
+
+    /// C14 §10.2: an answer can't turn a removal into a silent one: the question was never asked, so
+    /// a Don't send sent anyway still tells the organiser.
+    #[tokio::test]
+    async fn a_removal_tells_the_organiser_whatever_is_answered() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            delete_solo("\"s1\"", "sendUpdates=all", Scripted::Status(204)),
+        ]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &answered(Notify::None, two_updated()),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved());
+    }
+
+    /// C14 §10.1: a copy with no entry on the guest list (a public calendar's) has nothing to decline:
+    /// refused with the organiser's reason, and nothing is sent. So is a locked one, whose delete
+    /// Google doesn't document.
+    #[tokio::test]
+    async fn removing_an_invitation_you_were_not_invited_to_is_refused() {
+        let not_on_it = with(
+            invite(),
+            "attendees",
+            json!([{ "email": "o@x.org", "organizer": true }]),
+        );
+        let locked = with(invite(), "locked", json!(true));
+        for (event, reason) in [
+            (not_on_it, ReadOnlyReason::NotOrganizer),
+            (locked, ReadOnlyReason::NotOrganizer),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.finished();
+            assert!(outcome == WriteOutcome::ReadOnly { reason });
+        }
+    }
+
+    /// C14 §13.4: nothing of the organiser's is deleted by a removal, so its failures never say so.
+    /// A delete of your own keeps its words (`an_unscoped_delete_looks_after_a_lost_answer…`).
+    #[tokio::test]
+    async fn a_removals_failures_speak_of_removing() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let lost = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            delete_solo(
+                "\"s1\"",
+                "sendUpdates=all",
+                Scripted::Lost { retried: true },
+            ),
+            Step::get("/events/solo", "", event.clone()),
+        ]);
+        let outcome = send_delete(
+            &lost,
+            &*host,
+            &target(&event),
+            &seen,
+            &GuestAnswer::default(),
+        )
+        .await;
+        lost.asked_all();
+        assert!(
+            outcome
+                == WriteOutcome::Failed {
+                    message: "PM lost touch with Google, and the event is still there. \
+                              Nothing was removed; try again."
+                        .into(),
+                }
+        );
+        for (event, verb) in [(invite(), "remove"), (dentist(), "delete")] {
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let mut stampless = event.clone();
+            stampless.as_object_mut().unwrap().remove("etag");
+            let script = Script::new(vec![Step::get("/events/solo", "", stampless)]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.asked_all();
+            assert!(
+                outcome
+                    == WriteOutcome::Failed {
+                        message: format!(
+                            "Google sent this event without a version stamp, so PM won't {verb} it."
+                        ),
+                    },
+                "{verb}"
+            );
+        }
+    }
+
+    /// C14d, failing safe: the user was asked by what the row showed. A row they deleted (with its
+    /// email question) that Google now says is someone else's sends no decline they weren't shown;
+    /// a row they removed that Google now says is their own isn't cancelled for everyone, nor deleted
+    /// on an answer about something else. Each stops with nothing sent, and the row comes back as
+    /// Google has it, so the next try asks the right thing.
+    #[tokio::test]
+    async fn a_delete_stops_when_who_organises_it_changed_since_it_was_asked() {
+        let theirs = invite();
+        let mine = with(
+            invite(),
+            "organizer",
+            json!({ "email": CALENDAR, "self": true }),
+        );
+        for (row_was, row, event) in [
+            ("yours", mine.clone(), theirs.clone()),
+            ("theirs", theirs.clone(), mine.clone()),
+        ] {
+            let host = TestHost::holding(std::slice::from_ref(&row));
+            let seen = seen_by_user(&fresh_event(row));
             let script = Script::new(vec![Step::get("/events/solo", "", event.clone())]);
             let outcome = send_delete(
                 &script,
@@ -26914,11 +27150,287 @@ mod tests {
             script.finished();
             assert!(
                 outcome
-                    == WriteOutcome::ReadOnly {
-                        reason: ReadOnlyReason::NotOrganizer
-                    }
+                    == WriteOutcome::Conflict {
+                        fields: vec!["organizer".into()]
+                    },
+                "the row said {row_was}"
+            );
+            assert_eq!(
+                host.row("solo").organizer_self,
+                event["organizer"]["self"] == true,
+                "the row said {row_was}: it shows Google's copy now"
             );
         }
+    }
+
+    /// C14 §10.2: a removal's 412 goes round once more like any delete, on a fresh copy and with no
+    /// question, though a guest joined meanwhile.
+    #[tokio::test]
+    async fn a_removal_goes_again_on_a_412_whoever_joined() {
+        let event = invite();
+        let host = TestHost::holding(std::slice::from_ref(&event));
+        let seen = seen_by_user(&fresh_event(event.clone()));
+        let joined = with(
+            with(event.clone(), "etag", json!("\"2\"")),
+            "attendees",
+            json!([
+                { "email": "o@x.org", "organizer": true },
+                { "email": CALENDAR, "self": true },
+                { "email": "a@x.org" },
+                { "email": "new@x.org" }
+            ]),
+        );
+        let script = Script::new(vec![
+            Step::get("/events/solo", "", event.clone()),
+            delete_solo("\"s1\"", "sendUpdates=all", Scripted::Status(412)),
+            Step::get("/events/solo", "", joined),
+            delete_solo("\"2\"", "sendUpdates=all", Scripted::Status(204)),
+        ]);
+        let outcome = send_delete(
+            &script,
+            &*host,
+            &target(&event),
+            &seen,
+            &GuestAnswer::default(),
+        )
+        .await;
+        script.asked_all();
+        assert!(outcome == saved());
+    }
+
+    /// C14 §10.2, C20 §0.4 item 11: a birthday or a Gmail event someone else "organises" is deleted
+    /// with `sendUpdates=none`, never a decline, with its own guest entry on it or not.
+    #[tokio::test]
+    async fn a_birthday_or_a_gmail_event_sends_no_decline() {
+        for kind in ["birthday", "fromGmail"] {
+            let event = with(invite(), "eventType", json!(kind));
+            let host = TestHost::holding(std::slice::from_ref(&event));
+            let seen = seen_by_user(&fresh_event(event.clone()));
+            let script = Script::new(vec![
+                Step::get("/events/solo", "", event.clone()),
+                delete_solo("\"s1\"", "sendUpdates=none", Scripted::Status(204)),
+            ]);
+            let outcome = send_delete(
+                &script,
+                &*host,
+                &target(&event),
+                &seen,
+                &GuestAnswer::default(),
+            )
+            .await;
+            script.asked_all();
+            assert!(outcome == saved(), "{kind}");
+        }
+    }
+
+    /// C14d: what the editor says the user saw says whether it is asked as Remove: someone else's
+    /// ordinary event only.
+    #[test]
+    fn what_the_editor_saw_says_whether_it_is_removed() {
+        let removal = |event: Value| seen_of("cal", &event).unwrap().removal;
+        assert!(removal(invite()));
+        assert!(removal(with(invite(), "eventType", json!("default"))));
+        assert!(!removal(dentist()));
+        assert!(!removal(with(invite(), "eventType", json!("birthday"))));
+        assert!(!removal(with(invite(), "eventType", json!("fromGmail"))));
+    }
+
+    /// C14 §10.3: the rows for removing someone else's repeating event: All offered with nothing to
+    /// ask, the others refused in words that say which to choose. From its first occurrence "this and
+    /// following" is All.
+    #[tokio::test]
+    async fn the_rows_for_a_repeating_invitation_offer_all_events() {
+        let instance = monday_invite();
+        let delete = ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(instance.clone())),
+        };
+        let script = Script::new(reads(
+            &instance,
+            &weekly_invite(),
+            vec![weekly_invite()],
+            vec![instance.clone()],
+        ));
+        let (this, following, all) = ask(&script, &instance, delete, None, &["abc"]).await;
+        let refused = ScopeRow::Refused {
+            message: SeriesRefusal::RemoveEveryOccurrence.to_string(),
+        };
+        assert!(this == refused, "this occurrence");
+        assert!(following == refused, "this and following");
+        assert!(matches!(all, ScopeRow::Offered { guests: None, .. }));
+    }
+
+    /// A listing of split parts Google didn't answer, on an invitation nobody split: "All events"
+    /// says PM couldn't check, in Remove's words, and offers nothing, so no question says it was
+    /// split, or promises every occurrence.
+    #[tokio::test]
+    async fn a_removal_is_refused_when_the_listing_of_its_parts_fails() {
+        let instance = monday_invite();
+        let delete = || ChoiceRequest::Delete {
+            event_id: "cal:abc_20261019T080000Z".into(),
+            seen: seen_by_user(&fresh_event(instance.clone())),
+        };
+        let failed = Script::new(vec![
+            instance_read(&instance),
+            Step::get("/events/abc", "", weekly_invite()),
+            Step::get(
+                "/events",
+                "iCalUID=abc%40google.com",
+                page(vec![weekly_invite()], None),
+            ),
+            window_read(vec![instance.clone()]),
+            Step::status("/events", "privateExtendedProperty=pmSplitOf%3Dabc", 403),
+        ]);
+        let (.., all) = ask(&failed, &instance, delete(), None, &["abc"]).await;
+        failed.asked_all();
+        let refused = ScopeRow::Refused {
+            message: SeriesRefusal::RemovePartsUnread.to_string(),
+        };
+        assert!(all == refused, "All events");
+        assert_eq!(
+            SeriesRefusal::RemovePartsUnread.to_string(),
+            "PM couldn't check for a new part an earlier “this and following” change made of this \
+             repeating event, so it won't remove it now. Try again in a moment."
+        );
+    }
+
+    /// The reads and writes of removing the repeating invitation from Monday 19-10: the plan before
+    /// its hold, then the DELETE of the repeating event at the send.
+    #[tokio::test]
+    async fn removing_a_repeating_invitation_takes_every_occurrence_in_one_delete() {
+        let instance = monday_invite();
+        let host = TestHost::holding(std::slice::from_ref(&instance));
+        let target = target(&instance);
+        let window = vec![instance.clone()];
+        let mut steps = reads(
+            &instance,
+            &weekly_invite(),
+            vec![weekly_invite()],
+            window.clone(),
+        );
+        steps.extend(reads(
+            &instance,
+            &weekly_invite(),
+            vec![weekly_invite()],
+            window,
+        ));
+        steps.extend([
+            told(
+                Method::Delete,
+                "/events/abc",
+                "\"m1\"",
+                "sendUpdates=all",
+                Scripted::Status(204),
+            ),
+            refetch_read(Scripted::Status(410)),
+        ]);
+        let script = Script::new(steps);
+        let ctx = writer(&script, &host, &target);
+        let seen = seen_by_user(&fresh_event(instance.clone()));
+        let (_claim, held) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None)
+            .await
+            .unwrap();
+        let outcome = send_held_series_delete(&ctx, &target.row_id, &seen, Scope::All, &held).await;
+        script.asked_all();
+        assert!(outcome == saved());
+        assert!(host.ids().is_empty());
+    }
+
+    /// C14d, failing safe, as a one-off's send does: a row asked about as Delete whose repeating event
+    /// Google now says is someone else's sends no decline, and one asked about as Remove that's now
+    /// the user's own isn't deleted on that answer. One read goes out, before any hold.
+    #[tokio::test]
+    async fn a_repeating_delete_stops_when_who_organises_it_changed_since_it_was_asked() {
+        let (theirs, mine) = (monday_invite(), monday_19());
+        for (row_was, row, instance) in [("yours", &mine, &theirs), ("theirs", &theirs, &mine)] {
+            let host = TestHost::holding(std::slice::from_ref(row));
+            let script = Script::new(vec![instance_read(instance)]);
+            let target = target(instance);
+            let ctx = writer(&script, &host, &target);
+            let seen = seen_by_user(&fresh_event(row.clone()));
+            let refused =
+                plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None).await;
+            script.finished();
+            assert!(
+                matches!(
+                    refused,
+                    Err(WriteOutcome::Conflict { ref fields }) if fields == &["organizer"]
+                ),
+                "the row said {row_was}"
+            );
+        }
+    }
+
+    /// C14d: the same during the hold: the repeating event became the user's own, with nobody else on
+    /// it, so nothing is deleted on the answer given.
+    #[tokio::test]
+    async fn a_removal_that_became_your_own_during_its_hold_stops() {
+        let instance = monday_invite();
+        let host = TestHost::holding(std::slice::from_ref(&instance));
+        let target = target(&instance);
+        let mut steps = reads(
+            &instance,
+            &weekly_invite(),
+            vec![weekly_invite()],
+            vec![instance.clone()],
+        );
+        steps.push(instance_read(&monday_19()));
+        let script = Script::new(steps);
+        let ctx = writer(&script, &host, &target);
+        let seen = seen_by_user(&fresh_event(instance.clone()));
+        let (_claim, held) = plan_held_delete(&ctx, &target.row_id, &seen, Scope::All, None, None)
+            .await
+            .unwrap();
+        let outcome = send_held_series_delete(&ctx, &target.row_id, &seen, Scope::All, &held).await;
+        script.finished();
+        assert!(
+            outcome
+                == WriteOutcome::Conflict {
+                    fields: vec!["organizer".into()]
+                }
+        );
+        assert!(!host.ids().is_empty(), "nothing was deleted");
+    }
+
+    /// C14d: both holds keep what the user was asked, for a webview that reloads meanwhile.
+    #[test]
+    fn both_holds_keep_whether_it_is_a_removal() {
+        let source = include_str!("calendar_edit.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body_of = |head: &str| {
+            let start = shipped.find(head).expect("the function");
+            let rest = &shipped[start..];
+            rest[..rest.find("\n}\n").unwrap_or(rest.len())].to_string()
+        };
+        assert!(body_of("pub async fn delete_calendar_event(")
+            .contains("Vec::new(),\n        seen.removal,\n        Instant::now() + UNDO,"));
+        assert!(body_of("async fn start_series_delete(").contains(
+            "held.hidden.clone(),\n        seen.removal,\n        Instant::now() + UNDO,"
+        ));
+    }
+
+    /// C14 §10.4: what the webview gets back on reload says whether a held delete is a removal.
+    #[test]
+    fn a_reloaded_webview_is_told_a_held_delete_is_a_removal() {
+        let held = HeldDeletes::default();
+        let until = Instant::now() + UNDO;
+        let _a = held
+            .hold("a", "cal:a", "Dentist", Vec::new(), true, until)
+            .unwrap();
+        let listed = held.list();
+        assert!(listed[0].removal);
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(json["removal"], json!(true));
+        let _b = held
+            .hold("b", "cal:b", "Gym", Vec::new(), false, until + UNDO)
+            .unwrap();
+        let listed = held.list();
+        assert!(!listed[1].removal);
+        let json = serde_json::to_value(&listed[1]).unwrap();
+        assert!(json.get("removal").is_none(), "left out for a delete");
     }
 
     /// C14 §9.1: a refused draft names the refused field's own reason. With "modify event" and a

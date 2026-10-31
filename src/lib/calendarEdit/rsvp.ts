@@ -235,3 +235,41 @@ export function replyCopies(
     forWhom: copies.length > 1 || !c.calendar.is_primary ? c.calendar.name : null,
   }));
 }
+
+/** The calendar Remove on `ev` must name (C14d), as the reply strip names whose reply it is: one
+ *  that isn't its account's main one, whose guest entry is what declines; or any, when another copy
+ *  of the occurrence is among `rows` (the rows on screen) and stays there after this one goes.
+ *  Null: the only copy, on a main calendar, so "your calendar". */
+export function removingFrom(
+  rows: readonly CalendarEvent[],
+  ev: CalendarEvent,
+  calendars: readonly Calendar[],
+): string | null {
+  const calendar = calendars.find((c) => c.id === ev.calendar_id);
+  if (!calendar) return null;
+  const key = occurrenceKey(ev);
+  const another = key !== null && rows.some((e) => e.id !== ev.id && occurrenceKey(e) === key);
+  return another || !calendar.is_primary ? calendar.name : null;
+}
+
+/** What Google has of the replies sent from one editor, for its discard question: `sent`, it holds
+ *  the last one that went; `unconfirmed`, PM can't tell. */
+export type ReplyStanding = "sent" | "unconfirmed" | null;
+
+/** `standing` after a reply came to `outcome`. A definite refusal sent nothing, so it changes
+ *  nothing: an earlier reply is still with Google, or still in doubt. `failed` and
+ *  `ignored_by_google` aren't that: Google may have answered 200 before PM read back a shorter guest
+ *  list, or a copy without the reply, and `failed`'s words are all that tell its cases apart. */
+export function replyStanding(standing: ReplyStanding, outcome: WriteOutcome): ReplyStanding {
+  switch (outcome.outcome) {
+    case "saved":
+    case "no_change":
+      return "sent";
+    case "unconfirmed":
+    case "failed":
+    case "ignored_by_google":
+      return "unconfirmed";
+    default:
+      return standing;
+  }
+}
