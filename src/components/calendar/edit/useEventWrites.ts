@@ -89,6 +89,7 @@ import {
   moveFailedText,
   moveOfferText,
   moveText,
+  removesCopy,
   replyNoticeText,
   retryAfter,
   saveBackText,
@@ -174,6 +175,11 @@ interface HeldDelete {
   /** The title the user saw. */
   summary: string;
   noticeId: number;
+  /** It takes someone else's event off the user's calendar (C14d): its notices say so, and it hides
+   *  its own rows only, never other copies of the occurrence: the organiser's copy stays. */
+  removal: boolean;
+  /** Where a removal's settled notice says it went from, when it isn't "your calendar". */
+  place?: string;
   /** The row the user asked to delete, so the dialog can ask again with it when Google's copy has
    *  guests to tell (C12 critique C1-H2). Unknown for a delete picked up after a reload. */
   event?: CalendarEvent;
@@ -193,8 +199,9 @@ interface State {
    *  read that `calendar://write-outcome` starts can land after the settle). A number is the
    *  settle's mark: a read that started after it is the truth about the row, so a row it still
    *  has comes back (an occurrence a delete of several couldn't cancel stays in Google). Null: the
-   *  row is hidden while any read has it (Google deleted it; only the mirror lags). */
-  removed: ReadonlyMap<string, number | null>;
+   *  row is hidden while any read has it (Google deleted it; only the mirror lags). `removal`: as
+   *  on {@link HeldDelete}. */
+  removed: ReadonlyMap<string, { mark: number | null; removal: boolean }>;
   notices: readonly WriteNotice[];
   /** How many writes have settled (deletes, and moves since C16a). The calendar reads the mirror
    *  again on each, since the read the backend's landing starts can begin before the webview hears
@@ -293,14 +300,15 @@ export function dismissNotice(id: number) {
   update({ notices: state.notices.filter((n) => n.id !== id) });
 }
 
-/** The "Deleting …" notice for a held delete, with its Undo until `seconds` have passed. */
+/** The "Deleting …" (or "Removing …") notice for a held delete, with its Undo until `seconds` have
+ *  passed. */
 function showHeld(held: HeldDelete, seconds: number) {
   const notice: WriteNotice = {
     id: held.noticeId,
     tone: "ok",
-    text: `Deleting ${quoted(held.summary)}.`,
+    text: `${held.removal ? "Removing" : "Deleting"} ${quoted(held.summary)}.`,
     undoToken: held.token,
-    undoLabel: `Undo deleting ${quoted(held.summary)}`,
+    undoLabel: `Undo ${held.removal ? "removing" : "deleting"} ${quoted(held.summary)}`,
   };
   put(notice);
   // When the window closes the Undo goes; the notice stays until the delete settles.
@@ -319,6 +327,7 @@ function seenOf(event: CalendarEvent): SeenSummary {
     end: event.end ?? null,
     all_day: event.all_day,
     location: event.location ?? null,
+    removal: removesCopy(event),
   };
 }
 
@@ -359,10 +368,19 @@ function settle(settled: DeleteSettled) {
     result.warnings.includes("left_on_old_series") &&
     !result.warnings.includes("mirror_refresh_pending");
   const removed = new Map(state.removed);
-  if (gone) for (const id of held.hidden) removed.set(id, releasable ? mark : null);
+  if (gone) {
+    for (const id of held.hidden) {
+      removed.set(id, { mark: releasable ? mark : null, removal: held.removal });
+    }
+  }
   update({ held: state.held.filter((h) => h !== held), removed, settles: mark });
   if (result.outcome === "partial_split") {
-    holdPartial(held.summary, result, deleteText(result, held.summary).text, held.noticeId);
+    holdPartial(
+      held.summary,
+      result,
+      deleteText(result, held.summary, held.removal).text,
+      held.noticeId,
+    );
     return;
   }
   // Google's copy had guests to tell, and nothing was deleted: the dialog asks again with the
@@ -378,7 +396,7 @@ function settle(settled: DeleteSettled) {
     dismissNotice(held.noticeId);
     return;
   }
-  put({ id: held.noticeId, ...deleteText(result, held.summary) });
+  put({ id: held.noticeId, ...deleteText(result, held.summary, held.removal, held.place) });
 }
 
 /** Hear how held deletes end, and pick up any still waiting (a reload emptied this store; the backend
@@ -401,6 +419,9 @@ export function watchHeldDeletes() {
           hidden: hiddenOf(w.event_id, w.hidden),
           summary: w.summary,
           noticeId: nextNotice++,
+          removal: w.removal === true,
+          // A reload forgot which calendar was named, so nothing here claims it was the user's.
+          place: "its calendar",
         };
         update({ held: [...state.held, held] });
         showHeld(held, w.seconds_left);
@@ -422,16 +443,19 @@ export interface DeleteReask {
  *  window; hidden meanwhile are the row and every row a delete of several occurrences reaches.
  *  `{ ask }`: the backend wants the occurrences chosen, or chosen again (`ask` null), or whether
  *  Google emails the guests (`ask`, its numbers; R9), and nothing was held or said: the caller asks.
- *  Whether Google emails the guests is never asked by reopening the occurrences (C12). */
+ *  Whether Google emails the guests is never asked by reopening the occurrences (C12). `removeFrom`:
+ *  the calendar a removal's question named (`removingFrom`), which its notice names too. */
 export async function startDelete(
   event: CalendarEvent,
   picked: Picked | null = null,
   notify: Notify | null = null,
   asked: GuestNotice | null = null,
+  removeFrom: string | null = null,
 ): Promise<"held" | DeleteReask | "refused"> {
   watchHeldDeletes();
   stripUndo(event.id);
   const title = quoted(event.summary);
+  const removal = removesCopy(event);
   try {
     // A scope never goes without its token: `Picked` carries both.
     const start = await deleteCalendarEvent(
@@ -449,7 +473,7 @@ export async function startDelete(
       }
       if (result.outcome === "needs_choice" && result.scope) return { ask: null, again: false };
       if (result.outcome === "partial_split") {
-        holdPartial(event.summary, result, deleteText(result, event.summary).text);
+        holdPartial(event.summary, result, deleteText(result, event.summary, removal).text);
         return "refused";
       }
       // Busy before anything was held is PM's own write to the event, not Google.
@@ -460,7 +484,7 @@ export async function startDelete(
               tone: "warn",
               text: `PM is already changing ${title}. Wait a moment, then try again.`,
             }
-          : { id: nextNotice++, ...deleteText(result, event.summary) },
+          : { id: nextNotice++, ...deleteText(result, event.summary, removal) },
       );
       return "refused";
     }
@@ -470,13 +494,19 @@ export async function startDelete(
       hidden: hiddenOf(event.id, start.hidden),
       summary: event.summary,
       noticeId: nextNotice++,
+      removal,
+      place: removeFrom ?? undefined,
       event,
     };
     update({ held: [...state.held, held] });
     showHeld(held, start.undo_seconds);
     return "held";
   } catch (e) {
-    put({ id: nextNotice++, tone: "error", text: `${title} wasn't deleted. ${message(e)}` });
+    put({
+      id: nextNotice++,
+      tone: "error",
+      text: `${title} wasn't ${removal ? "removed" : "deleted"}. ${message(e)}`,
+    });
     return "refused";
   }
 }
@@ -511,7 +541,7 @@ export async function undoDelete(token: string): Promise<void> {
     put({
       id: held.noticeId,
       tone: "warn",
-      text: `Too late to undo: ${quoted(held.summary)} is already being deleted.`,
+      text: `Too late to undo: ${quoted(held.summary)} is already being ${held.removal ? "removed" : "deleted"}.`,
     });
   }
 }
@@ -1467,7 +1497,7 @@ export function pruneRemoved(events: readonly CalendarEvent[], startedAt = -1) {
   if (state.removed.size > 0) {
     const present = new Set(events.map((e) => e.id));
     const still = [...state.removed].filter(
-      ([id, mark]) => present.has(id) && (mark === null || mark > startedAt),
+      ([id, { mark }]) => present.has(id) && (mark === null || mark > startedAt),
     );
     if (still.length !== state.removed.size) next.removed = new Map(still);
   }
@@ -1586,25 +1616,28 @@ export function useDeleteDialog(openElsewhere: () => boolean) {
       picked: Picked | null,
       notify: Notify | null = null,
       asked: GuestNotice | null = null,
+      removeFrom: string | null = null,
     ) => {
       const was = open.current;
       setAsked(null);
-      void startDelete(event, picked, notify, asked).then((r) => {
+      void startDelete(event, picked, notify, asked, removeFrom).then((r) => {
         if (r === "held" || r === "refused") return;
         // Asked once already (a reopened dialog), or nowhere to ask: said instead, so nothing
         // loops. Occurrences chosen: their token binds who the delete tells, so a guests ask
         // there is the plan changing under the user too.
         const reasked = (r.ask ? was?.guests : was?.reask) != null || (!!r.ask && !!picked);
         if (reasked || !free()) {
+          const removal = removesCopy(event);
           noteSeriesNotice(
             picked
-              ? deleteChangedText(event.summary).text
+              ? deleteChangedText(event.summary, removal).text
               : r.ask
                 ? deleteText(
                     { outcome: "needs_choice", scope: false, guests: r.ask, again: r.again },
                     event.summary,
+                    removal,
                   ).text
-                : deleteText({ outcome: "needs_choice", scope: true }, event.summary).text,
+                : deleteText({ outcome: "needs_choice", scope: true }, event.summary, removal).text,
           );
           return;
         }
@@ -1631,9 +1664,20 @@ export function useEventWrites() {
     () => new Set([...snap.held.flatMap((h) => h.hidden), ...snap.removed.keys()]),
     [snap.held, snap.removed],
   );
+  // Of those, the rows a removal hides: their own alone. Another copy of the occurrence, the
+  // organiser's through a second account, is still there in Google, so it stays (C14 critique C1-M5).
+  const removalIds = useMemo(
+    () =>
+      new Set([
+        ...snap.held.filter((h) => h.removal).flatMap((h) => h.hidden),
+        ...[...snap.removed].filter(([, row]) => row.removal).map(([id]) => id),
+      ]),
+    [snap.held, snap.removed],
+  );
   return {
     notices: snap.notices,
     hiddenIds,
+    removalIds,
     settles: snap.settles,
     moves: snap.moves,
     twins: snap.twins,

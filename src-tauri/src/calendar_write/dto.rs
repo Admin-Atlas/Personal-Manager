@@ -388,6 +388,9 @@ pub struct SeenSummary {
     pub end: Option<String>,
     pub all_day: bool,
     pub location: Option<String>,
+    /// The row was someone else's ordinary event ([`super::gate::removes_copy`]), so the user was
+    /// asked to remove it and told the organiser hears, rather than asked to delete it (C14d).
+    pub removal: bool,
 }
 
 /// What the user saw of an event's time when they dragged it: the mirror row's start, end and kind,
@@ -577,6 +580,7 @@ pub struct FieldPermissions {
     /// May go to another calendar of the same account (C18d): the organiser's to change. The save
     /// checks the calendar chosen.
     pub calendar: bool,
+    /// May be deleted; on someone else's event, taken off the user's calendar ("Remove", C14d).
     pub delete: bool,
     /// The user may reply (Yes, No, Maybe). Not part of [`Self::any`]: a reply isn't one of the
     /// editor's fields (C14).
@@ -816,6 +820,10 @@ pub struct HeldDeleteInfo {
     /// The rows it hides, as [`DeleteStart::Held`] gave them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hidden: Vec<String>,
+    /// It takes someone else's event off the user's calendar (C14d), so a reloaded webview still
+    /// says "Removing". Left out for a delete.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removal: bool,
 }
 
 /// The `calendar://delete-settled` payload: a held delete went to Google, and this is what came of
@@ -1536,10 +1544,13 @@ mod tests {
         ));
         let request: ChoiceRequest = serde_json::from_str(
             r#"{"kind":"delete","event_id":"cal:e","seen":{"summary":"Gym","start":"2026-10-19",
-                "end":null,"all_day":true,"location":null}}"#,
+                "end":null,"all_day":true,"location":null,"removal":true}}"#,
         )
         .unwrap();
-        assert!(matches!(request, ChoiceRequest::Delete { event_id, .. } if event_id == "cal:e"));
+        assert!(matches!(
+            request,
+            ChoiceRequest::Delete { event_id, seen } if event_id == "cal:e" && seen.removal
+        ));
         let choices = SeriesChoices::Ready {
             this: ScopeRow::Offered {
                 warnings: Vec::new(),

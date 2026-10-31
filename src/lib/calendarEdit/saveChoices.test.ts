@@ -277,7 +277,7 @@ describe("the warnings", () => {
 
   it("words every warning, for a save and a delete, with no jargon", () => {
     for (const w of every) {
-      for (const kind of ["save", "delete"] as const) {
+      for (const kind of ["save", "delete", "remove"] as const) {
         for (const scope of ["following", "all"] as const) {
           const line = seriesWarningText(w, kind, scope, "Gym");
           expect(line).toMatch(/^[“A-Z0-9].*[.?]$/);
@@ -337,13 +337,17 @@ describe("the warnings", () => {
     expect(seriesWarningText({ warning: "new_identity" }, "save", "following", "Gym")).toBe(
       "From this occurrence on, it becomes a new repeating event in Google. If a milestone linked to it falls on or after this day, PM offers to move it to the new part after saving. Reminders to prepare may show again for the new part.",
     );
-    const sibling = (kind: "save" | "delete") =>
+    const sibling = (kind: "save" | "delete" | "remove") =>
       seriesWarningText({ warning: "split_sibling" }, kind, "all", "Gym");
     expect(sibling("save")).toBe(
       "Part of “Gym” was made into a repeating event of its own by an earlier “this and following” change. Google may treat that part as this one too.",
     );
     expect(sibling("delete")).toMatch(
       /earlier “this and following” change\. Google may delete that part too\.$/,
+    );
+    // Remove on someone else's event never reads as deleting theirs (C14d).
+    expect(sibling("remove")).toBe(
+      "Part of “Gym” was made into a repeating event of its own by an earlier “this and following” change. Google may remove that part too. If it stays, you can remove it the same way.",
     );
   });
 

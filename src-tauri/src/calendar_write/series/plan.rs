@@ -729,6 +729,18 @@ impl SeriesPlan {
             return Resend::Gone;
         }
         let guests_changed = Resend::Conflict(vec!["attendees".into()]);
+        // A removal tells the organiser alone, so a new guest list doesn't stop it (below). An event
+        // that has become the user's own does: a delete of it would cancel it for everyone.
+        let removal = self.is_removal();
+        if removal
+            && fresh
+                .get("organizer")
+                .and_then(|o| o.get("self"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Resend::Conflict(vec!["organizer".into()]);
+        }
         // R9: who hears is the user's to say, and they said it for no one here. A write of only the
         // user's own settings emails nobody, whoever is on the event, so it goes again as any other
         // write would (C14 critique C1-M6: an invitation always has guests).
@@ -751,7 +763,10 @@ impl SeriesPlan {
         }
         // An answer stands only for who it was given for (C12 critiques C1-M5, C2-H3).
         let sent = again.as_ref().unwrap_or(&step.op);
-        if step.notify != Notify::None && step.reach != reach_onto(sent, fresh, &self.own) {
+        if step.notify != Notify::None
+            && !removal
+            && step.reach != reach_onto(sent, fresh, &self.own)
+        {
             return guests_changed;
         }
         let changed: Vec<String> = match &step.conflict {
@@ -961,6 +976,11 @@ impl SeriesPlan {
         // Who it emails (C12 §6.4): a guest added or taken off in Google between the dialog and the
         // save asks again, with the new numbers. Never the answer, which comes with the save.
         let _ = write!(text, "\u{1f}{:?}", self.guests);
+        // Who it tells, when that isn't the user's to answer: an event that became the user's own
+        // between the choice and the send asks again, even with nobody else on it (C14 C1-H1).
+        if self.is_removal() {
+            text.push_str("\u{1f}removal");
+        }
         for step in &self.steps {
             let kind = match step.op {
                 Op::Insert { .. } => "insert",
@@ -1441,7 +1461,8 @@ pub(super) fn cut_step(
 /// (T8). `seen` is what the user saw of the occurrence; the delete goes ahead only if that's still
 /// what's there (A8, A15). `notify` is the user's Send / Don't send, `None` when nobody answered: a
 /// plan that would tell someone then never runs ([`SeriesPlan::needs_notify`]), and its guests say
-/// whom it would (C12).
+/// whom it would (C12). Someone else's repeating event has no such answer: its removal tells the
+/// organiser, whatever `notify` says ([`SeriesPlan::is_removal`], C14 §10.3).
 pub fn plan_series_delete(
     scope: Scope,
     input: &SeriesInput,
@@ -1449,7 +1470,12 @@ pub fn plan_series_delete(
     notify: Option<Notify>,
 ) -> Result<SeriesPlan, NotPlanned> {
     let mut plan = delete_plan(scope, input, seen, notify.unwrap_or(Notify::None))?;
-    plan.settle_notify(input, notify, true);
+    let master = Master::read(input.fresh.master)?;
+    if gate::removes_copy(master.event_type.as_deref(), master.organizer_self) {
+        plan.stamp_removal();
+    } else {
+        plan.settle_notify(input, notify, true);
+    }
     Ok(plan)
 }
 
@@ -1461,16 +1487,22 @@ fn delete_plan(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (master, original) = prepare(input, None)?;
     let kind = gate::kind_of(master.event_type.as_deref());
-    // Someone else's repeating event: removing it from the user's calendar is a later layer's
-    // (C14d), so it stays as the gate has it (C14 §9.3). Not a birthday's or a Gmail event's, whose
-    // organiser Google fixes and whose own list lets them be deleted (C20 critiques C1-H1, C2-H2).
-    if kind == gate::Kind::Default && !master.organizer_self {
-        return Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer));
+    let later = scope == Scope::Following && !is_first(&master, input.fresh.instance);
+    // Someone else's repeating event leaves the user's calendar whole, as Google web takes it (Help
+    // 37113: no per-occurrence choices), and only from a calendar on its guest list, whose entry is
+    // what Google declines (C14 §10.3). Not a birthday's or a Gmail event's, whose organiser Google
+    // fixes and whose own list lets them be deleted (C20 critiques C1-H1, C2-H2).
+    if gate::removes_copy(master.event_type.as_deref(), master.organizer_self) {
+        if !master.invited {
+            return Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer));
+        }
+        if scope == Scope::This || later {
+            return Err(SeriesRefusal::RemoveEveryOccurrence.into());
+        }
     }
     // A birthday goes for every year at once (`status` isn't on Google's list for it, so one year
     // can't be cancelled); a Gmail event's occurrence may be cancelled, but never "this and
     // following", a new event Google won't let PM make for it (C20 §5.4).
-    let later = scope == Scope::Following && !is_first(&master, input.fresh.instance);
     match kind {
         gate::Kind::SpecialDate if scope == Scope::This || later => {
             return Err(SeriesRefusal::SpecialDeleteEveryYear.into())
@@ -1486,7 +1518,12 @@ fn delete_plan(
     }
     let master_json = input.fresh.master.json();
     let mut warnings = Vec::new();
-    if input.sibling && scope != Scope::This {
+    // A removal's question says "every occurrence" unless told otherwise, so a later part PM knows
+    // of says so too, where a delete of your own goes by `sibling`. Never `Unread`, which says nothing
+    // was split: `plan_scope` has refused a listing that didn't finish (`RemovePartsUnread`).
+    let removal = gate::removes_copy(master.event_type.as_deref(), master.organizer_self);
+    let known_part = removal && matches!(input.later, LaterPart::At(_) | LaterPart::Through(_));
+    if (input.sibling || known_part) && scope != Scope::This {
         warnings.push(SeriesWarning::SplitSibling);
     }
     // Every arm that deletes the whole series comes through here.
@@ -2292,6 +2329,24 @@ impl SeriesPlan {
     /// It would email someone and nobody answered: it must not run (R9).
     pub fn needs_notify(&self) -> bool {
         self.guests.is_some() && self.chosen.is_none()
+    }
+
+    /// It takes the user's copy of someone else's repeating event off their calendar (C14d): the one
+    /// plan that tells someone with no guests to ask about, as [`SeriesPlan::settle_notify`] stamps
+    /// `none` on every step of any other plan with none.
+    pub fn is_removal(&self) -> bool {
+        self.guests.is_none() && self.steps.iter().any(|s| s.notify != Notify::None)
+    }
+
+    /// A removal's answer, which nobody is asked for (C14 critique C1-H1): the organiser is told, so
+    /// the remove form sends no numbers, and [`SeriesPlan::choice_digest`] keeps it apart from a
+    /// delete of the same shape. Its `guests` stay `None` and no step has a `reach`: it tells the
+    /// organiser whoever else is on the event, so no guest list can stand against it.
+    fn stamp_removal(&mut self) {
+        for step in &mut self.steps {
+            step.notify = gate::REMOVAL_NOTIFY;
+        }
+        self.chosen = Some(gate::REMOVAL_NOTIFY);
     }
 
     /// The body of the new event it inserts, if it inserts one.
@@ -7911,18 +7966,243 @@ mod tests {
         assert!(special_plan_check(&ordinary.input(), &deleting).is_ok());
     }
 
-    /// C14 §9.3: removing someone else's repeating event from the user's calendar is a later
-    /// layer's; until then every scope is refused with the organiser's reason.
+    /// C14 §10.3, critique C1-H1: someone else's repeating event leaves the user's calendar whole:
+    /// one DELETE of the series, telling the organiser, with no question and no numbers, whoever
+    /// else is on it, "this and following" from the first occurrence included. Any other row is
+    /// refused in words that say which to choose.
     #[test]
-    fn an_invitations_delete_is_refused_for_every_scope() {
+    fn removing_a_repeating_invitation_takes_every_occurrence() {
         for modify in [false, true] {
-            for scope in [Scope::This, Scope::Following, Scope::All] {
+            for scope in [Scope::All, Scope::Following] {
+                // The first occurrence: "this and following" is All.
+                let case = Case::new(
+                    theirs(weekly(), modify),
+                    theirs(plain("2026-10-05T09:00:00+01:00"), modify),
+                );
+                let plan = case.delete(scope).unwrap();
+                assert_eq!(plan.scope, Scope::All);
+                assert!(plan.is_removal() && !plan.needs_notify());
+                assert!(plan.guests.is_none());
+                assert_eq!(plan.chosen, Some(Notify::All));
+                assert_eq!(plan.steps.len(), 1);
+                let step = &plan.steps[0];
+                assert!(matches!(&step.op, Op::Delete { event, .. } if event == "abc"));
+                assert_eq!(step.notify, Notify::All);
+                assert!(
+                    plan.removes
+                        == Removes::Series {
+                            series: "abc".into()
+                        }
+                );
+            }
+            let later = invitation(modify);
+            assert_eq!(
+                later.delete(Scope::All).unwrap().steps[0].notify,
+                Notify::All
+            );
+            for scope in [Scope::This, Scope::Following] {
                 assert_eq!(
-                    invitation(modify).delete(scope),
-                    Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer)),
+                    later.delete(scope),
+                    Err(NotPlanned::Refused(SeriesRefusal::RemoveEveryOccurrence)),
                     "{scope:?}"
                 );
             }
         }
+    }
+
+    /// C14 §10.3: an answer to the email question changes nothing about a removal: nobody asked,
+    /// and the organiser is told. Who it tells isn't the user's to answer, so a Don't send sent by
+    /// anything but the remove form can't turn it into a silent one.
+    #[test]
+    fn a_removal_tells_the_organiser_whatever_is_answered() {
+        let case = invitation(false);
+        for notify in [None, Some(Notify::All), Some(Notify::None)] {
+            let plan = plan_series_delete(
+                Scope::All,
+                &case.input(),
+                &seen_of(&case.opened_instance),
+                notify,
+            )
+            .unwrap();
+            assert_eq!(plan.steps[0].notify, Notify::All, "{notify:?}");
+            assert!(plan.is_removal() && !plan.needs_notify(), "{notify:?}");
+        }
+    }
+
+    /// C14 §10.3: a copy with no entry on the guest list (a public calendar's) has nothing to decline,
+    /// whichever row, and says the organiser's reason rather than offering All.
+    #[test]
+    fn a_repeating_event_you_arent_invited_to_is_not_removed() {
+        for scope in [Scope::This, Scope::Following, Scope::All] {
+            let uninvited = with(
+                with(weekly(), "organizer", json!({ "email": ORGANISER })),
+                "attendees",
+                json!([{ "email": ORGANISER, "organizer": true }]),
+            );
+            let occurrence = with(monday_19(), "organizer", json!({ "email": ORGANISER }));
+            assert_eq!(
+                Case::new(uninvited, occurrence).delete(scope),
+                Err(NotPlanned::ReadOnly(ReadOnlyReason::NotOrganizer)),
+                "{scope:?}"
+            );
+        }
+    }
+
+    /// A removal can't promise every occurrence when another part of the series is about: it says
+    /// so, and goes by the part it was asked about; what Google does with the other is L-I4's (I4-8).
+    /// A later part PM couldn't read isn't one it knows of, so never said as fact: `plan_scope`
+    /// refuses that listing first (`a_removal_is_refused_when_the_listing_of_its_parts_fails`). A
+    /// delete of your own goes by `sibling` alone, as it did.
+    #[test]
+    fn a_removal_warns_when_another_part_may_stay() {
+        let warned = |case: &Case| case.delete(Scope::All).unwrap().warnings;
+        assert_eq!(warned(&invitation(false)), []);
+        let unread = Case {
+            later: LaterPart::Unread,
+            ..invitation(false)
+        };
+        assert_eq!(warned(&unread), []);
+        let day = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        for later in [LaterPart::At(Point::Day(day)), LaterPart::Through(day)] {
+            let case = Case {
+                later,
+                ..invitation(false)
+            };
+            assert_eq!(warned(&case), [SeriesWarning::SplitSibling], "{later:?}");
+            let own = Case {
+                later,
+                ..Case::new(weekly(), monday_19())
+            };
+            assert_eq!(warned(&own), [], "{later:?}");
+        }
+        let split = Case {
+            sibling: true,
+            ..invitation(false)
+        };
+        let plan = split.delete(Scope::All).unwrap();
+        assert_eq!(plan.warnings, [SeriesWarning::SplitSibling]);
+        assert!(plan.is_removal());
+        assert!(
+            plan.removes
+                == Removes::Series {
+                    series: "abc".into()
+                }
+        );
+    }
+
+    /// C14 critique C1-H1: the token tells a removal from a delete of the same shape, your own with
+    /// nobody on it: an event that became yours between the choice and the send asks again. The
+    /// token binds it, not the answer to anything: a removal planned with or without one is the same.
+    #[test]
+    fn a_removals_token_is_its_own() {
+        let bind = "row";
+        let removal = invitation(false);
+        let mine = Case::new(weekly(), monday_19());
+        let removes = removal.delete(Scope::All).unwrap();
+        let deletes = mine.delete(Scope::All).unwrap();
+        assert!(!deletes.is_removal() && deletes.guests.is_none());
+        assert_eq!(
+            deletes.steps[0].notify,
+            Notify::None,
+            "your own, with nobody on it"
+        );
+        assert_ne!(removes.choice_digest(bind), deletes.choice_digest(bind));
+        let answered = plan_series_delete(
+            Scope::All,
+            &removal.input(),
+            &seen_of(&removal.opened_instance),
+            Some(Notify::All),
+        )
+        .unwrap();
+        assert_eq!(removes.choice_digest(bind), answered.choice_digest(bind));
+    }
+
+    /// C14 §10.3: on a 412 a removal goes again whoever joined or left the guest list, since it tells
+    /// the organiser alone (a delete you organise stops and asks: C12). It stops when what the user
+    /// saw of the series changed, or the event became the user's own, whose delete would cancel it
+    /// for everyone. Gone is done.
+    #[test]
+    fn a_removal_goes_again_unless_what_the_user_saw_changed() {
+        let case = invitation(false);
+        let plan = case.delete(Scope::All).unwrap();
+        let fresh = theirs(weekly(), false);
+        assert_eq!(plan.resend(0, &fresh), Resend::Proceed);
+        let more = with(
+            fresh.clone(),
+            "attendees",
+            json!([
+                { "email": ORGANISER, "organizer": true },
+                { "email": CALENDAR, "self": true },
+                { "email": A },
+                { "email": "new@example.com" }
+            ]),
+        );
+        assert_eq!(plan.resend(0, &more), Resend::Proceed);
+        let renamed = with(fresh.clone(), "summary", json!("Another"));
+        assert_eq!(
+            plan.resend(0, &renamed),
+            Resend::Conflict(vec!["summary".into()])
+        );
+        let now_mine = with(
+            fresh.clone(),
+            "organizer",
+            json!({ "email": CALENDAR, "self": true }),
+        );
+        assert_eq!(
+            plan.resend(0, &now_mine),
+            Resend::Conflict(vec!["organizer".into()])
+        );
+        let gone = with(fresh, "status", json!("cancelled"));
+        assert_eq!(plan.resend(0, &gone), Resend::Gone);
+    }
+
+    /// C20 §0.4 item 11, critiques C1-H1, C2-H2: a birthday's and a Gmail event's organiser is
+    /// Google's, so neither is a removal, whoever the organiser and whatever the guest list: no
+    /// decline goes out, and neither gets `RemoveEveryOccurrence`.
+    #[test]
+    fn a_birthday_or_a_gmail_event_is_deleted_not_removed() {
+        let invited_kind = |kind: &str| -> (Value, Value) {
+            let master = with(theirs(weekly(), false), "eventType", json!(kind));
+            let occurrence = with(theirs(monday_19(), false), "eventType", json!(kind));
+            (master, occurrence)
+        };
+        // A birthday: every year or none, its own words, no decline.
+        let (master, occurrence) = invited_kind("birthday");
+        let birthday = Case::new(master, occurrence);
+        let plan = birthday.delete(Scope::All).unwrap();
+        assert!(!plan.is_removal() && !plan.needs_notify());
+        assert_eq!(plan.steps[0].notify, Notify::None);
+        assert_eq!(
+            birthday.delete(Scope::This),
+            Err(NotPlanned::Refused(SeriesRefusal::SpecialDeleteEveryYear))
+        );
+        // A Gmail event: this occurrence or all of them, no decline either way.
+        let (master, occurrence) = invited_kind("fromGmail");
+        let gmail = Case::new(master, occurrence);
+        for scope in [Scope::This, Scope::All] {
+            let plan = gmail.delete(scope).unwrap();
+            assert!(!plan.is_removal() && !plan.needs_notify(), "{scope:?}");
+            assert_eq!(plan.steps[0].notify, Notify::None, "{scope:?}");
+        }
+    }
+
+    /// C14 §10.3: nothing but a removal is ever read as one: a delete you organise, answered Send,
+    /// reaches its guests with a notice, so it stays the user's to have answered.
+    #[test]
+    fn a_delete_you_organise_is_never_a_removal() {
+        let list = json!([{ "email": A, "responseStatus": "accepted" }]);
+        let case = Case::new(
+            with(weekly(), "attendees", list.clone()),
+            with(monday_19(), "attendees", list),
+        );
+        let plan = plan_series_delete(
+            Scope::All,
+            &case.input(),
+            &seen_of(&case.opened_instance),
+            Some(Notify::All),
+        )
+        .unwrap();
+        assert_eq!(plan.steps[0].notify, Notify::All);
+        assert!(plan.guests.is_some() && !plan.is_removal());
     }
 }

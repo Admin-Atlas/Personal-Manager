@@ -12,11 +12,12 @@
 //! occurrences it's for ("this event", "this and following", "all events"), a change Google would
 //! email guests about names whether it should, and a write without that choice is asked again. On an
 //! invitation, the user's own notifications, colour and busy or free, their reply, and the shared
-//! fields only when the organiser lets guests change them; never how it repeats, who is invited, or
-//! deleting it. Replying is apart from the rest ([`reply_block`]): it follows whether the calendar is
-//! on the guest list, not who organises the event. A one-off that Google has since turned into a
-//! repeating event is read-only with its own reason on every path, since a write to it would change
-//! every occurrence with no choice asked.
+//! fields only when the organiser lets guests change them; never how it repeats or who is invited.
+//! Its delete only takes the user's own copy off their calendar ([`removes_copy`]). Replying is apart
+//! from the rest ([`reply_block`]): it follows whether the calendar is on the guest list, not who
+//! organises the event. A one-off that Google has since turned into a repeating event is read-only
+//! with its own reason on every path, since a write to it would change every occurrence with no
+//! choice asked.
 //!
 //! A video call is Meet only, where the calendar offers it, and the organiser's to add or remove;
 //! another service's call is shown and kept (C18). The calendar is the organiser's to change too, to
@@ -34,7 +35,7 @@ use serde_json::Value;
 
 use crate::calendar_editing::EditingStatus;
 
-use super::dto::{CallKind, FieldPermissions, ListRights, ReadOnlyReason, TimeDraft};
+use super::dto::{CallKind, FieldPermissions, ListRights, Notify, ReadOnlyReason, TimeDraft};
 
 /// Which of Google's event types PM edits, and by which rule. Read from `eventType`, where absent
 /// means `default` (Google: "This cannot be modified after the event is created"). Named for what
@@ -63,6 +64,20 @@ pub fn kind_of(event_type: Option<&str>) -> Kind {
         Some(_) => Kind::Other,
     }
 }
+
+/// Whether a delete of this copy only takes it off the user's calendar ("Remove", C14d): an ordinary
+/// event someone else organises. Google web: "After you remove an event, Calendar tells the event
+/// organizer you decline the event". Never a birthday or a Gmail event, whose organiser Google fixes
+/// and whose delete emails nobody (C20 §0.4 item 11). One rule for the send, the repeating event's
+/// planner and the webview's `removesCopy`.
+pub fn removes_copy(event_type: Option<&str>, organizer_self: bool) -> bool {
+    kind_of(event_type) == Kind::Default && !organizer_self
+}
+
+/// What a removal tells Google to send: the organiser hears of the decline, and nothing is asked (Q6:
+/// "a reply only ever reaches the organiser"). What Google does with it on a guest's copy is live test
+/// L-I4's, and this line is what changes if it says otherwise.
+pub const REMOVAL_NOTIFY: Notify = Notify::All;
 
 /// Who owns a special date's day (Google's `birthdayProperties`): only one added in Google Calendar
 /// may move. Google: "Timing details of a birthday event cannot be updated if the event is linked to
@@ -227,8 +242,10 @@ fn default_rights(facts: &EditFacts) -> FieldPermissions {
         if facts.guests_can_modify {
             perms.reasons.push(ReadOnlyReason::OrganizerOnlyGuests);
         }
-        // Removing your copy from your calendar is a later layer's (C14d).
-        perms.delete = false;
+        // Taking the user's own copy off their calendar (C14d): Google tells the organiser they
+        // declined, so it needs an entry on the guest list to decline from. A copy from a public
+        // calendar has none and stays. A lock closes it below, as it does a delete.
+        perms.delete = facts.invited;
         // A call is the organiser's, whatever they let guests change: one made on a guest's copy
         // would be a call nobody else sees (A11; C18 §0.5 row 7). The reason above names it.
         perms.meet = false;
@@ -1240,8 +1257,8 @@ mod tests {
 
     /// C14c's allow-list, field by field (`G`: the organiser lets guests change it). Someone else's
     /// event: the user's own busy or free, notifications and colour always, the shared fields only
-    /// with `G`, never how it repeats (C1-H2), who is invited or a delete; the reply wherever the
-    /// calendar is on the guest list. Reasons in order, the organiser's first.
+    /// with `G`, never how it repeats (C1-H2) or who is invited; the reply and Remove (C14d) wherever
+    /// the calendar is on the guest list. Reasons in order, the organiser's first.
     #[test]
     fn the_allow_list_table() {
         let i = invitation;
@@ -1260,17 +1277,19 @@ mod tests {
         );
         let rows: Vec<Row> = vec![
             ("A1", editable(), [true; 6], false, vec![]),
+            // C14d: Delete is Remove here, from a copy on the guest list; a lock still closes it (A4,
+            // A5), and a copy with no entry has nothing to decline (A6).
             (
                 "A2",
                 i(),
-                [false, false, true, false, false, false],
+                [false, false, true, false, false, true],
                 true,
                 vec![NotOrganizer],
             ),
             (
                 "A3",
                 with_g(i()),
-                [true, true, true, false, false, false],
+                [true, true, true, false, false, true],
                 true,
                 vec![OrganizerOnlyGuests],
             ),
@@ -1331,7 +1350,7 @@ mod tests {
                     unsupported_formatting: true,
                     ..i()
                 },
-                [false, false, true, false, false, false],
+                [false, false, true, false, false, true],
                 true,
                 vec![NotOrganizer],
             ),
@@ -1342,7 +1361,7 @@ mod tests {
                     unsupported_formatting: true,
                     ..with_g(i())
                 },
-                [true, true, true, false, false, false],
+                [true, true, true, false, false, true],
                 true,
                 vec![OrganizerOnlyGuests, UnsupportedFormatting],
             ),
@@ -1376,7 +1395,7 @@ mod tests {
     }
 
     /// C14c: an invitation is something the editor can change (its own settings), so the list
-    /// offers Edit with no reason, never Delete, and the reply.
+    /// offers Edit with no reason and the reply. C14d: and Remove, which the list marks as Delete.
     #[test]
     fn an_invitation_is_editable_in_the_list() {
         for (facts, retime) in [
@@ -1393,13 +1412,35 @@ mod tests {
                 list_rights(&facts)
                     == ListRights {
                         edit_block: None,
-                        can_delete: false,
+                        can_delete: true,
                         can_respond: true,
                         can_retime: retime,
                     },
-                "editable, no Delete, the reply, a drag only where guests may change it"
+                "editable, Remove, the reply, a drag only where guests may change it"
             );
         }
+    }
+
+    /// C14d, C20 §0.4 item 11: a delete only takes the copy off the calendar on an ordinary event
+    /// someone else organises. Your own event is deleted; a birthday's and a Gmail event's organiser
+    /// is Google's, whoever it names, so they are deleted with no decline; a kind PM doesn't know
+    /// fails closed (the gate refuses it anyway).
+    #[test]
+    fn only_someone_elses_ordinary_event_is_removed_from_a_calendar() {
+        for event_type in [None, Some("default")] {
+            assert!(removes_copy(event_type, false), "{event_type:?}");
+            assert!(!removes_copy(event_type, true), "{event_type:?}: yours");
+        }
+        for event_type in ["birthday", "fromGmail", "focusTime", "somethingNew"] {
+            assert!(!removes_copy(Some(event_type), false), "{event_type}");
+            assert!(!removes_copy(Some(event_type), true), "{event_type}");
+        }
+    }
+
+    /// C14d: what a removal asks Google to send, which is what the L-I4 live test checks.
+    #[test]
+    fn a_removal_tells_the_organiser() {
+        assert_eq!(REMOVAL_NOTIFY.as_param(), "all");
     }
 
     /// C14 critique C1-L1: a refusal names the refused field's own reason, never another field's: the

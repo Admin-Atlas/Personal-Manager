@@ -94,6 +94,9 @@ export interface PopoverEditing {
   canEdit: boolean;
   /** Offer Delete. */
   canDelete: boolean;
+  /** Delete is "Remove": it takes the user's copy of someone else's event off their calendar
+   *  (C14d). */
+  removes?: boolean;
   /** Offer Duplicate (C18c): a copy the user can change before it's created, on any calendar. */
   canDuplicate: boolean;
   /** Why the event can't be changed, or a part of it, when that's so; a line under the actions. */
@@ -670,7 +673,7 @@ export function CalendarEventPopover({
               editing.onDelete();
             }}
           >
-            Delete
+            {editing.removes ? "Remove" : "Delete"}
           </Button>
         )}
       </div>

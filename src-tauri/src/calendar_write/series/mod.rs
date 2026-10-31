@@ -164,6 +164,9 @@ pub struct Master {
     /// Google's `guestsCanModify` (absent = false): on someone else's series, whether its shared
     /// fields may change from a guest's copy (C14).
     pub guests_can_modify: bool,
+    /// The calendar this copy is on has an entry on the guest list: someone else's series can be
+    /// removed from it (C14d).
+    pub invited: bool,
     pub event_type: Option<String>,
     pub locked: bool,
     /// The series' video call, by kind, `None` for none (C18): another service's call on every
@@ -239,6 +242,7 @@ impl Master {
                 .get("guestsCanModify")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            invited: super::rsvp::invited(it),
             event_type: text("eventType"),
             locked: it.get("locked").and_then(Value::as_bool).unwrap_or(false),
             call: super::call::call_of(it).map(|c| c.kind),
@@ -696,6 +700,11 @@ pub enum SeriesRefusal {
     /// A birthday deleted for one year, or from one year on: it goes for every year at once (C20
     /// §5.4).
     SpecialDeleteEveryYear,
+    /// Someone else's repeating event removed for one occurrence, or from one occurrence on: it
+    /// leaves the user's calendar whole, as Google web takes it (C14 §10.3).
+    RemoveEveryOccurrence,
+    /// [`SeriesRefusal::PartsUnread`] on a removal, which has no one occurrence to fall back on.
+    RemovePartsUnread,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -914,6 +923,16 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "PM deletes a birthday or other special date for every year at once: choose “All \
                  events”."
+            ),
+            SeriesRefusal::RemoveEveryOccurrence => write!(
+                f,
+                "Google Calendar removes someone else's repeating event from your calendar all at \
+                 once, so choose “All events”."
+            ),
+            SeriesRefusal::RemovePartsUnread => write!(
+                f,
+                "PM couldn't check for a new part an earlier “this and following” change made of \
+                 this repeating event, so it won't remove it now. Try again in a moment."
             ),
         }
     }
@@ -1461,10 +1480,12 @@ pub(crate) mod fixtures {
         with(event, "attendees", Value::from(entries))
     }
 
-    /// What the user saw of an occurrence: its mirror row's summary and times.
+    /// What the user saw of an occurrence: its mirror row's summary and times, and whether it was
+    /// someone else's to remove.
     pub fn seen_of(instance: &FreshEvent) -> SeenSummary {
         let row = crate::calendar::parse_event("", instance.json()).unwrap();
         SeenSummary {
+            removal: gate::removes_copy(row.event_type.as_deref(), row.organizer_self),
             summary: row.summary,
             start: row.start,
             end: row.end,

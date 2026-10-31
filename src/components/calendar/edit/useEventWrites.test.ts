@@ -178,6 +178,7 @@ describe("a held delete", () => {
         end: event.end,
         all_day: false,
         location: "High St",
+        removal: false,
       },
       null,
       null,
@@ -336,6 +337,152 @@ describe("a held delete", () => {
     expect(hook.result.current.notices[0]).toMatchObject({
       text: "Deleting “Dentist”.",
       undoToken: "t9",
+    });
+  });
+
+  // C14 §10.4, §13.4: Remove on someone else's event, from the hold to how it ended.
+  describe("a removal", () => {
+    const invitation: CalendarEvent = { ...event, organizer_self: false };
+    const settled = (result: WriteOutcome) => ({
+      undo_token: "t1",
+      event_id: event.id,
+      result,
+    });
+
+    it("says it's asked as a removal, and its notices say Removing and Removed", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation));
+      expect(deleteCalendarEvent).toHaveBeenCalledWith(
+        event.id,
+        expect.objectContaining({ removal: true }),
+        null,
+        null,
+        null,
+        null,
+      );
+      expect(hook.result.current.notices).toEqual([
+        {
+          id: 1,
+          tone: "ok",
+          text: "Removing “Dentist”.",
+          undoToken: "t1",
+          undoLabel: "Undo removing “Dentist”",
+        },
+      ]);
+      act(() => settledHandler!(settled({ outcome: "saved", warnings: [] })));
+      expect(hook.result.current.notices).toEqual([
+        { id: 1, tone: "ok", text: "Removed “Dentist” from your calendar." },
+      ]);
+    });
+
+    it("says so when it doesn't happen, and when it's too late to undo", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      cancelCalendarDelete.mockResolvedValue(false);
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation));
+      await act(() => mod.undoDelete("t1"));
+      expect(hook.result.current.notices[0].text).toBe(
+        "Too late to undo: “Dentist” is already being removed.",
+      );
+      act(() => settledHandler!(settled({ outcome: "conflict", fields: ["organizer"] })));
+      expect(hook.result.current.notices[0].text).toBe(
+        "“Dentist” wasn't removed. It changed in Google since you opened it.",
+      );
+    });
+
+    it("keeps the event when undone in time", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      cancelCalendarDelete.mockResolvedValue(true);
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation));
+      await act(() => mod.undoDelete("t1"));
+      expect(hook.result.current.notices).toEqual([{ id: 1, tone: "ok", text: "Kept “Dentist”." }]);
+      expect(hook.result.current.hiddenIds.size).toBe(0);
+    });
+
+    it("says Removing and Removed after a reload too", async () => {
+      listHeldDeletes.mockResolvedValue([
+        {
+          undo_token: "t1",
+          event_id: event.id,
+          summary: "Dentist",
+          seconds_left: 5,
+          removal: true,
+        },
+      ]);
+      const { hook, act } = await load();
+      expect(hook.result.current.notices[0]).toMatchObject({
+        text: "Removing “Dentist”.",
+        undoLabel: "Undo removing “Dentist”",
+      });
+      expect(hook.result.current.removalIds.has(event.id)).toBe(true);
+      act(() => settledHandler!(settled({ outcome: "saved", warnings: [] })));
+      // The reload forgot which calendar was named, so nothing claims it was the user's.
+      expect(hook.result.current.notices[0].text).toBe("Removed “Dentist” from its calendar.");
+    });
+
+    it("names the calendar the question named", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation, null, null, null, "Boss"));
+      act(() => settledHandler!(settled({ outcome: "saved", warnings: [] })));
+      expect(hook.result.current.notices[0].text).toBe("Removed “Dentist” from Boss.");
+    });
+
+    it("says it wasn't removed when refused before its hold, or when asking fails", async () => {
+      deleteCalendarEvent.mockResolvedValue({
+        outcome: "refused",
+        result: { outcome: "read_only", reason: "editing_off" },
+      });
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation));
+      expect(hook.result.current.notices[0].text).toMatch(/^“Dentist” wasn't removed\. Editing/);
+      deleteCalendarEvent.mockRejectedValue(new Error("no store"));
+      await act(() => mod.startDelete(invitation));
+      expect(hook.result.current.notices[1].text).toBe("“Dentist” wasn't removed. no store");
+    });
+
+    // C14 critique C1-M5: the rows a removal hides are its own, marked apart, while it waits and
+    // once it landed until a read no longer has them, so the view leaves other copies showing.
+    it("marks its rows apart while they're hidden, and a delete's not at all", async () => {
+      deleteCalendarEvent.mockResolvedValue({ ...held, hidden: ["cal:later"] });
+      const { mod, hook, act } = await load();
+      await act(() => mod.startDelete(invitation));
+      const both = [event.id, "cal:later"];
+      expect([...hook.result.current.removalIds]).toEqual(both);
+      act(() => settledHandler!(settled({ outcome: "saved", warnings: [] })));
+      expect([...hook.result.current.removalIds]).toEqual(both);
+      expect([...hook.result.current.hiddenIds]).toEqual(both);
+      act(() => mod.pruneRemoved([]));
+      expect(hook.result.current.removalIds.size).toBe(0);
+      expect(hook.result.current.hiddenIds.size).toBe(0);
+      deleteCalendarEvent.mockResolvedValue(held);
+      await act(() => mod.startDelete(event));
+      expect(hook.result.current.hiddenIds.has(event.id)).toBe(true);
+      expect(hook.result.current.removalIds.size).toBe(0);
+    });
+
+    // C20 §0.4 item 11: a birthday's or a Gmail event's organiser is Google's: a delete, in a
+    // delete's words.
+    it("a birthday or a Gmail event in someone else's name is a delete", async () => {
+      deleteCalendarEvent.mockResolvedValue(held);
+      const { mod, hook, act } = await load();
+      const notRemoved = [
+        event.id,
+        expect.objectContaining({ removal: false }),
+        null,
+        null,
+        null,
+        null,
+      ] as const;
+      await act(() => mod.startDelete({ ...invitation, event_type: "fromGmail" }));
+      expect(deleteCalendarEvent).toHaveBeenLastCalledWith(...notRemoved);
+      expect(hook.result.current.notices[0].text).toBe("Deleting “Dentist”.");
+      expect(hook.result.current.removalIds.size).toBe(0);
+      deleteCalendarEvent.mockResolvedValue({ ...held, undo_token: "t2" });
+      await act(() => mod.startDelete({ ...invitation, event_type: "birthday" }));
+      expect(deleteCalendarEvent).toHaveBeenLastCalledWith(...notRemoved);
     });
   });
 
@@ -799,6 +946,25 @@ describe("a repeating event", () => {
       return { mod, hook, act, settle, renderHook, openOther };
     }
 
+    // C14 §13.4: where a removal can't ask again, the notice speaks of removing.
+    it("says a removal changed under it in a removal's words", async () => {
+      deleteCalendarEvent.mockResolvedValue(ASK);
+      const { hook, act, settle } = await loadDialog();
+      const invitation: CalendarEvent = { ...occurrence, organizer_self: false };
+      act(() => hook.result.current.dialog.ask(invitation));
+      act(() => hook.result.current.dialog.confirm(invitation, { scope: "all", token: "a" }));
+      await settle();
+      expect(hook.result.current.dialog.asked).toEqual({
+        event: invitation,
+        reask: { again: true },
+      });
+      act(() => hook.result.current.dialog.confirm(invitation, { scope: "all", token: "a" }));
+      await settle();
+      expect(hook.result.current.writes.notices.map((n) => n.text)).toEqual([
+        "“Gym” wasn't removed. This repeating event changed since you asked to remove it. Remove it again.",
+      ]);
+    });
+
     it("reopens once for a row that looked like a one-off, then says so", async () => {
       deleteCalendarEvent.mockResolvedValue(ASK);
       const { hook, act, settle } = await loadDialog();
@@ -1068,6 +1234,7 @@ describe("a repeating event", () => {
         end: event.end,
         all_day: false,
         location: "High St",
+        removal: false,
       },
     });
     await act(async () => {

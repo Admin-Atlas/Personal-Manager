@@ -230,7 +230,7 @@ const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
 /** The selected row's lines, the question first; equal kinds keep the backend's order. A warning
  *  with nothing to say (a "not carried" naming nothing) has no line. Each is worded by the plan the
  *  row was made from: a "this and following" row that changes every occurrence speaks as All. */
-export function warningLines(row: RowView, kind: ChoiceKind, title: string): string[] {
+export function warningLines(row: RowView, kind: WarningKind, title: string): string[] {
   const rank = (w: SeriesWarning) => WARNING_ORDER.indexOf(w.warning);
   const scope: SeriesScope = row.asAll ? "all" : row.scope;
   return [...row.warnings]
@@ -246,11 +246,15 @@ function andList(items: readonly string[]): string {
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
+/** What the warnings are for: the choices' kinds, or Remove on someone else's event (C14d), which
+ *  never deletes the organiser's. */
+export type WarningKind = ChoiceKind | "remove";
+
 /** One warning as a sentence the user reads before choosing. The "may keep or lose" hedges never
  *  claim to know what Google does with occurrences changed on their own. */
 export function seriesWarningText(
   w: SeriesWarning,
-  kind: ChoiceKind,
+  kind: WarningKind,
   scope: SeriesScope,
   title: string,
 ): string {
@@ -302,6 +306,10 @@ export function seriesWarningText(
       return "From this occurrence on, it becomes a new repeating event in Google. If a milestone linked to it falls on or after this day, PM offers to move it to the new part after saving. Reminders to prepare may show again for the new part.";
     case "split_sibling": {
       const head = `Part of ${t} was made into a repeating event of its own by an earlier “this and following” change.`;
+      // What Google does with the other part of someone else's event is L-I4's (I4-8).
+      if (kind === "remove") {
+        return `${head} Google may remove that part too. If it stays, you can remove it the same way.`;
+      }
       return kind === "save"
         ? `${head} Google may treat that part as this one too.`
         : `${head} Google may delete that part too.`;
