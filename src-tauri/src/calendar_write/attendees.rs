@@ -1427,4 +1427,41 @@ mod tests {
             "a list cut short is never whole"
         );
     }
+
+    /// An answer covers a calendar change's reach now only for people it counted, and only for a
+    /// list as whole as the one it read: a list cut short since may hold people it never counted.
+    #[test]
+    fn an_answer_covers_only_the_people_and_the_list_it_was_given_for() {
+        let own = Own::default();
+        let none = Map::new();
+        let reach = |guests: &[Value], cut: bool| {
+            let mut copy = event(guests);
+            if cut {
+                copy["attendeesOmitted"] = json!(true);
+            }
+            Reach::of_transfer(&copy, &none, &own)
+        };
+        let (one, two) = ([me(), a()], [me(), a(), b_guest()]);
+        for (now, asked, covered, why) in [
+            (reach(&two, false), reach(&two, false), true, "whole, whole"),
+            (reach(&one, false), reach(&two, false), true, "someone gone"),
+            (
+                reach(&two, true),
+                reach(&two, false),
+                false,
+                "cut short since",
+            ),
+            (reach(&two, true), reach(&two, true), true, "short, short"),
+            (reach(&two, false), reach(&two, true), true, "whole, short"),
+            (reach(&two, false), reach(&one, false), false, "someone new"),
+            (
+                reach(&two, true),
+                reach(&one, true),
+                false,
+                "someone new, short",
+            ),
+        ] {
+            assert!(now.within(&asked) == covered, "{why}");
+        }
+    }
 }

@@ -832,7 +832,7 @@ describe("CalendarEventPopover", () => {
       for (const words of ["Ann", "relative", "emptied"]) {
         expect(middle(link(words)), words).toBe(false);
       }
-      expect(middle(link("web"))).toBe(true);
+      expect(openUrl).not.toHaveBeenCalled();
       unmount();
       // The formatted view's mail link, and an address written in its words.
       const { rich } = shown(
@@ -843,6 +843,47 @@ describe("CalendarEventPopover", () => {
       expect(mails.length).toBe(2);
       for (const mail of mails) expect(middle(mail)).toBe(false);
       expect(openUrl).not.toHaveBeenCalled();
+    });
+
+    // Review round 2: no webview opens it by itself and `useExternalLinks` hears the first button
+    // only, so without this a middle-click does nothing, where Google Calendar's page opens a tab.
+    // The formatted view sits inside the details: two guards hear it, and it opens once.
+    it("a middle-click opens a web link in the browser, once", () => {
+      const press = (target: Element, button: number) =>
+        target.dispatchEvent(
+          new MouseEvent("auxclick", { bubbles: true, cancelable: true, button }),
+        );
+      const web = "https://example.com/a";
+      markdownView.mockImplementation(() => (
+        <a href={web} target="_blank" rel="noreferrer">
+          web
+        </a>
+      ));
+      const markdown = shown("See it", "microsoft");
+      const inMarkdown = markdown.box.querySelector("a")!;
+      expect(press(inMarkdown, 1)).toBe(false);
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith(web);
+      // Not the other buttons: a right-click's own menu is its default.
+      expect(press(inMarkdown, 2)).toBe(true);
+      expect(openUrl).toHaveBeenCalledTimes(1);
+      markdown.unmount();
+      openUrl.mockClear();
+      const { rich } = shown(`<b><a href="${web}">site</a></b>`, "google");
+      expect(press(rich!.querySelector("a")!, 1)).toBe(false);
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith(web);
+    });
+
+    it("a middle-click whose browser didn't open is no unhandled failure", async () => {
+      openUrl.mockRejectedValue("PM couldn't open that.");
+      const { rich } = shown('<a href="https://example.com/a">site</a><b>x</b>', "google");
+      await act(async () => {
+        rich!
+          .querySelector("a")!
+          .dispatchEvent(
+            new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+          );
+      });
+      expect(openUrl).toHaveBeenCalledTimes(1);
     });
   });
 

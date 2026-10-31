@@ -41,15 +41,25 @@ export function useMailLink(on: string): {
   return { open, failure: said?.on === on ? said.text : null };
 }
 
-/** A middle-click (any button but the first) on a description's link that isn't a web link opening
- *  in the browser: nothing. The engine sends it as `auxclick`, never `click`, and its default loads
- *  the address in PM's own window, which has no navigation guard: WebKitGTK replaced the app with an
- *  error page for a mail link (C19 critique C2-H3, the details' links too; review 1). */
+/** A middle-click (any button but the first) on a description's link. The engine sends it as
+ *  `auxclick`, never `click`, and its default loads the address in PM's own window, which has no
+ *  navigation guard: WebKitGTK replaced the app with an error page for a mail link (C19 critique
+ *  C2-H3, the details' links too; review 1), so a link that isn't a web link does nothing. A web link
+ *  opening in the browser opens there on the middle button, as Google Calendar's page opens a new tab:
+ *  no webview does so by itself, and `useExternalLinks` hears only the first button (review 2). Its
+ *  failure says nothing, as that click's does. Two of these can hear one click, the formatted view's
+ *  and the details' around it: the first to act stops the second. */
 export function stopLinkAuxClick(e: ReactMouseEvent): void {
+  if (e.defaultPrevented) return;
   const at = e.target instanceof Element ? e.target : null;
   const link = at?.closest("a") ?? null;
   if (link === null) return;
   const href = link.getAttribute("href") ?? "";
-  if (link.getAttribute("target") === "_blank" && /^https?:\/\//i.test(href)) return;
+  if (link.getAttribute("target") === "_blank" && /^https?:\/\//i.test(href)) {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    void openUrl(href).catch(() => {});
+    return;
+  }
   e.preventDefault();
 }

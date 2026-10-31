@@ -142,8 +142,8 @@ import {
   movedEarlierHeldText,
   movedEarlierText,
   movedEarlierUnreadText,
-  NOT_MOVED_UNREAD,
   notMovedText,
+  notMovedUnreadText,
   notOrganizerText,
   outcomeText,
   problemText,
@@ -343,6 +343,10 @@ export function EventEditor({
   // An earlier save's other changes landed and its calendar change didn't (C18d): they're in Google
   // already, so discarding loses only the calendar change and what was changed since.
   const [partlySaved, setPartlySaved] = useState(false);
+  // A save landed something and Google's copy couldn't be read afterwards: the session has moved on,
+  // and a repeating event's occurrences may have new ids, so this editor sends nothing more (a Save
+  // on the old row can read as the event deleted). Closing and opening it again is what's left.
+  const [mustReopen, setMustReopen] = useState(false);
   const [askDiscard, setAskDiscard] = useState<"close" | "delete" | "duplicate" | null>(null);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
   // The choices dialog for a repeating event (null = closed).
@@ -392,7 +396,10 @@ export function EventEditor({
   // Focus returns here whenever the choices close or a save stays open: the button was blurred
   // before the dialog opened, so the dialog's own restore has nowhere to go back to.
   const saveRef = useRef<HTMLButtonElement>(null);
-  const refocusSave = () => setTimeout(() => saveRef.current?.focus(), 0);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  // Save can be held by then (`mustReopen`, a repeat being checked), and takes no focus: Cancel does.
+  const refocusSave = () =>
+    setTimeout(() => (saveRef.current?.disabled ? cancelRef : saveRef).current?.focus(), 0);
 
   const setDraft = (next: EditorFields) => {
     draftRef.current = next;
@@ -597,23 +604,25 @@ export function EventEditor({
    *  save whose calendar change alone didn't land (`saved`, C18d), the fields are Google's already,
    *  so `head` says it all unless Google's copy differs from the draft somewhere. A read that fails
    *  then never takes `head`'s place: the fields did land, and the read's own words can say nothing
-   *  changed, or that the event is gone when the save gave its occurrences new ids. `moved`: a
-   *  calendar change that landed earlier, read on the row it has there, its words for a read that
-   *  fails and for a draft with nothing left to send. */
+   *  changed, or that the event is gone when the save gave its occurrences new ids. It holds this
+   *  editor too (`mustReopen`). `moved`: a calendar change that landed earlier, read on the row it
+   *  has there, its words for a read that fails and for a draft with nothing left to send. */
   async function rebaseAfterConflict(
     head: string,
     saved = false,
     moved: { id: string; unread: string; held: string } | null = null,
   ) {
     if (!loaded || !draftRef.current) return;
-    const unread = (text: string) =>
+    const unread = (text: string) => {
+      if (saved) setMustReopen(true);
       setBanner(
         moved
           ? { tone: "warn", text: moved.unread }
           : saved
-            ? { tone: "warn", text: `${head} ${NOT_MOVED_UNREAD}` }
+            ? { tone: "warn", text: notMovedUnreadText(head) }
             : { tone: "error", text },
       );
+    };
     let fresh: EditLoad;
     try {
       fresh = await openForEdit(moved?.id ?? row.id);
@@ -1228,7 +1237,7 @@ export function EventEditor({
           <>
             {perms?.delete && onDelete && (
               <span className={showDuplicate ? undefined : "mr-auto"}>
-                <Button variant="danger" onClick={requestDelete} disabled={saving}>
+                <Button variant="danger" onClick={requestDelete} disabled={saving || mustReopen}>
                   Delete
                 </Button>
               </span>
@@ -1236,19 +1245,23 @@ export function EventEditor({
             {/* After Delete, the left group's last; alone, it takes its place (critique C2-L6). */}
             {showDuplicate && (
               <span className="mr-auto">
-                <Button variant="tertiary" onClick={requestDuplicate} disabled={saving}>
+                <Button
+                  variant="tertiary"
+                  onClick={requestDuplicate}
+                  disabled={saving || mustReopen}
+                >
                   Duplicate
                 </Button>
               </span>
             )}
-            <Button variant="tertiary" onClick={requestClose} disabled={saving}>
+            <Button ref={cancelRef} variant="tertiary" onClick={requestClose} disabled={saving}>
               Cancel
             </Button>
             <Button
               ref={saveRef}
               variant="primary"
               onClick={() => void save()}
-              disabled={!loaded || saving || repeatHolds}
+              disabled={!loaded || saving || mustReopen || repeatHolds}
             >
               {saving ? "Saving…" : "Save"}
             </Button>
@@ -1283,7 +1296,7 @@ export function EventEditor({
                   forWhom={calendar && !calendar.is_primary ? calendar.name : null}
                   note={loaded.event.reply?.note ?? ""}
                   title={title}
-                  disabled={saving}
+                  disabled={saving || mustReopen}
                   onReply={onReply}
                 />
               </div>

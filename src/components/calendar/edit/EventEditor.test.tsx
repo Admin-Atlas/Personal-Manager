@@ -3618,6 +3618,11 @@ describe("EventEditor, its calendar", () => {
     on: Calendar = PERSONAL,
     onClose = vi.fn(),
     over: Partial<CalendarEvent> = {},
+    footer: {
+      onDelete?: (row: CalendarEvent) => void;
+      onDuplicate?: (row: CalendarEvent) => void;
+      canDuplicate?: boolean;
+    } = {},
   ) {
     openForEdit.mockResolvedValue(ready(ev, permissions));
     render(
@@ -3633,6 +3638,7 @@ describe("EventEditor, its calendar", () => {
         hidden={new Set([QUIET.id])}
         shapeOf={() => undefined}
         onClose={onClose}
+        {...footer}
       />,
     );
     await screen.findByLabelText("Title");
@@ -3892,6 +3898,8 @@ describe("EventEditor, its calendar", () => {
     ).toBeTruthy();
     expect(screen.queryByText(/no longer in PM's calendar/)).toBeNull();
     expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    // Those words say to open it again: its session ended, and nothing more goes from here.
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
   });
 
   it("a calendar change that had landed says nothing's left when Google's copy holds it all", async () => {
@@ -3970,6 +3978,67 @@ describe("EventEditor, its calendar", () => {
       expect(onClose).not.toHaveBeenCalled();
       cleanup();
     }
+  });
+
+  // Review round 2 of PR 1: what landed gave a repeating event's occurrences new ids, so the row the
+  // editor is on can be dead: nothing more goes from here, where a Save would read as the event
+  // deleted. Its words stop offering Save, and Cancel still closes.
+  it("not moved and unread holds the editor until it's opened again", async () => {
+    saveEdit.mockResolvedValueOnce({
+      outcome: "not_moved",
+      message:
+        "Its guests changed in Google just now, so PM didn't change its calendar. Save again to answer for them.",
+    });
+    const onDelete = vi.fn();
+    const onDuplicate = vi.fn();
+    const onClose = await openOn(
+      event(),
+      ALL,
+      BOTH,
+      PERSONAL,
+      vi.fn(),
+      {},
+      {
+        onDelete,
+        onDuplicate,
+        canDuplicate: true,
+      },
+    );
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockRejectedValueOnce(new Error("That event is no longer in PM's calendar."));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const said = await screen.findByText(new RegExp(NOT_MOVED_UNREAD));
+    expect(said.textContent).toBe(
+      `Your other changes are saved, but it's still on Personal. Its guests changed in Google just now, so PM didn't change its calendar. ${NOT_MOVED_UNREAD}`,
+    );
+    const cancel = screen.getByRole<HTMLButtonElement>("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel.disabled).toBe(false));
+    await waitFor(() => expect(document.activeElement).toBe(cancel));
+    for (const name of ["Save", "Delete", "Duplicate"]) {
+      const button = screen.getByRole<HTMLButtonElement>("button", { name });
+      expect(button.disabled, name).toBe(true);
+      fireEvent.click(button);
+    }
+    await act(async () => {});
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(cancel);
+    fireEvent.click(await screen.findByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("not moved holds nothing when Google's copy reads again", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    const save = screen.getByRole<HTMLButtonElement>("button", { name: "Save" });
+    await waitFor(() => expect(save.disabled).toBe(false));
   });
 
   // Review round 1 of PR 1: after not moved, the other changes are in Google: discarding loses only

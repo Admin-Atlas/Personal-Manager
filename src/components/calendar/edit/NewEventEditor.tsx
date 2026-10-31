@@ -282,6 +282,9 @@ export function NewEventEditor({
   // copy's time is the original's, as Google holds it (C18 §7.1), so it starts as changed: another
   // calendar never makes it the account's default length.
   const timeTouched = useRef(handover?.timeTouched ?? copyOf !== undefined);
+  // Whether `lengthRef` is the event's own rather than an account's default: an all-day copy has
+  // none to keep, so going timed on another calendar takes that account's length (review round 2).
+  const ownLength = useRef(timeTouched.current && newEventLength(startDraft) !== null);
   // Whether the user has picked Show as: until then, it follows the kind (all day free). A copy's is
   // the original's, so it starts as picked, and all day and back keeps it, as editing the original
   // would.
@@ -490,7 +493,10 @@ export function NewEventEditor({
   function lengthOf(t: Timed): number {
     const s = halfInstant(NEW_EVENT_BASE, t, "start");
     const e = halfInstant(NEW_EVENT_BASE, t, "end");
-    if (s !== null && e !== null && e - s >= 60_000) lengthRef.current = e - s;
+    if (s !== null && e !== null && e - s >= 60_000) {
+      if (e - s !== lengthRef.current) ownLength.current = true;
+      lengthRef.current = e - s;
+    }
     return lengthRef.current;
   }
 
@@ -565,6 +571,8 @@ export function NewEventEditor({
       lengthRef.current = length;
       const t = next.time;
       if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
+    } else if (!ownLength.current) {
+      lengthRef.current = lengthFor(overviewRef.current, target);
     }
     const call = meetOnCalendar(overviewRef.current, target, next, meetTouched.current);
     if (call.meet !== next.meet) next = { ...next, meet: call.meet };

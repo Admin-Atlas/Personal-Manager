@@ -7592,6 +7592,35 @@ mod tests {
                 refused(SeriesRefusal::SpecialYearAlone)
             );
         }
+        // Only on a date Google Calendar holds: where Contacts or the profile owns the day, the
+        // year can't change in Google Calendar either, so that is what's said.
+        for (props, reason) in [
+            (
+                json!({ "type": "birthday", "contact": "people/c1" }),
+                ReadOnlyReason::DateFromContacts,
+            ),
+            (json!({ "type": "self" }), ReadOnlyReason::DateFromProfile),
+        ] {
+            let theirs = Case::new(
+                with(yearly_master(), "birthdayProperties", props),
+                with(
+                    with(
+                        yearly_occurrence("2026-05-04"),
+                        "start",
+                        json!({ "date": "2026-06-05" }),
+                    ),
+                    "end",
+                    json!({ "date": "2026-06-06" }),
+                ),
+            );
+            for scope in [Scope::This, Scope::All] {
+                assert_eq!(
+                    refusal(theirs.edit(scope, one_day("2026-05-04"))),
+                    read_only(reason),
+                    "{scope:?}"
+                );
+            }
+        }
         assert!(
             SeriesRefusal::SpecialYearAlone
                 .to_string()

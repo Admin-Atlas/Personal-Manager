@@ -27,7 +27,7 @@ import {
   type DescNode,
   type Mark,
 } from "./descriptionHtml";
-import { asciiLower, isAlpha, isSpace } from "./descriptionTokens";
+import { LEGACY, asciiLower, isAlpha, isSpace } from "./descriptionTokens";
 
 const t = (text: string): DescNode => ({ kind: "text", text });
 const BR: DescNode = { kind: "br" };
@@ -52,6 +52,7 @@ const read = (description: string) => {
 interface Row {
   description: string;
   html: boolean;
+  markup?: boolean;
   pm_can_edit: boolean;
   supported: boolean;
   why: string;
@@ -236,9 +237,21 @@ describe("the shared fixture", () => {
       expect(looksLikeHtml(row.description), at).toBe(row.html);
       expect(parsed.html, at).toBe(row.html);
       expect(parsed.supported, at).toBe(row.supported);
+      if (row.markup !== undefined) expect(parsed.markup, at).toBe(row.markup);
       // The backend is never stricter than the webview.
       if (row.supported) expect(row.pm_can_edit, at).toBe(true);
     });
+  });
+
+  // Rust's pm_can_edit_unseen reads the same table, so it can't let through what the reader refuses.
+  it("the_fixture_addresses_read_as_the_fixture_says", () => {
+    for (const { href, kept } of fixture.hrefs) {
+      expect(parseDescription(`<a href="${href}">x</a>`).supported, href).toBe(kept);
+    }
+  });
+
+  it("the_legacy_names_are_the_fixtures", () => {
+    expect([...LEGACY].sort()).toEqual([...fixture.legacy].sort());
   });
 
   it("the_fixture_pm_can_edit_column_follows_the_backend_rule", () => {
@@ -874,6 +887,11 @@ describe("drawing (C19b)", () => {
     ["<form>Sign up</form>", true],
     ["<details><summary>x</summary>y</details>", true],
     ['<font color="red">\nHello\n</font>\nafter', true],
+    ["See <www.example.com> for details", false],
+    ["Dial in: <Room 4>", false],
+    ["Contact <first.last> please", false],
+    ["<example.com>", false],
+    ["<b>Dial in</b>: <Room 4>", true],
     ["a < b and c > d", false],
     ["a<!-- note -->b", false],
     ["", false],

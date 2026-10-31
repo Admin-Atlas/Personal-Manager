@@ -843,9 +843,12 @@ describe("DescriptionView", () => {
     const mails = view.querySelectorAll('a[href^="mailto:"]');
     expect(mails.length).toBe(2);
     for (const mail of mails) expect(middle(mail)).toBe(false);
-    expect(middle(view.querySelector('a[href="https://example.com"]') as Element)).toBe(true);
     expect(onMail).not.toHaveBeenCalled();
     expect(openUrl).not.toHaveBeenCalled();
+    // A web link opens in the browser, never in PM's window (review 2).
+    openUrl.mockResolvedValue(undefined);
+    expect(middle(view.querySelector('a[href="https://example.com"]') as Element)).toBe(false);
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith("https://example.com");
   });
 });
 

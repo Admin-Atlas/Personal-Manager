@@ -739,6 +739,13 @@ export function movedEarlierUnreadText(
 export const NOT_MOVED_UNREAD =
   "PM couldn't read the event again afterwards, so close it and open it again before changing anything more.";
 
+/** `head`, what that save came to, then `NOT_MOVED_UNREAD`. Save is held then, since nothing here is
+ *  known to match Google, or may even be the row the event has now: a change of guests' "Save again"
+ *  (the backend's `TRANSFER_GUESTS_CHANGED`) goes, as opening it again is how it's answered. */
+export function notMovedUnreadText(head: string): string {
+  return `${head.replace(" Save again to answer for them.", "")} ${NOT_MOVED_UNREAD}`;
+}
+
 /** Join on a video call when the browser didn't open: the link can still be copied beside it. */
 export const JOIN_FAILED = "PM couldn't open the call in your browser. Use Copy link instead.";
 

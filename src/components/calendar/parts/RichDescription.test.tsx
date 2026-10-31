@@ -160,6 +160,22 @@ describe("RichDescription", () => {
     expect(view.textContent).not.toContain("class");
   });
 
+  // Review round 2: a browser would hide them as an unknown element. What the editor shows, and the
+  // pop-up beside other formatting.
+  it.each([
+    ["See <www.example.com> for details", "www.example.com"],
+    ["Dial in: <Room 4>", "Room 4"],
+    ["Contact <first.last> please", "first.last"],
+    ["<b>Dial in</b>: <Room 4>", "Room 4"],
+  ])("words_in_angle_brackets_show: %j", (description, words) => {
+    expect(draw(description).textContent).toContain(`<${words}>`);
+  });
+
+  it("a_www_address_in_angle_brackets_links", () => {
+    const view = draw("See <www.example.com> for details");
+    expect(view.querySelector("a")?.getAttribute("href")).toBe("https://www.example.com");
+  });
+
   it("an_address_in_angle_brackets_shows_and_links", () => {
     const view = draw("<b>Teams</b> Click here to join<https://example.com/j/1>");
     expect(view.textContent).toBe("Teams Click here to join<https://example.com/j/1>");

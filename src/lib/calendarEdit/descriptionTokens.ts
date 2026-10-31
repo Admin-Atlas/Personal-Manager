@@ -19,7 +19,9 @@
 // One deliberate difference: an address in angle brackets, "<https://…>" or "<ann@example.com>" (how
 // Outlook and other apps write a link into plain text), is kept as its own words rather than read as an
 // element named "https:", which would make the address vanish. Whether Google draws it as words or as a
-// link is probe E11-1's; the readers treat it as formatting PM can't write back until then.
+// link is probe E11-1's; the readers treat it as formatting PM can't write back until then. So too any
+// other words in angle brackets that Markdown reads as words and a browser as an unknown element
+// ("<www.example.com>", "<first.last>", "<Room 4>"): a plain-text event never loses them.
 //
 // One pass that never steps back, so a hostile description costs linear time.
 
@@ -42,8 +44,8 @@ export type Token =
       readonly selfClosing: boolean;
     }
   | { readonly kind: "end"; readonly name: string }
-  /** An address in angle brackets ("<https://…>", "<mailto:…>", "<ann@example.com>"): its source from
-   *  "<" to ">", decoded once. Words, not an element. */
+  /** An address in angle brackets ("<https://…>", "<mailto:…>", "<ann@example.com>"), or other words
+   *  in them (`readsAsWords`): its source from "<" to ">", decoded once. Words, not an element. */
   | { readonly kind: "literal"; readonly text: string }
   /** A comment, `<!…>`, `<?…>` or `</` not followed by a letter. Nothing of it shows. */
   | { readonly kind: "comment" }
@@ -152,8 +154,9 @@ for (let k = 0; k + 1 < OTHERS.length; k += 2) {
 const MAX_NAME = 8;
 
 /** The names a browser reads without their ";" (HTML's legacy ones: HTML 4's Latin-1 names, and the
- *  escapes in both cases), as the start of a longer run too: "&copy2026" draws "©2026". */
-const LEGACY: ReadonlySet<string> = new Set([
+ *  escapes in both cases), as the start of a longer run too: "&copy2026" draws "©2026". The
+ *  fixture's `legacy`, and Rust's `LEGACY_NAMES`. */
+export const LEGACY: ReadonlySet<string> = new Set([
   ...LATIN1,
   ...["amp", "lt", "gt", "quot", "AMP", "LT", "GT", "QUOT", "COPY", "REG"],
 ]);
@@ -215,6 +218,8 @@ const UNSURE: Token = { kind: "unsure" };
 interface Note {
   unsure: boolean;
 }
+/** For what the reader drops, whose references change nothing it keeps: heard by nobody. */
+const UNHEARD: Note = { unsure: false };
 
 /** The tokens of an HTML description, in one pass that never steps back. */
 export function tokens(description: string): Token[] {
@@ -238,8 +243,8 @@ function read(description: string, note: Note): Token[] {
   while (i < n) {
     const c = html[i];
     if (c === "&") {
-      const [decoded, next] = reference(html, i, note);
-      text += decoded;
+      const [character, next] = reference(html, i, note, mayBeDrawn);
+      text += character;
       i = next;
       continue;
     }
@@ -280,7 +285,7 @@ function read(description: string, note: Note): Token[] {
       const end = ahead.addressEnd(i);
       if (end >= 0) {
         flush();
-        out.push({ kind: "literal", text: decoded(html.slice(i, end + 1), note) });
+        out.push({ kind: "literal", text: decoded(html.slice(i, end + 1), note, mayBeDrawn) });
         i = end + 1;
         continue;
       }
@@ -289,7 +294,7 @@ function read(description: string, note: Note): Token[] {
     while (j < n && !isSpace(html[j]) && html[j] !== "/" && html[j] !== ">") j++;
     const name = asciiLower(html.slice(nameAt, j));
     // An end tag's attributes mean nothing, so neither do their references.
-    const tag = readTag(html, j, closing ? { unsure: false } : note);
+    const tag = readTag(html, j, closing ? UNHEARD : note);
     flush();
     if (tag === null) {
       out.push(CUT); // the text ends inside the tag: it and the rest are dropped
@@ -297,6 +302,11 @@ function read(description: string, note: Note): Token[] {
     }
     if (closing) {
       out.push({ kind: "end", name }); // an end tag's attributes mean nothing
+      i = tag.end;
+      continue;
+    }
+    if (readsAsWords(name, tag.attrs)) {
+      out.push({ kind: "literal", text: decoded(html.slice(i, tag.end), note, mayBeDrawn) });
       i = tag.end;
       continue;
     }
@@ -334,6 +344,19 @@ class Ahead {
     if (this.at <= from) this.at = next(s, from + 1, (c) => c === "@");
     return this.at < this.gt ? this.gt : -1;
   }
+}
+
+/** Whether a tag is words in angle brackets, as Markdown reads them, rather than an element: a name
+ *  holding ASCII punctuation but "-" and ":" ("<www.example.com>", "<first.last>"), or an attribute
+ *  starting with something no attribute a person writes starts with ("<Room 4>", "<Room #4>"). A
+ *  browser would hide them as an unknown element, and Google's text can hold them unescaped. A quote,
+ *  "=" or "<" there is HTML's own reading of a tag with something odd in it, so it stays one. */
+function readsAsWords(name: string, attrs: readonly Attr[]): boolean {
+  if (!/^[a-z0-9:\u0080-￿-]+$/.test(name)) return true;
+  return attrs.some(({ name: attr }) => {
+    const first = attr[0] ?? "";
+    return !isAlpha(first) && !"_:\"'=<".includes(first);
+  });
 }
 
 /** The first index from `from` whose character passes `test`, or the length. */
@@ -376,16 +399,20 @@ function readTag(
       k++;
       while (k < n && isSpace(s[k])) k++;
       if (k >= n) return null;
+      // Only what the reader keeps of a tag can change with a reference a browser reads otherwise:
+      // an address or a style, its first writing. The rest is dropped, or refused anyway.
+      const kept = (name === "href" || name === "style") && !seen.has(name);
+      const heard = kept ? note : UNHEARD;
       const quote = s[k];
       if (quote === '"' || quote === "'") {
         const close = s.indexOf(quote, k + 1);
         if (close < 0) return null;
-        value = decoded(s.slice(k + 1, close), note);
+        value = decoded(s.slice(k + 1, close), heard, mayBeDrawnInValue);
         i = close + 1;
       } else {
         let e = k;
         while (e < n && !isSpace(s[e]) && s[e] !== ">") e++;
-        value = decoded(s.slice(k, e), note);
+        value = decoded(s.slice(k, e), heard, mayBeDrawnInValue);
         i = e;
       }
     }
@@ -398,14 +425,14 @@ function readTag(
 }
 
 /** `s` with its character references decoded once. */
-function decoded(s: string, note: Note): string {
+function decoded(s: string, note: Note, drawn: (s: string, at: number) => boolean): string {
   let out = "";
   let i = 0;
   while (i < s.length) {
     const amp = s.indexOf("&", i);
     if (amp < 0) return out + s.slice(i);
     out += s.slice(i, amp);
-    const [text, next] = reference(s, amp, note);
+    const [text, next] = reference(s, amp, note, drawn);
     out += text;
     i = next;
   }
@@ -452,9 +479,14 @@ function afterEndTag(s: string, from: number, name: string): number {
 }
 
 /** A character reference at `from` (its "&"), decoded, and where the text goes on. Anything that
- *  isn't one is a plain "&"; `note` hears of one left as written that a browser may draw as a
- *  character. */
-function reference(s: string, from: number, note: Note): [string, number] {
+ *  isn't one is a plain "&"; `note` hears of one left as written that `drawn` says a browser may draw
+ *  as a character. */
+function reference(
+  s: string,
+  from: number,
+  note: Note,
+  drawn: (s: string, at: number) => boolean,
+): [string, number] {
   if (s[from + 1] === "#") {
     const hex = s[from + 2] === "x" || s[from + 2] === "X";
     const digitsAt = from + (hex ? 3 : 2);
@@ -471,7 +503,7 @@ function reference(s: string, from: number, note: Note): [string, number] {
   while (j < s.length && j - from <= MAX_NAME && (isAlpha(s[j]) || isDigit(s[j]))) j++;
   const named = s[j] === ";" ? NAMED.get(s.slice(from + 1, j)) : undefined;
   if (named !== undefined) return [named, j + 1];
-  if (isAlpha(s[from + 1] ?? "") && mayBeDrawn(s, from + 1)) note.unsure = true;
+  if (isAlpha(s[from + 1] ?? "") && drawn(s, from + 1)) note.unsure = true;
   return ["&", from + 1];
 }
 
@@ -482,6 +514,26 @@ function mayBeDrawn(s: string, at: number): boolean {
   for (let len = LEGACY_MIN; len <= LEGACY_MAX; len++) {
     if (LEGACY.has(s.slice(at, at + len))) return true;
   }
+  return endsAsAName(s, at);
+}
+
+/** `mayBeDrawn` inside an attribute's value (`s`), under HTML's rule for one: a legacy name written
+ *  without its ";" stays as written when "=" or a letter or digit follows it, so a link's
+ *  "&region=eu", "&section=2" or "&copy=3" is what PM reads too; at the value's end, or before anything
+ *  else, a browser draws it ("&copy", "&amp"). */
+function mayBeDrawnInValue(s: string, at: number): boolean {
+  for (let len = LEGACY_MAX; len >= LEGACY_MIN; len--) {
+    if (LEGACY.has(s.slice(at, at + len))) {
+      const after = s[at + len] ?? "";
+      if (after !== "=" && !isAlpha(after) && !isDigit(after)) return true;
+      break; // the longest name is the one a browser takes
+    }
+  }
+  return endsAsAName(s, at);
+}
+
+/** A run of letters and digits from `at` with a ";" after it. Looks at most MAX_ANY_NAME ahead. */
+function endsAsAName(s: string, at: number): boolean {
   let j = at;
   while (j < s.length && j - at < MAX_ANY_NAME && (isAlpha(s[j]) || isDigit(s[j]))) j++;
   return s[j] === ";";

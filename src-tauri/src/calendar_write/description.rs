@@ -103,60 +103,165 @@ pub fn pm_can_edit(s: &str) -> bool {
 /// [`pm_can_edit`], for a description the webview never read, so its stricter check never ran: a
 /// repeating event's own description under an occurrence that shows another (C19 review 1). Every
 /// attribute must also be one that draws nothing PM must keep (Google's bookkeeping on links and
-/// spans, a `data-` or `aria-` one), a link's plain web, mail or phone address (or Google's address
-/// without its scheme), or a style of bold, italic, underline and Google's theme colours only. A
-/// colour, a class, a direction, a link without an address or an odd link fails, as in the webview.
-/// A name written twice is checked both times (browsers read the first). Laxer than the webview
-/// still on nesting and references, which lose nothing PM can't draw.
+/// spans, a `data-` or `aria-` one), a link's address as the webview reads one ([`plain_href`]), or
+/// a style of bold, italic, underline and Google's theme colours only, a list's of the colours alone
+/// (the webview can't write a list inside a mark). A colour, a class, a direction, a link without an
+/// address or an odd link fails, as in the webview. A name written twice is checked both times
+/// (browsers read the first). Laxer than the webview still on nesting and on references outside
+/// links, which lose nothing PM can't draw.
 pub fn pm_can_edit_unseen(s: &str) -> bool {
     scan(s, |tag, attrs| {
         let link = tag.eq_ignore_ascii_case(b"a");
+        let list = tag.eq_ignore_ascii_case(b"ul") || tag.eq_ignore_ascii_case(b"ol");
         let every = attrs.iter().all(|(name, value)| match name.as_slice() {
             b"id" | b"target" | b"rel" | b"lang" | b"__is_owner" => true,
             n if n.starts_with(b"data-") || n.starts_with(b"aria-") => true,
             b"href" => link && plain_href(value),
-            b"style" => plain_style(value),
+            b"style" => plain_style(value, !list),
             _ => false,
         });
         every && (!link || attrs.iter().any(|(name, _)| name == b"href"))
     })
 }
 
-/// A link address PM keeps as it is: no whitespace, control character, quote or angle bracket, no
-/// reference but `&amp;` (so no scheme hides in one), and any scheme http, https, mailto or tel.
+/// Longest name [`plain_ampersands`] looks ahead over: the webview's `MAX_ANY_NAME`.
+const MAX_ANY_NAME: usize = 32;
+
+/// The names a browser reads without their `;`, the webview's `LEGACY`, and the fixture's `legacy`.
+const LEGACY_NAMES: &[&str] = &[
+    "AElig", "AMP", "Aacute", "Acirc", "Agrave", "Aring", "Atilde", "Auml", "COPY", "Ccedil",
+    "ETH", "Eacute", "Ecirc", "Egrave", "Euml", "GT", "Iacute", "Icirc", "Igrave", "Iuml", "LT",
+    "Ntilde", "Oacute", "Ocirc", "Ograve", "Oslash", "Otilde", "Ouml", "QUOT", "REG", "THORN",
+    "Uacute", "Ucirc", "Ugrave", "Uuml", "Yacute", "aacute", "acirc", "acute", "aelig", "agrave",
+    "amp", "aring", "atilde", "auml", "brvbar", "ccedil", "cedil", "cent", "copy", "curren", "deg",
+    "divide", "eacute", "ecirc", "egrave", "eth", "euml", "frac12", "frac14", "frac34", "gt",
+    "iacute", "icirc", "iexcl", "igrave", "iquest", "iuml", "laquo", "lt", "macr", "micro",
+    "middot", "nbsp", "not", "ntilde", "oacute", "ocirc", "ograve", "ordf", "ordm", "oslash",
+    "otilde", "ouml", "para", "plusmn", "pound", "quot", "raquo", "reg", "sect", "shy", "sup1",
+    "sup2", "sup3", "szlig", "thorn", "times", "uacute", "ucirc", "ugrave", "uml", "uuml",
+    "yacute", "yen", "yuml",
+];
+
+/// A link address the webview's reader takes as it is, its `linkOfHref` on the fixture's `hrefs`:
+/// `http://`, `https://` or `mailto:`, a phone number, or an address Google stored without its scheme
+/// (a domain, or an email address); nothing with whitespace or a control character in it. References
+/// are stricter here (no scheme hides in one): none but `&amp;`, where the webview would decode them.
 fn plain_href(value: &[u8]) -> bool {
-    if value.is_empty()
-        || value
-            .iter()
-            .any(|&c| c <= b' ' || c == 0x7f || matches!(c, b'"' | b'\'' | b'<' | b'>' | b'`'))
-    {
+    let Ok(written) = std::str::from_utf8(value) else {
+        return false;
+    };
+    if !plain_ampersands(value) {
         return false;
     }
+    let href = written.replace("&amp;", "&");
+    let unbroken = href.chars().all(|c| {
+        // JavaScript's `\s` holds U+FEFF, which Unicode's whitespace doesn't.
+        c > ' ' && !('\u{7f}'..='\u{9f}').contains(&c) && !c.is_whitespace() && c != '\u{feff}'
+    });
+    if !unbroken {
+        return false;
+    }
+    let starts = |scheme: &[u8]| {
+        href.as_bytes()
+            .get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    if starts(b"http://") || starts(b"https://") || starts(b"mailto:") {
+        return true;
+    }
+    if starts(b"tel:") {
+        let phone = &href.as_bytes()[b"tel:".len()..];
+        return phone.iter().any(u8::is_ascii_digit)
+            && phone.iter().all(|c| {
+                c.is_ascii_digit()
+                    || matches!(
+                        c,
+                        b'+' | b'-' | b'.' | b'(' | b')' | b',' | b';' | b'#' | b'*'
+                    )
+            });
+    }
+    if href.encode_utf16().count() > MAX_TYPED {
+        return false;
+    }
+    if let Some((local, domain)) = href.split_once('@') {
+        if !local.is_empty()
+            && local
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".!#$&'*+=?^_`{|}~-".contains(&c))
+            && is_domain(domain)
+        {
+            return true;
+        }
+    }
+    let path = href.find(['/', '?', '#']).unwrap_or(href.len());
+    is_domain(&href[..path])
+}
+
+/// The longest address the webview reads as typed: its `MAX_TYPED`.
+const MAX_TYPED: usize = 2000;
+
+/// Two or more labels of letters, digits and `-`, split by `.`.
+fn is_domain(s: &str) -> bool {
+    s.contains('.')
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+}
+
+/// Whether every `&` in an attribute's value is `&amp;` or a plain `&`, as HTML's rule for attributes
+/// reads it: no number (`&#38`, with or without its `;`), no name with its `;`, known or not, and no
+/// legacy name a browser would draw without it (`&copy` at the end, or before anything but `=`, a
+/// letter or a digit). So `?a=1&region=eu&copy=3` is a plain address, as it is to the webview.
+fn plain_ampersands(value: &[u8]) -> bool {
     let mut at = find(value, b'&', 0);
     while let Some(amp) = at {
-        if !value[amp..].starts_with(b"&amp;") {
+        if !value[amp..].starts_with(b"&amp;") && reads_as_reference(value, amp + 1) {
             return false;
         }
         at = find(value, b'&', amp + 1);
     }
-    let path = value
-        .iter()
-        .position(|&c| matches!(c, b'/' | b'?' | b'#'))
-        .unwrap_or(value.len());
-    match find(&value[..path], b':', 0) {
-        None => true,
-        Some(colon) => {
-            let scheme = &value[..colon];
-            [&b"http"[..], b"https", b"mailto", b"tel"]
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(scheme))
-        }
-    }
+    true
 }
 
-/// A style the webview reads as marks or as nothing: each declaration bold (or a weight of 600 to
-/// 900), italic, underline, or a colour that is only Google's theme variable.
-fn plain_style(value: &[u8]) -> bool {
+/// [`plain_ampersands`] for the characters from `at`, just after an `&`.
+fn reads_as_reference(value: &[u8], at: usize) -> bool {
+    let rest = &value[at..];
+    if rest.first() == Some(&b'#') {
+        return match rest.get(1) {
+            Some(b'x' | b'X') => rest.get(2).is_some_and(u8::is_ascii_hexdigit),
+            next => next.is_some_and(u8::is_ascii_digit),
+        };
+    }
+    if !rest.first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let run = rest
+        .iter()
+        .take(MAX_ANY_NAME)
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .count();
+    if rest.get(run) == Some(&b';') {
+        return true;
+    }
+    // The longest legacy name is the one a browser takes; a name that runs on, or an `=`, stops it.
+    let name = LEGACY_NAMES
+        .iter()
+        .filter(|name| rest.starts_with(name.as_bytes()))
+        .map(|name| name.len())
+        .max();
+    name.is_some_and(|len| {
+        !rest
+            .get(len)
+            .is_some_and(|c| *c == b'=' || c.is_ascii_alphanumeric())
+    })
+}
+
+/// A style the webview reads as marks or as nothing: each declaration a colour that is only Google's
+/// theme variable and, with `marks`, bold (or a weight of 600 to 900), italic or underline.
+fn plain_style(value: &[u8], marks: bool) -> bool {
     let Ok(style) = std::str::from_utf8(value) else {
         return false;
     };
@@ -174,11 +279,12 @@ fn plain_style(value: &[u8]) -> bool {
         let value = value.trim();
         match property.trim() {
             "font-weight" => {
-                matches!(value, "bold" | "bolder")
-                    || value.parse::<u16>().is_ok_and(|n| (600..=900).contains(&n))
+                marks
+                    && (matches!(value, "bold" | "bolder")
+                        || value.parse::<u16>().is_ok_and(|n| (600..=900).contains(&n)))
             }
-            "font-style" => matches!(value, "italic" | "oblique"),
-            "text-decoration" | "text-decoration-line" => value == "underline",
+            "font-style" => marks && matches!(value, "italic" | "oblique"),
+            "text-decoration" | "text-decoration-line" => marks && value == "underline",
             "color" | "background-color" => theme_variable(value),
             _ => false,
         }
@@ -369,6 +475,18 @@ mod tests {
             .map(|t| t.as_str().unwrap())
             .collect();
         assert_eq!(tags, EDITABLE_TAGS);
+    }
+
+    #[test]
+    fn the_legacy_names_are_the_fixtures() {
+        let fixture = fixture();
+        let names: Vec<&str> = fixture["legacy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+        assert_eq!(names, LEGACY_NAMES);
     }
 
     /// `patch::description_is_html`'s table, moved here (C19 §9), with the two references it read as
@@ -568,6 +686,8 @@ mod tests {
             "<a href=\"tel:+15550100\">call</a>",
             "<a href=\"www.example.org/path\">site</a>",
             "<a href=https://example.com>unquoted</a>",
+            "<a href=\"https://zoom.us/j/1?pwd=x&uname=y\">a raw ampersand</a>",
+            "<ul style=\"color: var(--on-surface)\"><li>x</li></ul>",
             "<span style=\"background-color: var(--textfield-surface); color: var( --on-surface );\">x</span>",
             "<span style=\"font-weight: bold; font-style: italic; text-decoration: underline;\">x</span>",
             "<span style=\"font-weight: 600\">x</span>",
@@ -594,9 +714,32 @@ mod tests {
             "<a href=\"\">x</a>",
             "<a>x</a>",
             "<table><tr><td>x</td></tr></table>",
+            // No reference in a link but `&amp;`, where the webview would decode them.
+            "<a href=\"https://example.com/&eacute;\">x</a>",
+            "<a href=\"https://example.com/&#65;\">x</a>",
+            "<a href=\"https://example.com/&#65\">x</a>",
+            "<a href=\"https://example.com/&#x41\">x</a>",
+            // A list inside a mark is nothing the webview writes back.
+            "<ul style=\"font-weight:bold\"><li>x</li></ul>",
+            "<ol style=\"font-style:italic\"><li>x</li></ol>",
+            "<ul style=\"text-decoration:underline\"><li>x</li></ul>",
         ] {
             assert!(!pm_can_edit_unseen(refused), "{refused}");
         }
+        // The shared table of addresses, as the webview's reader takes them.
+        let fixture_rows = fixture();
+        for row in fixture_rows["hrefs"].as_array().unwrap() {
+            let href = row["href"].as_str().unwrap();
+            assert!(
+                pm_can_edit_unseen(&format!("<a href=\"{href}\">x</a>"))
+                    == row["kept"].as_bool().unwrap(),
+                "{href}"
+            );
+        }
+        assert!(
+            fixture_rows["hrefs"].as_array().unwrap().len() > 20,
+            "the fixture holds its addresses"
+        );
         // Never laxer than the backend's own check, on every fixture row.
         let fixture = fixture();
         for row in fixture["rows"].as_array().unwrap() {

@@ -252,6 +252,78 @@ describe("tokens", () => {
     expect(tokens(html)).toEqual([UNSURE, ...rest]);
   });
 
+  // HTML's rule for attributes, which a browser and PM read alike: a legacy name without its ";"
+  // stays as written before "=" or a letter or digit (review 2).
+  it.each([
+    "https://x.example/?a=1&region=eu&section=2&copy=3&para=4&notify=5",
+    "https://x.example/?a&b",
+    "https://x.example/?a=1&copy2",
+  ])("an_address_reads_as_a_browser_reads_it: %j", (href) => {
+    expect(tokens(`<a href="${href}">y</a>`)).toEqual([
+      start("a", [["href", href]]),
+      text("y"),
+      end("a"),
+    ]);
+    expect(tokens(`<a href=${href}>y</a>`)).not.toContainEqual(UNSURE);
+  });
+
+  it.each([
+    '<a href="https://x.example/?a=1&copy">y</a>',
+    '<a href="https://x.example/?a=1&copy&b=2">y</a>',
+    '<a href="https://x.example/?a=1&amp">y</a>',
+    "<a href=https://x.example/?a=1&copy>y</a>",
+    '<a href="https://x.example/?a=&check;">y</a>',
+    '<b style="color:&check;">y</b>',
+    // The same names in a text are the text's rule.
+    "&region=eu",
+    "&copy=3",
+  ])("what_a_browser_draws_in_an_address_is_said: %j", (html) => {
+    expect(tokens(html)[0]).toEqual(UNSURE);
+  });
+
+  // Only an address or a style is kept of a tag, and only its first writing.
+  it.each([
+    '<span data-note="a&b;c">x</span>',
+    '<span data-note="R&copy">x</span>',
+    "<a id='&check;' target=&copy href=\"https://x.example\">x</a>",
+    '<a href="https://x.example" href="https://x.example/&copy">x</a>',
+  ])("a_reference_in_what_the_reader_drops_changes_nothing: %j", (html) => {
+    expect(tokens(html)).not.toContainEqual(UNSURE);
+  });
+
+  // Markdown reads these as words; a browser hides them as an unknown element (review 2).
+  it.each([
+    ["See <www.example.com> for details", "<www.example.com>"],
+    ["<example.com>", "<example.com>"],
+    ["Contact <first.last> please", "<first.last>"],
+    ["Dial in: <Room 4>", "<Room 4>"],
+    ["<Room #4>", "<Room #4>"],
+    ["<Floor 2, Room 4>", "<Floor 2, Room 4>"],
+    ["<first_last>", "<first_last>"],
+    ["<a,b>", "<a,b>"],
+    ["<x.y a=&lt;>", "<x.y a=<>"],
+  ])("words_in_angle_brackets_stay_words: %j", (html, literalText) => {
+    const got = tokens(html);
+    expect(got).toContainEqual(literal(literalText));
+    expect(got.some((token) => token.kind === "start")).toBe(false);
+  });
+
+  // A quote, "=" or "<" where an attribute starts is HTML's own reading of a tag with something odd
+  // in it, and any other name holds to what it's written as.
+  it.each([
+    ['<b "x>y</b>', "b"],
+    ["<b =x>y</b>", "b"],
+    ["<b title=x <h2>y</b>", "b"],
+    ["<b _x>y</b>", "b"],
+    ["<o:p>y</o:p>", "o:p"],
+    ["<html-blob>y</html-blob>", "html-blob"],
+    ["<Room>y</Room>", "room"],
+    ["<Room A>y</Room>", "room"],
+    ["<h2 id=x>y</h2>", "h2"],
+  ])("a_tag_stays_a_tag: %j", (html, name) => {
+    expect(tokens(html)[0]).toMatchObject({ kind: "start", name });
+  });
+
   it.each(["Q&A, R&D, AT&T", "&#; &#x;", "&amp; &lt;b&gt; &eacute;", "</b title='&check;'>"])(
     "references_no_browser_draws_are_not: %j",
     (html) => {

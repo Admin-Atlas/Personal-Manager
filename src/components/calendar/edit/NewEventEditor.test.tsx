@@ -2399,6 +2399,52 @@ describe("NewEventEditor opened on a copy (C18c)", () => {
     expect(createEvent.mock.calls[0][1].summary).toBe("Retro");
   });
 
+  // Review round 2 of PR 1: an all-day copy has no length of its own, so going timed takes the length
+  // of the account it's on now, as a new event there would.
+  it("an all-day copy going timed on another calendar takes that account's length", () => {
+    const time: EditorFields["time"] = {
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-12",
+    };
+    open({ copy: copyOf({ time }) });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  it("an all-day copy going timed on the calendar it started on takes that account's length", () => {
+    const time: EditorFields["time"] = {
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-12",
+    };
+    open({ copy: copyOf({ time }) });
+    pickCalendar("Personal", "Work");
+    pickCalendar("Work", "Personal");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("10:00");
+  });
+
+  it("a new event all day and timed again on another calendar takes that account's length", () => {
+    open();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  // Its own length stays: a timed copy all day and back on another account's calendar.
+  it("a timed copy keeps its own length through All day and back on another calendar", () => {
+    const time = { ...seed.time, end_time: "12:00" } as EditorFields["time"];
+    open({ copy: copyOf({ time }) });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("12:00");
+  });
+
   // Review round 1 of PR 1: a copy's time is the original's (C18 §7.1), never the default length of
   // the account whose calendar is picked.
   it("a copy keeps its own end on another calendar, and back", async () => {

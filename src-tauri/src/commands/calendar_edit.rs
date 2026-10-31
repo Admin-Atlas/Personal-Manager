@@ -2062,7 +2062,10 @@ async fn gone_look<W: Wire>(wire: &W, dest: &CalendarTarget, event: &str) -> OnD
 /// unseen can read just so (the words after a lost answer say to try again, and what Google's source
 /// answers after one is live probe L-T6's), so `dest` is looked at before "deleted" is said: its own
 /// copy lands as the change it is, with `opened`, the copy the editor opened, standing for the one
-/// on its own calendar. `draft`, a Save's fields, may hold what the copy there doesn't
+/// on its own calendar. That copy can be older than the last one there (a title that landed in the
+/// Save whose calendar change lost its answer), so the row is remembered as removed no older than
+/// the copy on `dest`, as [`series_landed_unseen`] floors its rows: a lagging list still holding
+/// that title can't bring it back. `draft`, a Save's fields, may hold what the copy there doesn't
 /// ([`with_what_is_left`]). A look that fails is PM not knowing. `None`: it's gone.
 async fn landed_unseen<W: Wire, H: Host>(
     one: &OneWrite<'_, W, H>,
@@ -2073,8 +2076,20 @@ async fn landed_unseen<W: Wire, H: Host>(
 ) -> Option<WriteOutcome> {
     match gone_look(one.wire, dest, &one.target.remote_event).await {
         OnDest::Own(there) => {
-            let landed =
-                land_transferred(one.host, one.target, dest, opened, &there, Some(session));
+            let moments = [updated_of(Some(opened)), updated_of(Some(&there))];
+            let removed = GoneRow {
+                updated: diff::floor_of(moments.iter().flatten().map(String::as_str)),
+                ..gone_row(one.target, Some(opened))
+            };
+            let landed = land_transfer_removing(
+                one.host,
+                one.target,
+                dest,
+                removed,
+                opened,
+                &there,
+                Some(session),
+            );
             Some(match draft {
                 Some(draft) => {
                     with_what_is_left(landed, draft, Some(&there), dest, &one.target.remote_event)
@@ -2470,14 +2485,22 @@ fn land_transferred(
     moved: &Value,
     session: Option<&str>,
 ) -> WriteOutcome {
-    let off = land_on(
-        host,
-        &target.calendar_id,
-        Vec::new(),
-        &[],
-        vec![gone_row(target, Some(before))],
-    )
-    .is_ok();
+    let removed = gone_row(target, Some(before));
+    land_transfer_removing(host, target, dest, removed, before, moved, session)
+}
+
+/// [`land_transferred`], the row on its own calendar remembered as `removed`, which may be newer than
+/// `before`, a copy that still tells the event's iCal UID ([`links_left_behind`]).
+fn land_transfer_removing(
+    host: &impl Host,
+    target: &Target,
+    dest: &CalendarTarget,
+    removed: GoneRow,
+    before: &Value,
+    moved: &Value,
+    session: Option<&str>,
+) -> WriteOutcome {
+    let off = land_on(host, &target.calendar_id, Vec::new(), &[], vec![removed]).is_ok();
     // A copy PM can't read as a row is in Google all the same: the next sync shows it.
     let on = calendar::parse_event(&dest.calendar_id, moved).is_some_and(|row| {
         let id = row.id.clone();
@@ -31682,6 +31705,15 @@ mod tests {
                 open_session(&host.edit, &session).unwrap().is_none(),
                 "{case}"
             );
+            // A title that landed with the lost answer made a copy newer than the one the editor
+            // opened: a list that lags, still holding it, can't bring the row back beside the new one.
+            let lagging = written(&event, &[("summary", json!("Retro"))], "\"s2\"");
+            let lagging = with(lagging, "updated", json!("2026-10-05T10:00:00.000Z"));
+            assert!(
+                host.synced(std::slice::from_ref(&lagging), Instant::now())
+                    .is_empty(),
+                "{case}: a list that lags"
+            );
         }
     }
 
@@ -32999,6 +33031,27 @@ mod tests {
                 }
         );
         assert!(open_session(&host.edit, &session).unwrap().is_some());
+        // Send, with the list Google cut short since: it may hold people the question never counted.
+        let cut = with(retitled.clone(), "attendeesOmitted", json!(true));
+        let host = host_with_second(std::slice::from_ref(&event));
+        let (outcome, script, _) = save_to_second(
+            &host,
+            &event,
+            draft(),
+            answered(Notify::All, asked.clone()),
+            until_the_look("sendUpdates=all", &cut),
+        )
+        .await;
+        script.asked_all();
+        assert_eq!(transfers(&script), 0);
+        assert!(
+            outcome
+                == WriteOutcome::NotMoved {
+                    message: TRANSFER_GUESTS_CHANGED.into(),
+                    warnings: Vec::new(),
+                },
+            "a list cut short is not the list the answer was for"
+        );
         // Don't send emails nobody, so it goes.
         let host = host_with_second(std::slice::from_ref(&event));
         let mut steps = until_the_look("sendUpdates=none", &added);

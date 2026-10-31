@@ -145,6 +145,18 @@ describe("plain typed lines (an event's description)", () => {
     expect(equals.querySelector("h1, h2")).toBeNull();
   });
 
+  // A plain-text Google event takes this path (parseDescription's `markup`, C19 review 2).
+  it("keeps words in angle brackets that are no tag", () => {
+    for (const [line, words] of [
+      ["See <www.example.com> for details", "www.example.com"],
+      ["Dial in: <Room 4>", "<Room 4>"],
+      ["Contact <first.last> please", "<first.last>"],
+    ]) {
+      const { container } = render(<Markdown plainLines>{line}</Markdown>);
+      expect(container.textContent).toContain(words);
+    }
+  });
+
   it("keeps an indented line as text", () => {
     const { container } = render(<Markdown plainLines>{"Agenda\n\n    item one"}</Markdown>);
     expect(container.querySelector("pre, code")).toBeNull();
