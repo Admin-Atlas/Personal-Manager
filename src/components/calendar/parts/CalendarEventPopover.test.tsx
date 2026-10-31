@@ -696,6 +696,18 @@ describe("CalendarEventPopover", () => {
       expect(markdownView).toHaveBeenCalledWith({ children: description, plainLines: true });
     });
 
+    // C19 review 1: Markdown drops a block of HTML it doesn't know, words and all, where Google
+    // shows the words.
+    it.each([
+      ["<center>Hello</center>", ["Hello"]],
+      ["<html><body>Hello there</body></html>", ["Hello there"]],
+      ['<font color="red">\nHello\n</font>\nafter', ["Hello", "after"]],
+    ])("a google description of other elements shows its words: %j", (description, words) => {
+      const { rich } = shown(description, "google");
+      for (const word of words) expect(rich?.textContent).toContain(word);
+      expect(markdownView).not.toHaveBeenCalled();
+    });
+
     it("a bare address inside bold is a link", () => {
       const { rich } = shown("<b>Join at https://example.com/j/1</b>", "google");
       const link = rich?.querySelector("b > a");
@@ -795,6 +807,42 @@ describe("CalendarEventPopover", () => {
       // A web link is useExternalLinks' to open, so the pop-up leaves its default alone.
       expect(fireEvent.click(link("web"))).toBe(true);
       expect(openUrl).toHaveBeenCalledTimes(1);
+    });
+
+    // C19 review 1: a middle-click sends `auxclick`, never `click`, and its default loads the link
+    // in PM's own window (WebKitGTK showed an error page in place of the app for a mail link).
+    it("a middle-click never loads a link inside PM's window", () => {
+      const middle = (target: Element) =>
+        target.dispatchEvent(
+          new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+        );
+      markdownView.mockImplementation(() => (
+        <div>
+          <a href="mailto:ann@example.com">Ann</a>
+          <a href="/somewhere">relative</a>
+          <a href="">emptied</a>
+          <a href="https://example.com" target="_blank" rel="noreferrer">
+            web
+          </a>
+        </div>
+      ));
+      const { box, unmount } = shown("Mail Ann <ann@example.com>", "microsoft");
+      const link = (words: string) =>
+        [...box.querySelectorAll("a")].find((a) => a.textContent === words)!;
+      for (const words of ["Ann", "relative", "emptied"]) {
+        expect(middle(link(words)), words).toBe(false);
+      }
+      expect(middle(link("web"))).toBe(true);
+      unmount();
+      // The formatted view's mail link, and an address written in its words.
+      const { rich } = shown(
+        '<b><a href="mailto:ann@example.com">Email us</a> or bob@example.com</b>',
+        "google",
+      );
+      const mails = rich!.querySelectorAll('a[href^="mailto:"]');
+      expect(mails.length).toBe(2);
+      for (const mail of mails) expect(middle(mail)).toBe(false);
+      expect(openUrl).not.toHaveBeenCalled();
     });
   });
 

@@ -80,6 +80,31 @@ describe("LinkPanel", () => {
     expect(onApply).toHaveBeenCalledTimes(2);
   });
 
+  // C19 review 1: the Enter that ends an input method's composition picks the words, nothing more.
+  it("the_enter_that_ends_a_composition_does_not_apply", () => {
+    const { onApply } = panel({ text: "" });
+    fireEvent.change(link(), { target: { value: "example.com" } });
+    fireEvent.keyDown(text(), { key: "Enter", keyCode: 229 });
+    fireEvent.keyDown(text(), { key: "Enter", isComposing: true });
+    expect(onApply).not.toHaveBeenCalled();
+    fireEvent.keyDown(text(), { key: "Enter" });
+    expect(onApply).toHaveBeenCalledTimes(1);
+  });
+
+  // C19 review 1: a phone link PM keeps (C2-H5) keeps its own address when only its words change;
+  // typed again, an address goes through the link rule as any other.
+  it("a_links_own_address_left_as_it_was_stays", () => {
+    const { onApply } = panel({ text: "call", href: "tel:+15550100", editing: true });
+    fireEvent.change(text(), { target: { value: "ring" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(onApply).toHaveBeenCalledExactlyOnceWith("ring", "tel:+15550100");
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.change(link(), { target: { value: "tel:+15550101" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(onApply).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("alert").textContent).toBe(NOT_AN_ADDRESS);
+  });
+
   it("escape_closes_only_the_panel", () => {
     const { onCancel } = panel();
     const seen = vi.fn();

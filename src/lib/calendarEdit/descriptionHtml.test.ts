@@ -17,6 +17,7 @@ import {
   looksLikeHtml,
   normalise,
   parseDescription,
+  replacementDescription,
   replacementText,
   sameDescription,
   serialiseDescription,
@@ -75,27 +76,42 @@ function pmCanEdit(s: string): boolean {
     let j = name;
     while (j < s.length && !isSpace(s[j]) && s[j] !== "/" && s[j] !== ">") j++;
     if (!EDITABLE_TAGS.includes(asciiLower(s.slice(name, j)))) return false;
-    // The tag's end, as the webview finds it: a quote opens a value only after "=".
-    let afterEquals = false;
-    let end = -1;
-    for (let k = j; k < s.length; k++) {
-      const c = s[k];
-      if (c === ">") {
-        end = k + 1;
-        break;
-      }
-      if ((c === '"' || c === "'") && afterEquals) {
-        const close = s.indexOf(c, k + 1);
-        if (close < 0) return false;
-        k = close;
-        afterEquals = false;
-      } else if (c === "=") afterEquals = true;
-      else if (!isSpace(c)) afterEquals = false;
-    }
+    // The tag's end, as the tokenizer reads it (C19 review 1): a quote opens a value only right
+    // after "=" and whitespace; an unquoted value runs to whitespace or ">", and a "=" or a quote
+    // inside it opens nothing.
+    const end = tagEnd(s, j);
     if (end < 0) return false;
     at = s.indexOf("<", end);
   }
   return true;
+}
+
+/** Just past the ">" ending a tag whose name ends at `from`, or -1 if the text ends first. */
+function tagEnd(s: string, from: number): number {
+  const n = s.length;
+  let i = from;
+  for (;;) {
+    while (i < n && (isSpace(s[i]) || s[i] === "/")) i++;
+    if (i >= n) return -1;
+    if (s[i] === ">") return i + 1;
+    let j = s[i] === "=" ? i + 1 : i;
+    while (j < n && !isSpace(s[j]) && s[j] !== "/" && s[j] !== ">" && s[j] !== "=") j++;
+    i = j;
+    let k = i;
+    while (k < n && isSpace(s[k])) k++;
+    if (s[k] !== "=") continue;
+    k++;
+    while (k < n && isSpace(s[k])) k++;
+    if (k >= n) return -1;
+    if (s[k] === '"' || s[k] === "'") {
+      const close = s.indexOf(s[k], k + 1);
+      if (close < 0) return -1;
+      i = close + 1;
+    } else {
+      i = k;
+      while (i < n && !isSpace(s[i]) && s[i] !== ">") i++;
+    }
+  }
 }
 
 /** C1-L2's strict-valid: what PM's own reader takes back as it is. `li` only in a list or at the top;
@@ -290,6 +306,48 @@ describe("reading", () => {
   ])("engine_lines_read_as_lines: %j", (description, doc) => {
     expect(read(description)).toEqual({ doc, supported: true });
   });
+
+  // C19 review 1: a line ended inside formatting has ended (Bold, Enter, Enter, as both engines
+  // and Google's own copies leave it), whitespace between lines draws nothing, and a line inside
+  // formatting breaks after words before it. Each is drawn this way by Chromium and WebKitGTK.
+  it.each<[string, DescDoc]>([
+    ["<b>a</b><div><b><br></b></div><div>c</div>", [b(t("a")), BR, b(BR), t("c")]],
+    ["<i>a</i><div><i><br></i></div><div><i>c</i></div>", [i(t("a")), BR, i(BR), i(t("c"))]],
+    ["<div>a</div> <div>b</div>", [t("a"), BR, t(" b")]],
+    ["a<i><div>x</div></i>", [t("a"), i(BR, t("x"), BR)]],
+    ["<p><b>x<br></b><br></p>", [p(b(t("x"), BR), BR)]],
+    ['<div style="font-weight:bold">x<br></div>y', [b(t("x"), BR), t("y")]],
+  ])("a_line_that_ended_inside_formatting_has_ended: %j", (description, doc) => {
+    const parsed = read(description);
+    expect(parsed.doc).toEqual(doc);
+    // And a save writes back what it read.
+    expect(read(serialiseDescription(parsed.doc)).doc).toEqual(doc);
+  });
+
+  // A reference PM leaves as written, that a browser draws as a character, would be written back
+  // as the code (C19 review 1); and a carriage return written as one draws as a space.
+  it.each<[string, DescDoc]>([
+    ["<b>&check;</b>", [b(t("&check;"))]],
+    ["<b>&comma;</b>", [b(t("&comma;"))]],
+    ["<b>&copy 2026</b>", [b(t("&copy 2026"))]],
+    ["<b>&notes</b>", [b(t("&notes"))]],
+    ["x &foo; y", [t("x &foo; y")]],
+  ])("references_a_browser_may_draw_refuse: %j", (description, doc) => {
+    expect(read(description)).toEqual({ doc, supported: false });
+  });
+
+  it("references_no_browser_draws_stay_supported", () => {
+    expect(read("<b>Q&A, R&D, AT&T &#;</b>").supported).toBe(true);
+    expect(read('<a href="https://x.example?a=1&amp;b=2">y</a>').supported).toBe(true);
+    expect(read('<a href="https://x.example?a=1&amp">y</a>').supported).toBe(false);
+  });
+
+  it.each(["<b>a&#13;b</b>", "<b>a&#xD;b</b>", "a&#13;b"])(
+    "a_carriage_return_written_as_a_reference_refuses: %j",
+    (description) => {
+      expect(read(description).supported).toBe(false);
+    },
+  );
 
   it("raw_newlines_are_lines_except_between_blocks", () => {
     // Shown as Google is thought to show them, but not written back until E11-1's H9 says so.
@@ -613,6 +671,13 @@ describe("normalising", () => {
     expect(normalise([BR, t("a")])).toEqual([BR, t("a")]);
     // Inside formatting, a break stays.
     expect(normalise([b(t("a"), BR)])).toEqual([b(t("a"), BR)]);
+    // A line that ended inside formatting has ended: the break after it draws an empty line, and
+    // stays (C19 review 1). After words in formatting it goes; whitespace shows nothing.
+    expect(normalise([li(t("x"), b(BR), BR)])).toEqual([li(t("x"), b(BR), BR)]);
+    expect(normalise([p(b(t("x"), BR), BR)])).toEqual([p(b(t("x"), BR), BR)]);
+    expect(normalise([t("x"), i(b(BR)), BR])).toEqual([t("x"), i(b(BR)), BR]);
+    expect(normalise([b(t("x")), BR])).toEqual([b(t("x"))]);
+    expect(normalise([t("a"), BR, t(" "), BR])).toEqual([t("a"), BR, t(" "), BR]);
   });
 
   it("nestings_the_reader_never_makes_are_made_ones_it_does", () => {
@@ -780,7 +845,8 @@ describe("comparing", () => {
 
 describe("drawing (C19b)", () => {
   // Whether the pop-up draws a Google description through the codec, or keeps Markdown (critique
-  // C1-H1): formatting Google writes, a block, a never-shown element, or a reference.
+  // C1-H1): any element but a name with a ":" (review 1: Markdown drops a block of HTML it doesn't
+  // know, words and all), or a reference. An address in angle brackets is no element.
   it.each([
     ["<b>Agenda</b>", true],
     ["<span>x</span>", true],
@@ -795,8 +861,13 @@ describe("drawing (C19b)", () => {
     ["Click here to join<https://example.com/j/1>", false],
     ["Ann <ann@example.com>", false],
     ["<o:p>Room 4</o:p>", false],
-    ['<font color="red">x</font>', false],
-    ['<img src="https://example.com/x.png">', false],
+    ['<font color="red">x</font>', true],
+    ['<img src="https://example.com/x.png">', true],
+    ["<center>Hello</center>", true],
+    ["<html><body>Hello there</body></html>", true],
+    ["<form>Sign up</form>", true],
+    ["<details><summary>x</summary>y</details>", true],
+    ['<font color="red">\nHello\n</font>\nafter', true],
     ["a < b and c > d", false],
     ["a<!-- note -->b", false],
     ["", false],
@@ -960,6 +1031,45 @@ describe("replacing (C19d)", () => {
     expect(replaced(description)).toBe(text);
   });
 
+  // C19 review 1: what Replace saves reads back as the very words it showed, never as live
+  // formatting; an address in angle brackets stays as written (critique C1-H1).
+  it.each([
+    ['<pre>&lt;div class="x"&gt;hello&lt;/div&gt;</pre>', '<div class="x">hello</div>'],
+    ['<font color="red">a &lt;name&gt; b</font>', "a <name> b"],
+    ["<font color=red>Tom &amp;amp; Jerry</font>", "Tom &amp; Jerry"],
+    ["<font color=red>&lt;script&gt;alert(1)&lt;/script&gt;</font>", "<script>alert(1)</script>"],
+    [
+      "<h2>Notes</h2>&lt;img src=x onerror=alert(1)&gt; after",
+      "Notes\n<img src=x onerror=alert(1)> after",
+    ],
+    ["<h2>Use &lt;b&gt;bold&lt;/b&gt; tags</h2>", "Use <b>bold</b> tags"],
+    ["<table><tr><td>Ann &lt;ann@example.com&gt;</td></tr></table>", "Ann <ann@example.com>"],
+    ["<h2>x &lt; y</h2><p>plain</p>", "x < y\nplain"],
+  ])("what_replace_saves_reads_back_as_its_words: %j", (description, words) => {
+    const saved = replacementDescription(description);
+    const back = parseDescription(saved);
+    expect(replacementText(back.doc)).toBe(words);
+    expect(back.supported).toBe(true);
+    // Never live markup: no tag but a break, as typed words that look like formatting are written.
+    expect(saved.replace(/<br>/g, "")).not.toMatch(/<[a-z/!?]/i);
+  });
+
+  it("what_replace_saves_keeps_an_address_in_angle_brackets_as_written", () => {
+    expect(
+      replacementDescription("<table><tr><td>Join <https://example.com/j/1></td></tr></table>"),
+    ).toBe("Join <https://example.com/j/1>");
+    // Written escaped, it stays escaped.
+    expect(replacementDescription("<h2>Join &lt;https://example.com/j/1&gt;</h2>")).toBe(
+      "Join &lt;https://example.com/j/1&gt;",
+    );
+    // With other words that would read otherwise, all of it goes escaped: the words are kept.
+    expect(replacementDescription("<h2>&lt;b&gt; <https://example.com></h2>")).toBe(
+      "&lt;b&gt; &lt;https://example.com&gt;",
+    );
+    // Plain words stay plain lines.
+    expect(replacementDescription("<h2>a</h2>b & c")).toBe("a\nb & c");
+  });
+
   it("replacing_what_is_deeper_than_the_limit_keeps_its_words", () => {
     let doc: DescDoc = [t("deep")];
     for (let k = 0; k < MAX_DEPTH * 2; k++) doc = [b(...doc)];
@@ -994,6 +1104,15 @@ describe("costs", () => {
     ["breaks", "a" + "<br>".repeat(100_000)],
     ["nested lists", "<ul><li>a".repeat(50_000)],
     ["links in items", '<ol><li><a href="https://example.com">x</a></li></ol>'.repeat(20_000)],
+    // C19 review 1: a table's every cell asked how the words so far end.
+    ["cells", "<table><tr>" + "<td>xxxxxxxxxxxxxxxxxxxxxxxx</td>".repeat(25_000)],
+    ["cell ends", "<table><tr><td>" + "x</td>".repeat(100_000)],
+    // C19 review 1: one list of children past the engine's limit for arguments.
+    ["breaks in bold", "<b><b>" + "<br>".repeat(140_000)],
+    ["breaks in a paragraph", "<p>" + "<br>".repeat(140_000)],
+    ["items", "<ul>" + "<li>a</li>".repeat(140_000)],
+    // A line's edge after many empty marks.
+    ["empty marks, then lines", "a" + "<b></b>".repeat(50_000) + "<div>x</div>".repeat(50_000)],
   ])("reading_is_linear: %s", (_name, description) => {
     // Each pass timed on its own, so a busy machine running every suite at once keeps the margin a
     // quadratic reader would blow through many times over.

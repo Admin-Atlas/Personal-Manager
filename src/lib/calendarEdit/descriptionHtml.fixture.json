@@ -595,8 +595,8 @@
       "description": "x &foo; y",
       "html": true,
       "pm_can_edit": true,
-      "supported": true,
-      "why": "a name neither side knows still reads as formatting, and shows as written"
+      "supported": false,
+      "why": "a name PM doesn't know still reads as formatting, and shows as written; a browser may know it, so a save could change it (C19 review 1)"
     },
     {
       "description": "<b>a</b> <u class=x",
@@ -611,6 +611,62 @@
       "pm_can_edit": true,
       "supported": false,
       "why": "a tag after a > in a quoted value is part of the value; the title fails closed (C19c)"
+    },
+    {
+      "description": "<b>&check;</b> <b>&comma;</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "HTML 5's names PM leaves as written, which browsers draw as characters (C19 review 1)"
+    },
+    {
+      "description": "<b>&copy 2026</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an old name without its ;, which browsers still draw as a character (C19 review 1)"
+    },
+    {
+      "description": "<a href=\"https://x.example?a=1&amp\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an old name without its ; in an address (C19 review 1)"
+    },
+    {
+      "description": "<b>a&#13;b</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a carriage return written as a reference: browsers draw a space, a save would make a line (C19 review 1)"
+    },
+    {
+      "description": "<a href=https://example.com/?q=\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an unquoted value holding a quote: it opens nothing (C19 review 1)"
+    },
+    {
+      "description": "<b id=x=\">y</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an unquoted value holding = and a quote (C19 review 1)"
+    },
+    {
+      "description": "<b id=x=\"><table><tr><td>a</td></tr></table>\">y</b>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "after an unquoted value, a table is a table (C19 review 1)"
+    },
+    {
+      "description": "<b>a</b><div><b><br></b></div><div>c</div>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an empty line made in bold, as Bold, Enter, Enter leaves it in both engines (C19 review 1)"
     }
   ]
 }

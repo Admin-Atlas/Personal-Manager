@@ -1283,6 +1283,46 @@ describe("EventEditor", () => {
     );
   });
 
+  // C19 review 1: words Google showed as words ("&lt;b&gt;") stay words in the replacement, in the
+  // box and in what the save sends, never live markup that would bold a word or hide one.
+  it.each([
+    [
+      "<h2>Use &lt;b&gt;bold&lt;/b&gt; tags</h2>",
+      "Use <b>bold</b> tags",
+      "Use &lt;b&gt;bold&lt;/b&gt; tags",
+    ],
+    [
+      "<h2>Notes</h2>&lt;img src=x onerror=alert(1)&gt; after",
+      "Notes<img src=x onerror=alert(1)> after",
+      "Notes<br>&lt;img src=x onerror=alert(1)&gt; after",
+    ],
+    ['<font color="red">Tom &amp;amp; Jerry</font>', "Tom &amp; Jerry", "Tom &amp;amp; Jerry"],
+  ])("replace keeps words Google showed as words: %j", async (held, shows, sent) => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: held }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    expect(description().textContent).toBe(shows);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: sent, replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
   it("replace isn't offered while a save is out", async () => {
     let answer: (o: SaveAnswer) => void = () => {};
     saveEdit.mockReturnValue(new Promise<SaveAnswer>((resolve) => (answer = resolve)));
@@ -3883,6 +3923,46 @@ describe("EventEditor, its calendar", () => {
     expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
     expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Agenda");
     expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+  });
+
+  // C19 review 1: the replacement landed as Google's copy (the words), so the mark is spent: a table
+  // someone puts there later shows read-only with Replace, never in a live box that would flatten it
+  // on the next key.
+  it("a replacement that landed as the words asks again for a table put there later", async () => {
+    const held: FieldPermissions = {
+      ...ALL,
+      description: false,
+      reasons: ["unsupported_formatting"],
+    };
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    await openOn(event({ description: "<h2>Agenda</h2>" }), held);
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    pick("Personal", "Side");
+    // Google's copy now: the words the replacement sent.
+    openForEdit.mockResolvedValue(ready(event({ description: "Agenda" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    expect(description().textContent).toBe("Agenda");
+    // Someone puts a table there in Google; the user changes the title and saves again.
+    const table = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    openForEdit.mockResolvedValue(
+      ready(event({ summary: "Retro", description: table }), held, "s3"),
+    );
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(openForEdit).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Room 4.12"),
+    );
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+    expect(screen.getByText(FORMATTING)).toBeTruthy();
   });
 
   it("a repeating event says it goes whole and asks which occurrences, All its only row (C18e)", async () => {

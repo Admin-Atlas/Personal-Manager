@@ -286,6 +286,19 @@ describe("DescriptionEditor", () => {
     expect(sinks.sinks).toEqual([]);
   });
 
+  // C19 review 1: WebKit's insert splits lines at a line feed only, so a CRLF file's lines would
+  // each keep a carriage return, which a save makes a line of its own.
+  it.each([
+    ["a\r\nb\r\nc", "a\nb\nc"],
+    ["a\r\n\r\nb", "a\n\nb"],
+    ["a\rb", "a\nb"],
+  ])("pasted_line_endings_are_line_feeds: %j", (pasted, inserted) => {
+    const { box } = editor("");
+    select(box, true);
+    fireEvent.paste(box, { clipboardData: { getData: () => pasted } });
+    expect(exec).toHaveBeenCalledWith("insertText", false, inserted);
+  });
+
   // Critique C2-L9: text dropped from elsewhere comes in as words; a drag inside the box is the
   // engine's move.
   it("a_drop_from_elsewhere_brings_in_its_words_only", () => {
@@ -615,6 +628,96 @@ describe("DescriptionEditor's link panel", () => {
     expect(exec).toHaveBeenLastCalledWith("createLink", false, "mailto:ann@example.com");
   });
 
+  // C19 review 1: linked at a caret, the caret comes back after the link, so the next key types
+  // after it rather than over it; and the link starts at its words, not at the space before them,
+  // which both engines rewrite as they type (pulling a kept range back over it).
+  it("a_link_made_at_the_caret_leaves_the_caret_after_it", () => {
+    // A no-break space (U+00A0), as the engine types a space at the end of a line.
+    const { box, onChange } = editor(`See${String.fromCodePoint(0xa0)}`);
+    const words = box.firstChild as Text;
+    const sel = document.getSelection() as Selection;
+    select(words, true);
+    sel.collapse(words, 4);
+    exec.mockImplementation((command, _ui, value) => {
+      if (command === "insertText") {
+        // As the engines type after a no-break space: it becomes a space, then the words go in.
+        words.replaceData(3, 1, " ");
+        words.insertData(4, value ?? "");
+        sel.collapse(words, 4 + (value ?? "").length);
+      }
+      if (command === "createLink") {
+        // As the engines link: the selection's words wrapped, and left selected.
+        const link = document.createElement("a");
+        link.setAttribute("href", value ?? "");
+        sel.getRangeAt(0).surroundContents(link);
+        sel.selectAllChildren(link);
+      }
+      return true;
+    });
+    fireEvent.click(button("Link"));
+    fireEvent.change(textField(), { target: { value: "the site" } });
+    fireEvent.change(linkField(), { target: { value: "example.com" } });
+    fireEvent.keyDown(linkField(), { key: "Enter" });
+    expect(onChange).toHaveBeenLastCalledWith('See <a href="https://example.com">the site</a>');
+    expect(sel.isCollapsed).toBe(true);
+    const caret = sel.getRangeAt(0);
+    const link = box.querySelector("a") as HTMLAnchorElement;
+    // After the link's words, not inside them or before.
+    const after = document.createRange();
+    after.selectNodeContents(link);
+    expect(caret.compareBoundaryPoints(Range.END_TO_END, after)).toBeGreaterThanOrEqual(0);
+  });
+
+  // A selection linked keeps its selection (critique C2-M5).
+  it("a_link_made_on_a_selection_keeps_it", () => {
+    const { box } = editor("see the site");
+    const words = box.firstChild as Text;
+    const range = document.createRange();
+    range.setStart(words, 8);
+    range.setEnd(words, 12);
+    const sel = document.getSelection() as Selection;
+    sel.removeAllRanges();
+    sel.addRange(range);
+    exec.mockReturnValue(true);
+    fireEvent.click(button("Link"));
+    fireEvent.change(linkField(), { target: { value: "example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(sel.isCollapsed).toBe(false);
+  });
+
+  // C19 review 1: the panel opened again on another selection reads that one's words; Link's own
+  // button closes it, as its aria-expanded says.
+  it("the_panel_opened_again_reads_the_new_selection", () => {
+    const { box } = editor("alpha beta");
+    const words = box.firstChild as Text;
+    const sel = document.getSelection() as Selection;
+    const pick = (from: number, to: number) => {
+      const range = document.createRange();
+      range.setStart(words, from);
+      range.setEnd(words, to);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    };
+    pick(0, 5);
+    fireEvent.click(button("Link"));
+    expect(textField().value).toBe("alpha");
+    // Back in the box, another selection, the shortcut again.
+    pick(6, 10);
+    fireEvent.keyDown(box, { key: "k", code: "KeyK", ctrlKey: true });
+    expect(textField().value).toBe("beta");
+    exec.mockReturnValue(true);
+    fireEvent.change(linkField(), { target: { value: "example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    // The words already there: none typed over them.
+    expect(commands()).toEqual(["createLink"]);
+    // The button closes an open panel.
+    fireEvent.click(button("Link"));
+    expect(button("Link").getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(button("Link"));
+    expect(button("Link").getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("textbox", { name: "Link" })).toBeNull();
+  });
+
   it("a_link_is_opened_whole_and_can_be_removed", () => {
     const { box, onChange } = editor('one <a href="https://example.com/a">the site</a> two');
     const link = box.querySelector("a") as HTMLAnchorElement;
@@ -709,6 +812,40 @@ describe("DescriptionView", () => {
       screen.getByRole("group", { name: "Description" }).hasAttribute("aria-describedby"),
     ).toBe(false);
     expect(sinks.sinks).toEqual([]);
+  });
+
+  // C19 review 1: a middle-click sends `auxclick`, never `click`; on a mail link, its default
+  // loads the address in PM's own window. A web link opens in the browser as before.
+  it("a middle-click never loads a mail link inside PM's window", () => {
+    const onMail = vi.fn();
+    render(
+      <div>
+        <span id="desc-label">Description</span>
+        <DescriptionView
+          doc={[
+            {
+              kind: "a",
+              href: "mailto:ann@example.com",
+              children: [{ kind: "text", text: "Email us" }],
+            },
+            { kind: "text", text: " or bob@example.com, or https://example.com" },
+          ]}
+          labelledBy="desc-label"
+          onMail={onMail}
+        />
+      </div>,
+    );
+    const middle = (target: Element) =>
+      target.dispatchEvent(
+        new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+      );
+    const view = screen.getByRole("group", { name: "Description" });
+    const mails = view.querySelectorAll('a[href^="mailto:"]');
+    expect(mails.length).toBe(2);
+    for (const mail of mails) expect(middle(mail)).toBe(false);
+    expect(middle(view.querySelector('a[href="https://example.com"]') as Element)).toBe(true);
+    expect(onMail).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
   });
 });
 

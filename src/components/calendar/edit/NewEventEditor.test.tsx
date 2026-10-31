@@ -2493,6 +2493,21 @@ describe("NewEventEditor opened on a copy (C18c)", () => {
     expect(createEvent.mock.calls[0][1].description).toBe("Room 4.12");
   });
 
+  // C19 review 1: words the copy showed as words ("&lt;b&gt;") stay words, never live markup.
+  it("Replace on a copy keeps words Google showed as words", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({
+      copy: copyOf({ description: "<h2>Use &lt;b&gt;bold&lt;/b&gt; tags</h2>" }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Replace" }));
+    expect(description().textContent).toBe("Use <b>bold</b> tags");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe("Use &lt;b&gt;bold&lt;/b&gt; tags");
+  });
+
   it("Replace isn't offered while the copy is being created", async () => {
     const answer = later();
     createEvent.mockReturnValue(answer.promise);

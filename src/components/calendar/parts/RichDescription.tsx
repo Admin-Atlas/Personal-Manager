@@ -23,6 +23,7 @@ import {
   type DescDoc,
   type DescNode,
 } from "../../../lib/calendarEdit/descriptionHtml";
+import { stopLinkAuxClick } from "./useMailLink";
 
 interface Props {
   doc: DescDoc;
@@ -33,7 +34,11 @@ interface Props {
 /** A Google event's description with the formatting PM draws: React elements from the codec's
  *  document, and a link only to a web or email address. */
 export function RichDescription({ doc, onMail }: Props) {
-  return <div className="pm-rich">{drawAll(doc, 0, false, onMail)}</div>;
+  return (
+    <div className="pm-rich" onAuxClick={stopLinkAuxClick}>
+      {drawAll(doc, 0, false, onMail)}
+    </div>
+  );
 }
 
 function drawAll(doc: DescDoc, depth: number, inLink: boolean, onMail: Props["onMail"]) {

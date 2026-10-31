@@ -61,7 +61,7 @@ import { Button, CopyLinkButton, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
 import { RsvpControl } from "../edit/RsvpControl";
 import { RichDescription } from "./RichDescription";
-import { useMailLink } from "./useMailLink";
+import { stopLinkAuxClick, useMailLink } from "./useMailLink";
 import { repeatsText, whenText } from "./whenText";
 
 interface Props {
@@ -549,6 +549,8 @@ export function CalendarEventPopover({
           <div
             className="pm-event-desc mt-1 border-t border-border pt-2 text-xs text-ink2"
             onClick={onDescriptionClick}
+            // A middle-click is never a click: the Markdown path's links need the guard too.
+            onAuxClick={stopLinkAuxClick}
           >
             {rich !== null ? (
               <RichDescription doc={rich} onMail={mail.open} />

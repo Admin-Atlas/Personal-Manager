@@ -48,7 +48,10 @@ export type Token =
   /** A comment, `<!…>`, `<?…>` or `</` not followed by a letter. Nothing of it shows. */
   | { readonly kind: "comment" }
   /** The text ended inside a tag; always the last token. */
-  | { readonly kind: "cut" };
+  | { readonly kind: "cut" }
+  /** Somewhere, a reference left as written that a browser would, or may, draw as a character
+   *  ("&check;", "&copy 2026"); always the first token, and at most one. */
+  | { readonly kind: "unsure" };
 
 /** Elements whose content never shows: skipped to their end tag, or to the end if nothing ends them. */
 export const HIDDEN: ReadonlySet<string> = new Set([
@@ -112,7 +115,9 @@ const LATIN1 = (
  *  escapes and &apos;, as "name hex-code-point" pairs; ⟨ and ⟩ at the code points browsers use. Code
  *  points rather than characters, as several are invisible. HTML 5's other names, and the old forms
  *  written without the ";" ("&copy 2026"), stay as written: encoders that escape a description write
- *  HTML 4's names with the ";", Google included. */
+ *  HTML 4's names with the ";", Google included. A browser may draw those as a character, though, so
+ *  the tokens say one was met (`unsure`) and the reader fails closed: a save would write it back as
+ *  the code it shows here. */
 const OTHERS = (
   "quot 22 QUOT 22 amp 26 AMP 26 apos 27 lt 3c LT 3c gt 3e GT 3e " +
   "OElig 152 oelig 153 Scaron 160 scaron 161 Yuml 178 fnof 192 circ 2c6 tilde 2dc " +
@@ -145,6 +150,19 @@ for (let k = 0; k + 1 < OTHERS.length; k += 2) {
 
 /** As long as the longest name above ("thetasym"). */
 const MAX_NAME = 8;
+
+/** The names a browser reads without their ";" (HTML's legacy ones: HTML 4's Latin-1 names, and the
+ *  escapes in both cases), as the start of a longer run too: "&copy2026" draws "©2026". */
+const LEGACY: ReadonlySet<string> = new Set([
+  ...LATIN1,
+  ...["amp", "lt", "gt", "quot", "AMP", "LT", "GT", "QUOT", "COPY", "REG"],
+]);
+/** The shortest and longest of them ("lt", "frac12"). */
+const LEGACY_MIN = 2;
+const LEGACY_MAX = 6;
+/** As long as HTML 5's longest name ("CounterClockwiseContourIntegral"), and a little more: a run
+ *  with a ";" within this is a name some browser may know. */
+const MAX_ANY_NAME = 32;
 
 /** What browsers make of a numeric reference to 0x80-0x9F: the Windows-1252 character it meant
  *  ("&#146;" is ’). The five codes Windows-1252 leaves empty stay as they are. */
@@ -191,9 +209,21 @@ export const asciiLower = (s: string) => s.replace(/[A-Z]+/g, (m) => m.toLowerCa
 
 const COMMENT: Token = { kind: "comment" };
 const CUT: Token = { kind: "cut" };
+const UNSURE: Token = { kind: "unsure" };
+
+/** What the references read so far met: one left as written that a browser may draw otherwise. */
+interface Note {
+  unsure: boolean;
+}
 
 /** The tokens of an HTML description, in one pass that never steps back. */
 export function tokens(description: string): Token[] {
+  const note: Note = { unsure: false };
+  const out = read(description, note);
+  return note.unsure ? [UNSURE, ...out] : out;
+}
+
+function read(description: string, note: Note): Token[] {
   // The tokenizer reads CR LF and a lone CR as LF before anything else.
   const html = description.replace(/\r\n?/g, "\n");
   const n = html.length;
@@ -208,7 +238,7 @@ export function tokens(description: string): Token[] {
   while (i < n) {
     const c = html[i];
     if (c === "&") {
-      const [decoded, next] = reference(html, i);
+      const [decoded, next] = reference(html, i, note);
       text += decoded;
       i = next;
       continue;
@@ -250,7 +280,7 @@ export function tokens(description: string): Token[] {
       const end = ahead.addressEnd(i);
       if (end >= 0) {
         flush();
-        out.push({ kind: "literal", text: decoded(html.slice(i, end + 1)) });
+        out.push({ kind: "literal", text: decoded(html.slice(i, end + 1), note) });
         i = end + 1;
         continue;
       }
@@ -258,7 +288,8 @@ export function tokens(description: string): Token[] {
     let j = nameAt;
     while (j < n && !isSpace(html[j]) && html[j] !== "/" && html[j] !== ">") j++;
     const name = asciiLower(html.slice(nameAt, j));
-    const tag = readTag(html, j);
+    // An end tag's attributes mean nothing, so neither do their references.
+    const tag = readTag(html, j, closing ? { unsure: false } : note);
     flush();
     if (tag === null) {
       out.push(CUT); // the text ends inside the tag: it and the rest are dropped
@@ -318,6 +349,7 @@ function next(s: string, from: number, test: (c: string) => boolean): number {
 function readTag(
   s: string,
   from: number,
+  note: Note,
 ): { attrs: Attr[]; selfClosing: boolean; end: number } | null {
   const n = s.length;
   const attrs: Attr[] = [];
@@ -348,12 +380,12 @@ function readTag(
       if (quote === '"' || quote === "'") {
         const close = s.indexOf(quote, k + 1);
         if (close < 0) return null;
-        value = decoded(s.slice(k + 1, close));
+        value = decoded(s.slice(k + 1, close), note);
         i = close + 1;
       } else {
         let e = k;
         while (e < n && !isSpace(s[e]) && s[e] !== ">") e++;
-        value = decoded(s.slice(k, e));
+        value = decoded(s.slice(k, e), note);
         i = e;
       }
     }
@@ -366,14 +398,14 @@ function readTag(
 }
 
 /** `s` with its character references decoded once. */
-function decoded(s: string): string {
+function decoded(s: string, note: Note): string {
   let out = "";
   let i = 0;
   while (i < s.length) {
     const amp = s.indexOf("&", i);
     if (amp < 0) return out + s.slice(i);
     out += s.slice(i, amp);
-    const [text, next] = reference(s, amp);
+    const [text, next] = reference(s, amp, note);
     out += text;
     i = next;
   }
@@ -411,7 +443,7 @@ function afterEndTag(s: string, from: number, name: string): number {
       asciiLower(s.slice(at + 2, after)) === name &&
       (next === "" || next === ">" || next === "/" || isSpace(next))
     ) {
-      const tag = readTag(s, after);
+      const tag = readTag(s, after, { unsure: false });
       return tag === null ? s.length : tag.end;
     }
     at = s.indexOf("</", at + 2);
@@ -420,8 +452,9 @@ function afterEndTag(s: string, from: number, name: string): number {
 }
 
 /** A character reference at `from` (its "&"), decoded, and where the text goes on. Anything that
- *  isn't one is a plain "&". */
-function reference(s: string, from: number): [string, number] {
+ *  isn't one is a plain "&"; `note` hears of one left as written that a browser may draw as a
+ *  character. */
+function reference(s: string, from: number, note: Note): [string, number] {
   if (s[from + 1] === "#") {
     const hex = s[from + 2] === "x" || s[from + 2] === "X";
     const digitsAt = from + (hex ? 3 : 2);
@@ -437,7 +470,21 @@ function reference(s: string, from: number): [string, number] {
   let j = from + 1;
   while (j < s.length && j - from <= MAX_NAME && (isAlpha(s[j]) || isDigit(s[j]))) j++;
   const named = s[j] === ";" ? NAMED.get(s.slice(from + 1, j)) : undefined;
-  return named === undefined ? ["&", from + 1] : [named, j + 1];
+  if (named !== undefined) return [named, j + 1];
+  if (isAlpha(s[from + 1] ?? "") && mayBeDrawn(s, from + 1)) note.unsure = true;
+  return ["&", from + 1];
+}
+
+/** Whether a name PM leaves as written may be one a browser draws: a name with its ";" that isn't
+ *  HTML 4's ("&check;", "&foo;"; HTML 5 knows over two thousand), or a run starting with a legacy
+ *  name, which needs no ";" ("&copy 2026", "&notes"). Looks at most MAX_ANY_NAME characters ahead. */
+function mayBeDrawn(s: string, at: number): boolean {
+  for (let len = LEGACY_MIN; len <= LEGACY_MAX; len++) {
+    if (LEGACY.has(s.slice(at, at + len))) return true;
+  }
+  let j = at;
+  while (j < s.length && j - at < MAX_ANY_NAME && (isAlpha(s[j]) || isDigit(s[j]))) j++;
+  return s[j] === ";";
 }
 
 /** A numeric reference's character, as a browser reads it: Windows-1252's for 0x80-0x9F, and U+FFFD

@@ -14,13 +14,16 @@
 
 import {
   MAX_DEPTH,
+  fromLoose,
   keptLink,
   normalise,
+  shows,
   type DescDoc,
   type DescNode,
+  type Loose,
   type Mark,
 } from "./descriptionHtml";
-import { BLOCKS, HIDDEN, asciiLower } from "./descriptionTokens";
+import { BLOCKS, HIDDEN, asciiLower, isSpace } from "./descriptionTokens";
 
 /** The document as DOM nodes for the editor's box, made one by one: elements by literal name, text
  *  as strings for `append` to make text nodes, a link's address with `setAttribute` only after the
@@ -70,7 +73,8 @@ function nodeOf(node: DescNode, owner: Document, depth: number): (Node | string)
       break;
     }
   }
-  el.append(...children);
+  // One by one: spread as arguments, a huge description's list would pass the engine's limit.
+  for (const child of children) el.append(child);
   return [el];
 }
 
@@ -92,11 +96,23 @@ function leavesOf(node: DescNode, owner: Document): (Node | string)[] {
  *  underline come from their elements (`strong` and `em` too) or from a style the engine left on a
  *  span; a `div` is a line; a link the rule refuses, a span, `font` and anything unknown are their
  *  words (an image has none); what never shows (a script, a style) is dropped with its content.
- *  Then `normalise`, which makes it a document PM's own reader accepts as it is. */
+ *  A style that takes bold or italic off (Chromium's `font-weight: normal` inside bold) takes it off
+ *  the words it holds, as they show. Then `normalise`, which makes it a document PM's own reader
+ *  accepts as it is. */
 export function nodesToDoc(root: Node): DescDoc {
-  const doc: DescNode[] = [];
-  readInto(root, doc, 1);
-  return normalise(doc);
+  const doc: Loose[] = [];
+  const reading: Reading = { ended: true, plain: false };
+  readInto(root, doc, 1, reading);
+  return normalise(fromLoose(doc, reading.plain));
+}
+
+/** Where the reading is, in the order things show. */
+interface Reading {
+  /** The line has ended, or nothing has shown yet: the last thing that shows was a break or a
+   *  block's edge, through any formatting around it. Whitespace leaves it as it was. */
+  ended: boolean;
+  /** A `plain` node was made: the marks need redrawing around it. */
+  plain: boolean;
 }
 
 const MODEL_BLOCKS = new Map<string, "p" | "ul" | "ol" | "li">([
@@ -114,9 +130,9 @@ const MARK_NAMES = new Map<string, Mark>([
 ]);
 
 /** `parent`'s children, read into `out`. */
-function readInto(parent: Node, out: DescNode[], depth: number): void {
+function readInto(parent: Node, out: Loose[], depth: number, reading: Reading): void {
   for (let child = parent.firstChild; child !== null; child = child.nextSibling) {
-    readNode(child, out, depth);
+    readNode(child, out, depth, reading);
   }
 }
 
@@ -124,9 +140,11 @@ function readInto(parent: Node, out: DescNode[], depth: number): void {
 const ELEMENT = 1;
 const TEXT = 3;
 
-function readNode(node: Node, out: DescNode[], depth: number): void {
+function readNode(node: Node, out: Loose[], depth: number, reading: Reading): void {
   if (node.nodeType === TEXT) {
-    out.push({ kind: "text", text: (node as Text).data });
+    const text = (node as Text).data;
+    out.push({ kind: "text", text });
+    if (shows(text)) reading.ended = false;
     return;
   }
   // Comments and anything else that isn't an element show nothing.
@@ -135,75 +153,138 @@ function readNode(node: Node, out: DescNode[], depth: number): void {
   const name = asciiLower(el.localName);
   if (name === "br") {
     out.push({ kind: "br" });
+    reading.ended = true;
     return;
   }
   if (HIDDEN.has(name)) return;
   if (depth > MAX_DEPTH) {
-    readLeaves(el, out);
+    const leaves: DescNode[] = [];
+    readLeaves(el, leaves);
+    for (const leaf of leaves) {
+      if (leaf.kind === "text") {
+        out.push({ kind: "text", text: leaf.text });
+        if (shows(leaf.text)) reading.ended = false;
+      } else {
+        out.push({ kind: "br" });
+        reading.ended = true;
+      }
+    }
     return;
   }
   // A line of its own, as browsers draw a block that isn't one of the model's: its edges break the
   // line (§2.3), its words kept.
   if (BLOCKS.has(name) && !MODEL_BLOCKS.has(name)) {
-    edge(out);
-    readInto(el, out, depth + 1);
-    edge(out);
+    edge(out, reading);
+    readInto(el, out, depth + 1, reading);
+    edge(out, reading);
     return;
   }
-  // What it draws itself, outermost first, as the reader opens them: a block, a link, then marks.
+  // What it draws itself, outermost first, as the reader opens them: a block, a link, what its style
+  // takes off, then marks. A mark its style takes off isn't drawn (`<b style="font-weight: normal">`).
   const block = MODEL_BLOCKS.get(name);
   const href = name === "a" ? keptLink(el.getAttribute("href") ?? "") : null;
+  const style = styleOf(el);
   const marks: Mark[] = [];
   const mark = MARK_NAMES.get(name);
-  if (mark !== undefined) marks.push(mark);
-  for (const m of styleMarks(el)) if (!marks.includes(m)) marks.push(m);
+  for (const m of [mark, ...style.marks]) {
+    if (m !== undefined && !marks.includes(m) && !style.off.includes(m)) marks.push(m);
+  }
 
-  const children: DescNode[] = [];
-  readInto(el, children, depth + 1);
-  let made: DescNode[] = children;
+  if (block !== undefined) reading.ended = true; // a paragraph, list or item starts a line
+  const children: Loose[] = [];
+  readInto(el, children, depth + 1, reading);
+  if (block !== undefined) reading.ended = true; // and ends its last one
+  let made: Loose[] = children;
   for (const m of [...marks].reverse()) made = [{ kind: m, children: made }];
+  if (style.off.length > 0) {
+    reading.plain = true;
+    made = [{ kind: "plain", marks: style.off, children: made }];
+  }
   if (href !== null) made = [{ kind: "a", href, children: made }];
   if (block !== undefined) made = [{ kind: block, children: made }];
-  out.push(...made);
+  // One by one: spread as arguments, a huge box's list would pass the engine's limit.
+  for (const piece of made) out.push(piece);
 }
 
-/** A line's edge: a break, unless the line is empty or already ends at a break or a block. */
-function edge(out: DescNode[]): void {
-  const last = out[out.length - 1];
-  if (last === undefined || last.kind === "br" || MODEL_BLOCKS.has(last.kind)) return;
-  out.push({ kind: "br" });
+/** A line's edge: a break, unless the line is empty or has already ended, however deep in formatting
+ *  its last break is (`<b>a</b><div><b><br></b></div>`, Bold, Enter, Enter, in both engines), and
+ *  whatever whitespace follows it. */
+function edge(out: Loose[], reading: Reading): void {
+  if (!reading.ended) out.push({ kind: "br" });
+  reading.ended = true;
 }
 
-/** The marks an element's style draws: what WebKit leaves on a span (ApplyStyleCommand), or Chromium
- *  on a merge. Read from the style the engine parsed, never the attribute's text. */
-function styleMarks(el: Element): Mark[] {
+/** The marks an element's style draws, and the bold or italic it takes off: what WebKit leaves on a
+ *  span (ApplyStyleCommand), or Chromium on a merge or inside bold made into a list. Read from the
+ *  style the engine parsed, never the attribute's text, as the description reader reads a style. */
+function styleOf(el: Element): { marks: Mark[]; off: Mark[] } {
   const style = (el as Partial<HTMLElement>).style;
-  if (style === undefined) return [];
+  if (style === undefined) return { marks: [], off: [] };
   const marks: Mark[] = [];
+  const off: Mark[] = [];
   // What shows bold, as the description reader draws a weight.
   const weight = asciiLower(style.fontWeight ?? "");
   const number = /^\d{1,4}$/.test(weight) ? Number(weight) : null;
   if (weight === "bold" || weight === "bolder" || (number !== null && number >= 600)) {
     marks.push("b");
+  } else if (weight === "normal" || weight === "lighter" || (number !== null && number > 0)) {
+    off.push("b");
   }
   const slant = asciiLower(style.fontStyle ?? "");
   if (slant === "italic" || slant === "oblique") marks.push("i");
+  else if (slant === "normal") off.push("i");
   // The longhand where the engine has it, else the shorthand, which may name a style or colour too.
   const line = asciiLower(style.textDecorationLine || style.textDecoration || "");
   if (line.split(/\s+/).includes("underline")) marks.push("u");
-  return marks;
+  return { marks, off };
 }
 
 /** The words a range of the box holds, as the link panel's Text field shows them: each text node's
- *  `data`, a break as a space, what never shows left out. Read from a copy of the range's content,
- *  never `Selection.toString()` or `textContent`, which CodeQL reads as page text an attacker shaped. */
+ *  `data`, one space where a line ends between words (a break, or a block's edge: list items,
+ *  paragraphs and the engine's `div` lines), what never shows left out. Read from a copy of the
+ *  range's content, never `Selection.toString()` or `textContent`, which CodeQL reads as page text an
+ *  attacker shaped. */
 export function rangeWords(range: Range): string {
-  const out: DescNode[] = [];
   const copy = range.cloneContents();
-  for (let child = copy.firstChild; child !== null; child = child.nextSibling) {
-    readLeaves(child, out);
+  // In pieces joined once: asking a string built by `+=` how it ends copies it whole each time.
+  const words: string[] = [];
+  let last = "";
+  // A line ended since the last words: a space is owed before the next.
+  let gap = false;
+  // Nodes still to read, last first; `null` is a block's end.
+  const todo: (Node | null)[] = [];
+  for (let child = copy.lastChild; child !== null; child = child.previousSibling) todo.push(child);
+  while (todo.length > 0) {
+    const next = todo.pop() as Node | null;
+    if (next === null) {
+      gap = true;
+      continue;
+    }
+    if (next.nodeType === TEXT) {
+      const text = (next as Text).data;
+      if (text === "") continue;
+      if (gap && last !== "" && !isSpace(last) && !isSpace(text[0])) words.push(" ");
+      gap = false;
+      words.push(text);
+      last = text[text.length - 1];
+      continue;
+    }
+    if (next.nodeType !== ELEMENT) continue;
+    const name = asciiLower((next as Element).localName);
+    if (name === "br") {
+      gap = true;
+      continue;
+    }
+    if (HIDDEN.has(name)) continue;
+    if (BLOCKS.has(name)) {
+      gap = true;
+      todo.push(null);
+    }
+    for (let child = next.lastChild; child !== null; child = child.previousSibling) {
+      todo.push(child);
+    }
   }
-  return out.map((node) => (node.kind === "text" ? node.text : " ")).join("");
+  return words.join("");
 }
 
 /** An element's words and breaks, without recursing: what survives of anything too deep. */

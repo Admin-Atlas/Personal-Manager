@@ -13063,6 +13063,18 @@ mod tests {
             offered(&this) && offered(&following) && offered(&all),
             "bold is the editor's own"
         );
+        // Coloured words the occurrence never showed hold it back too (C19 review 1): only tag
+        // names pass the backend's own check, and the webview's never read them.
+        let coloured = with(
+            weekly(),
+            "description",
+            json!("<span style=\"color: red\">Urgent</span> agenda"),
+        );
+        let (this, following, all) = choices_for(coloured, monday_19(), notes.clone()).await;
+        assert!(
+            offered(&this) && held(&following) && held(&all),
+            "coloured words the user never saw"
+        );
         // A title is no reason to hold the series back.
         let (_, _, all) = choices_for(table_series, monday_19(), title("Retro")).await;
         assert!(offered(&all), "a title alone");

@@ -152,7 +152,11 @@ import {
 } from "../../../lib/calendarEdit/editReasons";
 import { createdWhere, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
-import { parseDescription, replacementText } from "../../../lib/calendarEdit/descriptionHtml";
+import {
+  parseDescription,
+  replacementDescription,
+  sameDescription,
+} from "../../../lib/calendarEdit/descriptionHtml";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
@@ -637,10 +641,16 @@ export function EventEditor({
     });
     setDraft(next);
     if (note !== undefined) setRemindersNote(note);
-    // Google's description stands in place of the replacement: one PM can't edit shows read-only
-    // again, with Replace. (A replacement that landed is Google's copy now, so nothing of it is
-    // left to send, and the mark goes with nothing.)
-    if (r.overwritten.includes("description")) setReplaced(false);
+    // The mark stays only while the draft holds the user's own replacement, unsaved. Google's
+    // description in its place shows read-only again, with Replace; a replacement that landed is
+    // Google's copy now, so the mark goes with it, and a table someone puts there later asks for
+    // Replace afresh rather than taking the spent one.
+    if (
+      r.overwritten.includes("description") ||
+      sameDescription(r.base.description, next.description)
+    ) {
+      setReplaced(false);
+    }
     const kept = saved && r.overwritten.length === 0 && r.lost_guests.length === 0;
     setBanner({
       tone: "warn",
@@ -1509,7 +1519,7 @@ export function EventEditor({
             setAskReplace(false);
             const now = draftRef.current;
             if (!now) return;
-            setDraft({ ...now, description: replacementText(shownDescription) });
+            setDraft({ ...now, description: replacementDescription(baseDescription ?? "") });
             setReplaced(true);
             setJustReplaced(true);
           }}

@@ -5,11 +5,11 @@
 // Link button asks for them. An inline panel under the toolbar rather than a dialog, as the time-zone
 // panel is: Escape closes only it. The address is read as typed (`linkFromTyped`): "example.com" is
 // https://example.com, "name@example.com" a mail link, and anything else is refused here, before it
-// reaches the description. The address goes only to the editor's link command, never into the page
+// reaches the description, except a link's own address left as it was (a phone number PM keeps). The address goes only to the editor's link command, never into the page
 // as an attribute.
 
 import { useState } from "react";
-import { linkFromTyped } from "../../../lib/calendarEdit/descriptionHtml";
+import { keptLink, linkFromTyped } from "../../../lib/calendarEdit/descriptionHtml";
 import { Button, Input, useFieldA11y } from "../../ui";
 
 /** Said under Link when what was typed isn't a web or email address. */
@@ -36,7 +36,10 @@ export function LinkPanel({ text, href, editing, onApply, onRemove, onCancel }: 
   const linkField = useFieldA11y({ error: refused ? NOT_AN_ADDRESS : undefined });
 
   const apply = () => {
-    const url = linkFromTyped(address);
+    // The link's own address, left as it was, stays when the link rule keeps it: a phone link's
+    // (C2-H5) is one `linkFromTyped` doesn't read.
+    const kept = address.trim() === href ? keptLink(href) : null;
+    const url = kept ?? linkFromTyped(address);
     if (url === null) {
       setRefused(true);
       return;
@@ -53,6 +56,9 @@ export function LinkPanel({ text, href, editing, onApply, onRemove, onCancel }: 
           e.stopPropagation();
           onCancel();
         } else if (e.key === "Enter" && e.target instanceof HTMLInputElement) {
+          // The Enter that ends an input method's composition picks the words, nothing more (WebKit
+          // sends it after the composition, as key code 229).
+          if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
           e.preventDefault();
           apply();
         }

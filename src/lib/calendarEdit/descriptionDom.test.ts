@@ -153,6 +153,14 @@ describe("seeding the box", () => {
     const doc = nodesToDoc(host);
     expect(JSON.stringify(doc)).toContain('"deep"');
   });
+
+  // C19 review 1: one element's children are appended one by one: as arguments, a list this long
+  // passes the engine's limit (Chromium's between 120,000 and 130,000).
+  it("seeds_an_element_with_more_children_than_arguments_may_be", () => {
+    const breaks: DescNode = { kind: "p", children: Array<DescNode>(200_000).fill(BR) };
+    const [made] = docToNodes([breaks], document) as [HTMLElement];
+    expect(made.childNodes.length).toBe(200_000);
+  });
 });
 
 describe("reading the box", () => {
@@ -219,6 +227,51 @@ describe("reading the box", () => {
       ["a raw line break in text", box("a\nb"), [t("a"), BR, t("b")]],
       // What an emptied box holds: a document that shows nothing, which a save writes as "".
       ["an emptied box", box(h("br")), [BR]],
+      // C19 review 1: Bold, Agenda, Enter, Enter, item, as both engines leave it (and italic, and
+      // bold off on the empty line): one empty line, never two.
+      [
+        "an empty line typed in bold",
+        box(
+          h("b", {}, "Agenda"),
+          h("div", {}, h("b", {}, h("br"))),
+          h("div", {}, h("b", {}, "item")),
+        ),
+        [b(t("Agenda")), BR, b(BR), b(t("item"))],
+      ],
+      [
+        "an empty line typed in italic, then plain",
+        box(h("i", {}, "a"), h("div", {}, h("i", {}, h("br"))), h("div", {}, "c")),
+        [i(t("a")), BR, i(BR), t("c")],
+      ],
+      [
+        "a line inside bold after words",
+        box("a", h("b", {}, h("div", {}, "x"))),
+        [t("a"), b(BR, t("x"), BR)],
+      ],
+      [
+        "whitespace between lines",
+        box(h("div", {}, "a"), " ", h("div", {}, "b")),
+        [t("a"), BR, t(" b")],
+      ],
+      // C19 review 1: Chromium's un-bold inside bold made into a list (§13 risk 3).
+      [
+        "a weight of normal inside bold",
+        box(
+          h(
+            "b",
+            {},
+            h("span", { style: "font-weight: normal;" }, "two"),
+            h("b", { style: "font-weight: bold;" }, " words"),
+          ),
+        ),
+        [t("two"), b(t(" words"))],
+      ],
+      [
+        "a slant of normal inside italic",
+        box(h("i", {}, "a", h("span", { style: "font-style: normal;" }, "b"))),
+        [i(t("a")), t("b")],
+      ],
+      ["bold that takes itself off", box(h("b", { style: "font-weight: 400" }, "x")), [t("x")]],
     ];
     for (const [why, host, doc] of cases) {
       expect(nodesToDoc(host), why).toEqual(doc);
@@ -307,6 +360,23 @@ describe("rangeWords", () => {
     // Nothing selected: no words.
     range.collapse(true);
     expect(rangeWords(range)).toBe("");
+  });
+
+  // C19 review 1: words on separate lines read with a space between, as a break does.
+  it("reads_words_on_separate_lines_apart", () => {
+    const host = box(
+      h("ul", {}, h("li", {}, "one"), h("li", {}, "two")),
+      h("p", {}, "three"),
+      "four",
+      h("div", {}, "five "),
+      h("div", {}, h("b", {}, "six")),
+    );
+    const range = document.createRange();
+    range.selectNodeContents(host);
+    expect(rangeWords(range)).toBe("one two three four five six");
+    // No space at the ends.
+    range.selectNodeContents(host.firstChild as Node);
+    expect(rangeWords(range)).toBe("one two");
   });
 
   it("reads_a_ranges_words_without_textContent", () => {

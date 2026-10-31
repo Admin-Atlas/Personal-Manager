@@ -93,9 +93,118 @@ fn is_reference(b: &[u8], from: usize) -> bool {
 
 /// Whether PM's editor can change this description with nothing Google shows lost: plain text, or
 /// formatting whose every tag is one it writes, with no comment or declaration and no tag the text
-/// ends inside. Never stricter than the webview, which also checks links, styles and nesting; a
-/// description the webview can't write back is never sent unless the user chose to replace it.
+/// ends inside. Never stricter than the webview, which also checks links, styles and nesting; it
+/// answers only for a description the webview read too (the one the user was shown). One the user
+/// was never shown answers to [`pm_can_edit_unseen`].
 pub fn pm_can_edit(s: &str) -> bool {
+    scan(s, |_, _| true)
+}
+
+/// [`pm_can_edit`], for a description the webview never read, so its stricter check never ran: a
+/// repeating event's own description under an occurrence that shows another (C19 review 1). Every
+/// attribute must also be one that draws nothing PM must keep (Google's bookkeeping on links and
+/// spans, a `data-` or `aria-` one), a link's plain web, mail or phone address (or Google's address
+/// without its scheme), or a style of bold, italic, underline and Google's theme colours only. A
+/// colour, a class, a direction, a link without an address or an odd link fails, as in the webview.
+/// A name written twice is checked both times (browsers read the first). Laxer than the webview
+/// still on nesting and references, which lose nothing PM can't draw.
+pub fn pm_can_edit_unseen(s: &str) -> bool {
+    scan(s, |tag, attrs| {
+        let link = tag.eq_ignore_ascii_case(b"a");
+        let every = attrs.iter().all(|(name, value)| match name.as_slice() {
+            b"id" | b"target" | b"rel" | b"lang" | b"__is_owner" => true,
+            n if n.starts_with(b"data-") || n.starts_with(b"aria-") => true,
+            b"href" => link && plain_href(value),
+            b"style" => plain_style(value),
+            _ => false,
+        });
+        every && (!link || attrs.iter().any(|(name, _)| name == b"href"))
+    })
+}
+
+/// A link address PM keeps as it is: no whitespace, control character, quote or angle bracket, no
+/// reference but `&amp;` (so no scheme hides in one), and any scheme http, https, mailto or tel.
+fn plain_href(value: &[u8]) -> bool {
+    if value.is_empty()
+        || value
+            .iter()
+            .any(|&c| c <= b' ' || c == 0x7f || matches!(c, b'"' | b'\'' | b'<' | b'>' | b'`'))
+    {
+        return false;
+    }
+    let mut at = find(value, b'&', 0);
+    while let Some(amp) = at {
+        if !value[amp..].starts_with(b"&amp;") {
+            return false;
+        }
+        at = find(value, b'&', amp + 1);
+    }
+    let path = value
+        .iter()
+        .position(|&c| matches!(c, b'/' | b'?' | b'#'))
+        .unwrap_or(value.len());
+    match find(&value[..path], b':', 0) {
+        None => true,
+        Some(colon) => {
+            let scheme = &value[..colon];
+            [&b"http"[..], b"https", b"mailto", b"tel"]
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(scheme))
+        }
+    }
+}
+
+/// A style the webview reads as marks or as nothing: each declaration bold (or a weight of 600 to
+/// 900), italic, underline, or a colour that is only Google's theme variable.
+fn plain_style(value: &[u8]) -> bool {
+    let Ok(style) = std::str::from_utf8(value) else {
+        return false;
+    };
+    if style.contains('&') {
+        return false;
+    }
+    style.split(';').all(|part| {
+        let declaration = part.trim().to_ascii_lowercase();
+        if declaration.is_empty() {
+            return true;
+        }
+        let Some((property, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let value = value.trim();
+        match property.trim() {
+            "font-weight" => {
+                matches!(value, "bold" | "bolder")
+                    || value.parse::<u16>().is_ok_and(|n| (600..=900).contains(&n))
+            }
+            "font-style" => matches!(value, "italic" | "oblique"),
+            "text-decoration" | "text-decoration-line" => value == "underline",
+            "color" | "background-color" => theme_variable(value),
+            _ => false,
+        }
+    })
+}
+
+/// `var(--name)`, spaces allowed inside the brackets: the webview's `VARIABLE`.
+fn theme_variable(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) else {
+        return false;
+    };
+    let Some(name) = inner.trim().strip_prefix("--") else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
+
+/// An attribute: its name lower-cased, its value as written.
+type Attr<'a> = (Vec<u8>, &'a [u8]);
+
+/// One scan of a formatted description's tags: every tag one the editor writes, no comment,
+/// declaration or tag the text ends inside, and `check(tag, attributes)` true for every start tag.
+fn scan(s: &str, mut check: impl FnMut(&[u8], &[Attr<'_>]) -> bool) -> bool {
     if !is_html(s) {
         return true;
     }
@@ -128,36 +237,79 @@ pub fn pm_can_edit(s: &str) -> bool {
         {
             return false;
         }
-        let Some(end) = tag_end(b, j) else {
+        let mut attrs = Vec::new();
+        let Some(end) = tag_end(b, j, &mut attrs) else {
             return false;
         };
+        // An end tag's attributes mean nothing.
+        if !closing && !check(tag, &attrs) {
+            return false;
+        }
         at = find(b, b'<', end);
     }
     true
 }
 
-/// Just past the `>` ending a tag whose name ends at `from`, found as the webview finds it: a quote
-/// opens a value only after `=` (spaces between allowed), and a `>` inside a value doesn't count.
-/// `None` when the text ends inside the tag.
-fn tag_end(b: &[u8], from: usize) -> Option<usize> {
-    let mut after_equals = false;
-    let mut k = from;
-    while k < b.len() {
-        let c = b[k];
-        if c == b'>' {
-            return Some(k + 1);
+/// Just past the `>` ending a tag whose name ends at `from`, read as the webview's tokenizer reads
+/// it (`readTag`), each attribute put in `attrs` (its name lower-cased, its value as written):
+/// whitespace and `/` between attributes; a name runs to whitespace, `/`, `>` or `=` (one starting
+/// with `=` keeps it); after it, whitespace, then `=`, whitespace and a value: a quote opens a quoted
+/// one, in which a `>` doesn't count, and anything else an unquoted one, to whitespace or `>`, in
+/// which a `=` or a quote means nothing. `None` when the text ends inside the tag.
+fn tag_end<'a>(b: &'a [u8], from: usize, attrs: &mut Vec<Attr<'a>>) -> Option<usize> {
+    let n = b.len();
+    let mut i = from;
+    loop {
+        while i < n && (is_space(b[i]) || b[i] == b'/') {
+            i += 1;
         }
-        if (c == b'"' || c == b'\'') && after_equals {
-            k = find(b, c, k + 1)?;
-            after_equals = false;
-        } else if c == b'=' {
-            after_equals = true;
-        } else if !c.is_ascii_whitespace() {
-            after_equals = false;
+        if i >= n {
+            return None;
         }
-        k += 1;
+        if b[i] == b'>' {
+            return Some(i + 1);
+        }
+        let mut j = if b[i] == b'=' { i + 1 } else { i };
+        while j < n && !is_space(b[j]) && !matches!(b[j], b'/' | b'>' | b'=') {
+            j += 1;
+        }
+        let name = b[i..j].to_ascii_lowercase();
+        i = j;
+        let mut k = i;
+        while k < n && is_space(b[k]) {
+            k += 1;
+        }
+        let mut value: &[u8] = &[];
+        if b.get(k) == Some(&b'=') {
+            k += 1;
+            while k < n && is_space(b[k]) {
+                k += 1;
+            }
+            if k >= n {
+                return None;
+            }
+            let quote = b[k];
+            if quote == b'"' || quote == b'\'' {
+                let close = find(b, quote, k + 1)?;
+                value = &b[k + 1..close];
+                i = close + 1;
+            } else {
+                let mut e = k;
+                while e < n && !is_space(b[e]) && b[e] != b'>' {
+                    e += 1;
+                }
+                value = &b[k..e];
+                i = e;
+            }
+        }
+        attrs.push((name, value));
     }
-    None
+}
+
+/// HTML's whitespace, as the webview's tokenizer reads it: space, tab, line feed, form feed and
+/// carriage return.
+fn is_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r')
 }
 
 /// The first `c` in `b` at or after `from`.
@@ -372,12 +524,87 @@ mod tests {
                 false,
                 "a mail address in angle brackets",
             ),
+            // C19 review 1: an unquoted value runs to whitespace or `>`, and a `=` or a quote
+            // inside it opens nothing, as the tokenizer reads it.
+            (
+                "<a href=https://example.com/?q=\">y</a>",
+                true,
+                "a quote inside an unquoted value",
+            ),
+            (
+                "<b id=x=\">y</b>",
+                true,
+                "= and a quote inside an unquoted value",
+            ),
+            (
+                "<b id=x=\"><table><tr><td>a</td></tr></table>\">y</b>",
+                false,
+                "a table after an unquoted value is a table",
+            ),
+            (
+                "<b id = x>y</b>",
+                true,
+                "spaces around = before an unquoted value",
+            ),
+            ("<b =x>y</b>", true, "a name starting with ="),
         ] {
             assert!(pm_can_edit(description) == editable, "{why}");
         }
         // Plain text is editable whatever it holds.
         assert!(pm_can_edit("a<!-- note -->b"));
         assert!(pm_can_edit("5 < 6 & 7 > 3"));
+    }
+
+    /// C19 review 1: a description the webview never read passes only with attributes that draw
+    /// nothing PM must keep; never more than `pm_can_edit` lets through.
+    #[test]
+    fn an_unseen_description_passes_only_with_attributes_pm_keeps() {
+        for kept in [
+            "plain words, 5 < 6 & such",
+            "<b>a</b><br><i>b</i> <u>c</u><p>d</p><ul><li>e</li></ul>",
+            "<a href=\"https://example.com/?a=1&amp;b=2\" target=\"_blank\" id=\"ow1\" \
+             __is_owner=\"true\" rel=\"noopener\">site</a>",
+            "<A HREF=\"MAILTO:ann@example.com\">mail</A>",
+            "<a href=\"tel:+15550100\">call</a>",
+            "<a href=\"www.example.org/path\">site</a>",
+            "<a href=https://example.com>unquoted</a>",
+            "<span style=\"background-color: var(--textfield-surface); color: var( --on-surface );\">x</span>",
+            "<span style=\"font-weight: bold; font-style: italic; text-decoration: underline;\">x</span>",
+            "<span style=\"font-weight: 600\">x</span>",
+            "<li data-id=\"1\" aria-label=\"x\" lang=\"en\">x</li>",
+            "</b class=\"x\">",
+        ] {
+            assert!(pm_can_edit_unseen(kept), "{kept}");
+        }
+        for refused in [
+            "<span style=\"color: red\">x</span>",
+            "<span style=\"color: var(--x); font-size: 20px\">x</span>",
+            "<span style=\"font-weight: normal\">x</span>",
+            "<span style=\"font-weight: bold !important\">x</span>",
+            "<span style=\"color: &#114;ed\">x</span>",
+            "<p dir=\"rtl\">x</p>",
+            "<span class=\"x\">x</span>",
+            "<b title=\"x\">x</b>",
+            "<b onclick=\"x\">x</b>",
+            "<span href=\"https://example.com\">x</span>",
+            "<a href=\"sms:1\">x</a>",
+            "<a href=\"javascript:alert(1)\">x</a>",
+            "<a href=\"javascript&#58;alert(1)\">x</a>",
+            "<a href=\"https://example.com/a b\">x</a>",
+            "<a href=\"\">x</a>",
+            "<a>x</a>",
+            "<table><tr><td>x</td></tr></table>",
+        ] {
+            assert!(!pm_can_edit_unseen(refused), "{refused}");
+        }
+        // Never laxer than the backend's own check, on every fixture row.
+        let fixture = fixture();
+        for row in fixture["rows"].as_array().unwrap() {
+            let description = row["description"].as_str().unwrap();
+            if pm_can_edit_unseen(description) {
+                assert!(pm_can_edit(description), "{description}");
+            }
+        }
     }
 
     /// A small seeded generator, so the property test needs no dependency and fails the same way

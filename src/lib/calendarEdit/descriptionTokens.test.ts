@@ -20,6 +20,7 @@ const text = (t: string): Token => ({ kind: "text", text: t });
 const literal = (t: string): Token => ({ kind: "literal", text: t });
 const COMMENT: Token = { kind: "comment" };
 const CUT: Token = { kind: "cut" };
+const UNSURE: Token = { kind: "unsure" };
 /** U+212A, spelled as a code point so the test reads plainly (it looks like "K"). */
 const KELVIN = String.fromCodePoint(0x212a);
 // Invisible or stand-in characters, spelled as code points so the test reads plainly.
@@ -59,7 +60,8 @@ describe("the words a description shows", () => {
       "a & b, &#; &#x; &foo; &constructor; &toString; &valueOf;",
     ],
     // Deliberately unlike a browser: HTML 5's own names, and the old forms without ";", stay as
-    // written. Encoders write HTML 4's names with the ";", Google included.
+    // written. Encoders write HTML 4's names with the ";", Google included. The tokens say so
+    // (`unsure`, below), so the reader fails closed.
     ["&colon; &check; &amp &copy 2026", "&colon; &check; &amp &copy 2026"],
   ])("decodes %j", (html, text) => {
     expect(words(html)).toBe(text);
@@ -232,6 +234,30 @@ describe("tokens", () => {
     expect(tokens("&amp;lt;b&amp;gt; &lt;i&gt;")).toEqual([text("&lt;b&gt; <i>")]);
     expect(tokens('<a title="&amp;quot;">')).toEqual([start("a", [["title", "&quot;"]])]);
   });
+
+  // C19 review 1: a reference left as written that a browser draws, or may, as a character is said
+  // once, first; one no browser draws isn't.
+  it.each<[string, Token[]]>([
+    ["<b>&check;</b>", [start("b"), text("&check;"), end("b")]],
+    ["&comma;", [text("&comma;")]],
+    ["&copy 2026", [text("&copy 2026")]],
+    ["&copy2026", [text("&copy2026")]],
+    ["&notes &amp", [text("&notes &amp")]],
+    ["&CounterClockwiseContourIntegral;", [text("&CounterClockwiseContourIntegral;")]],
+    [
+      '<a href="https://x.example?a=1&amp">y</a>',
+      [start("a", [["href", "https://x.example?a=1&amp"]]), text("y"), end("a")],
+    ],
+  ])("references_a_browser_may_draw_are_said: %j", (html, rest) => {
+    expect(tokens(html)).toEqual([UNSURE, ...rest]);
+  });
+
+  it.each(["Q&A, R&D, AT&T", "&#; &#x;", "&amp; &lt;b&gt; &eacute;", "</b title='&check;'>"])(
+    "references_no_browser_draws_are_not: %j",
+    (html) => {
+      expect(tokens(html)).not.toContainEqual(UNSURE);
+    },
+  );
 
   it("line_endings_are_line_feeds", () => {
     expect(tokens("a\r\nb\rc<b title='x\r\ny'>")).toEqual([

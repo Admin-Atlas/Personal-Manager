@@ -92,7 +92,10 @@ import {
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
 import { kindNoteText, type KindSwitchNote } from "../../../lib/calendarEdit/reminders";
-import { parseDescription, replacementText } from "../../../lib/calendarEdit/descriptionHtml";
+import {
+  parseDescription,
+  replacementDescription,
+} from "../../../lib/calendarEdit/descriptionHtml";
 import {
   ambiguousText,
   CALLOUT_TONE,
@@ -1085,7 +1088,7 @@ export function NewEventEditor({
             if (!copiedDescription) return;
             setDraft({
               ...draftRef.current,
-              description: replacementText(copiedDescription.doc),
+              description: replacementDescription(seed.description),
             });
             setReplaced(true);
           }}

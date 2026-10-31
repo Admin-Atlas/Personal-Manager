@@ -11,8 +11,9 @@
 //
 // Nothing here parses HTML or writes an HTML string into the page (INVARIANTS.md I-23): each command
 // is a literal `execCommand` name, a paste or a drop from elsewhere brings in its plain text, a link's
-// address goes only to the engine's link command and only after `linkFromTyped` took it, and the
-// selection's words are read node by node, never as page text.
+// address goes only to the engine's link command and only after `linkFromTyped` took it (or, left as
+// it was, `keptLink` kept the link's own), and the selection's words are read node by node, never as
+// page text.
 //
 // Typing never seeds the box again, so the engine's own Undo survives; a new value that shows
 // something else (Google's copy after a conflict) does. A link in the box never opens PM's own
@@ -139,8 +140,11 @@ function restore(box: HTMLElement, range: Range | null): void {
 }
 
 /** Text in at the selection, as plain words: the engine's own insert, so its Undo takes it back, or,
- *  in an engine without it, a text node in place of the selection. */
-function insertPlain(box: HTMLElement, text: string): void {
+ *  in an engine without it, a text node in place of the selection. Line endings are line feeds
+ *  first: WebKit's insert splits lines at a line feed only, and a carriage return left in a line
+ *  would save as a break of its own (a CRLF file's lines, double-spaced). */
+function insertPlain(box: HTMLElement, raw: string): void {
+  const text = raw.replace(/\r\n?/g, "\n");
   if (text === "") return;
   const doc = box.ownerDocument;
   if (doc.execCommand?.("insertText", false, text)) return;
@@ -221,6 +225,18 @@ function pressedAt(box: HTMLElement, sel: Selection): Pressed {
 const samePressed = (a: Pressed, b: Pressed) =>
   FORMAT_BUTTONS.every(({ key }) => a[key] === b[key]);
 
+const NO_BREAK_SPACE = String.fromCodePoint(0xa0);
+
+/** Where `words` start, when the text node `node` holds them just before `offset` (a no-break space
+ *  the engine typed reads as a space); else null. The Text field holds one line, so the words are one
+ *  run of text, and the count is the engine's own, in code units, never graphemes. */
+function typedBefore(node: Node, offset: number, words: string): number | null {
+  if (node.nodeType !== 3 || offset < words.length) return null;
+  const from = offset - words.length;
+  const spaced = (s: string) => s.split(NO_BREAK_SPACE).join(" ");
+  return spaced((node as Text).data.slice(from, offset)) === spaced(words) ? from : null;
+}
+
 /** A mail link's words when the link panel is given none: the address alone, as Google shows it. */
 const addressWords = (url: string) => (/^mailto:/i.test(url) ? url.slice("mailto:".length) : url);
 
@@ -238,7 +254,12 @@ export function DescriptionEditor({
   const state = useRef<Box>({ emitted: null, shown: [], kept: null, dragging: false, onChange });
   const [pressed, setPressed] = useState<Pressed>(NONE_PRESSED);
   // The link panel, while open, and the range it is about (the selection, or the whole link).
-  const [panel, setPanel] = useState<{ text: string; href: string; editing: boolean } | null>(null);
+  const [panel, setPanel] = useState<{
+    text: string;
+    href: string;
+    editing: boolean;
+    key: number;
+  } | null>(null);
   const panelRange = useRef<Range | null>(null);
   // The toolbar is one Tab stop: the button last moved to (critique C2-M4).
   const [stop, setStop] = useState(0);
@@ -255,7 +276,9 @@ export function DescriptionEditor({
     const s = state.current;
     if (s.emitted !== null && sameDescription(value, s.emitted)) return;
     const doc = parseDescription(value).doc;
-    box.replaceChildren(...docToNodes(doc, box.ownerDocument));
+    // One by one: spread as arguments, a huge description's nodes would pass the engine's limit.
+    box.replaceChildren();
+    for (const node of docToNodes(doc, box.ownerDocument)) box.append(node);
     s.emitted = value;
     s.shown = doc;
   }, [value]);
@@ -311,10 +334,15 @@ export function DescriptionEditor({
     };
   }, []);
 
-  /** A button or its shortcut. */
-  function run(key: FormatKeyName) {
+  /** A button or its shortcut. Link's button closes its panel when it is open, as its
+   *  `aria-expanded` says; its shortcut, pressed in the box, opens it again on the selection there. */
+  function run(key: FormatKeyName, button = false) {
     const box = host.current;
     if (!box || disabled) return;
+    if (key === "link" && button && panel !== null) {
+      closePanel(box);
+      return;
+    }
     // A button reached by Tab: back to the box, where the selection last was.
     if (!selectionIn(box)) restore(box, state.current.kept);
     if (key === "link") {
@@ -338,11 +366,14 @@ export function DescriptionEditor({
       range.selectNodeContents(link);
     }
     panelRange.current = range;
-    setPanel({
+    // A new key each time: a panel opened again on another selection reads its fields afresh,
+    // rather than keeping the words it was first given for the range it now acts on.
+    setPanel((was) => ({
       text: rangeWords(range),
       href: link?.getAttribute("href") ?? "",
       editing: link !== null,
-    });
+      key: (was?.key ?? 0) + 1,
+    }));
   }
 
   /** The panel closes, however it closes: focus back in the box, on the range it was about. */
@@ -358,22 +389,26 @@ export function DescriptionEditor({
     closePanel(box);
     const doc = box.ownerDocument;
     const sel = doc.getSelection();
-    const words = text !== "" ? text : range.collapsed ? addressWords(url) : "";
+    // Linked at a caret: the caret comes back after the link, so the next key doesn't type over it
+    // (critique C2-M5: the range it was about, which for a caret is a caret).
+    const caret = range.collapsed;
+    const words = text !== "" ? text : caret ? addressWords(url) : "";
     if (sel && words !== "" && words !== rangeWords(range)) {
-      // New words, then the selection over them for the link (critique C1-M7: no characters
-      // counted): from where they start to where the engine left the caret.
+      // New words, then the selection over them for the link (critique C1-M7: no graphemes
+      // counted): back from where the engine left the caret, in the text it typed them into, else
+      // from where they start. Where they start can move: both engines rewrite a typed no-break
+      // space before the words, which pulls a kept range back over it.
       const start = range.cloneRange();
       start.collapse(true);
       if (doc.execCommand?.("insertText", false, words) && sel.focusNode !== null) {
-        sel.setBaseAndExtent(
-          start.startContainer,
-          start.startOffset,
-          sel.focusNode,
-          sel.focusOffset,
-        );
+        const typed = typedBefore(sel.focusNode, sel.focusOffset, words);
+        const from: [Node, number] =
+          typed !== null ? [sel.focusNode, typed] : [start.startContainer, start.startOffset];
+        sel.setBaseAndExtent(from[0], from[1], sel.focusNode, sel.focusOffset);
       }
     }
     doc.execCommand?.("createLink", false, url);
+    if (caret && sel && sel.rangeCount > 0) sel.collapseToEnd();
     report(box, state.current);
   }
 
@@ -448,7 +483,7 @@ export function DescriptionEditor({
                 // The selection stays in the box, so the command lands where the caret is.
                 onMouseDown={(e) => e.preventDefault()}
                 onFocus={() => setStop(k)}
-                onClick={() => run(b.key)}
+                onClick={() => run(b.key, true)}
               >
                 {ICONS[b.key]}
               </IconButton>
@@ -458,6 +493,7 @@ export function DescriptionEditor({
       </div>
       {panel && (
         <LinkPanel
+          key={panel.key}
           text={panel.text}
           href={panel.href}
           editing={panel.editing}

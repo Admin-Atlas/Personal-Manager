@@ -51,10 +51,9 @@ export interface ParsedDescription {
   readonly supported: boolean;
   /** Formatted (HTML) rather than plain lines; `looksLikeHtml`. */
   readonly html: boolean;
-  /** It holds an element Google's own editor writes (`EDITABLE_TAGS`), another block (a table, a
-   *  heading), a never-shown element, or a character reference: formatting to draw as such. An address
-   *  in angle brackets alone isn't: Outlook and Teams write links that way into plain text, which
-   *  draws as before (the event pop-up). False for plain lines. */
+  /** It holds an element (any but a name with a ":", as Outlook's `<o:p>`) or a character reference:
+   *  formatting to draw as such. An address in angle brackets alone isn't: Outlook and Teams write
+   *  links that way into plain text, which draws as before (the event pop-up). False for plain lines. */
   readonly markup: boolean;
 }
 
@@ -79,9 +78,12 @@ export const EDITABLE_TAGS: readonly string[] = [
 /** Deeper than this is never a description someone wrote; it bounds every walk below. */
 export const MAX_DEPTH = 32;
 
-/** The elements that make a description `markup`: Google's own, the line-breaking blocks, and the
- *  never-shown ones. */
-const MARKUP: ReadonlySet<string> = new Set([...EDITABLE_TAGS, ...BLOCKS, ...HIDDEN]);
+/** Whether an element makes a description `markup`: any element but one whose name holds a ":"
+ *  (Outlook's `<o:p>`). Markdown drops a block of HTML it doesn't know whole (`<center>`,
+ *  `<html><body>…`), words and all, so only the formatted view shows such a description's words. An
+ *  address in angle brackets is never an element (`literal`), so Outlook's and Teams' plain text keeps
+ *  the Markdown path. */
+const isMarkup = (name: string) => !name.includes(":");
 
 // --- telling formatting from plain text ---
 
@@ -262,8 +264,9 @@ function linkOfHref(href: string): string | null {
 // --- reading formatted descriptions ---
 
 /** A node while reading: the model's, or `plain`, whose content is drawn without the marks it names
- *  however many enclose it (`font-weight: normal`). Only ever in a description PM can't write back. */
-type Loose =
+ *  however many enclose it (`font-weight: normal`). Only ever in a description PM can't write back,
+ *  or in the editor's box, where Chromium can leave one inside bold (descriptionDom.ts). */
+export type Loose =
   | { readonly kind: "text"; text: string }
   | { readonly kind: "br" }
   | { readonly kind: Mark | Block; readonly children: Loose[] }
@@ -447,6 +450,13 @@ class Reader {
   private openA = 0;
   /** The space owed after a table cell, written only when more text follows on the same line. */
   private cellGap = false;
+  /** The line has ended, or nothing has shown yet: the last thing read that shows, in the order it
+   *  shows, was a break or a block's edge, through any formatting and links around it. Whitespace
+   *  shows nothing, so it leaves this as it was. */
+  private ended = true;
+  /** The last text read ended in whitespace: read here, not from the text built so far, which the
+   *  engine would copy whole each time (critique: a table's every cell). */
+  private spaceEnd = false;
 
   constructor() {
     this.stack = [
@@ -473,9 +483,16 @@ class Reader {
         break;
       }
       switch (token.kind) {
+        case "unsure":
+          // A reference left as written that a browser may draw as a character: a save would write
+          // the code it shows here.
+          this.supported = false;
+          break;
         case "text":
-          // Whether Google draws a raw line break inside formatting is probe E11-1's (H9).
-          if (token.text.includes("\n")) this.supported = false;
+          // Whether Google draws a raw line break inside formatting is probe E11-1's (H9). A decoded
+          // carriage return ("&#13;") is one too: browsers draw it as a space, and `normalise` would
+          // make it a break.
+          if (/[\r\n]/.test(token.text)) this.supported = false;
           this.text(token.text);
           break;
         case "literal":
@@ -487,11 +504,11 @@ class Reader {
           this.supported = false; // it may be a marker another app reads
           break;
         case "start":
-          if (MARKUP.has(token.name)) this.markup = true;
+          if (isMarkup(token.name)) this.markup = true;
           this.start(token.name, token.attrs);
           break;
         case "end":
-          if (MARKUP.has(token.name)) this.markup = true;
+          if (isMarkup(token.name)) this.markup = true;
           this.end(token.name);
           break;
       }
@@ -504,6 +521,9 @@ class Reader {
     const owed = this.cellGap && !isSpace(text[0] ?? "");
     this.cellGap = false;
     const add = owed ? ` ${text}` : text;
+    if (add === "") return;
+    if (shows(add)) this.ended = false;
+    this.spaceEnd = isSpace(add[add.length - 1]);
     const last = into[into.length - 1];
     if (last?.kind === "text") last.text += add;
     else into.push({ kind: "text", text: add });
@@ -511,16 +531,17 @@ class Reader {
 
   private br(): void {
     this.cellGap = false;
+    this.ended = true;
     this.top.into.push(BR);
   }
 
-  /** A line's edge, as browsers draw a block's: a break unless the line is already empty or ends at
-   *  a break or a block. */
+  /** A line's edge, as browsers draw a block's: a break unless the line is already empty or ended,
+   *  however deep in formatting its last break is (`<b>a</b><div><b><br></b></div>`), and whatever
+   *  whitespace follows it. `container` is where the next thing read goes. */
   private edge(container: Loose[]): void {
     this.cellGap = false;
-    const last = container[container.length - 1];
-    if (last === undefined || last.kind === "br" || BLOCK_KINDS.has(last.kind)) return;
-    container.push(BR);
+    if (!this.ended) container.push(BR);
+    this.ended = true;
   }
 
   private start(name: string, attrs: readonly Attr[]): void {
@@ -589,7 +610,10 @@ class Reader {
       holder = kind;
       depth++;
     };
-    if (block !== undefined) open({ kind: block, children: [] }, block);
+    if (block !== undefined) {
+      open({ kind: block, children: [] }, block);
+      this.ended = true; // a paragraph, list or item starts a line of its own
+    }
     if (link !== null) open({ kind: "a", href: link, children: [] }, "a");
     if (read.plain.length > 0) {
       this.plain = true;
@@ -622,7 +646,7 @@ class Reader {
         last !== undefined &&
         last.kind !== "br" &&
         !BLOCK_KINDS.has(last.kind) &&
-        !(last.kind === "text" && isSpace(last.text.slice(-1)));
+        !(last.kind === "text" && this.spaceEnd);
     }
     // The stack never holds more than MAX_DEPTH elements, so this search is bounded.
     let at = this.stack.length - 1;
@@ -662,6 +686,7 @@ class Reader {
     const frame = this.stack.pop();
     if (frame === undefined) return;
     if (frame.line) this.edge(frame.outer);
+    if (BLOCK_TAGS.has(frame.name)) this.ended = true; // and ends its last one
     if (frame.name === "p") this.openP--;
     if (frame.name === "a") this.openA--;
   }
@@ -669,8 +694,9 @@ class Reader {
 
 /** The model from the reader's nodes. With a `plain` node in it, each piece of text is drawn with
  *  exactly the marks it shows with, outermost bold, then italic, then underline: the description
- *  can't be written back anyway, so only what shows matters. */
-function fromLoose(nodes: readonly Loose[], redraw: boolean): DescNode[] {
+ *  can't be written back anyway (or, from the editor's box, is written as it shows), so only what
+ *  shows matters. */
+export function fromLoose(nodes: readonly Loose[], redraw: boolean): DescNode[] {
   if (!redraw) return nodes.flatMap(asNodes);
   const items: Item[] = [];
   flatten(nodes, [], items);
@@ -752,7 +778,8 @@ function rebuild(items: readonly Item[]): DescNode[] {
     }
     let wrapped: DescNode[] = leaves;
     for (const m of [...key].reverse()) wrapped = [{ kind: m, children: wrapped }];
-    out.push(...wrapped);
+    // One by one: spread as arguments, a huge description's list would pass the engine's limit.
+    for (const node of wrapped) out.push(node);
   }
   return out;
 }
@@ -815,7 +842,8 @@ export function normalise(doc: DescDoc): DescDoc {
 
 function pieces(nodes: DescDoc, ctx: Context, depth: number): Piece[] {
   const out: Piece[] = [];
-  for (const node of nodes) out.push(...piecesOf(node, ctx, depth));
+  // Never `push(...list)`: spread as arguments, a huge description's list passes the engine's limit.
+  for (const node of nodes) for (const piece of piecesOf(node, ctx, depth)) out.push(piece);
   return out;
 }
 
@@ -850,7 +878,7 @@ function piecesOf(node: DescNode, ctx: Context, depth: number): Piece[] {
     }
     split = true;
     close();
-    out.push(...lifted(item, node, ctx, depth));
+    for (const piece of lifted(item, node, ctx, depth)) out.push(piece);
   }
   close();
   return out;
@@ -902,6 +930,12 @@ function flat(node: DescNode): DescNode[] {
 
 const isWhitespace = (text: string) => [...text].every(isSpace);
 
+/** Whether text draws anything: a character other than HTML's whitespace. */
+export function shows(text: string): boolean {
+  for (let k = 0; k < text.length; k++) if (!isSpace(text[k])) return true;
+  return false;
+}
+
 /** One container's children made tidy (§2.4 steps 1-3, 6 and 7). */
 function tidy(nodes: readonly DescNode[], ctx: Context): DescNode[] {
   // 1. Neighbouring texts merged, empty ones dropped.
@@ -932,15 +966,11 @@ function tidy(nodes: readonly DescNode[], ctx: Context): DescNode[] {
   // 6. The break that ends the document, a paragraph or an item right after its words draws nothing:
   // it ends a line that would end there anyway ("a<br>" is one line). One after another break, or
   // after a block, draws an empty line ("a<br><br>" is two; "<p><br></p>" is one), so it stays.
+  // Its line ends wherever the last thing that shows is, inside formatting too: after
+  // "<b>x<br></b>" it is a second, empty line, so it stays.
   if (ctx.parent === "root" || ctx.parent === "p" || ctx.parent === "li") {
     const n = lines.length;
-    const before = lines[n - 2];
-    if (
-      lines[n - 1]?.kind === "br" &&
-      before !== undefined &&
-      before.kind !== "br" &&
-      !BLOCK_KINDS.has(before.kind)
-    ) {
+    if (lines[n - 1]?.kind === "br" && lineEnded(lines, n - 1, 1) === false) {
       lines.length = n - 1;
     }
   }
@@ -948,6 +978,24 @@ function tidy(nodes: readonly DescNode[], ctx: Context): DescNode[] {
   return mergeTexts(lines);
 }
 const BR_NODE: DescNode = { kind: "br" };
+
+/** Whether the line has ended where `nodes[0..to)` end: true after a break or a block, false after
+ *  words, looked for through formatting and links (`<b>x<br></b>` ends one), past whitespace, which
+ *  shows nothing; null when nothing there shows. Looks no deeper than MAX_DEPTH. */
+function lineEnded(nodes: DescDoc, to: number, depth: number): boolean | null {
+  for (let k = to - 1; k >= 0; k--) {
+    const node = nodes[k];
+    if (node.kind === "text") {
+      if (shows(node.text)) return false;
+      continue;
+    }
+    if (node.kind === "br" || BLOCK_KINDS.has(node.kind)) return true;
+    if (depth > MAX_DEPTH) return false;
+    const inner = lineEnded(node.children, node.children.length, depth + 1);
+    if (inner !== null) return inner;
+  }
+  return null;
+}
 
 function mergeTexts(nodes: readonly DescNode[]): DescNode[] {
   const out: DescNode[] = [];
@@ -1031,7 +1079,7 @@ export function isEmptyDoc(doc: DescDoc): boolean {
       // emptied editor often leaves behind.
       if (![...next.text].every((c) => isSpace(c) || c === " ")) return false;
     } else if (next.kind !== "br") {
-      todo.push(...next.children);
+      for (const child of next.children) todo.push(child);
     }
   }
   return true;
@@ -1096,6 +1144,21 @@ export function replacementText(doc: DescDoc): string {
     .text()
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+/** "Replace with plain text…" on `description` (Google's copy), as the description it saves.
+ *  `replacementText` is words: plain lines, unless they would read as formatting, which goes escaped,
+ *  lines as breaks, as typed words that look like formatting are written (`serialiseDescription`):
+ *  "&lt;div&gt;" or "&amp;amp;" Google showed as words stays words rather than going to Google as
+ *  live markup, and "&lt;ann@example.com&gt;" stays escaped. An address the description itself writes
+ *  in angle brackets ("<https://…>") is kept as written (critique C1-H1, until probe H8), when
+ *  nothing else in the words would read otherwise. */
+export function replacementDescription(description: string): string {
+  const text = replacementText(parseDescription(description).doc);
+  if (!looksLikeHtml(text)) return text;
+  const literal = tokens(description).some((token) => token.kind === "literal");
+  if (literal && replacementText(parseDescription(text).doc) === text) return text;
+  return serialiseDescription(normalise([{ kind: "text", text }]));
 }
 
 class PlainText {

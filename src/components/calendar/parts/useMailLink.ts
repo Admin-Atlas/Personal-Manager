@@ -7,7 +7,7 @@
 // with the address, so it can still be copied. The one way PM opens a description's mail links: the
 // formatted view's and the Markdown view's alike.
 
-import { useCallback, useState } from "react";
+import { useCallback, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { openUrl } from "../../../lib/ipc";
 
 /** What the backend refuses a mail link the mail app didn't open with (reader.rs's
@@ -39,4 +39,17 @@ export function useMailLink(on: string): {
     [on],
   );
   return { open, failure: said?.on === on ? said.text : null };
+}
+
+/** A middle-click (any button but the first) on a description's link that isn't a web link opening
+ *  in the browser: nothing. The engine sends it as `auxclick`, never `click`, and its default loads
+ *  the address in PM's own window, which has no navigation guard: WebKitGTK replaced the app with an
+ *  error page for a mail link (C19 critique C2-H3, the details' links too; review 1). */
+export function stopLinkAuxClick(e: ReactMouseEvent): void {
+  const at = e.target instanceof Element ? e.target : null;
+  const link = at?.closest("a") ?? null;
+  if (link === null) return;
+  const href = link.getAttribute("href") ?? "";
+  if (link.getAttribute("target") === "_blank" && /^https?:\/\//i.test(href)) return;
+  e.preventDefault();
 }
