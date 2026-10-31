@@ -90,7 +90,9 @@ release remain the open post-v1 work.
     `src/components/ui/`.
   - Theme + capability state is frontend-only (`src/theme/`, `src/lib/capabilities.tsx`,
     localStorage — never IPC). Ingested Markdown renders ONLY through the sanitizing
-    `src/lib/markdown.tsx` boundary.
+    `src/lib/markdown.tsx` boundary; a Google event's formatted description renders only through
+    `RichDescription` (`src/lib/calendarEdit/descriptionHtml.ts`), and nothing in `src/` parses
+    HTML or writes it into the page (ESLint).
   - `src/lib/help.ts` — help-mode registry (`data-help` id → explanation) + context.
 - **Backend** — `src-tauri/src/` (Rust). Grouped by area; the roadmap board + `docs/` carry
   the living detail. Pure decision functions stay DB/network-free and unit-tested.
@@ -123,6 +125,8 @@ release remain the open post-v1 work.
     Google's clock, never this computer's);
     `calendar_recur/` (repeat rules, pure: read, described, cut for a split; the read and write
     paths share it, and it never lets the `rrule` crate parse or print a rule);
+    `calendar_ask.rs` (whom to ask for edit access to a Google calendar shared to view only, and the
+    email PM opens for the user to send, pure: Google has no API for it);
     `calendar_write/` + `commands/calendar_edit.rs` (Google event writes, fenced off from every
     model path: INVARIANTS.md I-22). Everything fetched is untrusted DATA (rule #6).
   - **Backup** — `backup/`: portable passphrase-encrypted zstd `.pmbackup`; a

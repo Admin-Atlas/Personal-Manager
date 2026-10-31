@@ -309,7 +309,6 @@ const opened: EventForEdit = {
   summary: "Retro",
   location: "",
   description: "",
-  description_html: false,
   time: {
     kind: "timed",
     start_date: "2026-10-20",
@@ -336,6 +335,8 @@ const opened: EventForEdit = {
   label_id: null,
   reply: null,
   organizer_self: true,
+  call: null,
+  meet_offered: false,
 };
 const fields = (guests: GuestDraft[]): EditorFields => seedDraft({ ...opened, guests });
 const retitled = (f: EditorFields): EditorFields => ({ ...f, summary: "Retro (moved)" });
@@ -420,6 +421,28 @@ describe("who a save would email (the backend's N1-N15)", () => {
       complete: false,
     });
   });
+
+  // C18d (§10.2): another calendar in the same Save tells everyone on the event then once more, as
+  // the backend's `Reach::of_transfer` counts it (attendees.rs, the same rows).
+  it("counts another calendar as a change everyone on it hears of", () => {
+    const moved = (base: EditorFields, draft: EditorFields, omitted = false) =>
+      guestNotice(base, draft, omitted, "cal@x.org", true);
+    // The calendar alone: each guest told once; nobody but the user and a room, nobody.
+    expect(moved(fields([ME, A]), fields([ME, A]))).toEqual(told(1));
+    expect(moved(fields([ME, R]), fields([ME, R]))).toBeNull();
+    // With a busy-or-free change, the user's own: still only the calendar's email.
+    expect(moved(fields([ME, A]), { ...fields([ME, A]), show_as: "free" })).toEqual(told(1));
+    // With a title: the same guest, an email for each.
+    expect(moved(fields([ME, A]), retitled(fields([ME, A])))).toEqual({ ...told(1), emails: 2 });
+    // A guest added in the same Save is on it when it goes: invited, then told.
+    expect(moved(fields([ME, A]), fields([ME, A, NEW_B]))).toEqual({ ...told(1, 1), emails: 4 });
+    // One taken off isn't on it any more when it goes.
+    expect(moved(fields([ME, A, B]), fields([ME, A]))).toEqual({ ...told(1, 0, 1), emails: 3 });
+    // A list Google cut short: "at least".
+    expect(moved(fields([ME, A]), fields([ME, A]), true)).toEqual({ ...told(1), complete: false });
+    // Without it, the calendar's own count goes: the same rows as before.
+    expect(guestNotice(fields([ME, A]), fields([ME, A]), false, "cal@x.org")).toBeNull();
+  });
 });
 
 describe("who a delete would tell (the backend's D1-D5, from the calendar's row)", () => {
@@ -461,6 +484,18 @@ describe("who a delete would tell (the backend's D1-D5, from the calendar's row)
     // An event the user doesn't organise is no delete of theirs to tell anyone about (C14).
     expect(deleteNotice(row([who("me@x.org", true), who("A@x.org")], false))).toBeNull();
     expect(deleteNotice(row([]))).toBeNull();
+  });
+
+  // C20 §4.4: a birthday or an event Gmail added tells nobody, whoever its row shows; an ordinary
+  // event's type, absent or Google's default, tells them.
+  it("tells nobody of a birthday or a Gmail event's delete", () => {
+    const guests = [who("me@x.org", true), who("A@x.org")];
+    for (const event_type of ["birthday", "fromGmail"]) {
+      expect(deleteNotice({ ...row(guests), event_type })).toBeNull();
+    }
+    for (const event_type of [null, "default"]) {
+      expect(deleteNotice({ ...row(guests), event_type })).toEqual(cancelled(1));
+    }
   });
 
   // Not one of the backend's rows. The backend knows the organiser of an event the calendar

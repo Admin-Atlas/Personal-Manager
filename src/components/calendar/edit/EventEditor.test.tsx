@@ -12,7 +12,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   Calendar,
+  CalendarAccount,
   CalendarEvent,
+  CalendarOverview,
   EditLoad,
   EventForEdit,
   EventPatchDraft,
@@ -92,11 +94,14 @@ vi.mock("./useEventWrites", () => ({
   noteReply: (...a: unknown[]) => noteReply(...a),
 }));
 
-// The repeat menu's two reads, answered as each test says.
+// The repeat menu's two reads, answered as each test says, and the mail app a description's mail
+// link opens.
+const openUrl = vi.fn<(url: string) => Promise<void>>();
 vi.mock("../../../lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   recurrencePresets: (day: string) => recurrencePresets(day),
   describeRecurrence: (rule: RepeatRule, start: RepeatStart) => describeRecurrence(rule, start),
+  openUrl: (url: string) => openUrl(url),
 }));
 
 vi.mock("../../../theme/timezones", async (importOriginal) => ({
@@ -104,17 +109,48 @@ vi.mock("../../../theme/timezones", async (importOriginal) => ({
   deviceTimeZoneOrNull: () => deviceZone,
 }));
 
+// Standard depth unless a test says Power.
+let depth = "standard";
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  useTheme: () => ({ system: "slate", depth: "standard" }),
+  useTheme: () => ({ system: "slate", depth }),
 }));
 
-vi.mock("../../../lib/markdown", () => ({
+// The rest of the module is real: the description codec's link rule asks its `safeUrl`.
+vi.mock("../../../lib/markdown", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
   Markdown: ({ children }: { children: string }) => <div>{children}</div>,
 }));
 
 import { EventEditor, UNREADABLE_REPEAT } from "./EventEditor";
-import { A11_NOTE } from "../../../lib/calendarEdit/editReasons";
+import {
+  A11_NOTE,
+  CALENDAR_ALONE,
+  CALENDAR_WHOLE,
+  NOT_MOVED_UNREAD,
+  reasonText,
+  savedNotice,
+} from "../../../lib/calendarEdit/editReasons";
+import { createTargets } from "../../../lib/calendarEdit/createTargets";
+
+/** Why a description shows read-only (C19). */
+const FORMATTING = reasonText("unsupported_formatting");
+
+/** The description's box (C19d). */
+const description = () => screen.getByRole("textbox", { name: "Description" });
+
+/** What the user typed into the box, as the engine leaves it, then the input event it fires. */
+function typeInto(box: HTMLElement, ...nodes: (Node | string)[]) {
+  box.replaceChildren(...nodes);
+  fireEvent.input(box);
+}
+
+/** An element made by hand, never by parsing. */
+function h(tag: string, ...children: (Node | string)[]) {
+  const made = document.createElement(tag);
+  made.append(...children);
+  return made;
+}
 
 /** What the user may change on someone else's event whose copy can reply (C14c). */
 const YOURS_WITH_REPLY = "Your reply, notifications, colour and busy or free are yours to change.";
@@ -143,17 +179,28 @@ const ALL: FieldPermissions = {
   guests: true,
   reminders: true,
   colour: true,
+  meet: true,
+  calendar: true,
   delete: true,
   respond: false,
+  one_day: false,
   reasons: [],
 };
+
+/** No calendars to choose from (C18d): the editor keeps its "Saving to …" line unless a test gives
+ *  it some. */
+const NO_CALENDARS = {
+  targets: null,
+  overview: null,
+  hidden: new Set<string>(),
+  shapeOf: () => undefined,
+} as const;
 
 function event(over: Partial<EventForEdit> = {}): EventForEdit {
   return {
     summary: "Dentist",
     location: "High St",
     description: "",
-    description_html: false,
     time: {
       kind: "timed",
       start_date: "2026-10-12",
@@ -180,6 +227,9 @@ function event(over: Partial<EventForEdit> = {}): EventForEdit {
     label_id: null,
     reply: null,
     organizer_self: true,
+    // No call, on a calendar without Meet: no video-call row unless a test asks for one (C18).
+    call: null,
+    meet_offered: false,
     ...over,
   };
 }
@@ -213,6 +263,7 @@ async function open(
       suggestions={NO_SUGGESTIONS}
       milestone={null}
       colorOf={colourOf}
+      {...NO_CALENDARS}
       onClose={onClose}
       onDelete={onDelete}
     />,
@@ -273,6 +324,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   deviceZone = "Europe/London";
+  depth = "standard";
   recurrencePresets.mockImplementation(async (day) => presetsFor(day));
   describeRecurrence.mockImplementation(async (_rule, start) => readyAt(start));
 });
@@ -283,24 +335,48 @@ afterEach(() => {
 });
 
 describe("EventEditor", () => {
-  // Google's formatted description shows read-only, as its text: lines where Google breaks them,
-  // escapes decoded once, and nothing of the markup (a script's text included) on screen.
-  it("shows a formatted description as its text", async () => {
+  // A description PM can't write back shows read-only, what PM can of it (C19b): bold as bold, a
+  // list as a list, escapes decoded once, and nothing of a script on screen. Its mail link opens the
+  // mail app, and a line under it says so with the address when nothing opens.
+  it("shows what PM can of a formatted description", async () => {
     openForEdit.mockResolvedValue(
       ready(
         event({
           description:
-            "<b>Agenda</b><br><ul><li>One &amp; two</li></ul><script>alert(1)</script>&lt;i&gt;",
-          description_html: true,
+            "<b>Agenda</b><br><ul><li>One &amp; two</li></ul><script>alert(1)</script>&lt;i&gt; " +
+            '<a href="mailto:ann@example.com">mail</a>',
         }),
       ),
     );
+    openUrl.mockRejectedValue("PM couldn't open your mail app.");
     await open();
-    const text = screen.getByText(
-      (_, el) => el?.tagName === "P" && /Agenda/.test(el.textContent ?? ""),
+    const view = document.querySelector(".pm-rich") as HTMLElement;
+    expect(view.querySelector("b")?.textContent).toBe("Agenda");
+    expect(view.querySelector("ul > li")?.textContent).toBe("One & two");
+    expect(view.querySelector("script, i")).toBeNull();
+    expect(view.textContent).toBe("AgendaOne & two<i> mail");
+    // Still read-only: no box to type it into (C19d offers Replace instead).
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.getByRole("group", { name: "Description" })).toBeTruthy();
+
+    await act(async () => {
+      expect(fireEvent.click(view.querySelector("a")!)).toBe(false);
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com");
+    expect(
+      screen
+        .getByText("PM couldn't open your mail app. The address is ann@example.com.")
+        .getAttribute("role"),
+    ).toBe("status");
+  });
+
+  // Help mode (C20b §11): the editor explains itself, its description's buttons their own.
+  it("carries the editor's help", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    await open();
+    expect(screen.getByRole("dialog", { name: "Edit event" }).getAttribute("data-help")).toBe(
+      "calendar-editor",
     );
-    expect(text.textContent).toBe("Agenda\nOne & two\n<i>");
-    expect(text.querySelector("b, i, script")).toBeNull();
   });
 
   it("sends only what changed, then closes and says so, asking no choices of a one-off", async () => {
@@ -326,6 +402,7 @@ describe("EventEditor", () => {
       false,
       false,
       { rowId: row.id, sent: null },
+      null,
     );
     expect(choicesForEdit).not.toHaveBeenCalled();
   });
@@ -349,7 +426,97 @@ describe("EventEditor", () => {
       false,
       false,
       { rowId: row.id, sent: null },
+      null,
     );
+  });
+
+  // C18: the video call is a field of the editor, after the guests.
+  it("shows an event's Meet call, and Remove sends remove", async () => {
+    const call = {
+      kind: "meet" as const,
+      name: "Google Meet",
+      join: "https://meet.google.com/abc-defg-hij",
+      state: "ready" as const,
+    };
+    openForEdit.mockResolvedValue(ready(event({ call, meet_offered: true })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const row_ = screen.getByRole("group", { name: "Video call" });
+    expect(within(row_).getByRole("button", { name: "Join with Google Meet" })).toBeTruthy();
+    fireEvent.click(within(row_).getByRole("button", { name: "Remove the video call" }));
+    expect(within(row_).getByText("The video call will be removed when you save.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { meet: "remove" }, ...UNSCOPED);
+  });
+
+  it("Add sends add, and the saved notice says when Google is still making it", async () => {
+    openForEdit.mockResolvedValue(ready(event({ meet_offered: true })));
+    const outcome: Extract<WriteOutcome, { outcome: "saved" }> = {
+      outcome: "saved",
+      warnings: ["call_pending"],
+    };
+    saveEdit.mockResolvedValue(outcome);
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Add Google Meet video conferencing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith("s1", { meet: "add" }, ...UNSCOPED);
+    expect(noteSaved).toHaveBeenCalledWith(
+      "Dentist",
+      outcome,
+      null,
+      "2026-10-12",
+      false,
+      false,
+      { rowId: row.id, sent: null },
+      null,
+    );
+    expect(savedNotice("Dentist", outcome, null).text).toBe(
+      "Saved “Dentist”. Google is still making the video call; its link shows after a later refresh.",
+    );
+  });
+
+  it("keeps another service's call, with its reason", async () => {
+    const zoom = {
+      kind: "add_on" as const,
+      name: "Zoom Meeting",
+      join: "https://zoom.us/j/987",
+      state: "ready" as const,
+    };
+    openForEdit.mockResolvedValue(
+      ready(event({ call: zoom, meet_offered: true }), {
+        ...ALL,
+        meet: false,
+        reasons: ["other_call"],
+      }),
+    );
+    await open();
+    const row_ = screen.getByRole("group", { name: "Video call" });
+    expect(within(row_).getByText("Zoom Meeting")).toBeTruthy();
+    expect(within(row_).getByRole("button", { name: "Join" })).toBeTruthy();
+    expect(within(row_).queryByRole("button", { name: /^Add|^Remove/ })).toBeNull();
+    expect(
+      screen.getByText(
+        "This event's video call is a kind PM can't change, so PM leaves it as it is. Change it in Google Calendar.",
+      ),
+    ).toBeTruthy();
+    // A Meet row the gate closed (someone else's event) can still be joined, never changed.
+    cleanup();
+    const meetCall = { ...zoom, kind: "meet" as const, name: "Google Meet" };
+    openForEdit.mockResolvedValue(
+      ready(event({ call: meetCall, meet_offered: true }), { ...ALL, meet: false }),
+    );
+    await open();
+    const closed = screen.getByRole("group", { name: "Video call" });
+    expect(
+      within(closed).getByRole<HTMLButtonElement>("button", { name: "Remove the video call" })
+        .disabled,
+    ).toBe(true);
+    expect(
+      within(closed).getByRole<HTMLButtonElement>("button", { name: "Join with Google Meet" })
+        .disabled,
+    ).toBe(false);
   });
 
   it("turns Close off with Cancel while a save is out, and back on after", async () => {
@@ -473,7 +640,7 @@ describe("EventEditor", () => {
         ...ALL,
         reminders: false,
         colour: false,
-        reasons: ["label_read_only", "reminders_unreadable", "html_description"],
+        reasons: ["label_read_only", "reminders_unreadable", "unsupported_formatting"],
       }),
     );
     await open(vi.fn(), vi.fn());
@@ -506,6 +673,107 @@ describe("EventEditor", () => {
     expect(onDelete).toHaveBeenCalledWith(
       expect.objectContaining({ id: row.id, summary: "Dentist (Google)" }),
     );
+  });
+
+  // C18c: Duplicate in the footer's left group, after Delete; the copy is read afresh, so the row is
+  // handed on as clicked. Unsaved changes are asked about first.
+  it("Duplicate from a dirty editor asks first", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onDuplicate = vi.fn();
+    const onDelete = vi.fn();
+    render(
+      <EventEditor
+        row={row}
+        calendar={null}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        {...NO_CALENDARS}
+        onClose={vi.fn()}
+        onDelete={onDelete}
+        onDuplicate={onDuplicate}
+        canDuplicate
+      />,
+    );
+    await screen.findByLabelText("Title");
+    const duplicate = screen.getByRole("button", { name: "Duplicate" });
+    // Delete keeps to the left of it; the last of the left group pushes the rest right.
+    expect(duplicate.parentElement?.className).toBe("mr-auto");
+    expect(screen.getByRole("button", { name: "Delete" }).parentElement?.className).toBe("");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(duplicate);
+    expect(await screen.findByText("Discard your changes and duplicate?")).toBeTruthy();
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard and duplicate" }));
+    expect(onDuplicate).toHaveBeenCalledWith(row);
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  // Review round 1 of PR 1: text that never reached the draft is lost by Duplicate and Delete too,
+  // so they ask as closing does.
+  it("Duplicate and Delete ask first when only an address it couldn't read stands", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onDuplicate = vi.fn();
+    const onDelete = vi.fn();
+    render(
+      <EventEditor
+        row={row}
+        calendar={null}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        {...NO_CALENDARS}
+        onClose={vi.fn()}
+        onDelete={onDelete}
+        onDuplicate={onDuplicate}
+        canDuplicate
+      />,
+    );
+    await screen.findByLabelText("Title");
+    const box = screen.getByRole("combobox", { name: "Add guests" });
+    box.focus();
+    fireEvent.change(box, { target: { value: "bob@" } });
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    expect(await screen.findByText("Discard your changes and duplicate?")).toBeTruthy();
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(await screen.findByText("Discard your changes and delete?")).toBeTruthy();
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it("Duplicate goes at once from a clean editor, and only where offered", async () => {
+    openForEdit.mockResolvedValue(ready(event()));
+    const onDuplicate = vi.fn();
+    const editor = (canDuplicate: boolean) => (
+      <EventEditor
+        row={row}
+        calendar={null}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        {...NO_CALENDARS}
+        onClose={vi.fn()}
+        onDuplicate={onDuplicate}
+        canDuplicate={canDuplicate}
+      />
+    );
+    const { rerender } = render(editor(true));
+    await screen.findByLabelText("Title");
+    // No Delete: Duplicate alone takes the left.
+    expect(screen.getByRole("button", { name: "Duplicate" }).parentElement?.className).toBe(
+      "mr-auto",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+    expect(onDuplicate).toHaveBeenCalledWith(row);
+    rerender(editor(false));
+    expect(screen.queryByRole("button", { name: "Duplicate" })).toBeNull();
   });
 
   it("refuses to save a date it couldn't read, rather than dropping it", async () => {
@@ -899,15 +1167,337 @@ describe("EventEditor", () => {
     openForEdit.mockResolvedValue(ready(event()));
     saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
     const onClose = await open();
-    const desc = screen.getByLabelText("Description");
-    // Nothing between the field and the window swallows Enter (fireEvent is false if anything
-    // called preventDefault), so the textarea's own line break happens.
+    const desc = description();
+    // Nothing between the box and the window swallows Enter (fireEvent is false if anything called
+    // preventDefault), so the engine's own line break happens.
     expect(fireEvent.keyDown(desc, { key: "Enter" })).toBe(true);
     expect(fireEvent.keyDown(desc, { key: "Enter", shiftKey: true })).toBe(true);
-    fireEvent.change(desc, { target: { value: "line one\nline two" } });
+    typeInto(desc, "line one", h("div", "line two"));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(saveEdit).toHaveBeenCalledWith("s1", { description: "line one\nline two" }, ...UNSCOPED);
+  });
+
+  // --- the description, formatted in place (C19d) ---
+
+  it("a_formatted_description_is_edited_in_place", async () => {
+    openForEdit.mockResolvedValue(ready(event({ description: "<b>Agenda</b><br>one" })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const box = description();
+    expect(box.querySelector("b")?.textContent).toBe("Agenda");
+    expect(box.classList.contains("pm-desc-box")).toBe(true);
+    expect(screen.getByRole("toolbar", { name: "Description formatting" })).toBeTruthy();
+    typeInto(box, h("b", "Agenda"), h("br"), "one ", h("i", "two"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "<b>Agenda</b><br>one <i>two</i>" },
+      ...UNSCOPED,
+    );
+  });
+
+  // C19 §7.8: what Google holds in its own wrapper, opened and left, is never sent.
+  it("only_the_title_changed_sends_no_description", async () => {
+    const held = "<html-blob><u></u><strong>Plan</strong><br>Room 2</html-blob>";
+    openForEdit.mockResolvedValue(ready(event({ description: held })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const box = description();
+    box.focus();
+    fireEvent.blur(box);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { summary: "Dentist (moved)" },
+      null,
+      "Dentist (moved)",
+      null,
+      null,
+    );
+  });
+
+  // The backend refuses a table (C19c); PM shows what it can of it and offers to replace it. The
+  // save then says it's the user's choice (`replace_formatting`), which alone reopens it.
+  it("a_description_pm_cant_edit_shows_with_replace", async () => {
+    const table = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
+    openForEdit.mockResolvedValue(
+      ready(event({ description: table }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const view = screen.getByRole("group", { name: "Description" });
+    expect(view.textContent).toBe("Room 4.12");
+    const reason = screen.getByText(FORMATTING);
+    expect(view.getAttribute("aria-describedby")).toBe(reason.id);
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    // Nothing changed until the user says so.
+    expect(screen.getByRole("group", { name: "Description" })).toBeTruthy();
+    fireEvent.click(within(ask).getByRole("button", { name: "Replace" }));
+    const box = description();
+    expect(document.activeElement).toBe(box);
+    expect(box.textContent).toBe("Room 4.12");
+    // The reason goes with the formatting.
+    expect(screen.queryByText(FORMATTING)).toBeNull();
+    typeInto(box, "Room 4.12 today");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "Room 4.12 today", replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  it("a replaced description sent unchanged still says it was replaced", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: '<span style="color: red">Red</span> words' }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "Red words", replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  // C19 review 1: words Google showed as words ("&lt;b&gt;") stay words in the replacement, in the
+  // box and in what the save sends, never live markup that would bold a word or hide one.
+  it.each([
+    [
+      "<h2>Use &lt;b&gt;bold&lt;/b&gt; tags</h2>",
+      "Use <b>bold</b> tags",
+      "Use &lt;b&gt;bold&lt;/b&gt; tags",
+    ],
+    [
+      "<h2>Notes</h2>&lt;img src=x onerror=alert(1)&gt; after",
+      "Notes<img src=x onerror=alert(1)> after",
+      "Notes<br>&lt;img src=x onerror=alert(1)&gt; after",
+    ],
+    ['<font color="red">Tom &amp;amp; Jerry</font>', "Tom &amp; Jerry", "Tom &amp;amp; Jerry"],
+  ])("replace keeps words Google showed as words: %j", async (held, shows, sent) => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: held }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    expect(description().textContent).toBe(shows);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: sent, replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  it("replace isn't offered while a save is out", async () => {
+    let answer: (o: SaveAnswer) => void = () => {};
+    saveEdit.mockReturnValue(new Promise<SaveAnswer>((resolve) => (answer = resolve)));
+    openForEdit.mockResolvedValue(
+      ready(event({ description: "<h2>Agenda</h2>" }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    await open();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Dentist (moved)" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(saveEdit).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+    await act(async () => answer({ outcome: "busy" }));
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+  });
+
+  it("replace_is_not_offered_on_a_locked_description", async () => {
+    const locked: FieldPermissions = {
+      ...ALL,
+      summary: false,
+      time: false,
+      repeat: false,
+      location: false,
+      description: false,
+      guests: false,
+      meet: false,
+      calendar: false,
+      reasons: ["locked"],
+    };
+    openForEdit.mockResolvedValue(
+      ready(event({ description: "<table><tr><td>Room</td></tr></table>" }), locked),
+    );
+    await open();
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Room");
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+    // A plain one locked shows the same way, with no box to type in.
+    cleanup();
+    openForEdit.mockResolvedValue(ready(event({ description: "Bring the form" }), locked));
+    await open();
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Bring the form");
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+  });
+
+  // The backend lets through a link PM's own reading refuses (it reads tags only): the view says
+  // why itself, and offers Replace. A link PM keeps keeps its address in the plain text; one to an
+  // address PM never opens (ftp:) was never a link to it, and leaves its words.
+  it.each([
+    [
+      '<a href="https://example.com/file" onclick="steal()">the file</a>',
+      "the file (https://example.com/file)",
+    ],
+    ['<a href="ftp://example.com/file">the file</a>', "the file"],
+  ])("a_link_the_backend_allows_but_pm_cant_open_still_offers_replace: %j", async (held, plain) => {
+    openForEdit.mockResolvedValue(ready(event({ description: held })));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open();
+    const view = screen.getByRole("group", { name: "Description" });
+    expect(view.textContent).toBe("the file");
+    expect(view.getAttribute("aria-describedby")).toBe(screen.getByText(FORMATTING).id);
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    expect(description().textContent).toBe(plain);
+    expect(screen.queryByText(FORMATTING)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: plain, replace_formatting: true },
+      ...UNSCOPED,
+    );
+  });
+
+  it("a_conflict_on_the_description_reseeds_the_box", async () => {
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ description: "<b>Plan</b>" })))
+      .mockResolvedValueOnce(ready(event({ description: "<b>Plan</b> from Google" }), ALL, "s2"));
+    saveEdit.mockResolvedValue({ outcome: "conflict", fields: ["description"] });
+    const onClose = await open();
+    const box = description();
+    typeInto(box, h("b", "Plan"), " from PM");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Google's version of the description is shown now/);
+    // Google's copy is in the box now, made afresh.
+    expect(description().textContent).toBe("Plan from Google");
+    expect(description().querySelector("b")?.textContent).toBe("Plan");
+    expect(onClose).not.toHaveBeenCalled();
+    // Typing after it is the user's again.
+    typeInto(description(), h("b", "Plan"), " from Google, and PM");
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { description: "<b>Plan</b> from Google, and PM" },
+      null,
+      "Dentist",
+      null,
+      null,
+    );
+  });
+
+  // After a Replace, a conflict that brings Google's description back puts the view back: the
+  // replacement is gone with the user's edit, and so is the mark.
+  it("a conflict on a replaced description shows Google's again, with Replace", async () => {
+    const table = "<table><tr><td>Room</td></tr></table>";
+    const held: FieldPermissions = {
+      ...ALL,
+      description: false,
+      reasons: ["unsupported_formatting"],
+    };
+    openForEdit
+      .mockResolvedValueOnce(ready(event({ description: table }), held))
+      .mockResolvedValueOnce(
+        ready(event({ description: "<table><tr><td>Hall</td></tr></table>" }), held, "s2"),
+      );
+    saveEdit.mockResolvedValue({ outcome: "conflict", fields: ["description"] });
+    await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Google's version of the description is shown now/);
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Hall");
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+    expect(screen.getByText(FORMATTING)).toBeTruthy();
+  });
+
+  it("the_dialog_closes_only_the_replace_question_on_escape", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: "<h2>Agenda</h2>" }), {
+        ...ALL,
+        description: false,
+        reasons: ["unsupported_formatting"],
+      }),
+    );
+    const onClose = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    expect(
+      screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+    ).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "Replace the description with plain text?" }),
+    ).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Edit event" })).toBeTruthy();
+    expect(screen.queryByText("Discard your changes?")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    // Nothing was replaced.
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Agenda");
+  });
+
+  it("a mail link in the box opens only on Ctrl+click", async () => {
+    openForEdit.mockResolvedValue(
+      ready(event({ description: '<a href="mailto:ann@example.com">Ann</a> and more' })),
+    );
+    openUrl.mockResolvedValue();
+    await open();
+    const link = description().querySelector("a") as HTMLAnchorElement;
+    expect(fireEvent.click(link)).toBe(false);
+    expect(openUrl).not.toHaveBeenCalled();
+    await act(async () => {
+      expect(fireEvent.click(link, { ctrlKey: true })).toBe(false);
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com");
   });
 
   it("says why it couldn't open", async () => {
@@ -920,6 +1510,7 @@ describe("EventEditor", () => {
         suggestions={NO_SUGGESTIONS}
         milestone={null}
         colorOf={colourOf}
+        {...NO_CALENDARS}
         onClose={() => {}}
       />,
     );
@@ -989,6 +1580,7 @@ describe("EventEditor, a repeating event", () => {
       false,
       false,
       { rowId: occurrence.id, sent: null },
+      null,
     );
   });
 
@@ -1015,6 +1607,7 @@ describe("EventEditor, a repeating event", () => {
       false,
       true,
       { rowId: occurrence.id, sent: null },
+      null,
     );
   });
 
@@ -1243,7 +1836,8 @@ describe("EventEditor, a repeating event", () => {
     await open(vi.fn(), undefined, occurrence);
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Gym" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByText(/can't be changed here/)).toBeTruthy();
+    // C20: the special kinds PM can't change, in their narrowed words.
+    expect(await screen.findByText(/PM can't change focus time/)).toBeTruthy();
     expect(choicesOpen()).toBeNull();
     expect(saveEdit).not.toHaveBeenCalled();
   });
@@ -1579,6 +2173,7 @@ describe("EventEditor, how it repeats", () => {
       true,
       false,
       expect.objectContaining({ sent: null }),
+      null,
     );
   });
 
@@ -1931,6 +2526,7 @@ describe("EventEditor, a linked milestone", () => {
       suggestions={NO_SUGGESTIONS}
       milestone={launch}
       colorOf={colourOf}
+      {...NO_CALENDARS}
       onClose={() => {}}
     />
   );
@@ -2717,7 +3313,7 @@ describe("EventEditor, an invitation", () => {
   };
   const saved: SaveAnswer = { outcome: "saved", warnings: [] };
   const theirsLine =
-    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar.";
   /** What the guest list says of the user's own entry. */
   const myEntry = () =>
     within(screen.getByRole("list", { name: "Guests" }))
@@ -2903,7 +3499,9 @@ describe("EventEditor, an invitation", () => {
     expect(
       screen.getByText("Someone else organises this event, so only they can make it repeat."),
     ).toBeTruthy();
-    expect(screen.getByText("In PM, only the organiser can change who's invited.")).toBeTruthy();
+    expect(
+      screen.getByText("In PM, only the organiser can change who's invited and the video call."),
+    ).toBeTruthy();
     expect(screen.queryByText(theirsLine, { exact: false })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
@@ -2958,5 +3556,879 @@ describe("EventEditor, an invitation", () => {
       emails: 2,
       complete: true,
     });
+  });
+});
+
+// C18d (§10): the Calendar row, on an event you organise on a calendar you own: the other
+// calendars you own on its account, sent with the rest in one Save.
+describe("EventEditor, its calendar", () => {
+  const ME = "gcal:me@x.com";
+  const WORK = "gcal:work@x.com";
+  const account = (id: string): CalendarAccount => {
+    const email = id.slice(id.indexOf(":") + 1);
+    return { id, provider: "google", email, label: email, state: "ok", last_synced_at: null };
+  };
+  const cal = (source: string, remote: string, over: Partial<Calendar> = {}): Calendar => ({
+    id: `${source}:${remote}`,
+    source_id: source,
+    provider: "google",
+    remote_id: remote,
+    name: remote,
+    color: null,
+    selected: true,
+    is_primary: false,
+    quiet: false,
+    kind: null,
+    access_role: "owner",
+    time_zone: "Europe/London",
+    default_reminders: [],
+    conference_types: [],
+    data_owner: null,
+    ...over,
+  });
+  // The row's own calendar is Personal (`row.calendar_id`).
+  const PERSONAL = cal(ME, "me@x.com", { name: "Personal", is_primary: true });
+  const SIDE = cal(ME, "side", { name: "Side" });
+  const QUIET = cal(ME, "quiet", { name: "Quiet" });
+  const SHARED = cal(ME, "shared", { name: "Shared", access_role: "writer" });
+  const WORK_CAL = cal(WORK, "work@x.com", { name: "Work", is_primary: true });
+  const overviewOf = (accounts: string[], calendars: Calendar[]): CalendarOverview => ({
+    google_client_configured: true,
+    microsoft_client_configured: false,
+    accounts: accounts.map(account),
+    calendars,
+    last_sync: null,
+    window_days: 7,
+    mirror_start: "2026-09-01T00:00:00Z",
+    mirror_end: "2027-11-01T00:00:00Z",
+    editing: Object.fromEntries(accounts.map((a) => [a, "on" as const])),
+    default_length: {},
+    auto_meet: {},
+    ask_access: {},
+  });
+  const BOTH = overviewOf([ME, WORK], [PERSONAL, SIDE, QUIET, SHARED, WORK_CAL]);
+  const saved: WriteOutcome = { outcome: "saved", warnings: [], calendar: SIDE.id };
+
+  /** Open `ev` with `permissions` on `on` (Personal unless said), the calendars of `overview`, Quiet
+   *  hidden in the calendar list. */
+  async function openOn(
+    ev = event(),
+    permissions = ALL,
+    overview = BOTH,
+    on: Calendar = PERSONAL,
+    onClose = vi.fn(),
+    over: Partial<CalendarEvent> = {},
+    footer: {
+      onDelete?: (row: CalendarEvent) => void;
+      onDuplicate?: (row: CalendarEvent) => void;
+      canDuplicate?: boolean;
+    } = {},
+  ) {
+    openForEdit.mockResolvedValue(ready(ev, permissions));
+    render(
+      <EventEditor
+        row={{ ...row, calendar_id: on.id, ...over }}
+        calendar={on}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        targets={createTargets(overview)}
+        overview={overview}
+        hidden={new Set([QUIET.id])}
+        shapeOf={() => undefined}
+        onClose={onClose}
+        {...footer}
+      />,
+    );
+    await screen.findByLabelText("Title");
+    return onClose;
+  }
+
+  const trigger = (name: string) =>
+    screen.getByRole<HTMLButtonElement>("button", { name: `Calendar: ${name}` });
+  /** Pick `to` from the list `from` opens: by its name, a hidden one's mark after it. */
+  function pick(from: string, to: string) {
+    fireEvent.click(trigger(from));
+    const list = screen.getByRole("group", { name: "Calendars this event can go on" });
+    const name = new RegExp(`^${to}(, hidden)?$`);
+    fireEvent.click(within(list).getByRole("radio", { name }), { detail: 1 });
+  }
+  const DUPLICATE_WORDS =
+    "Only calendars you own on me@x.com are listed. To put it on another account's calendar, duplicate it there, then delete this one.";
+
+  it("an event you organise shows a Calendar row with the calendars it owns on its account, and the Duplicate words", async () => {
+    await openOn();
+    // The row says where it is: no "Saving to" line beside it.
+    expect(screen.queryByText(/^Saving to /)).toBeNull();
+    expect(screen.getByText(DUPLICATE_WORDS)).toBeTruthy();
+    fireEvent.click(trigger("Personal"));
+    const list = within(screen.getByRole("group", { name: "Calendars this event can go on" }));
+    expect(list.getAllByRole("radio").map((r) => r.closest("label")?.textContent)).toEqual([
+      "Personal",
+      "Quiet, hidden",
+      "Side",
+    ]);
+    expect(list.queryByRole("radio", { name: "Shared" })).toBeNull();
+    expect(list.queryByRole("radio", { name: "Work" })).toBeNull();
+    cleanup();
+    // With no other account to take events, no Duplicate sentence.
+    await openOn(event(), ALL, overviewOf([ME], [PERSONAL, SIDE]));
+    expect(screen.getByText("Only calendars you own on me@x.com are listed.")).toBeTruthy();
+    expect(screen.queryByText(/duplicate it there/)).toBeNull();
+  });
+
+  it("an invitation, a locked event, a calendar you can only edit, or nowhere else to go keeps the subtitle", async () => {
+    const locked: FieldPermissions = { ...ALL, calendar: false, reasons: ["locked"] };
+    const cases: [FieldPermissions, CalendarOverview, Calendar, string][] = [
+      [locked, BOTH, PERSONAL, "Saving to Personal · me@x.com"],
+      [ALL, BOTH, SHARED, "Saving to Shared · me@x.com"],
+      [ALL, overviewOf([ME], [PERSONAL]), PERSONAL, "Saving to Personal · me@x.com"],
+    ];
+    for (const [permissions, overview, on, subtitle] of cases) {
+      await openOn(event(), permissions, overview, on);
+      expect(screen.queryByRole("button", { name: /^Calendar: / })).toBeNull();
+      expect(screen.getByText(subtitle)).toBeTruthy();
+      cleanup();
+    }
+  });
+
+  it("choosing another calendar makes Save send it, alone or with a title", async () => {
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    expect(trigger("Side")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith("s1", { calendar: SIDE.id }, ...UNSCOPED);
+    // The notice names where it went, from the backend's answer, and where it was.
+    expect(noteSaved).toHaveBeenLastCalledWith(
+      "Dentist",
+      saved,
+      null,
+      "2026-10-12",
+      false,
+      false,
+      { rowId: row.id, sent: null },
+      { to: "Side", from: "Personal" },
+    );
+    cleanup();
+    const again = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(again).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s1",
+      { summary: "Retro", calendar: SIDE.id },
+      null,
+      "Retro",
+      null,
+      null,
+    );
+    cleanup();
+    // Chosen, then put back: nothing to send.
+    const back = await openOn();
+    pick("Personal", "Side");
+    pick("Side", "Personal");
+    saveEdit.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(back).toHaveBeenCalled());
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("a calendar chosen counts as a change: closing asks first", async () => {
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+  });
+
+  it("a hidden calendar says so", async () => {
+    await openOn();
+    expect(screen.queryByText(/is hidden in your calendar list/)).toBeNull();
+    pick("Personal", "Quiet");
+    expect(
+      screen.getByText(
+        "Quiet is hidden in your calendar list, so the event won't show until you show that calendar again.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("a guest's event asks once, the calendar change counted", async () => {
+    const me: GuestForEdit = {
+      email: "me@x.com",
+      name: null,
+      response: "accepted",
+      optional: false,
+      organizer: true,
+      self: true,
+      room: false,
+    };
+    const ann: GuestForEdit = {
+      ...me,
+      email: "ann@x.org",
+      name: "Ann",
+      organizer: false,
+      self: false,
+    };
+    saveEdit.mockResolvedValue(saved);
+    const onClose = await openOn(event({ guests: [me, ann] }));
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send update emails to guests?" });
+    expect(within(prompt).getByText("1 guest already invited will get an update.")).toBeTruthy();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s1",
+      { summary: "Retro", calendar: SIDE.id },
+      null,
+      "Retro",
+      "all",
+      {
+        updated: 1,
+        invited: 0,
+        removed: 0,
+        told_cancelled: 0,
+        cancelled: false,
+        people: 1,
+        emails: 2,
+        complete: true,
+      },
+    );
+  });
+
+  it("not moved reloads Google's copy, says why, and keeps the calendar chosen", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    // Google's copy now: the title saved, under a new session.
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(
+        "Your other changes are saved, but it's still on Personal. Google is busy right now.",
+      ),
+    ).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(trigger("Side")).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    // Save tries the calendar again, alone, on the new session.
+    saveEdit.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { calendar: SIDE.id },
+      null,
+      "Retro",
+      null,
+      null,
+    );
+  });
+
+  // Review round 1 of PR 1: a calendar change whose answer was lost had landed, and the title was
+  // changed before Save was pressed again. The title is never dropped: the editor goes on from the
+  // row the event has now, on Google's copy there, and the next Save sends the title alone.
+  const MOVED = `${SIDE.id}:e1`;
+  const movedEarlier: WriteOutcome = {
+    outcome: "moved_earlier",
+    row_id: MOVED,
+    calendar: SIDE.id,
+  };
+  const STILL_TO_SAVE =
+    "It's already on Side: the calendar change landed earlier. Your other changes aren't saved yet: press Save to send them.";
+
+  it("a calendar change that had landed goes on from there, the later changes kept", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "unconfirmed" });
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/PM lost touch with Google/);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    saveEdit.mockResolvedValueOnce(movedEarlier);
+    // Google's copy there, under a new session: the title isn't on it.
+    openForEdit.mockResolvedValue(ready(event(), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(STILL_TO_SAVE)).toBeTruthy();
+    expect(openForEdit).toHaveBeenLastCalledWith(MOVED);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(trigger("Side")).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    // Leaving now loses the title, and the calendar stays changed: said so, not "nothing saved".
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(
+      await screen.findByText(
+        "The event is on Side already. Only what you’ve changed since is discarded.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Nothing has been saved to Google yet.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    // The title alone, on the new session; no calendar change is left to make.
+    saveEdit.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s2",
+      { summary: "Retro" },
+      null,
+      "Retro",
+      null,
+      null,
+    );
+    // What it's saved as is the row it has now, so an Undo names that one.
+    expect(noteSaved.mock.lastCall?.[6]).toEqual({ rowId: MOVED, sent: null });
+  });
+
+  it("a calendar change that had landed says why when the copy there can't be read", async () => {
+    saveEdit.mockResolvedValueOnce(movedEarlier);
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockRejectedValueOnce(new Error("That event is no longer in PM's calendar."));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText(
+        "It's already on Side: the calendar change landed earlier. PM couldn't read it there, so your other changes aren't saved. Close this and open the event again to make them.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/no longer in PM's calendar/)).toBeNull();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    // Those words say to open it again: its session ended, and nothing more goes from here.
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
+  });
+
+  it("a calendar change that had landed says nothing's left when Google's copy holds it all", async () => {
+    saveEdit.mockResolvedValueOnce(movedEarlier);
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByText("It's already on Side: the calendar change landed earlier."),
+    ).toBeTruthy();
+    expect(screen.queryByText(STILL_TO_SAVE)).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // The choices of a repeating event find the same: there's nothing left to choose.
+  it("the choices finding a calendar change that had landed go on from there too", async () => {
+    choicesForEdit.mockResolvedValue({ outcome: "refused", result: movedEarlier });
+    const repeats = { series_id: "abc", recurring: true };
+    const onClose = await openOn(event(), ALL, BOTH, PERSONAL, vi.fn(), repeats);
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event(), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(STILL_TO_SAVE)).toBeTruthy();
+    expect(openForEdit).toHaveBeenLastCalledWith(MOVED);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByLabelText<HTMLInputElement>("Title").value).toBe("Retro");
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  it("the choices finding all of a save landed close on it, saying where it is", async () => {
+    const landed: WriteOutcome = { outcome: "saved", warnings: [], calendar: SIDE.id };
+    choicesForEdit.mockResolvedValue({ outcome: "refused", result: landed });
+    const repeats = { series_id: "abc", recurring: true };
+    const onClose = await openOn(event(), ALL, BOTH, PERSONAL, vi.fn(), repeats);
+    pick("Personal", "Side");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(noteSaved.mock.lastCall?.[1]).toEqual(landed);
+    expect(noteSaved.mock.lastCall?.[7]).toEqual({ to: "Side", from: "Personal" });
+    expect(saveEdit).not.toHaveBeenCalled();
+  });
+
+  // Review round 1 of PR 1: the fields landed, so a read after that fails never takes the place of
+  // saying so (the read's own words can say nothing changed, or that the event is gone when the
+  // save gave its occurrences new ids), and what the fields had to say beside "saved" is said too.
+  it("not moved still says what saved when Google's copy can't be read again", async () => {
+    const head =
+      "Your other changes are saved, but it's still on Personal. Google is busy right now. Google didn't make the video call. Add it again from Edit, or in Google Calendar.";
+    const reads: (() => void)[] = [
+      () =>
+        openForEdit.mockRejectedValueOnce(new Error("That event is no longer in PM's calendar.")),
+      () =>
+        openForEdit.mockResolvedValueOnce({
+          outcome: "failed",
+          message:
+            "PM couldn't reach Google. Nothing was changed; try again when you're back online.",
+        }),
+      () => openForEdit.mockResolvedValueOnce({ outcome: "gone" }),
+    ];
+    for (const read of reads) {
+      saveEdit.mockResolvedValueOnce({
+        outcome: "not_moved",
+        message: "Google is busy right now.",
+        warnings: ["call_failed"],
+      });
+      const onClose = await openOn();
+      pick("Personal", "Side");
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+      read();
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(await screen.findByText(`${head} ${NOT_MOVED_UNREAD}`)).toBeTruthy();
+      expect(screen.queryByText(/Nothing was changed|no longer in/)).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+      cleanup();
+    }
+  });
+
+  // Review round 2 of PR 1: what landed gave a repeating event's occurrences new ids, so the row the
+  // editor is on can be dead: nothing more goes from here, where a Save would read as the event
+  // deleted. Its words stop offering Save, and Cancel still closes.
+  // Review round 3 of PR 1: the likeliest way here, offline, offers no Try again above a held Save.
+  it("not moved and unread offline says to open it again, never to try again", async () => {
+    saveEdit.mockResolvedValueOnce({
+      outcome: "not_moved",
+      message:
+        "PM couldn't reach Google to change its calendar. Try again when you're back online.",
+    });
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockRejectedValueOnce(new Error("offline"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const said = await screen.findByText(new RegExp(NOT_MOVED_UNREAD));
+    expect(said.textContent).toBe(
+      `Your other changes are saved, but it's still on Personal. PM couldn't reach Google to change its calendar. ${NOT_MOVED_UNREAD}`,
+    );
+  });
+
+  it("not moved and unread holds the editor until it's opened again", async () => {
+    saveEdit.mockResolvedValueOnce({
+      outcome: "not_moved",
+      message:
+        "Its guests changed in Google just now, so PM didn't change its calendar. Save again to answer for them.",
+    });
+    const onDelete = vi.fn();
+    const onDuplicate = vi.fn();
+    const onClose = await openOn(
+      event(),
+      { ...ALL, respond: true },
+      BOTH,
+      PERSONAL,
+      vi.fn(),
+      {},
+      {
+        onDelete,
+        onDuplicate,
+        canDuplicate: true,
+      },
+    );
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockRejectedValueOnce(new Error("That event is no longer in PM's calendar."));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const said = await screen.findByText(new RegExp(NOT_MOVED_UNREAD));
+    expect(said.textContent).toBe(
+      `Your other changes are saved, but it's still on Personal. Its guests changed in Google just now, so PM didn't change its calendar. ${NOT_MOVED_UNREAD}`,
+    );
+    const cancel = screen.getByRole<HTMLButtonElement>("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel.disabled).toBe(false));
+    await waitFor(() => expect(document.activeElement).toBe(cancel));
+    for (const name of ["Save", "Delete", "Duplicate"]) {
+      const button = screen.getByRole<HTMLButtonElement>("button", { name });
+      expect(button.disabled, name).toBe(true);
+      fireEvent.click(button);
+    }
+    // A reply from here would go on a row that can be dead too: a repeating event's old occurrence.
+    const reply = screen.getByRole<HTMLButtonElement>("button", { name: "Yes" });
+    expect(reply.disabled).toBe(true);
+    fireEvent.click(reply);
+    await act(async () => {});
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(respond).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(onDuplicate).not.toHaveBeenCalled();
+    fireEvent.click(cancel);
+    fireEvent.click(await screen.findByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("not moved holds nothing when Google's copy reads again", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    const save = screen.getByRole<HTMLButtonElement>("button", { name: "Save" });
+    await waitFor(() => expect(save.disabled).toBe(false));
+  });
+
+  // Review round 1 of PR 1: after not moved, the other changes are in Google: discarding loses only
+  // the calendar change and what was changed since, never "nothing has been saved".
+  it("discarding after not moved says the other changes are already saved", async () => {
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    const onClose = await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockResolvedValue(ready(event({ summary: "Retro" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Discard your changes?")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Nothing has been saved to Google yet.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  // Review round 1 of PR 1: at Power depth, another calendar chosen is a change the line names.
+  it("the Power-depth line counts the calendar chosen", async () => {
+    depth = "power";
+    await openOn();
+    expect(screen.getByText("No changes yet")).toBeTruthy();
+    pick("Personal", "Side");
+    expect(screen.getByText("Changed: calendar")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    expect(screen.getByText("Changed: title and calendar")).toBeTruthy();
+  });
+
+  // C19d: the replacement landed with the other changes, so the choice is spent. A description
+  // Google's copy still holds with formatting PM can't edit shows read-only again, never in the box.
+  it("a replaced description that landed without the calendar asks again before replacing", async () => {
+    const held: FieldPermissions = {
+      ...ALL,
+      description: false,
+      reasons: ["unsupported_formatting"],
+    };
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    await openOn(event({ description: "<h2>Agenda</h2>" }), held);
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    pick("Personal", "Side");
+    openForEdit.mockResolvedValue(ready(event({ description: "<h3>Agenda</h3>" }), held, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { description: "Agenda", replace_formatting: true, calendar: SIDE.id },
+      null,
+      "Dentist",
+      null,
+      null,
+    );
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Agenda");
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+  });
+
+  // C19 review 1: the replacement landed as Google's copy (the words), so the mark is spent: a table
+  // someone puts there later shows read-only with Replace, never in a live box that would flatten it
+  // on the next key.
+  it("a replacement that landed as the words asks again for a table put there later", async () => {
+    const held: FieldPermissions = {
+      ...ALL,
+      description: false,
+      reasons: ["unsupported_formatting"],
+    };
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    await openOn(event({ description: "<h2>Agenda</h2>" }), held);
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "Replace the description with plain text?" }),
+      ).getByRole("button", { name: "Replace" }),
+    );
+    pick("Personal", "Side");
+    // Google's copy now: the words the replacement sent.
+    openForEdit.mockResolvedValue(ready(event({ description: "Agenda" }), ALL, "s2"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/Your other changes are saved/);
+    expect(description().textContent).toBe("Agenda");
+    // Someone puts a table there in Google; the user changes the title and saves again.
+    const table = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
+    saveEdit.mockResolvedValueOnce({ outcome: "not_moved", message: "Google is busy right now." });
+    openForEdit.mockResolvedValue(
+      ready(event({ summary: "Retro", description: table }), held, "s3"),
+    );
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(openForEdit).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(screen.getByRole("group", { name: "Description" }).textContent).toBe("Room 4.12"),
+    );
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+    expect(screen.getByText(FORMATTING)).toBeTruthy();
+  });
+
+  it("a repeating event says it goes whole and asks which occurrences, All its only row (C18e)", async () => {
+    const onClose = vi.fn();
+    const occurrence: CalendarEvent = {
+      ...row,
+      calendar_id: PERSONAL.id,
+      series_id: "abc",
+      recurring: true,
+    };
+    openForEdit.mockResolvedValue(ready(event(), ALL));
+    render(
+      <EventEditor
+        row={occurrence}
+        calendar={PERSONAL}
+        account="me@x.com"
+        suggestions={NO_SUGGESTIONS}
+        milestone={null}
+        colorOf={colourOf}
+        targets={createTargets(BOTH)}
+        overview={BOTH}
+        hidden={new Set([QUIET.id])}
+        shapeOf={() => undefined}
+        onClose={onClose}
+      />,
+    );
+    await screen.findByLabelText("Title");
+    expect(screen.queryByText(CALENDAR_WHOLE)).toBeNull();
+    pick("Personal", "Side");
+    expect(screen.getByText(CALENDAR_WHOLE)).toBeTruthy();
+    const refused = (message: string): ScopeRow => ({ row: "refused", message });
+    const whole: SeriesChoices = {
+      outcome: "ready",
+      this: refused(
+        "Changing the calendar can't apply to just this occurrence: the whole repeating event goes to the other calendar.",
+      ),
+      following: refused(
+        "PM puts a whole repeating event on another calendar, not this one and the ones after it.",
+      ),
+      all: {
+        row: "offered",
+        warnings: [{ warning: "changes_calendar", to: "Side" }],
+        token: "t-all",
+      },
+    };
+    choicesForEdit.mockResolvedValue(whole);
+    saveEdit.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "Edit repeating event" }));
+    expect(choicesForEdit).toHaveBeenCalledWith("s1", { calendar: SIDE.id });
+    expect(dialog.getByRole<HTMLInputElement>("radio", { name: /^This event/ }).disabled).toBe(
+      true,
+    );
+    fireEvent.click(dialog.getByRole("radio", { name: /^All events/ }));
+    expect(dialog.getByText("Every occurrence goes to Side.")).toBeTruthy();
+    fireEvent.click(dialog.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      "s1",
+      { calendar: SIDE.id },
+      { scope: "all", token: "t-all", asAll: false },
+      "Dentist",
+      null,
+      null,
+    );
+    // Where it went, from the backend's answer: every occurrence, said by the notice.
+    expect(noteSaved).toHaveBeenLastCalledWith(
+      "Dentist",
+      saved,
+      "all",
+      "2026-10-12",
+      false,
+      false,
+      { rowId: occurrence.id, sent: null },
+      { to: "Side", from: "Personal" },
+    );
+  });
+
+  it("a new repeat and another calendar go one at a time", async () => {
+    await openOn();
+    const repeat = () => screen.getByRole<HTMLButtonElement>("button", { name: /^Repeat: / });
+    pick("Personal", "Side");
+    // Another calendar holds the repeat, saying why.
+    expect(repeat().disabled).toBe(true);
+    expect(screen.getByText(CALENDAR_ALONE)).toBeTruthy();
+    pick("Side", "Personal");
+    expect(repeat().disabled).toBe(false);
+    expect(screen.queryByText(CALENDAR_ALONE)).toBeNull();
+    // A new repeat holds the calendar, saying why under it.
+    await act(async () => {});
+    fireEvent.click(repeat());
+    const list = screen.getByRole("group", { name: "Repeat" });
+    fireEvent.click(within(list).getByRole("radio", { name: "Daily" }), { detail: 1 });
+    await act(async () => {});
+    expect(trigger("Personal").disabled).toBe(true);
+    expect(screen.getByText(CALENDAR_ALONE)).toBeTruthy();
+  });
+});
+
+// Birthdays and events Gmail added (#884, C20): what Google's list for each kind allows is live, the
+// rest greyed with the kind's line; a birthday's date is one whole day, one Date field; neither asks
+// whether to email anyone.
+describe("EventEditor, a birthday or an event Gmail added", () => {
+  const NONE: FieldPermissions = {
+    summary: false,
+    time: false,
+    repeat: false,
+    location: false,
+    description: false,
+    show_as: false,
+    visibility: false,
+    guests: false,
+    reminders: false,
+    colour: false,
+    meet: false,
+    calendar: false,
+    delete: false,
+    respond: false,
+    one_day: false,
+    reasons: [],
+  };
+  /** A birthday's list (gate.rs `special_rights`): its date open only where Google allows. */
+  const DATED: FieldPermissions = {
+    ...NONE,
+    summary: true,
+    reminders: true,
+    colour: true,
+    delete: true,
+    one_day: true,
+    reasons: ["special_date_fields"],
+  };
+  const GMAIL: FieldPermissions = {
+    ...NONE,
+    show_as: true,
+    visibility: true,
+    reminders: true,
+    colour: true,
+    delete: true,
+    reasons: ["from_gmail_fields"],
+  };
+  const yearly: CalendarEvent = {
+    ...row,
+    summary: "Mum",
+    location: null,
+    event_type: "birthday",
+    all_day: true,
+    start: "2026-05-04",
+    end: "2026-05-05",
+  };
+  const onTheDay = event({
+    summary: "Mum",
+    location: "",
+    time: { kind: "all_day", first_day: "2026-05-04", last_day: "2026-05-04" },
+    start_at: null,
+    end_at: null,
+  });
+  const gmailRow: CalendarEvent = { ...row, event_type: "fromGmail" };
+  const placeholder = "unknownorganizer@calendar.google.com";
+  /** Gmail's event, organised by Google's placeholder, who is on its list with the calendar. */
+  const fromGmail = event({
+    organizer_self: false,
+    organizer_email: placeholder,
+    guests: [
+      {
+        email: placeholder,
+        name: null,
+        response: "accepted",
+        optional: false,
+        organizer: true,
+        self: false,
+        room: false,
+      },
+      {
+        email: "me@x.com",
+        name: null,
+        response: "accepted",
+        optional: false,
+        organizer: false,
+        self: true,
+        room: false,
+      },
+    ],
+  });
+  const disabled = (el: HTMLElement) => (el as HTMLInputElement).disabled;
+
+  it("a birthday from Contacts opens with only its name, notifications and colour live, and both lines, the date's first", async () => {
+    openForEdit.mockResolvedValue(
+      ready(onTheDay, { ...DATED, reasons: ["date_from_contacts", "special_date_fields"] }),
+    );
+    await open(vi.fn(), vi.fn(), yearly);
+    expect(disabled(screen.getByLabelText("Title"))).toBe(false);
+    expect(disabled(screen.getByLabelText("Date"))).toBe(true);
+    expect(disabled(screen.getByLabelText("Location"))).toBe(true);
+    expect(disabled(screen.getByRole("button", { name: "Free" }))).toBe(true);
+    expect(disabled(screen.getByLabelText("Visibility"))).toBe(true);
+    // All day on the calendar's defaults: its notifications open with Change.
+    expect(disabled(screen.getByRole("button", { name: "Change" }))).toBe(false);
+    expect(disabled(screen.getByRole("button", { name: "Colour: Calendar colour" }))).toBe(false);
+    // Repeat is greyed: Google repeats a birthday every year itself.
+    expect(disabled(screen.getByRole("button", { name: /^Repeat: / }))).toBe(true);
+    const contacts = screen.getByText(reasonText("date_from_contacts"));
+    const kind = screen.getByText(reasonText("special_date_fields"));
+    expect(contacts.compareDocumentPosition(kind) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Google lets a birthday be deleted (C20 §0.4 item 1).
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  });
+
+  it("one day shows a single Date field and no All day switch, and a new date moves the last day with it", async () => {
+    openForEdit.mockResolvedValue(ready(onTheDay, { ...DATED, time: true }));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), vi.fn(), yearly);
+    expect(screen.queryByRole("switch", { name: "All day" })).toBeNull();
+    expect(screen.queryByLabelText("First day")).toBeNull();
+    expect(screen.queryByLabelText("Last day")).toBeNull();
+    const date = screen.getByLabelText<HTMLInputElement>("Date");
+    expect(date.disabled).toBe(false);
+    date.focus();
+    fireEvent.change(date, { target: { value: "05-06-2026" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(saveEdit).toHaveBeenCalledWith(
+      "s1",
+      { time: { kind: "all_day", first_day: "2026-06-05", last_day: "2026-06-05" } },
+      null,
+      "Mum",
+      null,
+      null,
+    );
+  });
+
+  it("an ordinary all-day event keeps its two days and its switch", async () => {
+    openForEdit.mockResolvedValue(ready(onTheDay));
+    await open(vi.fn(), vi.fn(), yearly);
+    expect(screen.getByRole("switch", { name: "All day" })).toBeTruthy();
+    expect(screen.getByLabelText("First day")).toBeTruthy();
+    expect(screen.queryByLabelText("Date")).toBeNull();
+  });
+
+  it("a Gmail event opens with busy or free, visibility, notifications and colour live and the rest greyed", async () => {
+    openForEdit.mockResolvedValue(ready(fromGmail, GMAIL));
+    await open(vi.fn(), vi.fn(), gmailRow);
+    expect(disabled(screen.getByLabelText("Title"))).toBe(true);
+    expect(disabled(screen.getByLabelText("Start time"))).toBe(true);
+    expect(disabled(screen.getByLabelText("Location"))).toBe(true);
+    expect(disabled(screen.getByRole("button", { name: "Free" }))).toBe(false);
+    expect(disabled(screen.getByLabelText("Visibility"))).toBe(false);
+    expect(disabled(screen.getByRole("button", { name: "Add notification" }))).toBe(false);
+    expect(disabled(screen.getByRole("button", { name: "Colour: Calendar colour" }))).toBe(false);
+    expect(screen.getByText(reasonText("from_gmail_fields"))).toBeTruthy();
+    // Google's placeholder organiser is no one whose event this is: nothing says "only they can".
+    expect(screen.queryByText(/Someone else organises/)).toBeNull();
+  });
+
+  it("a Gmail event's visibility saves with no email question, its organiser on the list", async () => {
+    openForEdit.mockResolvedValue(ready(fromGmail, GMAIL));
+    saveEdit.mockResolvedValue({ outcome: "saved", warnings: [] });
+    const onClose = await open(vi.fn(), vi.fn(), gmailRow);
+    fireEvent.change(screen.getByLabelText("Visibility"), { target: { value: "private" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(screen.queryByRole("dialog", { name: "Send update emails to guests?" })).toBeNull();
+    expect(saveEdit).toHaveBeenCalledWith("s1", { visibility: "private" }, ...UNSCOPED);
   });
 });

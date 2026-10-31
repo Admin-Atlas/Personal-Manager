@@ -26,9 +26,17 @@ import {
   repeatSeed,
   sameField,
   seedDraft,
+  seedDuplicate,
   switchNewKind,
   toChanges,
   toNewEvent,
+  withReplace,
+  COPY_ATTACHMENTS_NOTE,
+  COPY_CALL_NOTE,
+  COPY_GUESTS_NOTE,
+  COPY_OMITTED_NOTE,
+  copyMilestoneNote,
+  copyRepeatNote,
   type EditorFields,
   type GuestDraft,
 } from "./eventDraft";
@@ -54,7 +62,6 @@ const event: EventForEdit = {
   summary: "Dentist",
   location: "High St",
   description: "Bring the form\r\nand the card",
-  description_html: false,
   time: timed("2026-10-12", "09:00", "2026-10-12", "10:00"),
   start_at: "2026-10-12T08:00:00Z",
   end_at: "2026-10-12T09:00:00Z",
@@ -73,6 +80,8 @@ const event: EventForEdit = {
   label_id: null,
   reply: null,
   organizer_self: true,
+  call: null,
+  meet_offered: true,
 };
 
 const base = (): EditorFields => seedDraft(event);
@@ -97,6 +106,43 @@ describe("the event draft", () => {
     // The textarea hands back \n for Google's \r\n.
     const draft = { ...base(), description: "Bring the form\nand the card" };
     expect(changedFields(base(), draft)).toEqual([]);
+    const placed = seedDraft({ ...event, location: "Room 2\r\nfloor 4" });
+    expect(changedFields(placed, { ...placed, location: "Room 2\nfloor 4" })).toEqual([]);
+  });
+
+  // C19 §2.6, §7.8: an editor that only opened a formatted description sends none of it.
+  it("the_description_is_compared_by_what_it_shows", () => {
+    const formatted = seedDraft({ ...event, description: "<html-blob>a<br>b</html-blob>" });
+    // What the description editor reports for it, untouched: the same lines, written plainly.
+    const same = { ...formatted, description: "a\nb" };
+    expect(changedFields(formatted, same)).toEqual([]);
+    expect(toChanges(formatted, { ...same, summary: "Moved" })).toEqual({ summary: "Moved" });
+    expect(
+      sameField("description", formatted, { ...formatted, description: "<p>a<br>b</p>" }),
+    ).toBe(false);
+    // Google's own bold and PM's are the same; bold and plain aren't.
+    const bold = seedDraft({ ...event, description: "<strong>x</strong>" });
+    expect(changedFields(bold, { ...bold, description: "<b>x</b>" })).toEqual([]);
+    expect(toChanges(bold, { ...bold, description: "x" })).toEqual({ description: "x" });
+    // One PM can't write back compares by its text: replacing it is a change.
+    const table = seedDraft({ ...event, description: "<table><tr><td>a</td></tr></table>" });
+    expect(toChanges(table, { ...table, description: "a" })).toEqual({ description: "a" });
+  });
+
+  it("withReplace_marks_only_a_save_that_sends_the_description", () => {
+    expect(withReplace({ description: "Room 4.12" }, true)).toEqual({
+      description: "Room 4.12",
+      replace_formatting: true,
+    });
+    // Cleared is still a description sent.
+    expect(withReplace({ description: "" }, true)).toEqual({
+      description: "",
+      replace_formatting: true,
+    });
+    expect(withReplace({ description: "Room 4.12" }, false)).toEqual({ description: "Room 4.12" });
+    // Replaced, then put back as it was: the save carries no mark without a description.
+    expect(withReplace({ summary: "Moved" }, true)).toEqual({ summary: "Moved" });
+    expect(withReplace({}, true)).toEqual({});
   });
 
   it("sends a time change whole, and a switch to all day", () => {
@@ -121,8 +167,11 @@ describe("the event draft", () => {
       guests: false,
       reminders: true,
       colour: true,
+      meet: true,
+      calendar: false,
       delete: false,
       respond: false,
+      one_day: false,
       reasons: ["locked"],
     };
     expect(canEdit(perms, "summary")).toBe(false);
@@ -471,6 +520,22 @@ describe("carrying a draft onto Google's newer copy", () => {
     expect(r.overwritten).toEqual([]);
     expect(toChanges(r.base, r.draft)).toEqual({});
   });
+
+  // C19d: a description Google only wrote another way (its wrapper, its bold) is no change of
+  // Google's, so the user's edit of it stands.
+  it("takes a description Google wrote another way as the same one", () => {
+    const old = seedDraft({ ...event, description: "<b>Plan</b>" });
+    const google = { ...old, description: "<html-blob><strong>Plan</strong></html-blob>" };
+    const mine = { ...old, description: "<b>Plan</b> today" };
+    const r = rebaseDraft(old, google, mine);
+    expect(r.overwritten).toEqual([]);
+    expect(r.draft.description).toBe("<b>Plan</b> today");
+    expect(toChanges(r.base, r.draft)).toEqual({ description: "<b>Plan</b> today" });
+    // Changed in Google too, to something that shows otherwise: Google's wins, and is said.
+    const changed = rebaseDraft(old, { ...old, description: "<b>Plan</b> tomorrow" }, mine);
+    expect(changed.overwritten).toEqual(["description"]);
+    expect(changed.draft.description).toBe("<b>Plan</b> tomorrow");
+  });
 });
 
 // --- guests (#884, C12) ---
@@ -615,8 +680,11 @@ describe("guests in the draft", () => {
       guests: false,
       reminders: true,
       colour: true,
+      meet: true,
+      calendar: true,
       delete: true,
       respond: false,
+      one_day: false,
       reasons: [],
     };
     expect(canEdit(perms, "guests")).toBe(false);
@@ -902,6 +970,7 @@ describe("a new event's starting fields", () => {
       recurrence: { kind: "once" },
       guests: [],
       guest_perms: { modify: false, invite_others: true, see_others: true },
+      meet: true,
       reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
       colour: { kind: "colour", id: "3" },
       show_as: "free",
@@ -919,6 +988,7 @@ describe("a new event's starting fields", () => {
       guests: [],
       reminders: { use_default: false, overrides: [{ method: "email", minutes: 60 }] },
       colour: { kind: "colour", id: "3" },
+      meet: true,
     });
     // A copy: a later edit to the draft can't change what was sent.
     expect(sent.time).not.toBe(draft.time);
@@ -1125,8 +1195,11 @@ describe("notifications and colour in the draft", () => {
       guests: false,
       reminders: true,
       colour: false,
+      meet: true,
+      calendar: false,
       delete: false,
       respond: false,
+      one_day: false,
       reasons: ["label_read_only"],
     };
     expect(canEdit(perms, "reminders")).toBe(true);
@@ -1236,5 +1309,282 @@ describe("notifications and colour in the draft", () => {
     expect(
       remindersAfterKindSwitch(listed, { ...same, time: listed.time }, true, false).note,
     ).toBeNull();
+  });
+});
+
+// C18: the video call is a field: whether the event has a Meet call after Save.
+describe("the video call in the draft", () => {
+  const meet = (state: "ready" | "pending" | "failed") => ({
+    kind: "meet" as const,
+    name: "Google Meet",
+    join: state === "ready" ? "https://meet.google.com/abc-defg-hij" : null,
+    state,
+  });
+
+  it("a Meet call seeds meet on, a failed one off", () => {
+    expect(seedDraft(event).meet).toBe(false);
+    expect(seedDraft({ ...event, call: meet("ready") }).meet).toBe(true);
+    expect(seedDraft({ ...event, call: meet("pending") }).meet).toBe(true);
+    expect(seedDraft({ ...event, call: meet("failed") }).meet).toBe(false);
+    const zoom = {
+      kind: "add_on" as const,
+      name: "Zoom Meeting",
+      join: null,
+      state: "ready" as const,
+    };
+    expect(seedDraft({ ...event, call: zoom }).meet).toBe(false);
+  });
+
+  it("turning the call on sends add, off sends remove, unchanged sends nothing", () => {
+    const none = base();
+    expect(toChanges(none, { ...none, meet: true })).toEqual({ meet: "add" });
+    const held = seedDraft({ ...event, call: meet("ready") });
+    expect(toChanges(held, { ...held, meet: false })).toEqual({ meet: "remove" });
+    expect(toChanges(held, held)).toEqual({});
+    expect(changedFields(none, { ...none, meet: true })).toEqual(["meet"]);
+    // Google emails guests about a call like any shared field, as the backend counts it.
+    expect(sameField("meet", none, { ...none, meet: true })).toBe(false);
+  });
+
+  it("goes with its own right, and a change Google made to it meanwhile shows Google's", () => {
+    const perms: FieldPermissions = {
+      summary: true,
+      time: true,
+      repeat: true,
+      location: true,
+      description: true,
+      show_as: true,
+      visibility: true,
+      guests: true,
+      reminders: true,
+      colour: true,
+      meet: false,
+      calendar: true,
+      delete: true,
+      respond: false,
+      one_day: false,
+      reasons: ["other_call"],
+    };
+    expect(canEdit(perms, "meet")).toBe(false);
+    expect(canEdit({ ...perms, meet: true }, "meet")).toBe(true);
+    const old = base();
+    const theirs = seedDraft({ ...event, call: meet("ready") });
+    const mine = { ...old, meet: true, summary: "Retro" };
+    const carried = rebaseDraft(old, theirs, mine);
+    // The same change on both sides is no conflict.
+    expect(carried.overwritten).toEqual([]);
+    expect(carried.draft.meet).toBe(true);
+    const removing = seedDraft({ ...event, call: meet("ready") });
+    const gone = rebaseDraft(removing, base(), { ...removing, meet: false, summary: "Retro" });
+    expect(gone.overwritten).toEqual([]);
+    const kept = rebaseDraft(old, base(), { ...old, meet: true });
+    expect(kept.draft.meet).toBe(true);
+    const clash = rebaseDraft(
+      removing,
+      { ...removing, summary: "Gym" },
+      { ...removing, meet: false },
+    );
+    expect(clash.draft.meet).toBe(false);
+  });
+
+  // C18b: a seed has no guests, so no call (Meet starts with the first guest, `meetDefault`), and
+  // toNewEvent sends whether one is asked for.
+  it("a new event starts with no call, and toNewEvent sends meet", () => {
+    expect(NEW_EVENT_BASE.meet).toBe(false);
+    expect(
+      newEventSeed("2026-10-12", new Date("2026-10-11T12:00:00Z"), "Europe/London", 3_600_000).meet,
+    ).toBe(false);
+    expect(toNewEvent(base()).meet).toBe(false);
+    expect(toNewEvent({ ...base(), meet: true }).meet).toBe(true);
+  });
+});
+
+// --- duplicating an event (#884, C18c) ---
+
+describe("seedDuplicate", () => {
+  const WEEKLY: RepeatRule = {
+    pattern: { kind: "weekly", days: ["mon"] },
+    interval: 1,
+    ends: { kind: "never" },
+  };
+  const series = (rule: RepeatRule | null) => ({
+    first: false,
+    repeats: "Weekly on Monday",
+    rule,
+    starts: "2026-10-05",
+    zone: "Europe/London",
+  });
+
+  it("a plain event's copy is the original's fields, no call, and nothing to say", () => {
+    const original: EventForEdit = {
+      ...event,
+      show_as: "free",
+      visibility: "private",
+      reminders: { use_default: false, overrides: [{ method: "popup", minutes: 10 }] },
+      color_id: "4",
+      guests_can_modify: true,
+    };
+    const copy = seedDuplicate(original, null, false, "owner");
+    expect(copy.fields).toEqual({ ...seedDraft(original), organizer_email: null });
+    expect(copy.fields.summary).toBe("Dentist");
+    expect(copy.fields.meet).toBe(false);
+    expect(copy.fields.recurrence).toEqual({ kind: "once" });
+    expect(copy).toEqual({ fields: copy.fields, notes: [], callNote: null });
+  });
+
+  it("never copies a call, and says so; a formatted description is copied unchanged", () => {
+    const meet = {
+      kind: "meet" as const,
+      name: "Google Meet",
+      join: "https://x",
+      state: "ready" as const,
+    };
+    const withCall = seedDuplicate({ ...event, call: meet }, null, false, "owner");
+    expect(withCall.fields.meet).toBe(false);
+    expect(withCall.callNote).toBe(COPY_CALL_NOTE);
+    expect(withCall.notes).toEqual([]);
+    const other = seedDuplicate(
+      { ...event, call: { ...meet, kind: "add_on" } },
+      null,
+      false,
+      "owner",
+    );
+    expect(other.callNote).toBe(COPY_CALL_NOTE);
+    // A call being made is one; a request Google failed made none, so there's nothing to not copy.
+    const making = { ...meet, join: null, state: "pending" as const };
+    expect(seedDuplicate({ ...event, call: making }, null, false, "owner").callNote).toBe(
+      COPY_CALL_NOTE,
+    );
+    const failed = { ...meet, join: null, state: "failed" as const };
+    expect(seedDuplicate({ ...event, call: failed }, null, false, "owner").callNote).toBeNull();
+    // Critique C2-L12 (C19 critique C2-H1): as Google holds it, formatting PM can edit or not, with
+    // no note; the editor decides how it shows.
+    for (const html of ["<b>Bring</b> the form", "<table><tr><td>Room</td></tr></table>"]) {
+      const formatted = seedDuplicate({ ...event, description: html }, null, false, "owner");
+      expect(formatted.fields.description).toBe(html);
+      expect(formatted.notes).toEqual([]);
+    }
+    expect(seedDuplicate({ ...event, attachments: ["a.pdf"] }, null, false, "owner").notes).toEqual(
+      [COPY_ATTACHMENTS_NOTE],
+    );
+  });
+
+  it("keeps an organised event's guests, all but the user, none of them the organiser", () => {
+    const room = guest("room@resource.calendar.google.com", { room: true, response: null });
+    const opt = guest("b@x.org", { optional: true, response: "declined" });
+    const copy = seedDuplicate({ ...event, guests: [ME, A, opt, room] }, null, false, "owner");
+    expect(copy.fields.guests).toEqual([
+      { ...A, response: null },
+      { ...opt, response: null },
+      room,
+    ]);
+    expect(copy.fields.guests.some((g) => g.organizer || g.self)).toBe(false);
+    expect(copy.notes).toEqual([]);
+    // Google cut the list short: only those PM saw.
+    const omitted = seedDuplicate(
+      { ...event, guests: [ME, A], guests_omitted: true },
+      null,
+      false,
+      "owner",
+    );
+    expect(omitted.notes).toEqual([COPY_OMITTED_NOTE]);
+    // What it sends: who and whether optional, nobody's reply.
+    expect(toNewEvent(copy.fields).guests).toEqual([
+      { email: "A@x.org", optional: false },
+      { email: "b@x.org", optional: true },
+      { email: "room@resource.calendar.google.com", optional: false },
+    ]);
+  });
+
+  // Critique C2-M7: "Don't send" stops the email, but the invitation may still land on their
+  // calendars, so an invitation's copy invites nobody until the user adds them.
+  it("an invitation's copy starts with no guests, and says so", () => {
+    const organiser = guest("o@y.org", { organizer: true });
+    const me = guest("me@x.org", { self: true });
+    const copy = seedDuplicate(
+      { ...event, organizer_self: false, organizer_email: "o@y.org", guests: [organiser, me, A] },
+      null,
+      false,
+      "owner",
+    );
+    expect(copy.fields.guests).toEqual([]);
+    expect(copy.notes).toEqual([COPY_GUESTS_NOTE]);
+    // Nobody but the user on it: nothing to say.
+    const alone = seedDuplicate(
+      { ...event, organizer_self: false, guests: [me] },
+      null,
+      false,
+      "owner",
+    );
+    expect(alone.notes).toEqual([]);
+  });
+
+  // Review round 1 of PR 1: Google's organizer.self means the calendar it's read from organises it.
+  // On a colleague's calendar shared to view, that's their meeting: its copy invites nobody either.
+  it("a copy from a calendar the user can't change starts with no guests, though it organises it", () => {
+    const ana = guest("ana@y.org", { self: true, organizer: true });
+    const theirs = { ...event, organizer_self: true, guests: [ana, A] };
+    for (const role of ["reader", "freeBusyReader", null]) {
+      const copy = seedDuplicate(theirs, null, false, role);
+      expect(copy.fields.guests, String(role)).toEqual([]);
+      expect(copy.notes, String(role)).toEqual([COPY_GUESTS_NOTE]);
+    }
+    for (const role of ["owner", "writer", "writerWithoutPrivateAccess"]) {
+      expect(seedDuplicate(theirs, null, false, role).fields.guests, role).toEqual([
+        { ...A, response: null },
+      ]);
+    }
+  });
+
+  // Critiques C1-M4, C2-M6: an occurrence's copy is a one-off at that occurrence's time.
+  it("an occurrence's copy doesn't repeat, at the occurrence's time, and says how the original does", () => {
+    const occurrence: EventForEdit = {
+      ...event,
+      time: timed("2026-10-19", "11:00", "2026-10-19", "12:00"),
+    };
+    const copy = seedDuplicate(occurrence, series(WEEKLY), true, "owner");
+    expect(copy.fields.recurrence).toEqual({ kind: "once" });
+    expect(copy.fields.time).toEqual(timed("2026-10-19", "11:00", "2026-10-19", "12:00"));
+    expect(copy.notes).toEqual([
+      "The original repeats (Weekly on Monday); the copy doesn't. Choose Repeat to set it.",
+    ]);
+    expect(copyRepeatNote("Weekly on Monday")).toBe(copy.notes[0]);
+    // A rule PM can only show, or a series it couldn't read: the same one-off.
+    expect(seedDuplicate(occurrence, series(null), true, "owner").fields.recurrence).toEqual({
+      kind: "once",
+    });
+    expect(seedDuplicate(occurrence, null, true, "owner").notes).toEqual([
+      "The original repeats; the copy doesn't. Choose Repeat to set it.",
+    ]);
+    // A series read, whatever the row said, is one.
+    expect(seedDuplicate(occurrence, series(WEEKLY), false, "owner").notes).toEqual([
+      copy.notes[0],
+    ]);
+    expect(seedDuplicate(occurrence, null, false, "owner").notes).toEqual([]);
+  });
+
+  it("toNewEvent of a copy has only a new event's keys", () => {
+    const copy = seedDuplicate(
+      { ...event, attachments: ["a.pdf"], label_id: "l1", call: null, guests: [ME, A] },
+      null,
+      false,
+      "owner",
+    );
+    expect(Object.keys(toNewEvent(copy.fields)).sort()).toEqual([
+      "colour",
+      "description",
+      "guests",
+      "location",
+      "meet",
+      "recurrence",
+      "reminders",
+      "show_as",
+      "summary",
+      "time",
+      "visibility",
+    ]);
+    expect(copyMilestoneNote("Launch")).toBe(
+      "The “Launch” milestone stays linked to the original.",
+    );
   });
 });

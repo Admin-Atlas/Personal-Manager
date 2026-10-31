@@ -215,6 +215,8 @@ export function againText(kind: ChoiceKind): string {
 
 const WARNING_ORDER: readonly SeriesWarning["warning"][] = [
   "repeat_day_changes",
+  // Where every occurrence goes (C18e), before what happens to them on the way.
+  "changes_calendar",
   "becomes_one_event",
   "start_moved",
   "changes_lost",
@@ -290,7 +292,8 @@ export function seriesWarningText(
       ];
       if (missing.length === 0) return "";
       const keeps = missing.length === 1 ? "keeps it" : "keeps them";
-      const call = w.conference ? " Add a call to it in Google Calendar if you need one." : "";
+      // PM adds a video call from Edit since C18.
+      const call = w.conference ? " Add a video call to it from Edit if you need one." : "";
       return `The new repeating event this makes won't have ${andList(missing)}. The earlier part ${keeps}.${call}`;
     }
     case "new_identity":
@@ -303,6 +306,9 @@ export function seriesWarningText(
         ? `${head} Google may treat that part as this one too.`
         : `${head} Google may delete that part too.`;
     }
+    case "changes_calendar":
+      // Another calendar takes the whole repeating event (C18e): only "All events" offers it.
+      return `Every occurrence goes to ${w.to}.`;
     default:
       return unreachable(w);
   }

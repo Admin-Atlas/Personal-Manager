@@ -29,10 +29,11 @@ import {
   listAllMilestones,
   onCalendarSynced,
   onCalendarWriteLanded,
+  requestCalendarAccess,
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
-import { copyRank, eventRights } from "../../lib/calendarEdit/editReasons";
+import { askOwnerFor, copyRank, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
 import { markDeclined, myReply, replyCopies } from "../../lib/calendarEdit/rsvp";
@@ -43,9 +44,16 @@ import {
   createReasonFor,
   createTargets,
   defaultTarget,
+  duplicateTarget,
+  guestsOnto,
   lengthFor,
 } from "../../lib/calendarEdit/createTargets";
-import { newEventSeed, type EditorFields } from "../../lib/calendarEdit/eventDraft";
+import {
+  copyMilestoneNote,
+  newEventSeed,
+  type EditorFields,
+  type EventCopy,
+} from "../../lib/calendarEdit/eventDraft";
 import { slotSeed } from "../../lib/calendarEdit/slotSeed";
 import {
   clampDayCount,
@@ -106,12 +114,17 @@ import {
 } from "../../theme";
 import { Callout, Skeleton, VisuallyHidden } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
-import { CalendarEventPopover, type PopoverEditing } from "./parts/CalendarEventPopover";
+import {
+  CalendarEventPopover,
+  type PopoverAsk,
+  type PopoverEditing,
+} from "./parts/CalendarEventPopover";
 import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
 import { EventEditor } from "./edit/EventEditor";
-import { NewEventEditor, type CreateHandover } from "./edit/NewEventEditor";
+import { NewEventEditor, type CopyOf, type CreateHandover } from "./edit/NewEventEditor";
+import { CopyOpening } from "./edit/CopyOpening";
 import { QuickCreatePopover, type LeftDraft } from "./edit/QuickCreatePopover";
 import { WriteNotices } from "./edit/WriteNotices";
 import { MoveFlow } from "./edit/MoveFlow";
@@ -507,7 +520,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // or quick create under "+ New event" (`anchor`, the button's rect), which More options turns into
   // the full editor carrying its draft (`handover`), and which opens again on a draft that went with
   // the tab (`resume`). From a click or drag on the grid (C17), quick create opens beside the slot
-  // (`beside`), and a dragged range is the user's own time (`timeTouched`). Null = closed.
+  // (`beside`), and a dragged range is the user's own time (`timeTouched`). A copy (Duplicate, C18c)
+  // opens the full editor on the original's fields, and says what it left out (`copy`; `from`: the
+  // original's row, whose chip takes focus back when the editor closes). Null = closed.
   const [creating, setCreating] = useState<{
     seed: EditorFields;
     calendarId: string;
@@ -517,7 +532,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     resume?: LeftDraft;
     beside?: boolean;
     timeTouched?: boolean;
+    copy?: CopyOf & { from: string };
   } | null>(null);
+  // The event being read from Google for a copy (Duplicate, C18c): null = none.
+  const [copying, setCopying] = useState<CalendarEvent | null>(null);
   // The open surface's way to bring its title into focus: "+ New event" again, or a click on the
   // ghost, focuses it, never replaces it.
   const focusCreateRef = useRef<(() => void) | null>(null);
@@ -883,8 +901,72 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     const cal = overview?.calendars.find((c) => c.id === ev.calendar_id);
     return overview?.accounts.find((a) => a.id === cal?.source_id)?.email ?? null;
   };
+  // Duplicate (C18c): whether `ev` can be copied, onto a calendar that can take a new event.
+  const canCopy = (ev: CalendarEvent) =>
+    duplicable(
+      ev,
+      overview?.calendars.find((c) => c.id === ev.calendar_id),
+    ) && (targets?.groups.length ?? 0) > 0;
+  // The original is read from Google afresh, then the full editor opens on its copy. With a new
+  // event already being made, that one takes focus instead, as "+ New event" does. Where focus is as
+  // it starts (the original's chip: the popover and the editor hand it back there first) is where
+  // it goes when the copy's editor closes (critique C2-M9).
+  const copyOpener = useRef<HTMLElement | null>(null);
+  const startCopy = (ev: CalendarEvent) => {
+    if (creating) {
+      focusCreateRef.current?.();
+      return;
+    }
+    const active = document.activeElement;
+    copyOpener.current = active instanceof HTMLElement && active !== document.body ? active : null;
+    setCopying(ev);
+  };
+  // Google's copy read: the full editor's create mode on it, on the original's calendar while that
+  // takes new events, else where a new event would go. The calendar's own address, which can't be a
+  // guest of an event it organises, comes off the copy's guests (critique C1-L9); picking another
+  // calendar after does the same. A linked milestone stays with the original, which the copy says.
+  const onCopyReady = (row: CalendarEvent, copy: EventCopy) => {
+    setCopying(null);
+    const target = targets ? duplicateTarget(targets, row.calendar_id, readLastCreate()) : null;
+    if (!overview || !targets || !target) {
+      if (overview && targets) {
+        writes.noteSeriesNotice(
+          createReasonFor(overview, targets) ?? "None of your calendars can take new events.",
+        );
+      }
+      return;
+    }
+    const linked = row.uid ? milestones.find((m) => m.event_uid === row.uid) : undefined;
+    setLanded(null);
+    setCreating({
+      seed: { ...copy.fields, guests: guestsOnto(copy.fields.guests, target) },
+      calendarId: target.calendar.id,
+      mode: "full",
+      anchor: null,
+      copy: {
+        title: copy.fields.summary,
+        notes: linked ? [...copy.notes, copyMilestoneNote(linked.label)] : copy.notes,
+        callNote: copy.callNote,
+        from: row.id,
+      },
+    });
+  };
+  // On a calendar shared with the user to view only, whom to ask for edit access (C20b): the email
+  // names PM's calendar id alone, and the backend decides whom it goes to and what it says.
+  const askFor = (ev: CalendarEvent): PopoverAsk | null => {
+    const owner = askOwnerFor(ev, overview);
+    const calendar = overview?.calendars.find((c) => c.id === ev.calendar_id);
+    if (!owner || !calendar) return null;
+    return {
+      ...owner,
+      own: accountOf(ev),
+      calendar: calendar.name,
+      onAsk: () => requestCalendarAccess(ev.calendar_id),
+    };
+  };
   const popoverEditing = (ev: CalendarEvent): PopoverEditing => ({
     ...rights(ev),
+    canDuplicate: canCopy(ev),
     onEdit: () => {
       setEventPopup(null);
       setEditing(ev);
@@ -892,6 +974,10 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     onDelete: () => {
       setEventPopup(null);
       deleteDialog.ask(ev);
+    },
+    onDuplicate: () => {
+      setEventPopup(null);
+      startCopy(ev);
     },
     // A reply from each copy of the occurrence the user can send one from (C14b), the copy the
     // dedup hid included: with both accounts shown, the organiser's copy is the one kept.
@@ -907,6 +993,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       forWhom,
       onReply: (reply, scope) => writes.respond(event.id, reply, null, scope),
     })),
+    ask: askFor(ev),
   });
   // The popover reads its row afresh from the list, so after a reply lands and the list reloads,
   // its guest list and its reply strip show what Google holds now. A row gone from the list keeps
@@ -981,6 +1068,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   );
   const capability = useCallback(
     (ev: CalendarEvent) =>
+      // `dragCapability` says a birthday's own line by the pointer (C20, `dragReason`).
       dragCapability(ev, {
         rights: rights(ev),
         pending: movingIds.has(ev.id),
@@ -1370,13 +1458,31 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               : null
           }
           colorOf={colorOf}
+          targets={targets}
+          overview={overview}
+          hidden={hidden}
+          shapeOf={shapeOf}
           onDelete={(row) => {
             // Close the editor first so its focus goes back to the event's chip, and the delete
             // dialog that opens next returns it there too.
             flushSync(() => setEditing(null));
             deleteDialog.ask(row);
           }}
+          canDuplicate={canCopy(editing)}
+          onDuplicate={(row) => {
+            // As Delete: the editor closes first, so focus is back on the chip for what opens next.
+            flushSync(() => setEditing(null));
+            startCopy(row);
+          }}
           onClose={() => setEditing(null)}
+        />
+      )}
+      {copying && (
+        <CopyOpening
+          row={copying}
+          role={overview?.calendars.find((c) => c.id === copying.calendar_id)?.access_role ?? null}
+          onReady={(copy) => onCopyReady(copying, copy)}
+          onClose={() => setCopying(null)}
         />
       )}
       {creating?.mode === "full" && overview && targets && (
@@ -1391,12 +1497,26 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           shapeOf={shapeOf}
           focusRef={focusCreateRef}
           handover={creating.handover}
+          copyOf={creating.copy}
           onClose={() => {
             // From quick create, the editor opened from its More options, which is gone: focus
-            // goes back to "+ New event", as quick create's own close would have sent it.
+            // goes back to "+ New event", as quick create's own close would have sent it. A copy's
+            // editor opened from the copying dialog, gone too: focus goes back to the original's
+            // chip, where the popover or the editor left it (critique C2-M9), or to its first
+            // piece on the grid when the list has drawn it again since.
             const fromQuick = creating.handover !== undefined;
+            const copied = creating.copy?.from ?? null;
+            const back = copyOpener.current;
+            copyOpener.current = null;
             setCreating(null);
             if (fromQuick) createButtonRef.current?.focus();
+            else if (copied !== null) {
+              // After the editor's own hand-back, which goes to the copying dialog's, now gone.
+              requestAnimationFrame(() => {
+                if (back?.isConnected) back.focus({ preventScroll: true });
+                else focusEvent(copied);
+              });
+            }
           }}
         />
       )}

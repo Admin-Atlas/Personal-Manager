@@ -24,6 +24,10 @@
 // So are notifications and colour (C13): the notifications go whole, compared in any order, and a
 // colour is the calendar's or one of Google's eleven. Both are the user's own, so a change to them
 // emails no guest.
+//
+// And the video call (C18): whether the event will have a Google Meet call after Save, sent as Add
+// or Remove; Google emails guests about it like any shared field. A new event sends whether it
+// asks for one (C18b).
 
 import type {
   ColourChoice,
@@ -42,6 +46,7 @@ import type {
   TimeDraft,
 } from "../types";
 import { resolveWallTime, wallInstant, wallTimeOf } from "../wallTime";
+import { sameDescription } from "./descriptionHtml";
 import { addressKey, changeNotice, isEmail } from "./guests";
 import { calendarDefaults, copyReminders, sameReminders, type KindSwitchNote } from "./reminders";
 import {
@@ -80,6 +85,8 @@ export interface EditorFields {
   /** Who is on it, the organiser and the user included, in Google's order then the order added. */
   guests: GuestDraft[];
   guest_perms: GuestPerms;
+  /** The event will have a Google Meet call after Save (C18). */
+  meet: boolean;
   /** The calendar's default notifications, or the event's own list (C13). */
   reminders: RemindersDraft;
   /** The calendar's colour, or one of Google's eleven (C13). */
@@ -94,14 +101,16 @@ export interface EditorFields {
 export type EditorField = Exclude<keyof EditorFields, "organizer_email">;
 
 /** Every field, in the order the editor shows them: guests after the time, as Google's quick
- *  create has them (INFERRED); notifications and colour under the location, as Google's event page
- *  has them (INFERRED). */
+ *  create has them (INFERRED); the video call after the guests, above the place, as Google's event
+ *  page puts its Meet button (INFERRED); notifications and colour under the location, as Google's
+ *  event page has them (INFERRED). */
 export const EDITOR_FIELDS: readonly EditorField[] = [
   "summary",
   "time",
   "recurrence",
   "guests",
   "guest_perms",
+  "meet",
   "location",
   "reminders",
   "colour",
@@ -124,7 +133,8 @@ const copyColour = (c: ColourChoice): ColourChoice =>
 /** The editor's starting fields: Google's copy as it is, and how it repeats (`repeatSeed`), which a
  *  one-off has none of. Its colour is its `colorId`, any Google holds (one PM doesn't know is shown
  *  as that and sent only if changed); a label's colour isn't PM's to set, so a label leaves the
- *  colour field as `colorId` has it, read-only (the backend's `LabelReadOnly`). */
+ *  colour field as `colorId` has it, read-only (the backend's `LabelReadOnly`). It has a Meet call
+ *  when Google holds one, made or still being made; a request Google failed is none (C18). */
 export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): EditorFields {
   return {
     summary: event.summary,
@@ -138,6 +148,7 @@ export function seedDraft(event: EventForEdit, repeat: RepeatValue = ONCE): Edit
       invite_others: event.guests_can_invite_others,
       see_others: event.guests_can_see_other_guests,
     },
+    meet: event.call?.kind === "meet" && event.call.state !== "failed",
     reminders: copyReminders(event.reminders),
     colour: event.color_id ? { kind: "colour", id: event.color_id } : { kind: "calendar" },
     show_as: event.show_as,
@@ -156,9 +167,9 @@ export function repeatSeed(series: SeriesInfo | null, repeating: boolean): Repea
   return repeating ? { kind: "kept", words: "Repeats" } : ONCE;
 }
 
-/** A textarea hands back `\n` whatever Google stored, so `\r\n` and `\n` are the same text: without
- *  this, opening an event whose description has Windows line endings and saving the title would send
- *  the description too. */
+/** A field hands back `\n` whatever Google stored, so `\r\n` and `\n` are the same text: without
+ *  this, opening an event whose location has Windows line endings and saving the title would send
+ *  the location too. The description's own comparison (`sameDescription`) starts the same way. */
 const sameText = (a: string, b: string) => a.replace(/\r\n?/g, "\n") === b.replace(/\r\n?/g, "\n");
 
 function sameTime(a: TimeDraft, b: TimeDraft): boolean {
@@ -197,8 +208,11 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
   switch (field) {
     case "summary":
     case "location":
-    case "description":
       return sameText(a[field], b[field]);
+    // By what it shows (C19): Google's `<html-blob>` wrapper, `<strong>` for `<b>`, or `<br>` for a
+    // line are no change, so an editor that only opened a formatted description never sends it.
+    case "description":
+      return sameDescription(a.description, b.description);
     case "time":
       return sameTime(a.time, b.time);
     case "recurrence":
@@ -215,6 +229,7 @@ export function sameField(field: EditorField, a: EditorFields, b: EditorFields):
         a.colour.kind === b.colour.kind &&
         (a.colour.kind !== "colour" || b.colour.kind !== "colour" || a.colour.id === b.colour.id)
       );
+    case "meet":
     case "show_as":
     case "visibility":
       return a[field] === b[field];
@@ -306,6 +321,10 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
       case "colour":
         changes.colour = copyColour(draft.colour);
         break;
+      // Add or Remove, never the call itself: the backend asks Google for a new one (C18).
+      case "meet":
+        changes.meet = draft.meet ? "add" : "remove";
+        break;
       case "show_as":
         changes.show_as = draft.show_as;
         break;
@@ -317,19 +336,31 @@ export function toChanges(base: EditorFields, draft: EditorFields): EventPatchDr
   return changes;
 }
 
+/** The save's changes, marked as the user's "Replace with plain text…" when they replaced a
+ *  description and the save sends one (C19). The mark reopens only a description whose formatting PM
+ *  can't edit (the backend's `replacing_formatting`), so it never goes without the description it is
+ *  about: a save of the title alone after a Replace that was then undone by hand carries none. */
+export function withReplace(changes: EventPatchDraft, replaced: boolean): EventPatchDraft {
+  return replaced && changes.description !== undefined
+    ? { ...changes, replace_formatting: true }
+    : changes;
+}
+
 /** Who saving `draft` over `base` would email, judged as the backend judges it (its
  *  `notify_required`, the same table in both tests): null when nobody. A change to only busy or
  *  free, notifications or colour is the user's own and emails nobody. `omitted`: Google cut the list
  *  short, so "at least". `me`: the account saving, never a guest even where Google's copy doesn't
- *  mark it. The backend has the last word; this only lets the editor ask before a round trip. */
+ *  mark it. `calendarChanged`: the same Save puts it on another calendar, which tells its guests too
+ *  (C18d). The backend has the last word; this only lets the editor ask before a round trip. */
 export function guestNotice(
   base: EditorFields,
   draft: EditorFields,
   omitted: boolean,
   me: string | null = null,
+  calendarChanged = false,
 ): GuestNotice | null {
   const shared = changedFields(base, draft).some((f) => !PERSONAL.includes(f));
-  return changeNotice(base.guests, draft.guests, shared, omitted, me);
+  return changeNotice(base.guests, draft.guests, shared, omitted, me, calendarChanged);
 }
 
 /** Whether the editor may change `field` (the permission names match the fields). How it repeats
@@ -746,6 +777,7 @@ export const NEW_EVENT_BASE: EditorFields = {
   recurrence: ONCE,
   guests: [],
   guest_perms: { ...GOOGLE_PERMS },
+  meet: false,
   reminders: calendarDefaults(),
   colour: CALENDAR_COLOUR,
   show_as: "busy",
@@ -761,6 +793,18 @@ export function newEventLength(d: EditorFields): number | null {
   const s = halfInstant(NEW_EVENT_BASE, t, "start");
   const e = halfInstant(NEW_EVENT_BASE, t, "end");
   return s !== null && e !== null && e - s >= 60_000 ? e - s : null;
+}
+
+/** The length to keep once another calendar is picked for a draft whose time the user has changed.
+ *  Theirs stays (`own`), and so does one on screen, whichever account it came from; a draft showing
+ *  none, all day or under a minute, takes the usual length of the account it's on now (`usual`). */
+export function lengthOnCalendar(
+  d: EditorFields,
+  own: boolean,
+  length: number,
+  usual: number,
+): number {
+  return own || newEventLength(d) !== null ? length : usual;
 }
 
 const hhmm = (minutes: number) =>
@@ -796,6 +840,9 @@ export function newEventSeed(
     recurrence: ONCE,
     guests: [],
     guest_perms: { ...GOOGLE_PERMS },
+    // No video call: with the account's setting on, Meet starts with the first guest (C18b,
+    // `meetDefault`), and a new event starts with none.
+    meet: false,
     reminders: calendarDefaults(),
     colour: { kind: "calendar" } as const,
     visibility: "default" as const,
@@ -920,7 +967,8 @@ export function followStart(was: EditorFields, next: EditorFields): EditorFields
  *  are who and whether optional, in the order added (never an organiser's or the calendar's own
  *  entry, which only Google writes), and each guest permission goes only where it isn't Google's
  *  own. Its notifications are null on the calendar's defaults, and its colour null on the
- *  calendar's: Google then gives it the calendar's own (INFERRED, E9). */
+ *  calendar's: Google then gives it the calendar's own (INFERRED, E9). Whether it asks for a Meet
+ *  call (C18b): the backend mints the request. */
 export function toNewEvent(draft: EditorFields): NewEventDraft {
   const sent: NewEventDraft = {
     summary: draft.summary,
@@ -936,6 +984,7 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
       .map((g) => ({ email: g.email, optional: g.optional })),
     reminders: draft.reminders.use_default ? null : copyReminders(draft.reminders),
     colour: draft.colour.kind === "calendar" ? null : copyColour(draft.colour),
+    meet: draft.meet,
   };
   const perms = draft.guest_perms;
   if (perms.modify !== GOOGLE_PERMS.modify) sent.guests_can_modify = perms.modify;
@@ -946,6 +995,83 @@ export function toNewEvent(draft: EditorFields): NewEventDraft {
     sent.guests_can_see_other_guests = perms.see_others;
   }
   return sent;
+}
+
+// --- duplicating an event (C18c) ---
+
+/** A copy of an event, as Duplicate opens it in the full editor's create mode. */
+export interface EventCopy {
+  /** The new event's fields: the original's, as Google's Duplicate copies them. The type is the
+   *  allow-list: nothing outside the editor's fields (PM's notes, a label, the ids) can reach the
+   *  create. */
+  fields: EditorFields;
+  /** What wasn't copied, said under the dialog's bar. */
+  notes: string[];
+  /** Said under the video-call row when the original had a call, which a copy never takes. */
+  callNote: string | null;
+}
+
+/** Google's own Duplicate makes no video call ("no video conferencing by default", Workspace admin
+ *  help 9898950): one click adds a new one. */
+export const COPY_CALL_NOTE = "The video call isn't copied. Add a new one if you need it.";
+/** `COPY_CALL_NOTE` on a calendar that offers no Meet: there's nothing to add. */
+export const COPY_CALL_OFF_NOTE = "The video call isn't copied.";
+export const COPY_ATTACHMENTS_NOTE = "Attachments aren't copied: PM can't add attachments yet.";
+export const COPY_GUESTS_NOTE =
+  "The original's guests aren't copied. Add them if this is a meeting.";
+export const COPY_OMITTED_NOTE =
+  "Google didn't send the whole guest list, so the copy has only the guests PM could see.";
+
+/** Said of a copy of an occurrence, which starts as a one-off: `repeats` is how the original
+ *  repeats in Google Calendar's words, null when PM couldn't read it. */
+export const copyRepeatNote = (repeats: string | null): string =>
+  `The original repeats${repeats ? ` (${repeats})` : ""}; the copy doesn't. Choose Repeat to set it.`;
+
+/** Said when the original has a linked milestone, which stays with it (C18 critique C2-M5). */
+export const copyMilestoneNote = (label: string): string =>
+  `The “${label}” milestone stays linked to the original.`;
+
+/** The calendar roles that may add and change events: the backend's `create_block` refuses every
+ *  other. */
+export const WRITABLE_ROLES: readonly string[] = ["owner", "writer", "writerWithoutPrivateAccess"];
+
+/** A new event's fields copied from `event` (Google's fresh copy of the row the user chose) and, for
+ *  an occurrence, its repeating event's `series` (`repeating`: the row is one, though PM may not
+ *  have read its series), as Google's Duplicate makes a copy. The title, time, place, description
+ *  (unchanged, formatted or not, with no note: C18 critique C2-L12, C19 critique C2-H1), busy or
+ *  free, visibility, notifications, colour and guest permissions are the original's. A copy of an
+ *  event the user organises keeps its guests, all but the user's own entry, none of them the
+ *  organiser, with no replies; a copy of an invitation starts with none, since "Don't send" may
+ *  still put it on their calendars (C18 critique C2-M7, probe L-CP5). Google's `organizer_self`
+ *  means the calendar it's read from organises it, so it's the user's own only where `role`, that
+ *  calendar's access role, lets them change its events: on a colleague's calendar shared to view, it
+ *  is the colleague's meeting, and its copy starts with none too. An occurrence's copy starts as a
+ *  one-off at that occurrence's time (critiques C1-M4, C2-M6: a copied rule's count would start
+ *  again, and a moved occurrence's copy would jump to the rule's day; probe L-CP3). Never a video
+ *  call, never attachments; the note that the call isn't copied is for a call Google made or is
+ *  making, never a request it failed, which made none. */
+export function seedDuplicate(
+  event: EventForEdit,
+  series: SeriesInfo | null,
+  repeating: boolean,
+  role: string | null,
+): EventCopy {
+  const notes: string[] = [];
+  const others = event.guests.filter((g) => !g.self);
+  let guests: GuestDraft[] = [];
+  if (!event.organizer_self || role === null || !WRITABLE_ROLES.includes(role)) {
+    if (others.length > 0) notes.push(COPY_GUESTS_NOTE);
+  } else {
+    guests = others.map((g) => ({ ...g, organizer: false, response: null }));
+    if (event.guests_omitted) notes.push(COPY_OMITTED_NOTE);
+  }
+  if (repeating || series !== null) notes.push(copyRepeatNote(series?.repeats ?? null));
+  if (event.attachments.length > 0) notes.push(COPY_ATTACHMENTS_NOTE);
+  return {
+    fields: { ...seedDraft(event), guests, meet: false, organizer_email: null },
+    notes,
+    callNote: event.call !== null && event.call.state !== "failed" ? COPY_CALL_NOTE : null,
+  };
 }
 
 function setField(target: EditorFields, field: EditorField, from: EditorFields) {
@@ -967,6 +1093,9 @@ function setField(target: EditorFields, field: EditorField, from: EditorFields) 
       break;
     case "colour":
       target.colour = copyColour(from.colour);
+      break;
+    case "meet":
+      target.meet = from.meet;
       break;
     case "show_as":
       target.show_as = from.show_as;

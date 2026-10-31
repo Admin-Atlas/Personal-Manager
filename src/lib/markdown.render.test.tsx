@@ -13,6 +13,8 @@
 
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
+import { parseDescription } from "./calendarEdit/descriptionHtml";
+import { tokens } from "./calendarEdit/descriptionTokens";
 import { Markdown } from "./markdown";
 
 afterEach(cleanup);
@@ -143,6 +145,164 @@ describe("plain typed lines (an event's description)", () => {
     expect(container.querySelector("p")?.textContent).toBe("Meeting ID: 1\nPasscode: 2");
     const equals = render(<Markdown plainLines>{"Notes\n===\nbody"}</Markdown>).container;
     expect(equals.querySelector("h1, h2")).toBeNull();
+  });
+
+  // A plain-text Google event takes this path (parseDescription's `markup`, C19 review 2).
+  it("keeps words in angle brackets that are no tag", () => {
+    for (const [line, words] of [
+      ["See <www.example.com> for details", "www.example.com"],
+      ["Dial in: <Room 4>", "<Room 4>"],
+      ["Contact <first.last> please", "<first.last>"],
+    ]) {
+      const { container } = render(<Markdown plainLines>{line}</Markdown>);
+      expect(container.textContent).toContain(words);
+    }
+  });
+
+  // Review round 3 of PR 1: the description's reader calls a name it doesn't know an element only
+  // where this drops the tag too, so the flip to the formatted view loses no words. The two readers
+  // are held to each other, for what each is.
+  const asWords = (line: string) => tokens(line).some((token) => token.kind === "literal");
+  it.each([
+    ["Ask <José> about it", "José"],
+    ["Meet at <Building A, Room B> today", "Building A, Room B"],
+    ["<Ask Bob!> first", "Ask Bob!"],
+    ['Meet <Room "A">', 'Room "A"'],
+    ["Contact <John Smith, PM> please", "John Smith, PM"],
+    ["Ask <John O'Brien> today", "John O'Brien"],
+    ["Dial in: <Room A, B>", "Room A, B"],
+    ["See <Room A/B>", "Room A/B"],
+    ["see <your name here?>", "your name here?"],
+    ["Call <Ann Lee, Bob Ray> now", "Ann Lee, Bob Ray"],
+    ["x <Room / > y", "Room / "],
+    ['x <Room a="b"c> y', 'Room a="b"c'],
+    ["x <Room a=b`c> y", "Room a=b"],
+    ["x <Room a=> y", "Room a="],
+    ["x <Room =x> y", "Room =x"],
+    ["x </José> y", "José"],
+    ["x </Room 4> y", "Room 4"],
+    ["x </first.last> y", "first.last"],
+    ["x <first.last> y", "first.last"],
+    ["x </Room A> y", "Room A"],
+    // Words after a name that opens a block of HTML, anywhere but a line's start.
+    ["x <Option 2> y", "Option 2"],
+    ["<Option/B> Thursday", "Option/B"],
+    ["<Option, B> Thursday", "Option, B"],
+  ])("shows what the description's reader calls words: %j", (line, words) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent).toContain(words);
+    expect(asWords(line)).toBe(true);
+    expect(parseDescription(line).markup).toBe(false);
+  });
+
+  // Review round 5 of PR 1: a comment or declaration alone on its lines is hidden by both readers, so
+  // nothing is at risk and the rest keeps Markdown's reading.
+  it.each([
+    ["Team lunch\n\n<!-- booking 42 -->", "Team lunch", "booking"],
+    ["Agenda\n<!-- internal note -->\nNext steps", "Next steps", "internal"],
+    ["<!-- a\nnote -->\nHello", "Hello", "note"],
+    ["   <!-- note -->\nHello", "Hello", "note"],
+    ["    <!-- note -->\nHello", "Hello", "note"],
+    ["- <!-- note -->\nHello", "Hello", "note"],
+    ["> <!-- note -->\nHello", "Hello", "note"],
+    ['<?xml version="1.0"?>\nHello', "Hello", "xml"],
+    ["<!DOCTYPE note>\nHello", "Hello", "note"],
+    ["<![CDATA[ note ]]>\nHello", "Hello", "note"],
+  ])("keeps Markdown for what both readers hide: %j", (line, words, hidden) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent).toContain(words);
+    expect(container.textContent).not.toContain(hidden);
+    expect(parseDescription(line).markup).toBe(false);
+  });
+
+  it("a comment alone on a line leaves the rest to Markdown's reading", () => {
+    const line = "Agenda:\n- one\n- **two**\n<!-- c -->";
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.querySelector("li strong")?.textContent).toBe("two");
+    expect(parseDescription(line).markup).toBe(false);
+  });
+
+  // Review round 4 of PR 1: a line Markdown reads as a block of HTML goes whole, so the formatted view
+  // draws the description, whose words these hold.
+  it.each([
+    // Where a browser ends it and Markdown reads on, or words follow on its last line (round 5).
+    ["<!-- a --!> Thursday -->", "Thursday"],
+    ["<!-- a --!>\nThursday\n-->", "Thursday"],
+    ["<? a > Thursday ?>", "Thursday"],
+    ["<![CDATA[ a > Thursday ]]>", "Thursday"],
+    ["<? a >\nThursday ?>", "Thursday"],
+    ["<![CDATA[ a >\nThursday ]]>", "Thursday"],
+    ["<!-- a\nb --> Thursday", "Thursday"],
+    // A list ends the comment for Markdown, and the block that opens then takes the next line.
+    ["- <!-- a\n<Option 2> -->\nThursday", "Thursday"],
+    ["<Option 2> Thursday 3pm\nOption 3 Friday", "Thursday 3pm"],
+    ["<Form A, B> please sign\nby Friday", "please sign"],
+    ["<Details A, B> Thursday", "Thursday"],
+    ["<Center 4> Thursday", "Thursday"],
+    ["<Menu 4> Thursday", "Thursday"],
+    ["<Summary 1> Thursday", "Thursday"],
+    ["<textarea 1> Thursday", "Thursday"],
+    ["</Option 2> Thursday", "Thursday"],
+    ["Options:\n<Option 2> Thursday", "Thursday"],
+    ["   <Option 2> Thursday", "Thursday"],
+    ["    <Option 2> Thursday", "Thursday"],
+    ["\t<Option 2> Thursday", "Thursday"],
+    ["- <Option 2> Thursday", "Thursday"],
+    ["1. <Option 2> Thursday", "Thursday"],
+    ["> <Option 2> Thursday", "Thursday"],
+    // With no ">" it's no tag to the reader either: plain lines, that Markdown still drops.
+    ["<Option 2 Thursday", "Thursday"],
+    ["<p is a letter", "is a letter"],
+    ["<!-- note --> Thursday", "Thursday"],
+    ["<? note ?> Thursday", "Thursday"],
+    ["<!DOCTYPE note> Thursday", "Thursday"],
+    ["<![CDATA[ note ]]> Thursday", "Thursday"],
+  ])("draws through the formatted view what Markdown drops: %j", (line, words) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent).not.toContain(words);
+    const parsed = parseDescription(line);
+    expect(parsed.markup).toBe(true);
+    expect(JSON.stringify(parsed.doc)).toContain(words);
+  });
+
+  // Every element's name, whichever list it's on: whatever Markdown drops with its line, whatever the
+  // renderer's next version drops, the reader flips for.
+  it.each(
+    (
+      "a abbr acronym address applet area article aside audio b base basefont bdi bdo bgsound big " +
+      "blink blockquote body br button canvas caption center cite code col colgroup command data " +
+      "datalist dd del details dfn dialog dir div dl dt em embed fieldset figcaption figure font " +
+      "footer form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html i iframe image img " +
+      "input ins isindex kbd keygen label legend li link listing main map mark marquee math menu " +
+      "menuitem meta meter multicol nav nextid nobr noembed noframes noscript object ol optgroup " +
+      "option output p param picture plaintext pre progress q rb rp rt rtc ruby s samp script " +
+      "search section select slot small source spacer span strike strong style sub summary sup svg " +
+      "table tbody td template textarea tfoot th thead time title tr track tt u ul var video wbr " +
+      "xmp"
+    ).split(" "),
+  )("the description's reader flips for a line Markdown drops: <%s 4>", (name) => {
+    const line = `<${name} 4> Thursday`;
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    if (!container.textContent?.includes("Thursday")) {
+      expect(parseDescription(line).markup).toBe(true);
+    }
+  });
+
+  it.each([
+    "x <Room> y",
+    "x <Room A> y",
+    "x <Room/> y",
+    "x <Room A /> y",
+    "x <Room _a> y",
+    "x <Room :a.b-1> y",
+    'x <Room a="b>c"> y',
+    "x <Room a='b' c = d e> y",
+    "x </Room> y",
+    "x </Room > y",
+  ])("drops what the description's reader calls an element: %j", (line) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent?.trim()).toBe("x  y");
+    expect(asWords(line)).toBe(false);
   });
 
   it("keeps an indented line as text", () => {

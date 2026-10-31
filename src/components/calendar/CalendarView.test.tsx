@@ -20,12 +20,15 @@ import type {
   CalendarOverview,
   EditLoad,
   EventForEdit,
+  GuestForEdit,
   GuestNotice,
   Milestone,
+  NewEventDraft,
   WriteOutcome,
 } from "../../lib/types";
 import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-layout";
 import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
+import { COPY_CALL_OFF_NOTE } from "../../lib/calendarEdit/eventDraft";
 import { formatDateLocal, pad2 } from "../../lib/format";
 
 const ipc = vi.hoisted(() => ({
@@ -51,6 +54,7 @@ const ipc = vi.hoisted(() => ({
   getSeriesSummary: vi.fn(),
   eventFlags: vi.fn(),
   openUrl: vi.fn(),
+  requestCalendarAccess: vi.fn(),
   recurrencePresets: vi.fn(),
   describeRecurrence: vi.fn(),
 }));
@@ -139,6 +143,8 @@ const overview: CalendarOverview = {
   mirror_end: "2040-01-01T00:00:00Z",
   editing: { [ME]: "on" },
   default_length: {},
+  auto_meet: {},
+  ask_access: {},
 };
 
 const today = dayKey(startOfDay(new Date()));
@@ -531,7 +537,6 @@ describe("CalendarView: guests", () => {
       summary: "Standup",
       location: "",
       description: "",
-      description_html: false,
       time: {
         kind: "timed",
         start_date: today,
@@ -558,6 +563,8 @@ describe("CalendarView: guests", () => {
       label_id: null,
       reply: null,
       organizer_self: true,
+      call: null,
+      meet_offered: false,
     };
     const load: EditLoad = {
       outcome: "ready",
@@ -574,8 +581,11 @@ describe("CalendarView: guests", () => {
         guests: true,
         reminders: true,
         colour: true,
+        meet: false,
+        calendar: true,
         delete: true,
         respond: false,
+        one_day: false,
         reasons: [],
       },
       seen: null,
@@ -706,7 +716,7 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your reply, notifications, colour and busy or free are yours to change.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar. Your reply, notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
     expect(screen.getByRole("group", { name: "Going?" })).toBeTruthy();
@@ -739,7 +749,7 @@ describe("CalendarView: invitations", () => {
     fireEvent.click(chip());
     expect(
       screen.getByText(
-        "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests. Your notifications, colour and busy or free are yours to change.",
+        "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar. Your notifications, colour and busy or free are yours to change.",
       ),
     ).toBeTruthy();
   });
@@ -754,7 +764,9 @@ describe("CalendarView: invitations", () => {
     const groups = screen.getAllByRole("group", { name: /^Going\?/ });
     expect(groups[0]).toBe(screen.getByRole("group", { name: "Going? Replying for Work." }));
     expect(
-      screen.getByText("Google has locked this event's title, time, place and description."),
+      screen.getByText(
+        "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.",
+      ),
     ).toBeTruthy();
     // An invitation still wins over a copy that can't be changed at all.
     cleanup();
@@ -940,5 +952,256 @@ describe("CalendarView: invitations", () => {
         "Your reply to “Standup”: Google is busy right now. Reply again in a moment.",
       ),
     ).toBeTruthy();
+  });
+});
+
+// Duplicate (#884, C18c): from the details, the original is read from Google afresh and the full
+// editor opens on its copy; closing it puts focus back on the original's chip.
+describe("CalendarView: Duplicate", () => {
+  const chip = () => screen.getByRole("button", { name: /Standup/ });
+  const original: EventForEdit = {
+    summary: "Standup",
+    location: "Room 2",
+    description: "",
+    time: {
+      kind: "timed",
+      start_date: today,
+      start_time: "07:00",
+      start_zone: "Europe/London",
+      end_date: today,
+      end_time: "07:30",
+      end_zone: "Europe/London",
+    },
+    start_at: `${today}T06:00:00Z`,
+    end_at: `${today}T06:30:00Z`,
+    show_as: "busy",
+    visibility: "default",
+    attachments: [],
+    html_link: null,
+    guests: [],
+    guests_can_modify: false,
+    guests_can_invite_others: true,
+    guests_can_see_other_guests: true,
+    guests_omitted: false,
+    organizer_email: "me@x.com",
+    reminders: { use_default: true, overrides: [] },
+    color_id: null,
+    label_id: null,
+    reply: null,
+    organizer_self: true,
+    call: { kind: "meet", name: "Google Meet", join: "https://meet.google.com/x", state: "ready" },
+    meet_offered: true,
+  };
+  const load: EditLoad = {
+    outcome: "ready",
+    session: "s1",
+    event: original,
+    permissions: {
+      summary: true,
+      time: true,
+      repeat: true,
+      location: true,
+      description: true,
+      show_as: true,
+      visibility: true,
+      guests: true,
+      reminders: true,
+      colour: true,
+      meet: true,
+      calendar: true,
+      delete: true,
+      respond: false,
+      one_day: false,
+      reasons: [],
+    },
+    seen: null,
+    series: null,
+  };
+
+  it("opens the full editor on a copy, which says what it leaves out, and focus goes back to the original", async () => {
+    // The original has a linked milestone, which stays with it.
+    ipc.listAllMilestones.mockResolvedValue([{ ...milestone, event_uid: "u1" }]);
+    ipc.getCalendarEventForEdit.mockResolvedValue(load);
+    await mount();
+    // A click focuses the chip, as the app's webviews do; the details hand focus back to it.
+    act(() => chip().focus());
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate" }));
+    const editor = await screen.findByRole("dialog", { name: "New event" });
+    expect(ipc.getCalendarEventForEdit).toHaveBeenCalledOnce();
+    expect(within(editor).getByText("A copy of “Standup”.")).toBeTruthy();
+    expect(
+      within(editor).getByText("The “Plant bulbs” milestone stays linked to the original."),
+    ).toBeTruthy();
+    // Personal offers no Meet here, so the note asks for no new call (review round 1 of PR 1).
+    expect(within(editor).getByText(COPY_CALL_OFF_NOTE)).toBeTruthy();
+    expect(within(editor).getByLabelText<HTMLInputElement>("Title").value).toBe("Standup");
+    // On the original's calendar, which takes new events.
+    expect(within(editor).getByRole("button", { name: "Calendar: Personal" })).toBeTruthy();
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "New event" })).toBeNull();
+    expect(ipc.createCalendarEvent).not.toHaveBeenCalled();
+    // Critique C2-M9: the copy's editor opened from the copying dialog, which is gone.
+    await waitFor(() => expect(document.activeElement).toBe(chip()));
+  });
+
+  it("is offered on a calendar that's only read, onto one that takes new events", async () => {
+    rows = [row({ calendar_id: `${ME}:holidays` })];
+    const withHolidays: CalendarOverview = {
+      ...overview,
+      calendars: [
+        ...overview.calendars,
+        calendar("holidays", { name: "Holidays", access_role: "reader" }),
+      ],
+    };
+    ipc.calendarOverview.mockResolvedValue(withHolidays);
+    ipc.getCalendarEventForEdit.mockResolvedValue(load);
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate" }));
+    const editor = await screen.findByRole("dialog", { name: "New event" });
+    // A reader calendar takes no new event: the copy starts where a new one would.
+    expect(within(editor).getByRole("button", { name: "Calendar: Personal" })).toBeTruthy();
+  });
+
+  it("isn't offered without a calendar to put the copy on", async () => {
+    ipc.calendarOverview.mockResolvedValue({ ...overview, editing: { [ME]: "off" } });
+    await mount();
+    fireEvent.click(chip());
+    await screen.findByRole("dialog");
+    expect(screen.queryByRole("button", { name: "Duplicate" })).toBeNull();
+  });
+
+  // Critique C1-L9, review round 1 of PR 1: a copy that starts on a calendar other than the
+  // original's (its account has editing off) never invites that calendar to its own event: the
+  // calendar organises it.
+  it("a copy started on another account's calendar leaves that calendar off its guests", async () => {
+    const OTHER = "gcal:other@x.com";
+    const theirs: CalendarOverview = {
+      ...overview,
+      accounts: [...overview.accounts, { ...account, id: OTHER, email: "other@x.com" }],
+      calendars: [
+        ...overview.calendars,
+        {
+          ...calendar("other@x.com", { name: "Other", is_primary: true }),
+          id: `${OTHER}:other@x.com`,
+          source_id: OTHER,
+        },
+      ],
+      editing: { [ME]: "off", [OTHER]: "on" },
+    };
+    const guest = { name: null, response: null, optional: false, room: false };
+    const guests: GuestForEdit[] = [
+      { ...guest, email: "me@x.com", organizer: true, self: true },
+      { ...guest, email: "other@x.com", organizer: false, self: false },
+      { ...guest, email: "b@x.org", organizer: false, self: false },
+    ];
+    ipc.calendarOverview.mockResolvedValue(theirs);
+    ipc.getCalendarEventForEdit.mockResolvedValue({ ...load, event: { ...original, guests } });
+    ipc.createCalendarEvent.mockResolvedValue({ outcome: "saved", warnings: [] });
+    await mount();
+    fireEvent.click(chip());
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate" }));
+    const editor = await screen.findByRole("dialog", { name: "New event" });
+    expect(within(editor).getByRole("button", { name: "Calendar: Other" })).toBeTruthy();
+    fireEvent.click(within(editor).getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send invitation emails to guests?" });
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(ipc.createCalendarEvent).toHaveBeenCalled());
+    const [on, sent] = ipc.createCalendarEvent.mock.calls[0] as [string, NewEventDraft];
+    expect(on).toBe(`${OTHER}:other@x.com`);
+    expect(sent.guests).toEqual([{ email: "b@x.org", optional: false }]);
+  });
+});
+
+// Asking for edit access (#884, C20b): the details of an event on a calendar shared with the user to
+// view only offer to ask its owner, whom the overview names; the email is the backend's, from PM's
+// calendar id alone.
+describe("CalendarView: asking a calendar's owner for edit access", () => {
+  const SHARED = `${ME}:team@group.calendar.google.com`;
+  const shared: CalendarOverview = {
+    ...overview,
+    calendars: [
+      ...overview.calendars,
+      calendar("team@group.calendar.google.com", { name: "Team", access_role: "reader" }),
+    ],
+    ask_access: { [SHARED]: { owner: "boss@x.org", connected: false } },
+  };
+  const chip = () => screen.getByRole("button", { name: /Standup/ });
+
+  it("the popover of an event on a view-only calendar asks its owner", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue(shared);
+    ipc.requestCalendarAccess.mockResolvedValue({ outcome: "opened", owner: "boss@x.org" });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(
+      within(dialog).getByText(
+        /^This calendar is shared with you to view only, so its events can't be changed here\./,
+      ),
+    ).toBeTruthy();
+    await act(async () =>
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Ask boss@x.org for edit access" }),
+      ),
+    );
+    // The calendar's id, and nothing the webview could make up: no address, no link.
+    expect(ipc.requestCalendarAccess).toHaveBeenCalledExactlyOnceWith(SHARED);
+    expect(within(dialog).getByRole("status").textContent).toBe(
+      "PM asked your system to open an email to boss@x.org in your mail app. If nothing opened, write to boss@x.org and ask for “Make changes and see event details”.",
+    );
+  });
+
+  it("no mail app names the calendar the event is on", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue(shared);
+    ipc.requestCalendarAccess.mockResolvedValue({ outcome: "no_mail_app", owner: "boss@x.org" });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    await act(async () =>
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Ask boss@x.org for edit access" }),
+      ),
+    );
+    expect(within(dialog).getByRole("status").textContent).toBe(
+      "PM couldn't open your mail app. Write to boss@x.org and ask for “Make changes and see event details” on “Team”.",
+    );
+  });
+
+  it("a connected owner gets how to share it from there, with this account's address", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue({
+      ...shared,
+      ask_access: { [SHARED]: { owner: "boss@x.org", connected: true } },
+    });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
+    expect(dialog.textContent).toContain(
+      "boss@x.org is connected to PM too: open Google Calendar as boss@x.org and share this calendar with me@x.com, choosing “Make changes and see event details”.",
+    );
+  });
+
+  it("offers nothing on a calendar the overview names no owner for", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue({ ...shared, ask_access: {} });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
+    expect(within(dialog).queryAllByRole("status")).toHaveLength(0);
+  });
+
+  it("offers nothing on a calendar the overview doesn't list", async () => {
+    rows = [row({ calendar_id: SHARED, edit_block: "calendar_read_only", can_delete: false })];
+    ipc.calendarOverview.mockResolvedValue({ ...shared, calendars: overview.calendars });
+    await mount();
+    fireEvent.click(chip());
+    const dialog = await screen.findByRole("dialog", { name: "Standup" });
+    expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
   });
 });

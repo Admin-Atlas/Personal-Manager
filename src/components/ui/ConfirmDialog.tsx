@@ -35,6 +35,8 @@ export interface ConfirmDialogProps {
   /** "cancel": focus starts on the cancel button, so Enter on open goes back rather than confirming
    *  (and never lands on a choice in the body). Without it, the first control takes focus. */
   initialFocus?: "cancel";
+  /** Registry id for help mode, on the dialog element (`Modal`'s `helpId`). */
+  helpId?: string;
   onConfirm: () => void;
   onClose: () => void;
 }
@@ -49,12 +51,14 @@ export function ConfirmDialog({
   busy,
   confirmDisabled,
   initialFocus,
+  helpId,
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
   return (
     <Dialog
       open={open}
+      helpId={helpId}
       onClose={busy ? () => {} : onClose}
       title={title}
       widthClassName="max-w-md"

@@ -61,6 +61,9 @@ interface Props {
   day?: string;
   /** The address Google sends guests' emails from (the account), for a row that would email them. */
   from?: string | null;
+  /** A delete's own sentence beside what Undo can do: a birthday's, that Google Contacts keeps it
+   *  (C20). */
+  deleteNote?: string | null;
   /** The row picked, and Send or Don't send when the row would email guests (null when it wouldn't:
    *  nothing was asked). */
   onChoose: (picked: Picked, notify: Notify | null) => void;
@@ -78,6 +81,7 @@ export function SaveChoicesDialog({
   calendarName,
   day,
   from = null,
+  deleteNote = null,
   onChoose,
   onSettle,
   onClose,
@@ -146,6 +150,7 @@ export function SaveChoicesDialog({
       onClose={onClose}
       title={kind === "save" ? "Edit repeating event" : "Delete repeating event"}
       tone={kind === "delete" ? "danger" : "default"}
+      helpId="calendar-choices"
       widthClassName="max-w-md"
       footer={
         <>
@@ -249,6 +254,7 @@ export function SaveChoicesDialog({
       {kind === "delete" && (
         <p className="mt-3 text-xs text-ink4">
           You can undo it for a few seconds. If you quit PM in that time, nothing is deleted.
+          {deleteNote && ` ${deleteNote}`}
         </p>
       )}
     </Dialog>

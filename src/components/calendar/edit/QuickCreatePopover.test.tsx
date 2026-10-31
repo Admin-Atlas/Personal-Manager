@@ -123,6 +123,8 @@ const overview: CalendarOverview = {
   editing: { [ME]: "on", [WORK]: "on" },
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
+  auto_meet: {},
+  ask_access: {},
 };
 
 const seed: EditorFields = {
@@ -141,6 +143,7 @@ const seed: EditorFields = {
   recurrence: { kind: "once" },
   guests: [],
   guest_perms: { modify: false, invite_others: true, see_others: true },
+  meet: false,
   reminders: { use_default: true, overrides: [] },
   colour: { kind: "calendar" },
   show_as: "busy",
@@ -164,6 +167,7 @@ const sentFor = (summary: string) => ({
     guests: [],
     reminders: null,
     colour: null,
+    meet: false,
   } as NewEventDraft,
 });
 
@@ -254,8 +258,10 @@ function open(
     anchor?: DOMRect;
     placement?: "below" | "beside";
     timeTouched?: boolean;
+    overview?: CalendarOverview;
   } = {},
 ) {
+  const shown = over.overview ?? overview;
   const onClose = vi.fn();
   const onMore = vi.fn();
   const onDraft = vi.fn();
@@ -290,9 +296,9 @@ function open(
         placement={over.placement}
         timeTouched={over.timeTouched}
         seed={seed}
-        targets={createTargets(overview)}
+        targets={createTargets(shown)}
         calendarId={over.calendarId ?? PERSONAL}
-        overview={overview}
+        overview={shown}
         hidden={new Set()}
         colorOf={() => "var(--accent)"}
         shapeOf={() => undefined}
@@ -332,6 +338,12 @@ function zOf(el: Element | null): number {
 }
 
 describe("QuickCreatePopover", () => {
+  // Help mode (C20b §11): the quick box explains a new event, not the grid around it.
+  it("carries the new event's help", () => {
+    open();
+    expect(box().getAttribute("data-help")).toBe("calendar-new-event");
+  });
+
   it("Enter in the title creates with no notify and closes on saved", async () => {
     createEvent.mockResolvedValue(saved);
     const { onClose, header } = open();
@@ -341,13 +353,14 @@ describe("QuickCreatePopover", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
     // The calendar, every field of the draft, and no token or answer: no repeat, and no guests, so
     // no one to notify (C12d: the guest list goes, empty); the calendar's notifications and colour,
-    // as null (C13: quick create has neither row).
+    // as null (C13: quick create has neither row); no video call asked for (C18b).
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
       "colour",
       "description",
       "guests",
       "location",
+      "meet",
       "recurrence",
       "reminders",
       "show_as",
@@ -393,6 +406,8 @@ describe("QuickCreatePopover", () => {
       unproven: null,
       showAsTouched: false,
       timeTouched: true,
+      meetTouched: false,
+      length: null,
       badDate: null,
       openCustom: false,
     });
@@ -591,6 +606,108 @@ describe("QuickCreatePopover", () => {
       start_time: "14:00",
       end_time: "14:30",
     });
+  });
+
+  // Review round 3 of PR 1: what the event's length is, when all day hides it, here and on the way
+  // to the full editor and back from another tab.
+  const pickWork = () => {
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Work" }), { detail: 1 });
+  };
+  const allDayToggle = () => fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+  const handedLength = (onMore: ReturnType<typeof vi.fn>) => {
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    return onMore.mock.lastCall![0];
+  };
+
+  it("a dragged range ticked all day hands over its length", () => {
+    const { onMore } = open({ placement: "beside", timeTouched: true });
+    allDayToggle();
+    expect(handedLength(onMore)).toMatchObject({
+      timeTouched: true,
+      length: 3_600_000,
+      draft: { time: { kind: "all_day" } },
+    });
+  });
+
+  it("a slot clicked and ticked all day hands over no length of its own", () => {
+    const { onMore } = open({ placement: "beside" });
+    allDayToggle();
+    expect(handedLength(onMore)).toMatchObject({ timeTouched: true, length: null });
+  });
+
+  it("an end the user changed is handed over as theirs", () => {
+    const { onMore } = open();
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "10:30" } });
+    allDayToggle();
+    expect(handedLength(onMore).length).toBe(90 * 60_000);
+  });
+
+  it("a start the user moved, its length still the account's, hands over no length of its own", () => {
+    const { onMore } = open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
+    expect(handedLength(onMore).length).toBeNull();
+  });
+
+  it("all day on another calendar and back takes that account's length", () => {
+    const { onDraft } = open();
+    allDayToggle();
+    pickWork();
+    allDayToggle();
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({
+      start_time: "09:00",
+      end_time: "09:30",
+    });
+  });
+
+  it("a dragged range, all day on another calendar and back, keeps its own", () => {
+    const { onDraft } = open({ placement: "beside", timeTouched: true });
+    allDayToggle();
+    pickWork();
+    allDayToggle();
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({ end_time: "10:00" });
+  });
+
+  it("a length on screen stays through another calendar, then all day and back", () => {
+    const { onDraft } = open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
+    pickWork();
+    allDayToggle();
+    allDayToggle();
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({
+      start_time: "09:00",
+      end_time: "10:00",
+    });
+  });
+
+  it("a draft back from the tab, all day, keeps its length or takes its calendar's", async () => {
+    const left = {
+      seed,
+      draft: {
+        ...seed,
+        summary: "Dentist",
+        time: { kind: "all_day", first_day: "2026-10-12", last_day: "2026-10-12" },
+      } as EditorFields,
+      calendarId: WORK_CAL,
+      timeTouched: true,
+      meetTouched: false,
+      badDate: null,
+    };
+    for (const [length, end] of [
+      [45 * 60_000, "09:45"],
+      [null, "09:30"],
+    ] as const) {
+      const { onDraft, onLeave, unmount } = open({
+        calendarId: WORK_CAL,
+        resume: { ...left, length },
+      });
+      allDayToggle();
+      expect(onDraft.mock.lastCall![0].time).toMatchObject({ end_time: end });
+      // And it goes back to the tab with what it came with, all day again.
+      allDayToggle();
+      await leave(unmount);
+      expect(onLeave.mock.lastCall![0].length).toBe(length);
+    }
   });
 
   // C17: a range dragged out on the grid keeps its own length through All day and back, never the
@@ -1000,6 +1117,8 @@ describe("QuickCreatePopover", () => {
           },
           calendarId: PERSONAL,
           timeTouched: true,
+          length: null,
+          meetTouched: false,
           badDate: "31-02-2026",
         },
       ],
@@ -1015,7 +1134,15 @@ describe("QuickCreatePopover", () => {
     const draft: EditorFields = { ...seed, summary: "Dentist" };
     const { onLeave, unmount } = open({
       strict: true,
-      resume: { seed, draft, calendarId: PERSONAL, timeTouched: false, badDate: null },
+      resume: {
+        seed,
+        draft,
+        calendarId: PERSONAL,
+        timeTouched: false,
+        length: null,
+        meetTouched: false,
+        badDate: null,
+      },
     });
     await act(async () => {});
     expect(onLeave).not.toHaveBeenCalled();
@@ -1081,7 +1208,15 @@ describe("QuickCreatePopover", () => {
       time: { ...seed.time, start_time: "11:00", end_time: "12:00" } as EditorFields["time"],
     };
     const { onDraft } = open({
-      resume: { seed, draft, calendarId: PERSONAL, timeTouched: true, badDate: "31-02-2026" },
+      resume: {
+        seed,
+        draft,
+        calendarId: PERSONAL,
+        timeTouched: true,
+        length: null,
+        meetTouched: false,
+        badDate: "31-02-2026",
+      },
     });
     expect(title().value).toBe("Dentist");
     expect(document.activeElement).toBe(title());
@@ -1313,8 +1448,118 @@ describe("QuickCreatePopover", () => {
       unproven: null,
       showAsTouched: false,
       timeTouched: false,
+      meetTouched: false,
+      length: null,
       badDate: null,
       openCustom: true,
     });
+  });
+});
+
+// --- a video call on new events (C18b) ---
+
+/** Personal offers Google Meet and its account adds Meet to the events it creates; Work offers
+ *  none. */
+const meetOverview: CalendarOverview = {
+  ...overview,
+  calendars: overview.calendars.map((c) =>
+    c.id === PERSONAL ? { ...c, conference_types: ["hangoutsMeet"] } : c,
+  ),
+  auto_meet: { [ME]: true },
+};
+
+const meetButton = () => screen.queryByRole("button", { name: "Google Meet" });
+
+describe("QuickCreatePopover video call (C18b)", () => {
+  // Quick create has no guests, so the setting alone turns nothing on (critique C2-H2).
+  it("the Meet button follows the setting and the calendar", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ overview: meetOverview });
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(meetButton()!, { detail: 1 });
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("true");
+    // Work offers no Meet: the button goes, the call is off, and the box says so.
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Work" }), { detail: 1 });
+    expect(meetButton()).toBeNull();
+    expect(
+      screen.getByText("Work doesn't offer Google Meet, so the video call is off."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Work" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Personal" }), { detail: 1 });
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByText(/doesn't offer Google Meet/)).toBeNull();
+    // Pressed again and saved: the create asks for the call.
+    fireEvent.click(meetButton()!, { detail: 1 });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Dentist").draft, meet: true }, null],
+    ]);
+  });
+
+  // Critique C2-M3: a click hands focus back to the title, so Enter saves as it does there; a key
+  // press leaves focus on the button, whose Enter presses it.
+  it("a click on Google Meet hands focus back to the title", () => {
+    open({ overview: meetOverview });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    meetButton()!.focus();
+    fireEvent.click(meetButton()!, { detail: 1 });
+    expect(document.activeElement).toBe(title());
+    meetButton()!.focus();
+    fireEvent.click(meetButton()!, { detail: 0 });
+    expect(document.activeElement).toBe(meetButton());
+    expect(meetButton()!.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("More options carries the call, and that it was pressed", () => {
+    const { onMore } = open({ overview: meetOverview });
+    fireEvent.click(meetButton()!, { detail: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    expect(onMore).toHaveBeenCalledWith(
+      expect.objectContaining({ draft: { ...seed, meet: true }, meetTouched: true }),
+    );
+  });
+
+  it("is absent where the calendar offers no Meet", () => {
+    open();
+    expect(meetButton()).toBeNull();
+  });
+
+  it("a draft that goes with the tab keeps the call, and whether it was pressed", async () => {
+    const { onLeave, unmount } = open({ overview: meetOverview });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(meetButton()!, { detail: 1 });
+    await leave(unmount);
+    expect(onLeave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        draft: expect.objectContaining({ meet: true }) as unknown,
+        meetTouched: true,
+      }),
+    );
+  });
+
+  // The view may open it again on another calendar than the one it left: one without Meet asks for
+  // no call, which the backend would refuse.
+  it("a draft back on a calendar without Meet asks for no call", async () => {
+    createEvent.mockResolvedValue(saved);
+    const draft: EditorFields = { ...seed, summary: "Dentist", meet: true };
+    const { onClose } = open({
+      overview: meetOverview,
+      calendarId: WORK_CAL,
+      resume: {
+        seed,
+        draft,
+        calendarId: WORK_CAL,
+        timeTouched: true,
+        length: null,
+        meetTouched: true,
+        badDate: null,
+      },
+    });
+    fireEvent.keyDown(title(), { key: "Enter" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    expect(createEvent.mock.calls[0][1].meet).toBe(false);
   });
 });

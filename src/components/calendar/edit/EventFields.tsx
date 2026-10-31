@@ -39,6 +39,9 @@ const DATE_FIELD = {
   all_day: { start: "First day", end: "Last day" },
 } as const;
 
+/** The one date field of an event that is one whole day (a birthday, C20). */
+const ONE_DAY = { start: "Date", end: "Date" } as const;
+
 const SHOW_AS: { value: ShowAs; label: string }[] = [
   { value: "busy", label: "Busy" },
   { value: "free", label: "Free" },
@@ -209,6 +212,7 @@ export function WhenFields({
   canSwitchKind,
   onPickZone,
   repeat,
+  oneDay = false,
 }: {
   /** What its date fields' ids start with (`dateFieldId`), so a save can find one. */
   id: string;
@@ -236,9 +240,14 @@ export function WhenFields({
   /** The Repeat row (`RepeatRow`), drawn last: Google puts "Does not repeat" under the date and
    *  time, and inside this fieldset it is off whenever the times are. */
   repeat?: ReactNode;
+  /** Only one whole day may be chosen (a birthday, C20): no All day switch, one date field named
+   *  "Date", and a new date moves the end with it. A timed draft can't arise (Google holds a
+   *  birthday all day); were one to, it draws as any other, and the backend refuses it. */
+  oneDay?: boolean;
 }) {
   const t = draft.time;
-  const names = DATE_FIELD[t.kind];
+  const single = oneDay && t.kind === "all_day";
+  const names = single ? ONE_DAY : DATE_FIELD[t.kind];
   const lineId = (half: Half) => `${dateFieldId(id, half)}-refused`;
   // What every date field here shares, for the half of the event it sets: a refusal it holds marks
   // it wrong and points it at the line that names it.
@@ -256,16 +265,26 @@ export function WhenFields({
     // Never wider than the editor: a fieldset is as wide as its widest content unless told otherwise.
     <fieldset className="flex min-w-0 flex-col gap-2" disabled={disabled}>
       <legend className="text-sm text-ink2">When</legend>
-      <label className="flex items-center gap-2 text-xs text-ink3">
-        <Toggle
-          ariaLabel="All day"
-          checked={t.kind === "all_day"}
-          disabled={disabled || !canSwitchKind}
-          onChange={onSwitchKind}
-        />
-        All day
-      </label>
-      {t.kind === "all_day" ? (
+      {!single && (
+        <label className="flex items-center gap-2 text-xs text-ink3">
+          <Toggle
+            ariaLabel="All day"
+            checked={t.kind === "all_day"}
+            disabled={disabled || !canSwitchKind}
+            onChange={onSwitchKind}
+          />
+          All day
+        </label>
+      )}
+      {single ? (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
+          <DateField
+            {...dateProps("start")}
+            value={t.first_day}
+            onCommit={(day) => onChange({ kind: "all_day", first_day: day, last_day: day })}
+          />
+        </div>
+      ) : t.kind === "all_day" ? (
         <div className="flex flex-wrap items-center gap-2 text-xs text-ink3">
           <DateField
             {...dateProps("start")}

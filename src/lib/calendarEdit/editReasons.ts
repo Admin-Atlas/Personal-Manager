@@ -8,6 +8,9 @@
 import type { Tone as CalloutTone } from "../../components/ui/tone";
 import { formatDateOnly } from "../format";
 import type {
+  AccessAsk,
+  AskOwner,
+  Calendar,
   CalendarEvent,
   CalendarOverview,
   EditLoad,
@@ -30,9 +33,10 @@ function unreachable(value: never): never {
 
 const NOT_ORGANISER = "Someone else organises this event.";
 
-/** What stays the organiser's on an event they haven't let guests change (C14c). */
+/** What stays the organiser's on an event they haven't let guests change (C14c), its video call
+ *  (C18) and its calendar (C18d) among it. */
 const THEIRS =
-  "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+  "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar.";
 
 /** What the user may change on someone else's event: their reply only where its calendar is on the
  *  guest list (C14 critique C2-L1). */
@@ -68,20 +72,37 @@ export function reasonText(reason: ReadOnlyReason): string {
     // (C14 critique C2-M8).
     case "not_invited":
       return "PM can only reply where this calendar is on the guest list itself (not through a group).";
+    // The video call too, whatever the organiser lets guests change (C18).
     case "organizer_only_guests":
-      return "In PM, only the organiser can change who's invited.";
+      return "In PM, only the organiser can change who's invited and the video call.";
     case "became_repeating":
       return "This became a repeating event in Google. Refresh, then open one of its occurrences.";
     case "special_type":
-      return "Birthdays, events from Gmail, focus time, out of office and working locations can't be changed here.";
+      return "PM can't change focus time, out of office, working locations or other special Google events.";
+    // Google's `birthday` type holds anniversaries and other dates too (C20 critique C2-L5).
+    case "special_date_fields":
+      return "On a birthday or other special date, Google lets PM change only its name, notifications and colour, and its date if it was added in Google Calendar.";
+    case "date_from_contacts":
+      return "This date comes from Google Contacts, so change it there.";
+    // On someone else's calendar that you can change, the birthday is theirs (C20 critique C2-L4).
+    case "date_from_profile":
+      return "This birthday comes from the calendar owner's Google Account, so change its date there.";
+    case "from_gmail_fields":
+      return "Gmail added this event, so Google lets PM change only its busy or free, visibility, notifications and colour, and your reply if you're invited.";
+    // And its calendar, which Google doesn't say a locked copy may change (C18d).
     case "locked":
-      return "Google has locked this event's title, time, place and description.";
-    case "html_description":
-      return "This description has formatting, so PM shows its text here and can't change it yet.";
+      return "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.";
+    // Not "as Google shows it": PM draws only the formatting its own editor writes (C19 critique
+    // C2-M1). The backend's `read_only_message` says these very words.
+    case "unsupported_formatting":
+      return "This description has formatting PM can't edit. PM shows what it can of it here; Google Calendar shows all of it.";
     case "label_read_only":
       return "This event has a Google Calendar label, which sets its colour. Change it in Google Calendar.";
     case "reminders_unreadable":
       return "PM can't read one of this event's notifications, so it leaves them as they are.";
+    // Another service's, Google's old Hangouts, or a bare link (C18 critique C2-L2).
+    case "other_call":
+      return "This event's video call is a kind PM can't change, so PM leaves it as it is. Change it in Google Calendar.";
     default:
       return unreachable(reason);
   }
@@ -125,8 +146,10 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
   const on = cal?.provider === "google" && overview?.editing[cal.source_id] === "on";
   // Someone else's event says what the user may still do from this copy: reply when it's on the
   // guest list, which the strip above the line offers, their own settings, and how when editing is
-  // off (C14b, C14c).
-  const theirs = ev.organizer_self === false;
+  // off (C14b, C14c). A special kind is never "someone else's": Google's list for its kind replaces
+  // the organiser rule, and a Gmail event's organiser is Google's placeholder (C20a deviation 5).
+  const kind = specialKind(ev.event_type);
+  const theirs = kind === null && ev.organizer_self === false;
   if (ev.edit_block === "not_organizer") {
     return none(notOrganizerText(ev.can_respond === true, on));
   }
@@ -139,22 +162,131 @@ export function eventRights(ev: CalendarEvent, overview: CalendarOverview | null
   }
   // The gate decides Delete (C14) and a drag (C16 critique C2-M4): a locked copy, whose delete Google
   // doesn't document and whose times it refuses, and an invitation can't be deleted, nor dragged
-  // unless the organiser lets guests change it. A row the list didn't mark gets neither. On an
-  // invitation the line says what stays the organiser's, or Google's warning where they let guests
-  // change it.
-  const reason = ev.locked
-    ? reasonText("locked")
-    : theirs
-      ? ev.guests_can_modify
-        ? A11_NOTE
-        : notOrganizerText(ev.can_respond === true, true)
-      : null;
+  // unless the organiser lets guests change it. A row the list didn't mark gets neither. A birthday
+  // or a Gmail event says what Google lets change on it first, locked or not and whoever organises
+  // it, since Google's list for its kind is the rule (C20 critique C2-H1). On an invitation the line
+  // says what stays the organiser's, or Google's warning where they let guests change it.
+  const reason =
+    kind === "special_date"
+      ? reasonText("special_date_fields")
+      : kind === "from_gmail"
+        ? reasonText("from_gmail_fields")
+        : ev.locked
+          ? reasonText("locked")
+          : theirs
+            ? ev.guests_can_modify
+              ? A11_NOTE
+              : notOrganizerText(ev.can_respond === true, true)
+            : null;
   return {
     canEdit: true,
     canDelete: ev.can_delete === true,
     canRetime: ev.can_retime === true,
     reason,
   };
+}
+
+/** Which of Google's special kinds an event is, read as the backend's `kind_of` reads `event_type`
+ *  (a parity test keeps them one): null for an ordinary event, absent or Google's default. */
+export type SpecialKind = "special_date" | "from_gmail" | "other";
+export function specialKind(eventType: string | null | undefined): SpecialKind | null {
+  switch (eventType ?? "default") {
+    case "default":
+      return null;
+    case "birthday":
+      return "special_date";
+    case "fromGmail":
+      return "from_gmail";
+    default:
+      return "other";
+  }
+}
+
+/** By the pointer when a birthday is pressed to drag (C20 critiques C2-M4, C1-L12). Not its
+ *  details' line, whose "its date if it was added in Google Calendar" would read as a drag on
+ *  offer: the calendar can't tell who owns a birthday's date, so none is dragged. */
+export const SPECIAL_DATE_DRAG =
+  "Birthdays can't be dragged in PM. Open Edit to change what Google allows.";
+
+/** What a drag of `ev` that its `rights` refuse says by the pointer (LD14): the row's own line, but
+ *  a birthday's own words. */
+export function dragReason(
+  ev: CalendarEvent,
+  rights: Pick<EventRights, "canEdit" | "canRetime" | "reason">,
+): string | null {
+  return rights.canEdit && !rights.canRetime && specialKind(ev.event_type) === "special_date"
+    ? SPECIAL_DATE_DRAG
+    : rights.reason;
+}
+
+/** What deleting a birthday or other special date adds (C20 §14.3): Google's own help says the
+ *  same of deleting one from Calendar. */
+export const SPECIAL_DATE_DELETE =
+  "Deleting it here doesn't change Google Contacts or your Google Account.";
+
+/** The permission an owner gives in Google Calendar's sharing settings for someone to change a
+ *  calendar's events, by Google's name for it (Help 37082; live probe G-A2 checks the label). The
+ *  email PM opens asks for it by the same name (`calendar_ask.rs`). */
+const EDIT_PERMISSION = "“Make changes and see event details”";
+
+/** Whom a row's reason line may ask for edit access (C20b, plan Q10): only a row the list marked
+ *  view-only, on a calendar the overview names an owner for. */
+export function askOwnerFor(ev: CalendarEvent, overview: CalendarOverview | null): AskOwner | null {
+  if (ev.edit_block !== "calendar_read_only") return null;
+  return overview?.ask_access[ev.calendar_id] ?? null;
+}
+
+/** The ask's button. */
+export function askLabel(owner: string): string {
+  return `Ask ${owner} for edit access`;
+}
+
+/** Instead of the button when the owner is one of the user's own Google accounts in PM: an email to
+ *  themselves would ask nobody. `own` is the address of the account this copy is on, when known. */
+export function askConnectedText(owner: string, own: string | null): string {
+  return `${owner} is connected to PM too: open Google Calendar as ${owner} and share this calendar with ${own ?? "this account"}, choosing ${EDIT_PERMISSION}.`;
+}
+
+/** What asking came to, or why it couldn't start. */
+export type AskResult = AccessAsk | { outcome: "failed"; message: string };
+
+/** The line under the ask after it was pressed (C20b, critiques C2-L4, C2-L12). PM can tell only
+ *  that the system took the email, never that a mail app showed it, so `opened` says what to do if
+ *  nothing did. */
+export function askText(result: AskResult, calendar: string): string {
+  switch (result.outcome) {
+    case "opened":
+      return `PM asked your system to open an email to ${result.owner} in your mail app. If nothing opened, write to ${result.owner} and ask for ${EDIT_PERMISSION}.`;
+    case "no_mail_app":
+      return `PM couldn't open your mail app. Write to ${result.owner} and ask for ${EDIT_PERMISSION} on “${calendar}”.`;
+    case "no_owner":
+      return "PM can't tell who to ask for this calendar now. If its sharing just changed, refresh the calendar.";
+    case "failed":
+      return `PM couldn't open the email: ${result.message}`;
+    default:
+      return unreachable(result);
+  }
+}
+
+/** The roles whose calendars show an event's details, which a copy is made from: a busy-only
+ *  calendar (`freeBusyReader`) shows none. */
+const READABLE_ROLES: readonly string[] = [
+  "owner",
+  "writer",
+  "writerWithoutPrivateAccess",
+  "reader",
+];
+
+/** Whether PM can copy `ev` (Duplicate, C18c): a Google event of the ordinary kind on a calendar
+ *  whose details the account can read, editing on or not, since the copy is read afresh and made on
+ *  a calendar of the user's choosing. Birthdays and Gmail events aren't copied (C20 makes their own
+ *  fields editable, not copyable). The view also needs a calendar to put the copy on. */
+export function duplicable(ev: CalendarEvent, calendar: Calendar | undefined | null): boolean {
+  return (
+    calendar?.provider === "google" &&
+    READABLE_ROLES.includes(calendar.access_role ?? "") &&
+    (ev.event_type ?? "default") === "default"
+  );
 }
 
 /** The calendar's dedup rank for one copy of an occurrence two accounts both show (C14 §9.5): the
@@ -186,6 +318,8 @@ export function fieldLabel(field: EditorField): string {
       return "guests";
     case "guest_perms":
       return "guest permissions";
+    case "meet":
+      return "video call";
     case "location":
       return "location";
     // Google's word for them, never "reminders".
@@ -215,6 +349,8 @@ export function conflictFields(keys: readonly string[]): EditorField[] {
     guestsCanModify: "guest_perms",
     guestsCanInviteOthers: "guest_perms",
     guestsCanSeeOtherGuests: "guest_perms",
+    // A call added or removed in Google meanwhile (C18 critique C1-L5).
+    conferenceData: "meet",
     location: "location",
     reminders: "reminders",
     // A colour's conflict check watches the label too: to the user, both are the colour.
@@ -296,11 +432,12 @@ export function leftBehindText(days?: readonly string[]): string {
 
 /** A warning a save or a delete came back with, as a sentence. `leftBehind`: the days of
  *  `left_on_old_series`. A delete's occurrences "may still show"; a save's may be on the earlier
- *  part. */
+ *  part. `calendar`: the name of the calendar a save put the event on (C18d). */
 export function writeWarningText(
   warning: WriteWarning,
   kind: ChoiceKind,
   leftBehind?: readonly string[],
+  calendar?: string | null,
 ): string {
   switch (warning) {
     case "mirror_refresh_pending":
@@ -327,6 +464,15 @@ export function writeWarningText(
     // Only a reply for every occurrence comes back with it (C14): the days are its `leftBehind`.
     case "kept_own_reply":
       return keptReplyText(leftBehind?.length ?? 0);
+    // A save that asked for a Meet call (C18). The link can wait for a later sync: PM keeps the
+    // saved copy until Google's own is newer (critique C1-L11).
+    case "call_pending":
+      return "Google is still making the video call; its link shows after a later refresh.";
+    case "call_failed":
+      return "Google didn't make the video call. Add it again from Edit, or in Google Calendar.";
+    // Raised only when something was linked to the old event (critique C2-L15).
+    case "links_left_behind":
+      return `On ${calendar || "its new calendar"} it became a new event in Google, so the milestone or reminder to prepare linked to it stays with the old one.`;
     default:
       return unreachable(warning);
   }
@@ -506,9 +652,124 @@ export function outcomeText(outcome: WriteOutcome): { tone: Tone; text: string }
       };
     case "failed":
       return { tone: "error", text: outcome.message };
+    case "not_moved":
+      return { tone: "warn", text: notMovedText(outcome.message, null, outcome.warnings) };
+    case "moved_earlier":
+      return { tone: "warn", text: movedEarlierText(null, outcome.warnings) };
     default:
       return unreachable(outcome);
   }
+}
+
+/** Under the editor's Calendar row while its Repeat row is changed, and the other way round (C18
+ *  critique C2-H1): Google web takes both in one Save, PM one at a time, as its backend refuses the
+ *  two together in the same words. */
+export const CALENDAR_ALONE = "Change the calendar on its own, then how it repeats.";
+
+/** Under the Calendar row of a repeating event with another calendar chosen (C18e): it goes whole,
+ *  "All events" the only row offered (C18 Q2). Not "every occurrence moves": what Google does with
+ *  an occurrence changed on its own is live probe L-T5's (critique C2-L13). */
+export const CALENDAR_WHOLE = "Changing the calendar is for the whole repeating event.";
+
+/** The line under the editor's Calendar row (C18d): only the calendars the user owns on the event's
+ *  own account are listed (critique C1-M5: Google's help puts an event on "a calendar you own"),
+ *  and, where another account can take events (critique C2-L8), Duplicate is the way there. */
+export function calendarRowText(account: string, otherAccounts: boolean): string {
+  const other = otherAccounts
+    ? " To put it on another account's calendar, duplicate it there, then delete this one."
+    : "";
+  return `Only calendars you own on ${account} are listed.${other}`;
+}
+
+/** A save whose other changes landed and whose calendar change didn't (C18d), `calendar` being the
+ *  name of the one it's still on, when known. The message is the backend's, a sentence. What those
+ *  changes had to say beside "saved" (`warnings`: a call Google didn't make, say) follows it, in a
+ *  save's words. */
+export function notMovedText(
+  message: string,
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  const still = calendar ? `it's still on ${calendar}` : "its calendar didn't change";
+  const said = warningWords(warnings).words;
+  return [`Your other changes are saved, but ${still}.`, message, ...said]
+    .filter((sentence) => sentence !== "")
+    .join(" ");
+}
+
+/** A calendar change PM lost the answer to had landed, found by a Save with more to send
+ *  (`moved_earlier`): where the event is, and what the landing has to say. */
+function movedEarlierHead(calendar: string | null, warnings: readonly WriteWarning[]): string[] {
+  const on = calendar ? `It's already on ${calendar}` : "It's already on the calendar you chose";
+  return [`${on}: the calendar change landed earlier.`, ...warningWords(warnings).words];
+}
+
+/** `moved_earlier`, the event read again there: the user's changes are still in the editor, and go
+ *  with the next Save. */
+export function movedEarlierText(
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  return [
+    ...movedEarlierHead(calendar, warnings),
+    "Your other changes aren't saved yet: press Save to send them.",
+  ].join(" ");
+}
+
+/** `moved_earlier` where Google's copy there already holds all the user changed. */
+export function movedEarlierHeldText(
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  return movedEarlierHead(calendar, warnings).join(" ");
+}
+
+/** `moved_earlier` and PM couldn't read the event there: the session has ended, so nothing more can
+ *  be saved from this editor. */
+export function movedEarlierUnreadText(
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  return [
+    ...movedEarlierHead(calendar, warnings),
+    "PM couldn't read it there, so your other changes aren't saved. Close this and open the event again to make them.",
+  ].join(" ");
+}
+
+/** After a save whose calendar change alone didn't land (C18d), PM couldn't read the event again:
+ *  said after what the save came to, never the read's own words, which can say nothing changed. */
+export const NOT_MOVED_UNREAD =
+  "PM couldn't read the event again afterwards, so close it and open it again before changing anything more.";
+
+/** A sentence of a `not_moved` message that offers another go at the Save. A test in Rust holds the
+ *  backend to this: each such sentence it can send opens with these words, with a row of its own in
+ *  this file's test. */
+const RETRY_SENTENCE = /(^|\. )(?:Try|Save) again[^.]*\./g;
+
+/** What that save came to (`notMovedText`), then `NOT_MOVED_UNREAD`. Save is held then, since nothing
+ *  here is known to match Google, or may even be the row the event has now: the message's offer of
+ *  another go at it goes, as opening the event again is how it's answered. Only the message is
+ *  searched: a calendar's name is the user's. */
+export function notMovedUnreadText(
+  message: string,
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  const reason = message.replace(RETRY_SENTENCE, (_, before: string) => (before ? "." : "")).trim();
+  return `${notMovedText(reason, calendar, warnings)} ${NOT_MOVED_UNREAD}`;
+}
+
+/** Join on a video call when the browser didn't open: the link can still be copied beside it. */
+export const JOIN_FAILED = "PM couldn't open the call in your browser. Use Copy link instead.";
+
+/** The details' "Open in Google Calendar" (or Outlook, or the calendar's own) when the browser
+ *  didn't open: the event's link can still be copied beside it, as Join's can. */
+export const OPEN_FAILED = "PM couldn't open this event in your browser. Use Copy link instead.";
+
+/** The editor's Power-depth line: the fields changed, and the calendar when another is chosen
+ *  (C18d), which isn't a field. */
+export function changedText(fields: readonly EditorField[], calendar: boolean): string {
+  return listWords([...fields.map(fieldLabel), ...(calendar ? ["calendar"] : [])]);
 }
 
 /** What a delete of the event called `title` came to, as one sentence naming it. A delete that
@@ -591,6 +852,11 @@ export function deleteText(outcome: WriteOutcome, title: string): { tone: Tone; 
       };
     case "failed":
       return notDeleted(outcome.message);
+    // Only an editor's save answers these; a delete never does, so it says what it carries.
+    case "not_moved":
+      return notDeleted(outcome.message);
+    case "moved_earlier":
+      return notDeleted(movedEarlierHeldText(null, outcome.warnings));
     default:
       return unreachable(outcome);
   }
@@ -644,6 +910,8 @@ export function replyText(
     case "partial_split":
     case "split_removed":
     case "ambiguous":
+    case "not_moved":
+    case "moved_earlier":
       return { tone: "error", text: "Your reply wasn't sent." };
     default:
       return unreachable(outcome);
@@ -747,7 +1015,8 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
         tone: "warn",
         text: `${t}: Google is busy right now, so PM put the repeating event back as it was. Make the change again in a moment.`,
       };
-    // `ambiguous` is listed for completeness: only creating an event answers it; a settle never does.
+    // `ambiguous`, `not_moved` and `moved_earlier` are listed for completeness: only creating an
+    // event, or an editor's save, answers them; a settle never does.
     case "no_change":
     case "needs_choice":
     case "ignored_by_google":
@@ -757,6 +1026,8 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
     case "reauth":
     case "unconfirmed":
     case "ambiguous":
+    case "not_moved":
+    case "moved_earlier":
     case "failed": {
       const said = outcomeText(result);
       return { tone: said.tone, text: `${t}: ${said.text}` };
@@ -780,7 +1051,10 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
  *  left, `from` (C11c review); All's own stop names none, since the one it keeps is the first
  *  occurrence still there, which the choices named. One that left the event outside the months PM
  *  syncs says so, and points to Google Calendar, never to editing it again here (C11c review, C11d
- *  review 1). */
+ *  review 1). `moved`: the save put it on another calendar (C18d), named `to`, from the one named
+ *  `from`; it says where it is now and how to put it back, since there's no Undo for it (Q3). A
+ *  repeating event goes there whole, from "All events" (C18e), so with a scope it's every
+ *  occurrence. */
 export function savedNotice(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
@@ -789,8 +1063,20 @@ export function savedNotice(
   stops = false,
   asAll = false,
   undo: { sent: Notify | null } | null = null,
+  moved: { to: string; from: string } | null = null,
 ): { tone: Tone; text: string } {
   const t = quote(title);
+  if (moved) {
+    const said = savedWarnings(outcome, moved.to);
+    const parts = [
+      scope === null
+        ? `${t} is now on ${moved.to}.`
+        : `Every occurrence of ${t} is now on ${moved.to}.`,
+      ...said.words,
+      `To put it back, open it and choose ${moved.from}.`,
+    ];
+    return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
+  }
   // A new event or a one-off made to repeat whose occurrences all fall outside the months PM syncs
   // (C11 §10), or the one event "Does not repeat" leaves there.
   const outside = outcome.warnings.includes("outside_mirror");
@@ -895,6 +1181,8 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
     case "needs_choice":
     case "partial_split":
     case "split_removed":
+    case "not_moved":
+    case "moved_earlier":
       return notBack("Edit it again instead.", "warn");
     case "failed":
       return notBack(outcome.message);
@@ -907,23 +1195,46 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
  *  (`savedNotice`, and `settleText` for a Finish): outside the months PM syncs; then PM's calendar
  *  catching up, which beside an event outside is in a delete's words, since the saved event won't
  *  show after a refresh but what it replaced still does until then (C11c review); then occurrences
- *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1). A
- *  milestone that stayed has a notice of its own, naming it. `warn`: the user should look, and
- *  nothing says to edit it again here. */
-function savedWarnings(outcome: Extract<WriteOutcome, { outcome: "saved" }>): {
+ *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1), and
+ *  the video call asked for last (C18). A milestone that stayed has a notice of its own, naming it.
+ *  `warn`: the user should look, and nothing says to edit it again here; a call still being made
+ *  isn't one, since the next refresh shows it. Links left with the old event (C18d) close it,
+ *  `calendar` naming where the event went. */
+function savedWarnings(
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  calendar: string | null = null,
+): {
   words: string[];
   warn: boolean;
 } {
-  const partly = outcome.warnings.includes("partly_applied");
-  const outside = outcome.warnings.includes("outside_mirror");
-  const pending = outcome.warnings.includes("mirror_refresh_pending");
-  const left = outcome.warnings.includes("left_on_old_series");
+  return warningWords(outcome.warnings, outcome.left_behind, calendar);
+}
+
+/** `savedWarnings` of a save's `warnings` alone: a "not moved" says them too (C18d). */
+function warningWords(
+  warnings: readonly WriteWarning[],
+  leftBehind?: readonly string[],
+  calendar: string | null = null,
+): {
+  words: string[];
+  warn: boolean;
+} {
+  const partly = warnings.includes("partly_applied");
+  const outside = warnings.includes("outside_mirror");
+  const pending = warnings.includes("mirror_refresh_pending");
+  const left = warnings.includes("left_on_old_series");
+  const callPending = warnings.includes("call_pending");
+  const callFailed = warnings.includes("call_failed");
+  const links = warnings.includes("links_left_behind");
   const words: string[] = [];
   if (partly) words.push(writeWarningText("partly_applied", "save"));
   if (outside) words.push(writeWarningText("outside_mirror", "save"));
   if (pending) words.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
-  if (left) words.push(writeWarningText("left_on_old_series", "save", outcome.left_behind));
-  return { words, warn: partly || outside || left };
+  if (left) words.push(writeWarningText("left_on_old_series", "save", leftBehind));
+  if (callPending) words.push(writeWarningText("call_pending", "save"));
+  if (callFailed) words.push(writeWarningText("call_failed", "save"));
+  if (links) words.push(writeWarningText("links_left_behind", "save", undefined, calendar));
+  return { words, warn: partly || outside || left || callFailed || links };
 }
 
 // --- moving an event (C16a) ---
@@ -1008,6 +1319,11 @@ export function moveText(
       return notMoved("PM removed the new part of an earlier change instead.", "warn");
     case "failed":
       return notMoved(outcome.message);
+    // Only an editor's save answers these; a drag never does, so it says what it carries.
+    case "not_moved":
+      return notMoved(outcome.message);
+    case "moved_earlier":
+      return notMoved(movedEarlierHeldText(null, outcome.warnings));
     default:
       return unreachable(outcome);
   }
@@ -1058,6 +1374,8 @@ export function moveBackText(outcome: WriteOutcome, title: string): { tone: Tone
     case "needs_choice":
     case "partial_split":
     case "split_removed":
+    case "not_moved":
+    case "moved_earlier":
       return notBack("Drag it back, or change it in Edit.", "warn");
     case "failed":
       return notBack(outcome.message);
@@ -1135,8 +1453,28 @@ export function createReasonText(reason: ReadOnlyReason): string {
 }
 
 /** A new event Google holds, once the editor has closed (C10 §15): created, and whether PM's
- *  calendar will show it. Ok when it will, a warning (which stays) when it won't. */
+ *  calendar will show it. Ok when it will, a warning (which stays) when it won't. A video call it
+ *  asked for that Google is still making, or didn't make, is said after (C18b); one it didn't make
+ *  is a warning too. */
 export function createdText(
+  title: string,
+  outcome: Extract<WriteOutcome, { outcome: "saved" }>,
+  where: CreatedWhere,
+): { tone: Tone; text: string } {
+  const said = createdWords(title, outcome, where);
+  const calls = CALL_WARNINGS.filter((w) => outcome.warnings.includes(w));
+  if (calls.length === 0) return said;
+  return {
+    tone: outcome.warnings.includes("call_failed") ? "warn" : said.tone,
+    text: [said.text, ...calls.map((w) => writeWarningText(w, "save"))].join(" "),
+  };
+}
+
+/** The warnings about a video call a write asked for, in the order they're said. */
+const CALL_WARNINGS: readonly WriteWarning[] = ["call_pending", "call_failed"];
+
+/** `createdText` before what's said of the call. */
+function createdWords(
   title: string,
   outcome: Extract<WriteOutcome, { outcome: "saved" }>,
   where: CreatedWhere,
@@ -1235,6 +1573,8 @@ export function createText(
     case "partial_split":
     case "split_removed":
     case "conflict":
+    case "not_moved":
+    case "moved_earlier":
     case "unconfirmed": {
       const said = outcomeText(outcome);
       return notMade(said.text, said.tone);

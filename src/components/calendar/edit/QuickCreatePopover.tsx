@@ -32,6 +32,12 @@
 // the event really starts or why its rule can't be saved, which stops every save as in the full
 // editor. Custom… carries on in the full editor with its dialog open, sending nothing: a modal
 // dialog over this box would fight its click-outside rule.
+//
+// It can have a Google Meet call (C18b): a "Google Meet" button beside the calendar, where the
+// calendar offers Meet, pressed while the new event will ask for one. With no guests here it starts
+// off (Google adds Meet with the first guest, `meetDefault`); another calendar without Meet turns it
+// off and says so. A click on it hands focus back to the title, so Enter then saves as there; a key
+// press leaves focus on it. More options carries it on, and whether it was pressed.
 
 import {
   useCallback,
@@ -55,6 +61,7 @@ import {
   endTimeChoices,
   followStart,
   halfInstant,
+  lengthOnCalendar,
   newEventLength,
   switchNewKind,
   toNewEvent,
@@ -74,6 +81,9 @@ import {
   createdWhere,
   createNotes,
   lengthFor,
+  meetOffered,
+  meetOffText,
+  meetOnCalendar,
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
@@ -84,6 +94,7 @@ import { Button, Callout, IconButton, Input, Toggle } from "../../ui";
 import { DateField } from "../../DateField";
 import { TimeField } from "../../TimeField";
 import { CalendarPicker } from "./CalendarPicker";
+import { MeetField } from "./MeetField";
 import { NO_ZONE_CREATE, RepeatRow, type Timed } from "./EventFields";
 import type { CreateHandover, Unproven } from "./NewEventEditor";
 import { createEvent, noteCreateResult, noteHeldCreate, type CreateSent } from "./useEventWrites";
@@ -137,6 +148,11 @@ export interface LeftDraft {
   draft: EditorFields;
   calendarId: string;
   timeTouched: boolean;
+  /** The event's own length (a range dragged, or one changed there), which an all-day draft can't
+   *  show; `null` when it has none and takes the length of the calendar it's on. */
+  length: number | null;
+  /** Whether Google Meet was pressed (C18b). */
+  meetTouched: boolean;
   /** Text the date field couldn't read, still refusing a save. */
   badDate: string | null;
 }
@@ -191,7 +207,13 @@ export function QuickCreatePopover({
   const titleRef = useRef<HTMLInputElement>(null);
   const saveButton = useRef<HTMLButtonElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
-  const startDraft = resume?.draft ?? seed;
+  // A draft back from the tab opens on the calendar the view chose, which may not be the one it was
+  // on: a call asked for there goes where this one offers no Meet (the backend would refuse it).
+  const resumed = resume?.draft ?? seed;
+  const startDraft =
+    resumed.meet && !meetOffered(targetById(targets, firstCalendar))
+      ? { ...resumed, meet: false }
+      : resumed;
   const [draft, setDraftState] = useState<EditorFields>(startDraft);
   // The latest draft and calendar, readable synchronously: Save blurs the focused field first, and a
   // date typed but not yet committed commits in that blur, before React re-renders.
@@ -210,13 +232,23 @@ export function QuickCreatePopover({
   // The event's length, kept while its start moves or it goes all day and back: its own to begin
   // with (a range dragged on the grid is the user's, C17), else the account's default.
   const lengthRef = useRef(
-    newEventLength(startDraft) ??
-      newEventLength(seed) ??
+    resume?.length ??
+      newEventLength(startDraft) ??
       lengthFor(overview, targetById(targets, firstCalendar)),
   );
   // Whether the user has changed the time (or dragged it out on the grid): until then, another
   // calendar brings its own length.
   const timeTouched = useRef(resume?.timeTouched ?? timeChosen);
+  // Whether `lengthRef` is the event's own rather than an account's default: one with none to keep
+  // takes the length of the calendar it's on when it goes timed (`lengthOnCalendar`).
+  const ownLength = useRef(
+    resume ? resume.length !== null : timeChosen && newEventLength(startDraft) !== null,
+  );
+  // Whether the user has pressed Google Meet: until then, it follows Google (`meetOnCalendar`).
+  const meetTouched = useRef(resume?.meetTouched ?? false);
+  // Another calendar turned the call off, offering no Meet: said with the notes until it next
+  // changes.
+  const [meetNote, setMeetNote] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ tone: Tone; text: string } | null>(null);
   // The one guard every way to save passes, set before the request goes.
   const savingRef = useRef(false);
@@ -367,6 +399,8 @@ export function QuickCreatePopover({
               draft: d,
               calendarId: calendarRef.current,
               timeTouched: timeTouched.current,
+              length: ownLength.current ? lengthRef.current : null,
+              meetTouched: meetTouched.current,
               badDate: badDateRef.current,
             };
       queueMicrotask(() => {
@@ -456,7 +490,10 @@ export function QuickCreatePopover({
   function lengthOf(t: Timed): number {
     const s = halfInstant(NEW_EVENT_BASE, t, "start");
     const e = halfInstant(NEW_EVENT_BASE, t, "end");
-    if (s !== null && e !== null && e - s >= 60_000) lengthRef.current = e - s;
+    if (s !== null && e !== null && e - s >= 60_000) {
+      if (e - s !== lengthRef.current) ownLength.current = true;
+      lengthRef.current = e - s;
+    }
     return lengthRef.current;
   }
 
@@ -468,19 +505,31 @@ export function QuickCreatePopover({
    *  day came from the start date follows it. */
   function changeTime(time: TimeDraft) {
     timeTouched.current = true;
+    if (time.kind === "timed") lengthOf(time);
     setDraft(followStart(draftRef.current, { ...draftRef.current, time }));
   }
 
-  /** Another calendar. While the time is still the seed's, the end follows that account's length. */
+  /** Another calendar. While the time is still the seed's, the end follows that account's length;
+   *  after that a length on screen stays (`lengthOnCalendar`). The video call follows the calendar
+   *  (`meetOnCalendar`, C18b). */
   function pickCalendar(id: string) {
     setCalendarId(id);
-    if (timeTouched.current) return;
-    const length = lengthFor(overviewRef.current, targetById(targets, id));
-    lengthRef.current = length;
-    const t = draftRef.current.time;
-    if (t.kind === "timed") {
-      setDraft({ ...draftRef.current, time: endAfterStart(NEW_EVENT_BASE, t, length) });
+    const target = targetById(targets, id);
+    const was = draftRef.current;
+    let next = was;
+    if (!timeTouched.current) {
+      const length = lengthFor(overviewRef.current, target);
+      lengthRef.current = length;
+      const t = next.time;
+      if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
+    } else {
+      const usual = lengthFor(overviewRef.current, target);
+      lengthRef.current = lengthOnCalendar(next, ownLength.current, lengthRef.current, usual);
     }
+    const call = meetOnCalendar(overviewRef.current, target, next, meetTouched.current);
+    if (call.meet !== next.meet) next = { ...next, meet: call.meet };
+    setMeetNote(call.off && target ? meetOffText(target.calendar.name) : null);
+    if (next !== was) setDraft(next);
   }
 
   /** All day ↔ timed, as the full editor switches a new event. */
@@ -506,6 +555,8 @@ export function QuickCreatePopover({
       // Quick create has no Show as: it still follows the kind.
       showAsTouched: false,
       timeTouched: timeTouched.current,
+      meetTouched: meetTouched.current,
+      length: ownLength.current ? lengthRef.current : null,
       // Read after the blur above, so a date typed and not yet read is refused there too: the field
       // put back the date it had, which the full editor must not save in its place.
       badDate: badDateRef.current,
@@ -623,6 +674,8 @@ export function QuickCreatePopover({
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
     ...createNotes(t, draft.recurrence.kind === "rule", overview, hidden, calendarId),
+    // The compact button has no line of its own (critique C2-L4).
+    ...(meetNote !== null ? [meetNote] : []),
   ];
 
   return (
@@ -633,6 +686,7 @@ export function QuickCreatePopover({
       // notices (z-[48]), as a modal's scrim is: a notice that never goes would cover Save.
       aria-label="New event"
       tabIndex={-1}
+      data-help="calendar-new-event"
       className="fixed z-50 flex w-[22rem] max-w-[calc(100vw-1rem)] flex-col gap-3 rounded-[var(--radius)] border border-border2 bg-panel p-3 shadow-2xl focus:outline-none"
       style={{
         left: pos?.left ?? anchor.left,
@@ -788,6 +842,20 @@ export function QuickCreatePopover({
           colorOf={colorOf}
           shapeOf={shapeOf}
           disabled={locked}
+        />
+        <MeetField
+          compact
+          call={null}
+          value={draft.meet}
+          offered={meetOffered(targetById(targets, calendarId))}
+          disabled={locked}
+          onChange={(meet) => {
+            meetTouched.current = true;
+            setMeetNote(null);
+            setDraft({ ...draftRef.current, meet });
+          }}
+          // A click leaves the keyboard in the title, where Enter saves (critique C2-M3).
+          onPointerPress={() => titleRef.current?.focus()}
         />
         <div className="ml-auto flex items-center gap-2">
           <Button variant="tertiary" size="sm" onClick={() => more()} disabled={saving}>

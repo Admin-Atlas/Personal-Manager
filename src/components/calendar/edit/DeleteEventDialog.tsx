@@ -22,7 +22,11 @@ import type {
   SeriesChoices,
   SplitAction,
 } from "../../../lib/types";
-import { deleteText } from "../../../lib/calendarEdit/editReasons";
+import {
+  deleteText,
+  SPECIAL_DATE_DELETE,
+  specialKind,
+} from "../../../lib/calendarEdit/editReasons";
 import { deleteNotice, notifyOf } from "../../../lib/calendarEdit/guests";
 import { isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
 import { parseLocal } from "../../../lib/calendar-layout";
@@ -112,6 +116,7 @@ function PlainDelete({
   guests: { notice: GuestNotice; again: boolean } | null;
 }) {
   const title = event ? event.summary.trim() || "(no title)" : "";
+  const note = event ? deleteNoteOf(event) : null;
   // The backend's numbers when it asked again, else the row's own (null: nobody to tell).
   const notice = useMemo(
     () => guests?.notice ?? (event ? deleteNotice(event, from) : null),
@@ -132,6 +137,7 @@ function PlainDelete({
       danger
       confirmDisabled={notice !== null && notify === null}
       initialFocus="cancel"
+      helpId="calendar-delete"
       // Delete is off until answered; were it pressed anyway, the backend asks (R9). Closing
       // clears the event, so the next one asks afresh.
       onConfirm={() =>
@@ -146,6 +152,7 @@ function PlainDelete({
       </p>
       <p className="mt-2">
         You can undo it for a few seconds. If you quit PM in that time, nothing is deleted.
+        {note && ` ${note}`}
       </p>
       {/* Reopened by the backend: the delete didn't happen, which is said first, whether or not
           anyone had answered (C12c review). Neutral, as the editor's question is: the backend knows
@@ -279,12 +286,20 @@ function RepeatingDelete({
       calendarName={calendarName}
       day={start ? formatDateLocal(start) : undefined}
       from={from}
+      deleteNote={deleteNoteOf(event)}
       // The token binds who each row tells, so no numbers go with the answer.
       onChoose={(picked, notify) => onConfirm(event, picked, notify, null)}
       onSettle={(token, action) => void onSettle(token, action)}
       onClose={close}
     />
   );
+}
+
+/** What deleting `event` adds beside Undo: a birthday's, that Google Contacts and the Google
+ *  Account keep it (C20 §6.5). The choices for a repeating one come from the backend, which refuses
+ *  "This event" in its own words. */
+function deleteNoteOf(event: CalendarEvent): string | null {
+  return specialKind(event.event_type) === "special_date" ? SPECIAL_DATE_DELETE : null;
 }
 
 function unreachable(value: never): never {

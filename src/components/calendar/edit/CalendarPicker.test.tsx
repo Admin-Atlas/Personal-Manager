@@ -80,6 +80,8 @@ const overview: CalendarOverview = {
     "gcal:consent@x.com": "needs_consent",
   },
   default_length: {},
+  auto_meet: {},
+  ask_access: {},
 };
 
 // jsdom ships no ResizeObserver, and the list's popover (escapeClipping) builds one to re-place
@@ -171,7 +173,9 @@ describe("CalendarPicker", () => {
 
   it("disables a no-private calendar for a private draft", () => {
     const { list } = open({ privateDraft: true });
-    const family = within(list).getByRole("radio", { name: /Family/ }) as HTMLInputElement;
+    const family = within(list).getByRole("radio", {
+      name: "Family, Can't hold private events",
+    }) as HTMLInputElement;
     expect(family.disabled).toBe(true);
     expect(family.closest("label")?.textContent).toContain("Can't hold private events");
     expect(family.closest("label")?.className).not.toContain("text-faint");
@@ -187,8 +191,9 @@ describe("CalendarPicker", () => {
 
   it("a hidden calendar is listed and says so", () => {
     const { list } = open({ hidden: new Set([`${WORK}:work@x.com`]) });
-    const work = within(list).getByRole("radio", { name: /Work/ });
-    expect(work.closest("label")?.textContent).toBe("Workhidden");
+    // What a screen reader hears, its name and its mark apart.
+    expect(within(list).getByRole("radio", { name: "Work, hidden" })).toBeTruthy();
+    expect(within(list).queryByRole("radio", { name: "Workhidden" })).toBeNull();
   });
 
   it("a click picks and closes, focus back on the button; the arrow keys only move the choice", () => {
@@ -299,5 +304,24 @@ describe("CalendarPicker", () => {
     );
     const trigger = screen.getByRole("button", { name: "Calendar: Personal" }) as HTMLButtonElement;
     expect(trigger.disabled).toBe(true);
+  });
+
+  // C18 critique C2-L5: the editor's Calendar row names its list for what it's for.
+  it("names its list as the caller says", () => {
+    render(
+      <CalendarPicker
+        targets={createTargets(overview)}
+        value={`${ME}:me@x.com`}
+        onChange={vi.fn()}
+        privateDraft={false}
+        hidden={new Set()}
+        colorOf={() => "var(--accent)"}
+        shapeOf={() => undefined}
+        listName="Calendars this event can go on"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    expect(screen.getByRole("group", { name: "Calendars this event can go on" })).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Calendars that can take a new event" })).toBeNull();
   });
 });

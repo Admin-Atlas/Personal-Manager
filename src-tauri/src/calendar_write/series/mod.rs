@@ -45,7 +45,8 @@ use crate::calendar_recur::spec::SpecError;
 use crate::calendar_recur::{Point, RecurError, SeriesStart};
 
 use super::attendees::{guest_set, GuestError};
-use super::dto::ReadOnlyReason;
+use super::dto::{CallKind, ReadOnlyReason};
+use super::gate::{self, DateSource};
 use super::patch::PatchError;
 use super::time::TimeError;
 
@@ -165,6 +166,12 @@ pub struct Master {
     pub guests_can_modify: bool,
     pub event_type: Option<String>,
     pub locked: bool,
+    /// The series' video call, by kind, `None` for none (C18): another service's call on every
+    /// occurrence is shown and kept.
+    pub call: Option<CallKind>,
+    /// Who owns a special date's day, from the series' own copy: the one an "all events" write
+    /// changes, so its copy decides (C20).
+    pub date_source: DateSource,
 }
 
 impl Master {
@@ -234,6 +241,8 @@ impl Master {
                 .unwrap_or(false),
             event_type: text("eventType"),
             locked: it.get("locked").and_then(Value::as_bool).unwrap_or(false),
+            call: super::call::call_of(it).map(|c| c.kind),
+            date_source: gate::date_source_of(it),
         })
     }
 
@@ -244,8 +253,10 @@ impl Master {
     /// so the planners refuse what it closes (`plan::locks`), and a locked series' notifications and
     /// colour still change (C13 critique C1-M1). Nor is someone else's series: an invitation's rules
     /// are the planners' (`plan::invitation_check`), so a refused row says its own words (C14).
+    /// Nor a birthday's or a Gmail event's: theirs are the planners' too (`plan::special_check`,
+    /// C20), leaving focus time, out of office, working locations and types Google adds later.
     pub fn read_only(&self) -> Option<ReadOnlyReason> {
-        if !matches!(self.event_type.as_deref(), None | Some("default")) {
+        if gate::kind_of(self.event_type.as_deref()) == gate::Kind::Other {
             return Some(ReadOnlyReason::SpecialType);
         }
         None
@@ -591,7 +602,8 @@ pub enum SeriesRefusal {
     /// An occurrence after the split has guests, attachments, a call, a label or a visibility of its
     /// own.
     CannotCarry(NaiveDate),
-    /// The series' description is formatted (HTML), and the draft would save it as plain text.
+    /// The series' own description has formatting PM can't edit, which the draft would replace, and
+    /// the user didn't choose to replace that very description (C19).
     FormattedDescription,
     /// Its visibility applies to every occurrence (Google), so it can't change for one.
     VisibilityIsSeriesWide,
@@ -654,6 +666,36 @@ pub enum SeriesRefusal {
     /// A new rule, or a move of every occurrence, on someone else's repeating event: re-ruling the
     /// user's copy would leave it apart from the organiser's event (C14 §0.5 row 5).
     InvitationRule,
+    /// A video call added or removed on "this and following" past the first occurrence: a split's
+    /// new part never carries a call (DECISIONS 17-10 #3), so it is "This event" or "All events"
+    /// (C18 Q4).
+    CallFollowing,
+    /// Another calendar for one occurrence: a repeating event goes there whole (C18e).
+    CalendarIsSeriesWide,
+    /// Another calendar from an occurrence past the first on: PM doesn't cut a repeating event
+    /// across two calendars (C18 Q2).
+    CalendarFollowing,
+    /// Another calendar for a repeating event that is one part of a "this and following" change
+    /// (PM's or Google's), or has a part split off it: the other part would stay behind, out of
+    /// reach of the checks such a change relies on, each on one calendar (C18 critique C1-H2).
+    TransferSplit,
+    /// "This and following" past the first occurrence on a birthday or a Gmail event: a new event
+    /// Google won't let PM make for these kinds (C20 §5.2).
+    SpecialWhole,
+    /// A birthday's date for one year: it moves for every year at once (C20 §0.4 item 2).
+    SpecialDateEveryYear,
+    /// A birthday's date moved to or from 29 February, or with Google's 29 February rule: Google
+    /// would need to repeat it differently (C20 critique C1-M1).
+    SpecialLeapDay,
+    /// A birthday's date moved where its repeat would have to change: a rule other than Google's
+    /// plain yearly one, or a year changed or deleted on its own (C20 §5.3).
+    SpecialDateRule,
+    /// One year of a birthday, moved on its own in Google, put back on its day: "All events" has
+    /// nothing to move and "This event" won't change one year, so only Google Calendar can.
+    SpecialYearAlone,
+    /// A birthday deleted for one year, or from one year on: it goes for every year at once (C20
+    /// §5.4).
+    SpecialDeleteEveryYear,
 }
 
 impl fmt::Display for SeriesRefusal {
@@ -694,8 +736,8 @@ impl fmt::Display for SeriesRefusal {
             ),
             SeriesRefusal::FormattedDescription => write!(
                 f,
-                "This repeating event's description has formatting, which saving it here as plain \
-                 text would remove. Change this occurrence on its own instead."
+                "This repeating event's own description has formatting PM can't edit, which this \
+                 change would replace. Change this occurrence on its own instead."
             ),
             SeriesRefusal::VisibilityIsSeriesWide => write!(
                 f,
@@ -817,6 +859,61 @@ impl fmt::Display for SeriesRefusal {
                 f,
                 "Someone else organises this repeating event, so only they can change how it \
                  repeats or move all of it. You can move this occurrence."
+            ),
+            SeriesRefusal::CallFollowing => write!(
+                f,
+                "PM adds or removes a video call on this occurrence or on all of them, not on this \
+                 one and the ones after it."
+            ),
+            SeriesRefusal::CalendarIsSeriesWide => write!(
+                f,
+                "Changing the calendar can't apply to just this occurrence: the whole repeating \
+                 event goes to the other calendar."
+            ),
+            SeriesRefusal::CalendarFollowing => write!(
+                f,
+                "PM puts a whole repeating event on another calendar, not this one and the ones \
+                 after it."
+            ),
+            // C18 critique C1-H3(b): C9's own phrasing, true of a part Google made too.
+            SeriesRefusal::TransferSplit => write!(
+                f,
+                "An earlier “this and following” change made a new part of this repeating event, \
+                 so PM keeps it on this calendar: the other part would be left behind. Change it \
+                 in Google Calendar."
+            ),
+            // Google's `birthday` type holds anniversaries and other dates too (C20 critique
+            // C2-L5).
+            SeriesRefusal::SpecialWhole => write!(
+                f,
+                "Google keeps a birthday, another special date or a Gmail event as one repeating \
+                 event, so PM can change this occurrence or all of them, not this one and the ones \
+                 after it."
+            ),
+            SeriesRefusal::SpecialDateEveryYear => write!(
+                f,
+                "A birthday or other special date moves for every year at once: choose “All \
+                 events”."
+            ),
+            SeriesRefusal::SpecialLeapDay => write!(
+                f,
+                "PM can't move a birthday to or from 29 February, because Google would need to \
+                 repeat it differently."
+            ),
+            SeriesRefusal::SpecialDateRule => write!(
+                f,
+                "PM can't move this date, because Google would need to repeat it differently (for \
+                 example, one of its years was changed or deleted on its own)."
+            ),
+            SeriesRefusal::SpecialYearAlone => write!(
+                f,
+                "This year was moved on its own, and PM can't put one year back on its day. Change \
+                 it in Google Calendar."
+            ),
+            SeriesRefusal::SpecialDeleteEveryYear => write!(
+                f,
+                "PM deletes a birthday or other special date for every year at once: choose “All \
+                 events”."
             ),
         }
     }
@@ -1188,6 +1285,67 @@ pub(crate) mod fixtures {
         plain("2026-10-19T09:00:00+01:00")
     }
 
+    /// A birthday added in Google Calendar on 04-05-1990, as Google holds the repeating event: all
+    /// day, every year, its own busy or free and visibility (C20). No name here says "birth": CodeQL
+    /// reads such a name as private data.
+    pub fn yearly_master() -> Value {
+        json!({
+            "kind": "calendar#event",
+            "id": "abc",
+            "etag": "\"m1\"",
+            "status": "confirmed",
+            "iCalUID": "abc@google.com",
+            "summary": "Mum",
+            "updated": "2026-10-01T10:00:00.000Z",
+            "start": { "date": "1990-05-04" },
+            "end": { "date": "1990-05-05" },
+            "recurrence": ["RRULE:FREQ=YEARLY"],
+            "organizer": { "email": "me@example.com", "self": true },
+            "eventType": "birthday",
+            "birthdayProperties": { "type": "birthday" },
+            "transparency": "transparent",
+            "visibility": "private",
+            "reminders": { "useDefault": true },
+        })
+    }
+
+    /// [`yearly_master`]'s occurrence on `day` (`YYYY-MM-DD`), as the series makes it.
+    pub fn yearly_occurrence(day: &str) -> Value {
+        let date = NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap();
+        let next = (date + TimeDelta::days(1)).format("%Y-%m-%d").to_string();
+        json!({
+            "kind": "calendar#event",
+            "id": format!("abc_{}", date.format("%Y%m%d")),
+            "etag": format!("\"i{}\"", date.format("%Y")),
+            "status": "confirmed",
+            "summary": "Mum",
+            "updated": "2026-10-01T10:00:00.000Z",
+            "recurringEventId": "abc",
+            "originalStartTime": { "date": day },
+            "start": { "date": day },
+            "end": { "date": next },
+            "organizer": { "email": "me@example.com", "self": true },
+            "eventType": "birthday",
+            "birthdayProperties": { "type": "birthday" },
+            "transparency": "transparent",
+            "visibility": "private",
+            "reminders": { "useDefault": true },
+        })
+    }
+
+    /// [`yearly_master`]'s occurrence on `day`, cancelled on its own.
+    pub fn yearly_cancelled(day: &str) -> Value {
+        let date = NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap();
+        json!({
+            "kind": "calendar#event",
+            "id": format!("abc_{}", date.format("%Y%m%d")),
+            "etag": format!("\"c{}\"", date.format("%Y")),
+            "status": "cancelled",
+            "recurringEventId": "abc",
+            "originalStartTime": { "date": day },
+        })
+    }
+
     pub fn title(s: &str) -> EventPatchDraft {
         EventPatchDraft {
             summary: Some(s.into()),
@@ -1220,6 +1378,8 @@ pub(crate) mod fixtures {
         pub instances: Option<Listing>,
         pub sibling: bool,
         pub later: LaterPart,
+        /// The name of the calendar a calendar change goes to (C18e).
+        pub calendar_to: Option<String>,
     }
 
     impl Case {
@@ -1233,6 +1393,7 @@ pub(crate) mod fixtures {
                 instances: None,
                 sibling: false,
                 later: LaterPart::None,
+                calendar_to: None,
             }
         }
 
@@ -1257,6 +1418,7 @@ pub(crate) mod fixtures {
                 sibling: self.sibling,
                 later: self.later,
                 me: CALENDAR,
+                calendar_to: self.calendar_to.as_deref(),
             }
         }
 
@@ -1422,6 +1584,23 @@ mod tests {
             json!("focusTime"),
         ));
         assert_eq!(focus.read_only(), Some(ReadOnlyReason::SpecialType));
+        // A birthday's and a Gmail event's own rules are the planners' (C20), and the series' own
+        // copy says who owns a birthday's day.
+        let yearly = read(yearly_master());
+        assert_eq!(yearly.read_only(), None);
+        assert_eq!(yearly.date_source, DateSource::Calendar);
+        let contact = read(with(
+            yearly_master(),
+            "birthdayProperties",
+            json!({ "type": "birthday", "contact": "people/c1" }),
+        ));
+        assert_eq!(contact.date_source, DateSource::Contacts);
+        let gmail = read(with(
+            master(&["RRULE:FREQ=DAILY"]),
+            "eventType",
+            json!("fromGmail"),
+        ));
+        assert_eq!(gmail.read_only(), None);
         // A lock closes only some fields, which the planners refuse (C13 critique C1-M1): not the
         // whole series.
         let locked = read(with(master(&["RRULE:FREQ=DAILY"]), "locked", json!(true)));

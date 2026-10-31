@@ -129,17 +129,30 @@ body {
 }
 
 /* The Markdown render surface (src/lib/markdown.tsx) — the one sanitized renderer for ingested content.
- * Every element binds to a design token (never a hex literal); there is no typography plugin. */
-.pm-markdown {
+ * Every element binds to a design token (never a hex literal); there is no typography plugin.
+ * `.pm-rich` is the second sanitised renderer, a Google event's formatted description
+ * (src/components/calendar/parts/RichDescription.tsx, C19): Google's subset only (bold, italic,
+ * underline, paragraphs, lists, links), drawn with Markdown's look. Its `white-space` is set, not
+ * inherited: runs of spaces collapse, as Google Calendar draws them, whatever box holds it.
+ * `.pm-desc-box` is the editor's box for the same description (DescriptionEditor.tsx, C19d): it
+ * takes the element rules below so lists and links show while editing (critique C2-H4), but not the
+ * base type, since these rules are unlayered and would beat the box's own Tailwind classes. */
+.pm-markdown,
+.pm-rich {
   color: var(--ink2);
   font-size: 0.875rem;
   line-height: 1.6;
   word-break: break-word;
 }
-.pm-markdown > :first-child {
+.pm-rich {
+  white-space: normal;
+}
+.pm-markdown > :first-child,
+:is(.pm-rich, .pm-desc-box) > :first-child {
   margin-top: 0;
 }
-.pm-markdown > :last-child {
+.pm-markdown > :last-child,
+:is(.pm-rich, .pm-desc-box) > :last-child {
   margin-bottom: 0;
 }
 .pm-markdown h1,
@@ -164,26 +177,33 @@ body {
   font-size: 0.875rem;
   color: var(--ink2);
 }
-.pm-markdown p {
+.pm-markdown p,
+:is(.pm-rich, .pm-desc-box) p {
   margin: 0.5rem 0;
 }
-.pm-markdown a {
+.pm-markdown a,
+:is(.pm-rich, .pm-desc-box) a {
   color: var(--accent-text);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
 .pm-markdown ul,
-.pm-markdown ol {
+.pm-markdown ol,
+:is(.pm-rich, .pm-desc-box) ul,
+:is(.pm-rich, .pm-desc-box) ol {
   margin: 0.5rem 0;
   padding-left: 1.25rem;
 }
-.pm-markdown ul {
+.pm-markdown ul,
+:is(.pm-rich, .pm-desc-box) ul {
   list-style: disc;
 }
-.pm-markdown ol {
+.pm-markdown ol,
+:is(.pm-rich, .pm-desc-box) ol {
   list-style: decimal;
 }
-.pm-markdown li {
+.pm-markdown li,
+:is(.pm-rich, .pm-desc-box) li {
   margin: 0.125rem 0;
 }
 /* Dash points — a pinboard note's second bullet kind (see src/lib/markdownDashLists.ts). The note

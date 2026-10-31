@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// THE single sanitization boundary for rendering ingested content as Markdown.
+// THE single sanitization boundary for rendering ingested content as Markdown. (A Google event's
+// formatted description has its own narrower one, `RichDescription` over
+// `src/lib/calendarEdit/descriptionHtml.ts`, C19.)
 //
 // Until this component, PM rendered every model/ingested string as escaped plain text
 // (`whitespace-pre-wrap`), so raw HTML in content was inert. Rendering vault content AS Markdown is the

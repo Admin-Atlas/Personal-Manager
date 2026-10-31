@@ -12,6 +12,7 @@ mod better_fit;
 mod blocking;
 mod briefing;
 mod calendar;
+mod calendar_ask;
 mod calendar_editing;
 mod calendar_fresh;
 mod calendar_recur;
@@ -1777,6 +1778,7 @@ pub fn run() {
             commands::delete_milestone,
             commands::reorder_milestones,
             commands::calendar_overview,
+            commands::request_calendar_access,
             commands::set_calendar_selected,
             commands::set_calendar_quiet,
             commands::set_calendar_kind,

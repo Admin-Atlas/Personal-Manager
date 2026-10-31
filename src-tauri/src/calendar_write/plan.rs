@@ -27,8 +27,9 @@ pub struct RequestPlan {
 /// Body features that need Google to be told which API version of them the client speaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionFlags {
-    /// The body adds or removes a conference (`conferenceDataVersion=1`). Sending it on any other
-    /// write would make Google ignore the calendar's "add Meet automatically" setting.
+    /// `conferenceDataVersion=1`. Every insert sets it (AS16: Google then adds no call of its own,
+    /// and PM applies the account's setting itself). A PATCH gets it from its body
+    /// ([`patch_event`]): exactly when the body carries `conferenceData` (C18).
     pub conference: bool,
     /// The body sets an event label (`eventLabelVersion=1`). Never sent otherwise.
     pub labels: bool,
@@ -144,6 +145,12 @@ pub fn patch_event(
     notify: Notify,
     flags: VersionFlags,
 ) -> RequestPlan {
+    // Version 1 exactly when this PATCH changes the call: never on any other PATCH, where it would
+    // only add risk (the plan's C18 card: "version 1 only when the user touched the row").
+    let flags = VersionFlags {
+        conference: flags.conference || body.get("conferenceData").is_some(),
+        ..flags
+    };
     RequestPlan {
         method: Method::Patch,
         url: url(
@@ -164,6 +171,32 @@ pub fn delete_event(calendar: &str, event: &str, etag: &str, notify: Notify) -> 
             &[("sendUpdates", notify.as_param())],
         ),
         if_match: Some(etag.to_string()),
+        body: None,
+    }
+}
+
+/// Put the event on another of the account's calendars (`events.move`), `destination` being Google's
+/// id of that calendar (C18). Google keeps everything about the event but its organiser, which
+/// becomes the destination; whether its id and iCal UID stay is live probe L-T1. No body ("Do not
+/// supply a request body") and no If-Match (none documented): the caller compares first (R2) and
+/// looks on both calendars after an answer it can't trust. No version flags: none is documented for
+/// it, and it sends no call.
+pub fn transfer_event(
+    calendar: &str,
+    event: &str,
+    destination: &str,
+    notify: Notify,
+) -> RequestPlan {
+    RequestPlan {
+        method: Method::Transfer,
+        url: url(
+            &["calendars", calendar, "events", event, "move"],
+            &[
+                ("destination", destination),
+                ("sendUpdates", notify.as_param()),
+            ],
+        ),
+        if_match: None,
         body: None,
     }
 }
@@ -395,6 +428,76 @@ mod tests {
         );
         assert!(both.url.contains("conferenceDataVersion=1"));
         assert!(both.url.contains("eventLabelVersion=1"));
+    }
+
+    /// C18: a PATCH's call version follows its body, a call asked for or removed alike; one that
+    /// sends no call never says it. An insert always does (AS16).
+    #[test]
+    fn a_patch_with_a_call_says_version_one_and_one_without_doesnt() {
+        for call in [
+            Value::Null,
+            json!({ "createRequest": { "requestId": "r" } }),
+        ] {
+            let p = patch_event(
+                "c",
+                "e",
+                "\"1\"",
+                json!({ "conferenceData": call }),
+                Notify::None,
+                VersionFlags::default(),
+            );
+            assert!(
+                p.url
+                    .ends_with("/events/e?sendUpdates=none&conferenceDataVersion=1"),
+                "{}",
+                p.url
+            );
+        }
+        let title = patch_event(
+            "c",
+            "e",
+            "\"1\"",
+            json!({ "summary": "x" }),
+            Notify::None,
+            VersionFlags::default(),
+        );
+        assert!(
+            !title.url.contains("conferenceDataVersion"),
+            "{}",
+            title.url
+        );
+        let insert = insert_event(
+            "c",
+            "abcde",
+            json!({ "summary": "x" }),
+            Notify::None,
+            VersionFlags {
+                conference: true,
+                labels: false,
+            },
+        );
+        assert!(insert.url.contains("conferenceDataVersion=1"));
+    }
+
+    /// C18d: putting an event on another calendar names its destination in the query, encoded as an
+    /// id is, states who is emailed, and carries no body, no etag and no version flag.
+    #[test]
+    fn a_transfer_names_its_destination_and_sends_no_body() {
+        for notify in [Notify::All, Notify::None] {
+            let p = transfer_event("me@x.org", "e1", "team#x@group.calendar.google.com", notify);
+            assert_eq!(p.method, Method::Transfer);
+            assert_eq!(
+                p.url,
+                format!(
+                    "https://www.googleapis.com/calendar/v3/calendars/me@x.org/events/e1/move\
+                     ?destination=team%23x%40group.calendar.google.com&sendUpdates={}",
+                    notify.as_param()
+                )
+            );
+            assert_eq!(p.if_match, None);
+            assert_eq!(p.body, None);
+            assert!(!p.url.contains("conferenceDataVersion"), "{}", p.url);
+        }
     }
 
     #[test]

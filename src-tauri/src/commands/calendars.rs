@@ -16,7 +16,9 @@ use std::time::Instant;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::blocking::spawn_blocking_result;
 use crate::calendar::{self, CalendarEvent, IcsFeedInfo};
+use crate::calendar_ask::{self, AskOwner};
 use crate::calendar_editing::{self, Choice, ConsentVerdict, EditingStatus};
 use crate::calendar_fresh::{Freshness, Plan, Verdict};
 use crate::calendar_write::dto::ListRights;
@@ -28,9 +30,9 @@ use crate::{briefing, drive, flags, microsoft, outlook_calendar, secrets, AppSta
 use super::shared::own_client;
 use super::shared::resolve_zone;
 use super::shared::{
-    google_account_emails, google_grant_token_keys, google_grant_users, pin_existing_grants,
-    release_plan, require_main_window, saved_project_account, wrong_account, GoogleDisconnect,
-    GoogleUse,
+    caller_may_write, google_account_emails, google_grant_token_keys, google_grant_users,
+    pin_existing_grants, release_plan, require_main_window, saved_project_account, wrong_account,
+    GoogleDisconnect, GoogleUse,
 };
 use super::vaults::require_vault_owner;
 
@@ -70,6 +72,30 @@ pub struct CalendarOverview {
     /// Google's default length for a new event, in minutes, keyed by account id (`gcal:<email>`)
     /// like `editing`. An account with none stored is missing: the editor then uses an hour.
     pub default_length: BTreeMap<String, u32>,
+    /// Each Google account's "Automatically add Google Meet video conferences to events I create",
+    /// keyed by account id like `editing` (C18b). An account with none stored is missing: a new
+    /// event then starts with no call.
+    pub auto_meet: BTreeMap<String, bool>,
+    /// Whom to ask for edit access, keyed by PM's calendar id: only calendars shared with you to view
+    /// only, with an owner PM can name (`calendar_ask`, C20b). Computed here only, so the rule lives
+    /// in Rust.
+    pub ask_access: BTreeMap<String, AskOwner>,
+}
+
+/// `by_email`'s values (keyed by lowercased address) keyed by the id of each Google account in
+/// `accounts` instead, as the overview's maps are; an account with none stored is left out.
+fn by_account<T: Copy>(
+    accounts: &[calendar::CalendarAccount],
+    by_email: &BTreeMap<String, T>,
+) -> BTreeMap<String, T> {
+    accounts
+        .iter()
+        .filter(|a| a.provider == "google")
+        .filter_map(|a| {
+            let email = a.email.as_deref()?.trim().to_lowercase();
+            Some((a.id.clone(), *by_email.get(&email)?))
+        })
+        .collect()
 }
 
 /// The unified calendar state across every provider. Runs the one-time legacy Google migration first
@@ -78,7 +104,7 @@ pub struct CalendarOverview {
 pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
     let _ = migrate_legacy_google_calendar(&app).await;
     let state = app.state::<AppState>();
-    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices, lengths) = {
+    let (accounts, calendars, last_sync, (mirror_start, mirror_end), choices, lengths, meets) = {
         let conn = state.conn()?;
         (
             calendar::list_sources(&conn, None)?,
@@ -87,16 +113,18 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
             calendar::time_window(&conn)?,
             calendar_editing::choices(&conn)?,
             calendar::default_lengths(&conn)?,
+            calendar::auto_meets(&conn)?,
         )
     };
-    let default_length = accounts
+    let default_length = by_account(&accounts, &lengths);
+    let auto_meet = by_account(&accounts, &meets);
+    // No fetch: Google's role and owner for each calendar are refreshed on every sync.
+    let connected: Vec<&str> = accounts
         .iter()
         .filter(|a| a.provider == "google")
-        .filter_map(|a| {
-            let email = a.email.as_deref()?.trim().to_lowercase();
-            Some((a.id.clone(), *lengths.get(&email)?))
-        })
+        .filter_map(|a| a.email.as_deref())
         .collect();
+    let ask_access = calendar_ask::ask_map(&calendars, &connected);
     // Token scopes come from the keychain, read with the DB lock released. Only an account with a
     // stored choice needs one: without it, editing is off whatever the token holds.
     let editing = accounts
@@ -125,6 +153,72 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         mirror_end,
         editing,
         default_length,
+        auto_meet,
+        ask_access,
+    })
+}
+
+/// What asking for edit access came to. The owner's address is the user's own data (their calendar
+/// list), shown back to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AccessAsk {
+    /// The system handed the email to the mail app.
+    Opened { owner: String },
+    /// The system couldn't start anything to open it.
+    NoMailApp { owner: String },
+    /// Nobody to ask now: the calendar is gone, its role changed, its owner is connected to PM, or PM
+    /// doesn't know this account's address.
+    NoOwner,
+}
+
+/// Open a new email in the system's mail app asking the owner of a calendar shared with you to view
+/// only for edit access (plan Q10, A12). `calendar_id` is PM's calendar id; whom to ask and what the
+/// email says come from the stored calendar list, never from the webview. Nothing is sent: the user
+/// sends the email, or doesn't. Checked like a calendar write (the main window, the vault's owner),
+/// since the email names the owner's account. Not one: it changes nothing in Google.
+#[tauri::command]
+pub async fn request_calendar_access(
+    app: AppHandle,
+    window: tauri::Window,
+    calendar_id: String,
+) -> Result<AccessAsk> {
+    if !caller_may_write(window.label()) {
+        return Err(Error::Other(
+            "PM can only open this email from its main window.".into(),
+        ));
+    }
+    require_vault_owner(&app).map_err(|_| {
+        Error::Other("On a shared vault, only its owner can ask for access from PM.".into())
+    })?;
+    let plan = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        let calendars = calendar::list_calendars(&conn)?;
+        let sources = calendar::list_sources(&conn, Some("google"))?;
+        let addresses: Vec<(&str, &str)> = sources
+            .iter()
+            .filter_map(|s| Some((s.id.as_str(), s.email.as_deref()?)))
+            .collect();
+        calendar_ask::ask_plan(&calendars, &addresses, &calendar_id)
+    };
+    let Some((owner, link)) = plan else {
+        return Ok(AccessAsk::NoOwner);
+    };
+    // Detached, and on the blocking pool all the same: a launcher that waits (macOS's `open`, or
+    // xdg-open on a desktop it doesn't know) must never hold the main thread. Started is all PM can
+    // know; whether a mail app then opened, it can't tell. The error is logged by its kind only: its
+    // text repeats the link.
+    let opened = spawn_blocking_result("ask for access", move || {
+        Ok(open::that_detached(&link)
+            .map_err(|e| eprintln!("ask for access: no mail app opened ({:?})", e.kind()))
+            .is_ok())
+    })
+    .await?;
+    Ok(if opened {
+        AccessAsk::Opened { owner }
+    } else {
+        AccessAsk::NoMailApp { owner }
     })
 }
 
@@ -227,12 +321,15 @@ async fn do_connect_google_calendar(
     google::save_consented_token(&google_calendar_token_key(&email), &token).await?;
     // Google's default length for a new event, read now so a new account has it before its first
     // full sync (C10b); one that can't be read leaves any stored one, and the editor uses an hour.
+    // The same for its Meet setting (C18b): unread, a new event starts with no call.
     let default_length = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
+    let auto_meet = calendar::fetch_auto_meet(&google_calendar_token_key(&email)).await;
     let conn = state.conn()?;
     calendar::upsert_source(&conn, &account, "google", Some(&email), &email)?;
     // A nicety, so a store that can't take it never fails the connect. The same guarded store as a
     // sync's (the source was registered just above, under this lock).
     let _ = calendar::remember_default_length_if_connected(&conn, &account, &email, default_length);
+    let _ = calendar::remember_auto_meet_if_connected(&conn, &account, &email, auto_meet);
     // A read-only connect asked Google for reading only, so it turns editing off even when the
     // account had it: only the "Turn on editing" consent sets the choice.
     calendar_editing::set_choice(&conn, &email, None)?;
@@ -304,7 +401,7 @@ pub async fn disconnect_google_calendar_account(
     }
     calendar::remove_source(&conn, &calendar::google_account_id(&email))?;
     calendar_editing::set_choice(&conn, &email, None)?;
-    calendar::set_default_length(&conn, &email, None)?;
+    calendar::forget_account_settings(&conn, &email)?;
     // A grant Google keeps still carries the write scope if editing was ever granted; a revoke ends it.
     let calendar_write = !plan.revoke && calendar_editing::write_granted(&conn, &email)?;
     if plan.revoke {
@@ -677,7 +774,7 @@ pub fn clear_google_client(app: AppHandle, state: State<'_, AppState>) -> Result
     }
     secrets::clear_google_token_for(google::CALENDAR_TOKEN_KEY).ok(); // any not-yet-migrated legacy token
     calendar_editing::clear_all(&conn)?;
-    calendar::clear_default_lengths(&conn)?;
+    calendar::clear_account_settings(&conn)?;
     drive::forget_all_accounts(&conn)?;
     // A backup-only account has no Drive row, so the loop above never saw its sign-in. Clear it before
     // the destination below forgets which account it was.
@@ -864,15 +961,19 @@ async fn reconcile_calendar_lists(app: &AppHandle) {
             );
         }
         if acc.provider == "google" {
-            // Google's default length for a new event (A28, C10b): one more GET per account beside
-            // the list's, read with no lock held. A failed read keeps the last good value.
-            let read = calendar::fetch_default_length(&google_calendar_token_key(&email)).await;
+            // Google's default length for a new event (A28, C10b) and its Meet setting (C18b): two
+            // more GETs per account beside the list's, read with no lock held. A failed read keeps
+            // the last good value.
+            let key = google_calendar_token_key(&email);
+            let read = calendar::fetch_default_length(&key).await;
+            let meet = calendar::fetch_auto_meet(&key).await;
             let state = app.state::<AppState>();
             let Ok(conn) = state.conn() else {
                 continue;
             };
-            // Disconnected during the read: its length went with it, and stays gone.
+            // Disconnected during the read: its settings went with it, and stay gone.
             let _ = calendar::remember_default_length_if_connected(&conn, &acc.id, &email, read);
+            let _ = calendar::remember_auto_meet_if_connected(&conn, &acc.id, &email, meet);
         }
     }
 }
@@ -1255,7 +1356,7 @@ pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<Listed
     Ok(rows
         .into_iter()
         .zip(rights)
-        .map(|(event, rights)| ListedEvent { event, rights })
+        .map(|(event, rights)| ListedEvent::new(event, rights))
         .collect())
 }
 
@@ -1268,6 +1369,20 @@ pub struct ListedEvent {
     /// account's real status from `calendar_overview`), beside the row's own fields.
     #[serde(flatten)]
     pub rights: ListRights,
+    /// See [`calendar::description_cut`]. Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub description_cut: bool,
+}
+
+impl ListedEvent {
+    fn new(event: CalendarEvent, rights: ListRights) -> Self {
+        let description_cut = calendar::description_cut(event.description.as_deref());
+        Self {
+            event,
+            rights,
+            description_cut,
+        }
+    }
 }
 
 /// The active PM flags anchored on a calendar event's iCal UID — shown in the event detail popup so a
@@ -1398,25 +1513,96 @@ mod tests {
         assert_eq!(titles(&conn), vec!["Gym"]);
     }
 
+    /// C18b: the overview names each Google account's Meet setting by account id, as it does the
+    /// default length; an account with none stored, and one that isn't Google's, is missing.
+    #[test]
+    fn the_overview_says_each_accounts_meet_setting() {
+        let (_d, conn, _cal) = store();
+        calendar::upsert_source(
+            &conn,
+            "gcal:work@x.com",
+            "google",
+            Some("Work@X.com"),
+            "Work@X.com",
+        )
+        .unwrap();
+        calendar::upsert_source(&conn, "gcal:new@x.com", "google", Some("new@x.com"), "new")
+            .unwrap();
+        calendar::upsert_source(&conn, "ics:feed", "other", None, "Feed").unwrap();
+        // Another provider's account at an address Google's setting was read for: never named.
+        calendar::upsert_source(
+            &conn,
+            "outlook:work@x.com",
+            "microsoft",
+            Some("work@x.com"),
+            "work@x.com",
+        )
+        .unwrap();
+        calendar::set_auto_meet(&conn, "me@x.com", Some(true)).unwrap();
+        calendar::set_auto_meet(&conn, "work@x.com", Some(false)).unwrap();
+        // An address no account has: never in the overview.
+        calendar::set_auto_meet(&conn, "gone@x.com", Some(true)).unwrap();
+        let accounts = calendar::list_sources(&conn, None).unwrap();
+        let shown = by_account(&accounts, &calendar::auto_meets(&conn).unwrap());
+        let want: BTreeMap<String, bool> = [
+            ("gcal:me@x.com".to_string(), true),
+            ("gcal:work@x.com".to_string(), false),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(shown, want);
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["gcal:me@x.com"], true);
+    }
+
+    /// C18b: a disconnect forgets what PM read of the account's Meet setting, as it does its default
+    /// length, and clearing the Google client forgets every account's.
+    #[test]
+    fn a_disconnect_forgets_the_meet_setting() {
+        let (_d, conn, _cal) = store();
+        calendar::set_auto_meet(&conn, "me@x.com", Some(true)).unwrap();
+        calendar::set_default_length(&conn, "me@x.com", Some(30)).unwrap();
+        calendar::forget_account_settings(&conn, "Me@X.com").unwrap();
+        assert!(calendar::auto_meets(&conn).unwrap().is_empty());
+        assert!(calendar::default_lengths(&conn).unwrap().is_empty());
+        // The commands themselves (they need the app) forget through those two.
+        let source = include_str!("calendars.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body_of = |name: &str| {
+            let start = shipped.find(name).expect("the command is there");
+            let end = shipped[start..]
+                .find("\n}\n")
+                .map_or(shipped.len(), |e| start + e);
+            &shipped[start..end]
+        };
+        assert!(body_of("pub async fn disconnect_google_calendar_account(")
+            .contains("calendar::forget_account_settings(&conn, &email)?;"));
+        assert!(body_of("pub fn clear_google_client(")
+            .contains("calendar::clear_account_settings(&conn)?;"));
+    }
+
     /// The calendar view reads what it may offer on a row beside the row's own fields (C14): one
     /// flat object, never a nested one it would miss.
     #[test]
     fn a_listed_row_carries_its_rights_flat() {
-        let listed = ListedEvent {
-            event: CalendarEvent {
+        let listed = ListedEvent::new(
+            CalendarEvent {
                 id: format!("{CAL}:a"),
                 calendar_id: CAL.into(),
                 summary: "Dentist".into(),
                 start: "2026-10-09T10:00:00Z".into(),
                 ..Default::default()
             },
-            rights: ListRights {
+            ListRights {
                 edit_block: None,
                 can_delete: true,
                 can_respond: false,
                 can_retime: true,
             },
-        };
+        );
         let json = serde_json::to_value(&listed).unwrap();
         assert_eq!(json["summary"], "Dentist");
         assert_eq!(json["edit_block"], serde_json::Value::Null);
@@ -1424,5 +1610,112 @@ mod tests {
         assert_eq!(json["can_respond"], false);
         assert_eq!(json["can_retime"], true);
         assert!(json.get("rights").is_none(), "flat, not nested");
+        assert!(
+            json.get("description_cut").is_none(),
+            "left out when not cut"
+        );
+    }
+
+    /// A description the mirror kept to its cap says so on the calendar view's row, beside the rest
+    /// (C19), for the pop-up's "the rest is in Google Calendar".
+    #[test]
+    fn a_listed_row_says_its_description_was_cut() {
+        let listed = ListedEvent::new(
+            CalendarEvent {
+                id: format!("{CAL}:a"),
+                calendar_id: CAL.into(),
+                description: Some("x".repeat(8000)),
+                ..Default::default()
+            },
+            ListRights {
+                edit_block: None,
+                can_delete: false,
+                can_respond: false,
+                can_retime: false,
+            },
+        );
+        let json = serde_json::to_value(&listed).unwrap();
+        assert_eq!(json["description_cut"], true);
+    }
+
+    /// What asking for edit access came to, in the words the view reads (C20b).
+    #[test]
+    fn an_ask_says_what_came_of_it_flat() {
+        let json = |ask: AccessAsk| serde_json::to_value(ask).unwrap();
+        assert!(
+            json(AccessAsk::Opened {
+                owner: "boss@x.org".into()
+            }) == serde_json::json!({"outcome": "opened", "owner": "boss@x.org"}),
+            "opened, with whom it asked"
+        );
+        assert!(
+            json(AccessAsk::NoMailApp {
+                owner: "boss@x.org".into()
+            }) == serde_json::json!({"outcome": "no_mail_app", "owner": "boss@x.org"}),
+            "no mail app, with whom to write to"
+        );
+        assert!(
+            json(AccessAsk::NoOwner) == serde_json::json!({"outcome": "no_owner"}),
+            "nobody to ask"
+        );
+    }
+
+    /// The ask's command needs the app, so its shape is read from the source (C20b): the window and
+    /// the vault's owner checked before anything is read, the DB lock let go before the email
+    /// opens, and the email opened detached on the blocking pool, its error logged by kind only.
+    /// And the overview computes whom to ask in Rust.
+    #[test]
+    fn asking_is_checked_like_a_write_and_opens_off_the_main_thread() {
+        let source = include_str!("calendars.rs");
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        let body_of = |name: &str| {
+            let start = shipped.find(name).expect("the command is there");
+            let end = shipped[start..]
+                .find("\n}\n")
+                .map_or(shipped.len(), |e| start + e);
+            &shipped[start..end]
+        };
+        let ask = body_of("pub async fn request_calendar_access(");
+        let at = |needle: &str| ask.find(needle).unwrap_or(usize::MAX);
+        let order = [
+            "if !caller_may_write(window.label()) {",
+            "require_vault_owner(&app).map_err(",
+            "let conn = state.conn()?;",
+            // Only a Google sign-in counts as the user's own address or a connected owner.
+            "calendar::list_sources(&conn, Some(\"google\"))?;",
+            "calendar_ask::ask_plan(&calendars, &addresses, &calendar_id)",
+            // The block that holds the lock ends before the email opens.
+            "};\n    let Some((owner, link)) = plan else {",
+            "spawn_blocking_result(\"ask for access\", move || {",
+            "open::that_detached(&link)",
+            "e.kind()",
+            "Ok(if opened {\n        AccessAsk::Opened { owner }\n    } else {\n        AccessAsk::NoMailApp { owner }",
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                at(pair[0]) < at(pair[1]) && at(pair[1]) != usize::MAX,
+                "the ask's steps are in order: {} before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(
+            !ask.contains("open::that(") && !ask.contains("{e}") && !ask.contains("{e:?}"),
+            "never the waiting opener, and never the error's text"
+        );
+        let overview = body_of("pub async fn calendar_overview(");
+        assert!(
+            overview.contains(
+                "let connected: Vec<&str> = accounts\n        .iter()\n        \
+                 .filter(|a| a.provider == \"google\")"
+            ),
+            "only a Google account is a connected owner: an Outlook sign-in can't share a Google calendar"
+        );
+        assert!(
+            overview.contains("let ask_access = calendar_ask::ask_map(&calendars, &connected);")
+        );
     }
 }

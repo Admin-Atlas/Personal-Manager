@@ -5,10 +5,14 @@
 // aggregator, so this surfaces everything the mirror holds — source calendar, when, busy/free,
 // location, attendees + organiser, conferencing, recurrence, description, and any linked milestone /
 // project / PM flag — plus buttons to open the event in its source calendar or its project, and, on
-// an event the user is invited to (#884, C14b), "Going?" with Yes, No and Maybe. It's an
+// an event the user is invited to (#884, C14b), "Going?" with Yes, No and Maybe. On a calendar
+// shared with the user to view only, the line saying so offers to ask its owner for edit access
+// (C20b): an email PM opens in the mail app for the user to send, never one PM sends. It's an
 // in-place floating panel (the pinboard folder-popup pattern): fixed-position, clamped to the
 // viewport, dismissed by click-outside or Escape. The description is the one piece of untrusted
-// provider text, so it renders ONLY through the sanitising Markdown boundary.
+// provider text, so it renders only through a sanitising boundary: `<Markdown>`, or, for a Google
+// description with formatting, `RichDescription` (C19b). Its mail links open the mail app with the
+// address alone (`useMailLink`), and a link that would open inside PM's own window does nothing.
 //
 // A NON-MODAL dialog, and staying one: it takes initial focus and hands focus back on Escape/Close
 // (`useRestoreFocus`), but no focus trap and no `aria-modal` — the calendar behind it stays live and
@@ -24,12 +28,15 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
   type MutableRefObject,
   type ReactNode,
 } from "react";
 import type {
+  AccessAsk,
   Calendar,
   CalendarEvent,
   Flag,
@@ -38,7 +45,15 @@ import type {
   RsvpScope,
   WriteOutcome,
 } from "../../../lib/types";
+import {
+  askConnectedText,
+  askLabel,
+  askText,
+  JOIN_FAILED,
+  OPEN_FAILED,
+} from "../../../lib/calendarEdit/editReasons";
 import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
+import { linkTarget, parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
 import { eventFlags, openUrl } from "../../../lib/ipc";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
@@ -46,6 +61,8 @@ import { eventColour } from "../../../theme/eventPalette";
 import { Button, CopyLinkButton, IconButton } from "../../ui";
 import { Markdown } from "../../../lib/markdown";
 import { RsvpControl } from "../edit/RsvpControl";
+import { RichDescription } from "./RichDescription";
+import { stopLinkAuxClick, useMailLink } from "./useMailLink";
 import { repeatsText, whenText } from "./whenText";
 
 interface Props {
@@ -77,12 +94,32 @@ export interface PopoverEditing {
   canEdit: boolean;
   /** Offer Delete. */
   canDelete: boolean;
+  /** Offer Duplicate (C18c): a copy the user can change before it's created, on any calendar. */
+  canDuplicate: boolean;
   /** Why the event can't be changed, or a part of it, when that's so; a line under the actions. */
   reason: string | null;
   onEdit: () => void;
   onDelete: () => void;
+  onDuplicate: () => void;
   /** Copies the user can reply from, the one shown first (C14b). Empty or absent: no reply strip. */
   rsvp?: readonly PopoverRsvp[];
+  /** On a calendar shared with you to view only: whom to ask for edit access, and how (C20b). Shown
+   *  with the reason line, so only where there is one. */
+  ask?: PopoverAsk | null;
+}
+
+/** Asking a view-only calendar's owner for edit access (C20b, plan Q10). */
+export interface PopoverAsk {
+  owner: string;
+  /** The owner is one of the user's own Google accounts in PM: a sentence on how to share it from
+   *  there, and no email. */
+  connected: boolean;
+  /** This account's address, for the words. */
+  own: string | null;
+  /** The calendar's name, for the words. */
+  calendar: string;
+  /** Opens the email in the mail app (the backend decides to whom, and what it says). */
+  onAsk: () => Promise<AccessAsk>;
 }
 
 /** One copy of the event the user can reply from. */
@@ -113,6 +150,19 @@ function showAsLabel(v: string): string {
   }
 }
 
+/** Where the rest of a description PM's copy cut short is. */
+function restOfDescription(provider: string | undefined): string {
+  switch (provider) {
+    case "google":
+      return "The rest is in Google Calendar.";
+    case "outlook":
+    case "microsoft":
+      return "The rest is in Outlook.";
+    default:
+      return "The rest is in the calendar it comes from.";
+  }
+}
+
 /** "Open in Google" / "Open in Outlook" / a generic label from the provider. */
 function sourceLabel(provider: string | undefined): string {
   switch (provider) {
@@ -132,6 +182,57 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span className="w-20 shrink-0 font-mono uppercase tracking-wide text-ink4">{label}</span>
       <div className="min-w-0 flex-1 text-ink2">{children}</div>
     </div>
+  );
+}
+
+/** The reason line of an event on a calendar shared with you to view only, with the ask for edit
+ *  access after it (C20b): an inline button that opens an email in the mail app, and a status line
+ *  under it saying what came of that. The status line is there, empty, from the start: a live region
+ *  that appears together with its words isn't announced (critique C2-L2). Keyed by the event, so a
+ *  re-pointed pop-up never shows the last event's answer. A long address wraps anywhere. */
+function AskLine({ reason, ask }: { reason: string; ask: PopoverAsk }) {
+  const [asking, setAsking] = useState(false);
+  const [said, setSaid] = useState("");
+  const onClick = () => {
+    // aria-disabled, not disabled, so focus stays on the button while it waits.
+    if (asking) return;
+    setAsking(true);
+    // Emptied first, as the mail links' line is: a second try that ends the same way is said again
+    // (a live region whose words don't change announces nothing) and is seen to have happened.
+    setSaid("");
+    // Anything the command refuses with comes back as the backend's own words.
+    void ask
+      .onAsk()
+      .then(
+        (result) => askText(result, ask.calendar),
+        (e: unknown) =>
+          askText(
+            { outcome: "failed", message: typeof e === "string" ? e : String(e) },
+            ask.calendar,
+          ),
+      )
+      .then((text) => {
+        setSaid(text);
+        setAsking(false);
+      });
+  };
+  return (
+    <>
+      <p>
+        {reason}{" "}
+        <button
+          type="button"
+          aria-disabled={asking || undefined}
+          onClick={onClick}
+          className="border-0 bg-transparent p-0 text-left align-baseline text-accent-text underline decoration-dotted underline-offset-2 transition [overflow-wrap:anywhere] hover:brightness-110 motion-reduce:transition-none"
+        >
+          {askLabel(ask.owner)}
+        </button>
+      </p>
+      <p role="status" className="text-ink3 [overflow-wrap:anywhere]">
+        {said}
+      </p>
+    </>
   );
 }
 
@@ -287,6 +388,44 @@ export function CalendarEventPopover({
 
   const attendees = event.attendees ?? [];
 
+  // A Google description draws its formatting when it has some Google writes (C19b, critique C1-H1);
+  // any other keeps the Markdown path, as Outlook's and a feed's always do (DECISIONS 10-10: their
+  // "<https://…>" addresses are links there). Read once per description, not per render.
+  const google = calendar?.provider === "google";
+  const rich = useMemo(() => {
+    if (!google || !event.description) return null;
+    const parsed = parseDescription(event.description);
+    return parsed.markup ? parsed.doc : null;
+  }, [google, event.description]);
+  const mail = useMailLink(event.id);
+  // Join the call pressed and the browser didn't open: said under it, for this event only (a
+  // re-pointed pop-up never shows another's), Copy link being beside it.
+  const [joinFailed, setJoinFailed] = useState<string | null>(null);
+  const joinCall = (link: string) => {
+    setJoinFailed(null);
+    const on = event.id;
+    openUrl(link).catch(() => setJoinFailed(on));
+  };
+  // "Open in Google Calendar" likewise, said under the actions.
+  const [openFailed, setOpenFailed] = useState<string | null>(null);
+  const openSource = (link: string) => {
+    setOpenFailed(null);
+    const on = event.id;
+    openUrl(link).catch(() => setOpenFailed(on));
+  };
+  // A Markdown description's mail links open as the formatted view's do (whose own handler has
+  // already taken its own), and a link that would load inside PM's window (a relative one, or one
+  // `safeUrl` emptied) does nothing. Web links are `useExternalLinks`', left to it.
+  const onDescriptionClick = (e: ReactMouseEvent) => {
+    const anchor = e.target instanceof Element ? e.target.closest("a") : null;
+    if (anchor === null || e.defaultPrevented) return;
+    const href = anchor.getAttribute("href") ?? "";
+    if (anchor.target === "_blank" && /^https?:\/\//i.test(href)) return;
+    e.preventDefault();
+    const target = linkTarget(href);
+    if (target !== null && /^mailto:/i.test(target)) mail.open(target);
+  };
+
   // A `role="dialog"` with a blank accessible name is announced as an unnamed dialog, and the
   // heading below would render empty beside it. Every producer of `summary` does already substitute
   // something — Google's parse writes this exact string, the milestone overlay always appends
@@ -302,6 +441,9 @@ export function CalendarEventPopover({
       // No `aria-modal`: the calendar behind this stays live and Tab must be able to leave.
       aria-label={title}
       tabIndex={-1}
+      // Its own help in the calendar view, on the panel rather than the grid's (C20b). Without
+      // `editing` (Focus › Upcoming) the help is the agenda's around it.
+      data-help={editing ? "calendar-event" : undefined}
       className="fixed z-50 flex max-h-[75vh] w-[340px] flex-col overflow-hidden rounded-[var(--radius)] border border-border2 bg-panel shadow-2xl focus:outline-none"
       style={{
         left: pos?.left ?? anchor.left,
@@ -374,7 +516,7 @@ export function CalendarEventPopover({
             <span className="flex min-w-0 items-center gap-2">
               <button
                 type="button"
-                onClick={() => void openUrl(event.conference_url!)}
+                onClick={() => joinCall(event.conference_url!)}
                 className="truncate text-left text-accent-text hover:brightness-110"
               >
                 Join the call →
@@ -387,6 +529,10 @@ export function CalendarEventPopover({
                 className="shrink-0"
               />
             </span>
+            {/* Always there (empty, it takes no room), so a screen reader hears it. */}
+            <p role="status" className="text-st-due">
+              {joinFailed === event.id ? JOIN_FAILED : ""}
+            </p>
           </Field>
         )}
 
@@ -410,8 +556,26 @@ export function CalendarEventPopover({
         )}
 
         {event.description && (
-          <div className="pm-event-desc mt-1 border-t border-border pt-2 text-xs text-ink2">
-            <Markdown plainLines>{event.description}</Markdown>
+          // It hears clicks on its links only, which the keyboard sends as links do.
+          <div
+            className="pm-event-desc mt-1 border-t border-border pt-2 text-xs text-ink2"
+            onClick={onDescriptionClick}
+            // A middle-click is never a click: the Markdown path's links need the guard too.
+            onAuxClick={stopLinkAuxClick}
+          >
+            {rich !== null ? (
+              <RichDescription doc={rich} onMail={mail.open} />
+            ) : (
+              <Markdown plainLines>{event.description}</Markdown>
+            )}
+            {event.description_cut && (
+              <p className="mt-1 text-ink3">{restOfDescription(calendar?.provider)}</p>
+            )}
+            {/* Always there (empty, it takes no room), so a screen reader hears it when a mail link
+                didn't open; selectable, so the address can be copied. */}
+            <p role="status" className="text-st-due">
+              {mail.failure ?? ""}
+            </p>
           </div>
         )}
 
@@ -449,7 +613,7 @@ export function CalendarEventPopover({
       <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2.5">
         {event.html_link && (
           <>
-            <Button variant="secondary" size="sm" onClick={() => void openUrl(event.html_link!)}>
+            <Button variant="secondary" size="sm" onClick={() => openSource(event.html_link!)}>
               {sourceLabel(calendar?.provider)}
             </Button>
             <CopyLinkButton url={event.html_link} to="this event" />
@@ -464,11 +628,27 @@ export function CalendarEventPopover({
             Open in Project
           </Button>
         )}
+        {/* Duplicate first of the event's own actions, taking the row's push to the right from
+            whichever comes first (critique C2-L6). */}
+        {editing?.canDuplicate && (
+          <Button
+            variant="tertiary"
+            size="sm"
+            className="ml-auto"
+            onClick={() => {
+              // As Edit below: focus back to the chip, for what opens next to return it there.
+              restoreFocus();
+              editing.onDuplicate();
+            }}
+          >
+            Duplicate
+          </Button>
+        )}
         {editing?.canEdit && (
           <Button
             variant="primary"
             size="sm"
-            className="ml-auto"
+            className={editing.canDuplicate ? undefined : "ml-auto"}
             onClick={() => {
               // As Delete below: focus back to the chip, for the editor to return it there.
               restoreFocus();
@@ -482,7 +662,7 @@ export function CalendarEventPopover({
           <Button
             variant="danger"
             size="sm"
-            className={editing.canEdit ? undefined : "ml-auto"}
+            className={editing.canEdit || editing.canDuplicate ? undefined : "ml-auto"}
             onClick={() => {
               // Back to the event's chip first, so the delete dialog that opens next returns
               // focus there when it closes, rather than to this button, which is about to go.
@@ -494,10 +674,32 @@ export function CalendarEventPopover({
           </Button>
         )}
       </div>
-      {editing?.reason && (
-        <p className="border-t border-border px-3 py-2 text-[0.6875rem] leading-relaxed text-ink4">
-          {editing.reason}
+      {/* Always there with the link (empty, it takes no room), so a screen reader hears it. */}
+      {event.html_link && (
+        <p
+          role="status"
+          className={`px-3 text-xs text-st-due${openFailed === event.id ? " pb-2.5" : ""}`}
+        >
+          {openFailed === event.id ? OPEN_FAILED : ""}
         </p>
+      )}
+      {editing?.reason && (
+        <div className="border-t border-border px-3 py-2 text-[0.6875rem] leading-relaxed text-ink4">
+          {editing.ask && !editing.ask.connected ? (
+            <AskLine key={event.id} reason={editing.reason} ask={editing.ask} />
+          ) : (
+            <p>
+              {editing.reason}
+              {/* The owner is one of the user's own accounts: how to share it from there. */}
+              {editing.ask && (
+                <span className="[overflow-wrap:anywhere]">
+                  {" "}
+                  {askConnectedText(editing.ask.owner, editing.ask.own)}
+                </span>
+              )}
+            </p>
+          )}
+        </div>
       )}
     </div>
   );

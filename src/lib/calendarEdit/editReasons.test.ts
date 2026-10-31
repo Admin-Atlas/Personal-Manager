@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  Calendar,
   CalendarEvent,
   CalendarOverview,
   GuestNotice,
@@ -20,6 +21,14 @@ import type {
 } from "../types";
 import {
   A11_NOTE,
+  askConnectedText,
+  askLabel,
+  askOwnerFor,
+  askText,
+  CALENDAR_ALONE,
+  CALENDAR_WHOLE,
+  calendarRowText,
+  changedText,
   CALLOUT_TONE,
   CREATE_CHANGED,
   CREATE_LOST,
@@ -29,10 +38,15 @@ import {
   createReasonText,
   createText,
   deleteText,
+  dragReason,
+  duplicable,
   emailsGuests,
   endsRetry,
   eventRights,
   heldCreateText,
+  SPECIAL_DATE_DRAG,
+  specialKind,
+  type SpecialKind,
   moveBackText,
   moveText,
   saveBackText,
@@ -54,6 +68,9 @@ import {
   moveFailedText,
   moveLabel,
   moveOfferText,
+  NOT_MOVED_UNREAD,
+  notMovedText,
+  notMovedUnreadText,
   notOrganizerText,
   outcomeText,
   partialText,
@@ -101,10 +118,15 @@ const REASONS: ReadOnlyReason[] = [
   "organizer_only_guests",
   "became_repeating",
   "special_type",
+  "special_date_fields",
+  "date_from_contacts",
+  "date_from_profile",
+  "from_gmail_fields",
   "locked",
-  "html_description",
+  "unsupported_formatting",
   "label_read_only",
   "reminders_unreadable",
+  "other_call",
 ];
 
 describe("edit reasons", () => {
@@ -112,6 +134,48 @@ describe("edit reasons", () => {
     const lines = REASONS.map(reasonText);
     for (const line of lines) expect(line).toMatch(/^[A-Z].*\.$/);
     expect(new Set(lines).size).toBe(REASONS.length);
+  });
+
+  // C20: birthdays and Gmail events have Google's own list now; the rest of Google's special kinds
+  // stay read-only, in words that no longer name them. No jargon: never Google's type names.
+  it("words birthdays and Gmail events as Google's lists for them (C20)", () => {
+    const special = reasonText("special_type");
+    expect(special).toBe(
+      "PM can't change focus time, out of office, working locations or other special Google events.",
+    );
+    expect(special).not.toMatch(/birthday|gmail|yet/i);
+    expect(reasonText("special_date_fields")).toBe(
+      "On a birthday or other special date, Google lets PM change only its name, notifications and colour, and its date if it was added in Google Calendar.",
+    );
+    expect(reasonText("date_from_contacts")).toBe(
+      "This date comes from Google Contacts, so change it there.",
+    );
+    expect(reasonText("date_from_profile")).toBe(
+      "This birthday comes from the calendar owner's Google Account, so change its date there.",
+    );
+    expect(reasonText("from_gmail_fields")).toBe(
+      "Gmail added this event, so Google lets PM change only its busy or free, visibility, notifications and colour, and your reply if you're invited.",
+    );
+    for (const line of REASONS.map(reasonText)) {
+      expect(line).not.toMatch(/eventType|fromGmail|birthdayProperties|transparency|series|RSVP/);
+    }
+  });
+
+  // C20 critique C2-L13: a pure copy of the backend's `kind_of`, read the same way.
+  it("specialKind reads Google's types as the backend does", () => {
+    const rows: [string | null | undefined, SpecialKind | null][] = [
+      [null, null],
+      [undefined, null],
+      ["default", null],
+      ["birthday", "special_date"],
+      ["fromGmail", "from_gmail"],
+      ["focusTime", "other"],
+      ["outOfOffice", "other"],
+      ["x", "other"],
+      ["Birthday", "other"],
+      ["", "other"],
+    ];
+    for (const [type, kind] of rows) expect([type, specialKind(type)]).toEqual([type, kind]);
   });
 
   it("words a label and unreadable notifications plainly, as the backend does (C13)", () => {
@@ -124,13 +188,34 @@ describe("edit reasons", () => {
     for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/reminder/i);
   });
 
+  it("words formatting PM can't edit as the backend does, never promising Google's look (C19)", () => {
+    const line = reasonText("unsupported_formatting");
+    expect(line).toBe(
+      "This description has formatting PM can't edit. PM shows what it can of it here; Google Calendar shows all of it.",
+    );
+    expect(line).not.toMatch(/html|rich text|markup|tag/i);
+  });
+
+  // C18: another service's call, Google's old Hangouts or a bare link, in one sentence, never
+  // Google's own word for a call.
+  it("words a call PM can't change plainly, as the backend does (C18)", () => {
+    expect(reasonText("other_call")).toBe(
+      "This event's video call is a kind PM can't change, so PM leaves it as it is. Change it in Google Calendar.",
+    );
+    for (const line of REASONS.map(reasonText)) expect(line).not.toMatch(/conference|add-on/i);
+    expect(fieldLabel("meet")).toBe("video call");
+  });
+
   it("names conflicting fields in the editor's words", () => {
     // A key the editor has no field for names nothing.
-    expect(conflictFields(["start", "end", "summary", "transparency", "conferenceData"])).toEqual([
+    expect(conflictFields(["start", "end", "summary", "transparency", "attachments"])).toEqual([
       "time",
       "summary",
       "show_as",
     ]);
+    // C18: the call is the video-call row's (critique C1-L5).
+    expect(conflictFields(["conferenceData", "summary"])).toEqual(["meet", "summary"]);
+    expect(listFields(conflictFields(["conferenceData"]))).toBe("video call");
     // Notifications and colour (C13): a colour's check watches the label too, and both are the
     // colour, said once.
     expect(conflictFields(["eventLabelId"])).toEqual(["colour"]);
@@ -199,6 +284,7 @@ describe("edit reasons", () => {
       { outcome: "unconfirmed" },
       { outcome: "ambiguous", retry_token: "ref-1" },
       { outcome: "failed", message: "Google didn't accept the change: Invalid start" },
+      { outcome: "not_moved", message: "Google is busy right now." },
     ];
     for (const o of outcomes) {
       expect(outcomeText(o).text.length).toBeGreaterThan(0);
@@ -368,12 +454,19 @@ describe("a write's warnings", () => {
       "milestone_not_offered",
       "partly_applied",
       "kept_own_reply",
+      "call_pending",
+      "call_failed",
+      "links_left_behind",
     ];
     for (const w of all) {
       for (const kind of ["save", "delete"] as const) {
         expect(writeWarningText(w, kind)).toMatch(/^[A-Z].*\.$/);
       }
     }
+    // C18d: it names the calendar the event went to, when it's known.
+    expect(writeWarningText("links_left_behind", "save", undefined, "Work")).toBe(
+      "On Work it became a new event in Google, so the milestone or reminder to prepare linked to it stays with the old one.",
+    );
     expect(writeWarningText("mirror_refresh_pending", "save")).toBe(
       "PM's calendar will show it after the next refresh.",
     );
@@ -402,6 +495,184 @@ describe("a write's warnings", () => {
 
   it("maps every tone onto a Callout's", () => {
     expect(CALLOUT_TONE).toEqual({ ok: "info", warn: "warning", error: "danger" });
+  });
+});
+
+// C18d: putting an event on another calendar, in the words the editor and its notice say.
+describe("another calendar (C18d)", () => {
+  const moved = { to: "Work", from: "Home" };
+
+  it("says where a saved event is now and how to put it back, from the backend's answer", () => {
+    const outcome: Extract<WriteOutcome, { outcome: "saved" }> = {
+      outcome: "saved",
+      warnings: [],
+      calendar: "gcal:me@x.com:work",
+    };
+    expect(savedNotice("Dentist", outcome, null, "2026-10-12", false, false, null, moved)).toEqual({
+      tone: "ok",
+      text: "“Dentist” is now on Work. To put it back, open it and choose Home.",
+    });
+    // Links left with the old event: said, naming the calendar, and worth a look.
+    expect(
+      savedNotice(
+        "Dentist",
+        { ...outcome, warnings: ["links_left_behind"] },
+        null,
+        undefined,
+        false,
+        false,
+        null,
+        moved,
+      ),
+    ).toEqual({
+      tone: "warn",
+      text: "“Dentist” is now on Work. On Work it became a new event in Google, so the milestone or reminder to prepare linked to it stays with the old one. To put it back, open it and choose Home.",
+    });
+    // No calendar change: a save's own words, as before.
+    expect(savedNotice("Dentist", { outcome: "saved", warnings: [] }, null).text).toBe(
+      "Saved “Dentist”.",
+    );
+  });
+
+  it("says every occurrence of a repeating event is there now (C18e)", () => {
+    const outcome: Extract<WriteOutcome, { outcome: "saved" }> = {
+      outcome: "saved",
+      warnings: ["mirror_refresh_pending"],
+      calendar: "gcal:me@x.com:work",
+    };
+    // "All events", and "This and following" from the first occurrence, which saved every one.
+    for (const [scope, asAll] of [
+      ["all", false],
+      ["following", true],
+    ] as const) {
+      expect(savedNotice("Gym", outcome, scope, "2026-10-19", false, asAll, null, moved)).toEqual({
+        tone: "ok",
+        text: `Every occurrence of “Gym” is now on Work. ${writeWarningText("mirror_refresh_pending", "save")} To put it back, open it and choose Home.`,
+      });
+    }
+    // Saved for every occurrence on its own calendar: as before.
+    expect(savedNotice("Gym", { outcome: "saved", warnings: [] }, "all").text).toBe(
+      "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    );
+  });
+
+  // Review round 3 of PR 1: with Save held, no message offers it. A backend message that offers
+  // another go has a row here: a test in Rust looks each one up in this file, word for word.
+  it.each([
+    [
+      "Its guests changed in Google just now, so PM didn't change its calendar. Save again to answer for them.",
+      "Its guests changed in Google just now, so PM didn't change its calendar.",
+    ],
+    [
+      "PM lost touch with Google, and the event is still on its calendar. Try again.",
+      "PM lost touch with Google, and the event is still on its calendar.",
+    ],
+    [
+      "PM couldn't reach Google to change its calendar. Try again when you're back online.",
+      "PM couldn't reach Google to change its calendar.",
+    ],
+    [
+      "PM couldn't get this account's Google sign-in ready to change its calendar. Try again in a moment.",
+      "PM couldn't get this account's Google sign-in ready to change its calendar.",
+    ],
+    [
+      "PM couldn't ask Google about this event, so its calendar didn't change. Try again.",
+      "PM couldn't ask Google about this event, so its calendar didn't change.",
+    ],
+    ["PM couldn't change its calendar. Try again.", "PM couldn't change its calendar."],
+    [
+      "This Google account has reached one of Google Calendar's usage limits, so Google isn't taking changes for now. Try again later; the limit usually lifts within a day.",
+      "This Google account has reached one of Google Calendar's usage limits, so Google isn't taking changes for now.",
+    ],
+    ["Google had a problem with this. Try again in a moment.", "Google had a problem with this."],
+    // What offers nothing stays whole, and a sentence that isn't an offer isn't mistaken for one.
+    [
+      "Google won't let this account open the event any more.",
+      "Google won't let this account open the event any more.",
+    ],
+    ["Google is busy right now.", "Google is busy right now."],
+    [
+      "Google needs you to sign in to this account again.",
+      "Google needs you to sign in to this account again.",
+    ],
+  ])("a held save's words offer no other go: %j", (message, reason) => {
+    expect(notMovedUnreadText(message, "Home")).toBe(
+      `Your other changes are saved, but it's still on Home. ${reason} ${NOT_MOVED_UNREAD}`,
+    );
+  });
+
+  it("a held save's words leave the calendar's name and the warnings alone", () => {
+    expect(notMovedUnreadText("Try again.", "St. Try again. Club", ["call_failed"])).toBe(
+      `Your other changes are saved, but it's still on St. Try again. Club. Google didn't make the video call. Add it again from Edit, or in Google Calendar. ${NOT_MOVED_UNREAD}`,
+    );
+    expect(notMovedUnreadText("Try again.", null)).toBe(
+      `Your other changes are saved, but its calendar didn't change. ${NOT_MOVED_UNREAD}`,
+    );
+  });
+
+  it("says a save whose calendar change didn't land kept the rest, and why", () => {
+    expect(notMovedText("Google is busy right now.", "Home")).toBe(
+      "Your other changes are saved, but it's still on Home. Google is busy right now.",
+    );
+    expect(outcomeText({ outcome: "not_moved", message: "Try again." })).toEqual({
+      tone: "warn",
+      text: "Your other changes are saved, but its calendar didn't change. Try again.",
+    });
+    // Never any other write's answer, but each says what it carries rather than nothing.
+    const notMoved: WriteOutcome = { outcome: "not_moved", message: "Try again." };
+    expect(replyText(notMoved, "yes", null).text).toBe("Your reply wasn't sent.");
+    expect(saveBackText(notMoved, "Gym").text).toMatch(/^Couldn't undo the save of “Gym”\./);
+    expect(moveText(notMoved, "Gym", "", null).text).toMatch(/Try again\.$/);
+    expect(moveBackText(notMoved, "Gym").text.length).toBeGreaterThan(0);
+    expect(settleText(notMoved, "Gym").text).toMatch(/^“Gym”: /);
+    expect(createText(notMoved, "Gym", false).text.length).toBeGreaterThan(0);
+    // Review round 1 of PR 1: what the fields had to say beside "saved" is said too, never dropped.
+    expect(
+      outcomeText({
+        outcome: "not_moved",
+        message: "Try again.",
+        warnings: ["call_failed", "partly_applied"],
+      }).text,
+    ).toBe(
+      "Your other changes are saved, but its calendar didn't change. Try again. Google didn't keep all of your changes, so check the event. Google didn't make the video call. Add it again from Edit, or in Google Calendar.",
+    );
+    expect(notMovedText("Try again.", "Home", ["call_pending"])).toBe(
+      "Your other changes are saved, but it's still on Home. Try again. Google is still making the video call; its link shows after a later refresh.",
+    );
+  });
+
+  // Review round 1 of PR 1: the editor's Power-depth line names another calendar chosen.
+  it("names the calendar among the changes", () => {
+    expect(changedText([], true)).toBe("calendar");
+    expect(changedText(["summary", "time"], true)).toBe("title, time and calendar");
+    expect(changedText(["summary"], false)).toBe("title");
+  });
+
+  it("says under the Calendar row whose calendars are listed, and Duplicate only where it helps", () => {
+    expect(calendarRowText("me@x.com", false)).toBe(
+      "Only calendars you own on me@x.com are listed.",
+    );
+    expect(calendarRowText("me@x.com", true)).toBe(
+      "Only calendars you own on me@x.com are listed. To put it on another account's calendar, duplicate it there, then delete this one.",
+    );
+    expect(CALENDAR_ALONE).toBe("Change the calendar on its own, then how it repeats.");
+    // A repeating event goes whole (C18e), never claimed as what Google does with each occurrence.
+    expect(CALENDAR_WHOLE).toBe("Changing the calendar is for the whole repeating event.");
+    // A lock keeps it on its calendar, and says so; someone else's names the calendar as theirs.
+    expect(reasonText("locked")).toBe(
+      "Google has locked this event's title, time, place and description, so PM also keeps it on its calendar.",
+    );
+    expect(reasonText("not_organizer")).toMatch(/guests, video call and calendar\./);
+    // Never C16's word for a drag, nor Google's API's, for a calendar change.
+    for (const line of [
+      calendarRowText("me@x.com", true),
+      CALENDAR_ALONE,
+      CALENDAR_WHOLE,
+      notMovedText("x.", "Home"),
+      writeWarningText("links_left_behind", "save", undefined, "Work"),
+    ]) {
+      expect(line).not.toMatch(/move|transfer/i);
+    }
   });
 });
 
@@ -504,8 +775,9 @@ describe("what a reply came to (C14)", () => {
 
 // C14 critiques C1-L10, C2-L1, C2-L10: under someone else's event, what the user may still do.
 describe("the line under someone else's event (C14b, C14c)", () => {
+  // The video call is the organiser's too (C18), and so is the calendar (C18d).
   const theirs =
-    "Someone else organises this event, so only they can change its title, time, place, description, visibility and guests.";
+    "Someone else organises this event, so only they can change its title, time, place, description, visibility, guests, video call and calendar.";
 
   it("says what stays the organiser's and what the user may change, the reply only when this copy can", () => {
     // The reason alone never promises a reply: the calendar may not be on the guest list.
@@ -526,7 +798,7 @@ describe("the line under someone else's event (C14b, C14c)", () => {
 
   it("says the guest list is the organiser's, and why a group invitation can't be answered", () => {
     expect(reasonText("organizer_only_guests")).toBe(
-      "In PM, only the organiser can change who's invited.",
+      "In PM, only the organiser can change who's invited and the video call.",
     );
     expect(reasonText("not_invited")).toBe(
       "PM can only reply where this calendar is on the guest list itself (not through a group).",
@@ -660,6 +932,23 @@ describe("a repeating event's save, said once the editor has closed", () => {
     expect(outcomeText(saved(["partly_applied", "mirror_refresh_pending"])).text).toBe(
       "Saved to Google. Google didn't keep all of your changes, so check the event. PM's calendar will show it after the next refresh.",
     );
+  });
+
+  // C18 §13.3: a save that asked for a Meet call says when Google is still making it (the link can
+  // wait for a later sync, critique C1-L11), and when Google made none, which is worth a look.
+  it("says when Google is still making the video call, or made none", () => {
+    expect(savedNotice("Gym", saved(["call_pending"]), null)).toEqual({
+      tone: "ok",
+      text: "Saved “Gym”. Google is still making the video call; its link shows after a later refresh.",
+    });
+    expect(savedNotice("Gym", saved(["call_failed"]), "this")).toEqual({
+      tone: "warn",
+      text: "Saved “Gym” for this occurrence. Google didn't make the video call. Add it again from Edit, or in Google Calendar. To change it back, edit it again.",
+    });
+    expect(savedNotice("Gym", saved(["call_pending", "partly_applied"]), null)).toEqual({
+      tone: "warn",
+      text: "Saved “Gym”. Google didn't keep all of your changes, so check the event. Google is still making the video call; its link shows after a later refresh.",
+    });
   });
 
   // C11 §10: a one-off made to repeat whose occurrences all fall outside the months PM syncs is in
@@ -985,6 +1274,28 @@ describe("creating an event", () => {
     });
   });
 
+  // C18b: a call the new event asked for that Google is still making is said, and one it didn't
+  // make is a warning that stays.
+  it("says what came of a new event's video call", () => {
+    const here = { name: "Work", hidden: false };
+    expect(createdText("Dentist", made(["call_pending"]), here)).toEqual({
+      tone: "ok",
+      text: "Created “Dentist”. Google is still making the video call; its link shows after a later refresh.",
+    });
+    expect(createdText("Dentist", made(["call_failed"]), here)).toEqual({
+      tone: "warn",
+      text: "Created “Dentist”. Google didn't make the video call. Add it again from Edit, or in Google Calendar.",
+    });
+    expect(createdText("Dentist", made(["mirror_refresh_pending", "call_pending"]), here)).toEqual({
+      tone: "ok",
+      text: "Created “Dentist” in Google. PM's calendar will show it after the next refresh. Google is still making the video call; its link shows after a later refresh.",
+    });
+    expect(createdText("Dentist", made(["call_pending"]), { name: "Work", hidden: true })).toEqual({
+      tone: "warn",
+      text: "Created “Dentist” in Work, which is hidden here. Google is still making the video call; its link shows after a later refresh.",
+    });
+  });
+
   it("never says a create PM may have made wasn't made", () => {
     const ambiguous = createText({ outcome: "ambiguous", retry_token: "ref-1" }, "Dentist", true);
     expect(ambiguous.tone).toBe("warn");
@@ -1188,6 +1499,31 @@ describe("an event's rights in the calendar", () => {
   });
   const theirs = { organizer_self: false, can_delete: false, can_respond: true };
 
+  // C18c: any Google event of the ordinary kind whose details the account can read, editing on or
+  // not and whoever organises it.
+  it("duplicable: a Google event PM can read, of the ordinary kind", () => {
+    const calendar = (provider: string, access_role: string | null) =>
+      ({ id: CAL, provider, access_role }) as unknown as Calendar;
+    const rows: [string, CalendarEvent, Calendar | undefined, boolean][] = [
+      ["owner", row({}), calendar("google", "owner"), true],
+      ["writer", row({}), calendar("google", "writer"), true],
+      ["no private access", row({}), calendar("google", "writerWithoutPrivateAccess"), true],
+      ["reader", row({}), calendar("google", "reader"), true],
+      ["invitation", row(theirs), calendar("google", "owner"), true],
+      ["free/busy reader", row({}), calendar("google", "freeBusyReader"), false],
+      ["no role", row({}), calendar("google", null), false],
+      ["birthday", row({ event_type: "birthday" }), calendar("google", "owner"), false],
+      ["Gmail", row({ event_type: "fromGmail" }), calendar("google", "owner"), false],
+      ["kind unset", row({ event_type: null }), calendar("google", "owner"), true],
+      ["iCal", row({}), calendar("ical", "reader"), false],
+      ["Outlook", row({}), calendar("microsoft", "owner"), false],
+      ["no calendar", row({}), undefined, false],
+    ];
+    for (const [name, ev, cal, want] of rows) {
+      expect([name, duplicable(ev, cal)]).toEqual([name, want]);
+    }
+  });
+
   it("offers a drag exactly where the list says the time may change", () => {
     const on = overview("on");
     const rows: [string, CalendarEvent, CalendarOverview, EventRights][] = [
@@ -1221,11 +1557,70 @@ describe("an event's rights in the calendar", () => {
         overview("off"),
         { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("editing_off") },
       ],
+      // A Gmail event's organiser is Google's placeholder: editing off says the editing-off line,
+      // never "Someone else organises this event" (C20a deviation 5, live row G1).
       [
-        "a birthday",
-        row({ edit_block: "special_type", can_delete: false, can_retime: false }),
+        "a Gmail event, editing off",
+        row({ ...theirs, event_type: "fromGmail", can_delete: true, can_retime: false }),
+        overview("off"),
+        { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("editing_off") },
+      ],
+      [
+        "focus time",
+        row({
+          event_type: "focusTime",
+          edit_block: "special_type",
+          can_delete: false,
+          can_retime: false,
+        }),
         on,
         { canEdit: false, canDelete: false, canRetime: false, reason: reasonText("special_type") },
+      ],
+      // C20: a birthday offers Edit and Delete, no drag, and says what can change; a Gmail event
+      // says what Google allows on it, whoever organises it; a lock doesn't change either line.
+      [
+        "a birthday",
+        row({ event_type: "birthday", can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("special_date_fields"),
+        },
+      ],
+      [
+        "a locked birthday",
+        row({ event_type: "birthday", locked: true, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("special_date_fields"),
+        },
+      ],
+      [
+        "a Gmail event",
+        row({ ...theirs, event_type: "fromGmail", can_delete: true, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("from_gmail_fields"),
+        },
+      ],
+      [
+        "a locked Gmail event",
+        row({ event_type: "fromGmail", locked: true, can_retime: false }),
+        on,
+        {
+          canEdit: true,
+          canDelete: true,
+          canRetime: false,
+          reason: reasonText("from_gmail_fields"),
+        },
       ],
       [
         "a subscription",
@@ -1251,12 +1646,110 @@ describe("an event's rights in the calendar", () => {
     }
   });
 
+  // C20 critiques C2-M4, C1-L12 (LD14): a refused drag of a birthday says its own line by the
+  // pointer; every other refused drag says the row's line, and one that's allowed says nothing.
+  it("a birthday's refused drag says it can't be dragged, by the pointer", () => {
+    const on = overview("on");
+    const drag = (ev: CalendarEvent, view = on) => dragReason(ev, eventRights(ev, view));
+    expect(SPECIAL_DATE_DRAG).toBe(
+      "Birthdays can't be dragged in PM. Open Edit to change what Google allows.",
+    );
+    const dated = row({ event_type: "birthday", can_retime: false });
+    expect(drag(dated)).toBe(SPECIAL_DATE_DRAG);
+    // Its details keep the line that says what changes (C2-M4).
+    expect(eventRights(dated, on).reason).toBe(reasonText("special_date_fields"));
+    // A Gmail event's drag says the Gmail line; a locked event's, the lock's.
+    const gmail = row({ event_type: "fromGmail", can_retime: false });
+    expect(drag(gmail)).toBe(reasonText("from_gmail_fields"));
+    expect(drag(row({ locked: true, can_retime: false }))).toBe(reasonText("locked"));
+    // Editing off says so, birthday or not. Were the list ever to allow a birthday's drag (it never
+    // knows who owns the date), nothing would refuse it: the row's line stands, unshown.
+    expect(drag(dated, overview("off"))).toBe(reasonText("editing_off"));
+    expect(drag(row({ event_type: "birthday", can_retime: true }))).toBe(
+      reasonText("special_date_fields"),
+    );
+    expect(drag(row({}))).toBeNull();
+  });
+
   it("ranks the copy you organise first, then any you can change (C14 §9.5)", () => {
     const on = overview("on");
     const rank = (ev: CalendarEvent, view = on) => copyRank(eventRights(ev, view), ev);
     expect(rank(row({}))).toBe(2);
     expect(rank(row(theirs))).toBe(1);
     expect(rank(row({}), overview("off"))).toBe(0);
+  });
+});
+
+// Asking a view-only calendar's owner for edit access (C20b §10, §14.4 and the Adopted words).
+describe("asking for edit access", () => {
+  const SHARED = "gcal:me@x.org:team@group.calendar.google.com";
+  const BOSS = { owner: "boss@x.org", connected: false };
+  const overview = { ask_access: { [SHARED]: BOSS } } as unknown as CalendarOverview;
+  const row = (over: Partial<CalendarEvent>): CalendarEvent => ({
+    id: `${SHARED}:e1`,
+    calendar_id: SHARED,
+    summary: "Retro",
+    description: null,
+    location: null,
+    start: "2026-10-20T09:00:00Z",
+    end: "2026-10-20T10:00:00Z",
+    all_day: false,
+    html_link: null,
+    uid: null,
+    edit_block: "calendar_read_only",
+    ...over,
+  });
+
+  it("a view-only row asks the owner the overview names", () => {
+    expect(askOwnerFor(row({}), overview)).toBe(BOSS);
+  });
+
+  it("no ask on a row the list didn't mark view-only, or without an owner", () => {
+    for (const block of [null, "not_google", "editing_off", "private_event", "locked"] as const) {
+      expect(askOwnerFor(row({ edit_block: block }), overview), String(block)).toBeNull();
+    }
+    expect(askOwnerFor(row({ calendar_id: "gcal:me@x.org:other" }), overview)).toBeNull();
+    expect(askOwnerFor(row({}), null)).toBeNull();
+  });
+
+  it("says what came of it, naming the owner, the permission and the calendar", () => {
+    const permission = "“Make changes and see event details”";
+    expect(askLabel("boss@x.org")).toBe("Ask boss@x.org for edit access");
+    expect(askText({ outcome: "opened", owner: "boss@x.org" }, "Team")).toBe(
+      `PM asked your system to open an email to boss@x.org in your mail app. If nothing opened, write to boss@x.org and ask for ${permission}.`,
+    );
+    expect(askText({ outcome: "no_mail_app", owner: "boss@x.org" }, "Team")).toBe(
+      `PM couldn't open your mail app. Write to boss@x.org and ask for ${permission} on “Team”.`,
+    );
+    expect(askText({ outcome: "no_owner" }, "Team")).toBe(
+      "PM can't tell who to ask for this calendar now. If its sharing just changed, refresh the calendar.",
+    );
+    expect(askText({ outcome: "failed", message: "Not now." }, "Team")).toBe(
+      "PM couldn't open the email: Not now.",
+    );
+    expect(askConnectedText("boss@x.org", "me@x.org")).toBe(
+      `boss@x.org is connected to PM too: open Google Calendar as boss@x.org and share this calendar with me@x.org, choosing ${permission}.`,
+    );
+    expect(askConnectedText("boss@x.org", null)).toContain(
+      "share this calendar with this account, choosing",
+    );
+  });
+
+  it("names Google's permission as the email does", () => {
+    // The email (calendar_ask.rs) asks for the permission by the name these lines tell the user to
+    // ask for, so the two can't drift apart.
+    const email = Object.values(
+      import.meta.glob<string>("../../../src-tauri/src/calendar_ask.rs", {
+        query: "?raw",
+        import: "default",
+        eager: true,
+      }),
+    );
+    expect(email).toHaveLength(1);
+    const named = email[0].match(/const PERMISSION: &str = "([^"]+)";/)?.[1];
+    expect(named).toBe("Make changes and see event details");
+    expect(askText({ outcome: "opened", owner: "o@x.org" }, "T")).toContain(`“${named}”`);
+    expect(askConnectedText("o@x.org", null)).toContain(`“${named}”`);
   });
 });
 

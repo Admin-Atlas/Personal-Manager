@@ -22,6 +22,7 @@ use std::fmt;
 use serde_json::{Map, Value};
 
 use super::attendees;
+use super::call;
 use super::dto::{
     ColourDraft, EventPatchDraft, NewEventDraft, RemindersDraft, SeenSummary, SeenTimes, TimeDraft,
     Visibility,
@@ -34,8 +35,9 @@ use crate::calendar_recur::wire::RepeatRule;
 use crate::calendar_recur::SeriesStart;
 
 /// The only fields a single-event save sends: the guest list and what guests may do among them
-/// (C12), the event's notifications and its colour (C13). Never a label (`eventLabelId`): PM doesn't
-/// set Google's labels (the C13 spec's Adopted list).
+/// (C12), the event's notifications and its colour (C13), and its video call (C18: a new Meet call
+/// asked for, or `null` to remove one). Never a label (`eventLabelId`): PM doesn't set Google's
+/// labels (the C13 spec's Adopted list).
 pub const PATCHABLE: &[&str] = &[
     "summary",
     "location",
@@ -50,6 +52,7 @@ pub const PATCHABLE: &[&str] = &[
     "guestsCanSeeOtherGuests",
     "reminders",
     "colorId",
+    "conferenceData",
 ];
 
 /// What a save that makes a one-off repeat may send (C11 §10): [`PATCHABLE`]'s fields and the rule,
@@ -69,12 +72,13 @@ pub const REPEAT_PATCHABLE: &[&str] = &[
     "guestsCanSeeOtherGuests",
     "reminders",
     "colorId",
+    "conferenceData",
     "recurrence",
 ];
 
 /// What a create may send: a save's fields, the repeat rule (C11), the guests with what they may do
-/// (C12d), and the notifications and colour (C13). Still no conference, label or private notes until
-/// their layers. Widening it is a decision, never a slip:
+/// (C12d), the notifications and colour (C13), and a request for a new Meet call (C18b). Still no
+/// label or private notes. Widening it is a decision, never a slip:
 /// `creatable_is_the_c11_list_guests_notifications_and_colour` pins it to exactly this, and the
 /// create plan's own refusal test names what it still refuses (C10 critique 1 L10).
 pub const CREATABLE: &[&str] = &[
@@ -92,6 +96,7 @@ pub const CREATABLE: &[&str] = &[
     "guestsCanSeeOtherGuests",
     "reminders",
     "colorId",
+    "conferenceData",
 ];
 
 /// What a drop may send (C16a): its start and end, nothing else. A move's body is checked against it
@@ -129,6 +134,9 @@ pub enum PatchError {
     Time(TimeError),
     Reminders(ReminderError),
     Colour(ColourError),
+    /// A Meet call was asked for without the session's request id (C18): never on a path the
+    /// backend put its id in, so nothing is sent rather than a call asked for twice.
+    MeetUnready,
 }
 
 /// Why a draft's notifications can't be sent.
@@ -195,6 +203,9 @@ impl fmt::Display for PatchError {
                 "This event has a Google Calendar label, which sets its colour. Change it in Google \
                  Calendar."
             }
+            PatchError::MeetUnready => {
+                "PM couldn't get the video call ready, so nothing was sent. Try again."
+            }
         };
         f.write_str(words)
     }
@@ -257,6 +268,10 @@ impl From<SpecError> for InsertError {
 /// Notifications (C13) go only as a list of the event's own, checked as any new ones are; the
 /// calendar's defaults send nothing, since Google gives a new event those (INFERRED, probe E9). A
 /// colour goes only when it's one of Google's eleven, never the calendar's own.
+///
+/// A Meet call (C18b) goes only when the draft asks for one, under the request id the create
+/// command put in; asked for without one, nothing is built ([`PatchError::MeetUnready`]), so a call
+/// is never asked for twice under two ids.
 pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertError> {
     let (time, rule) = match &draft.recurrence {
         None => (draft.time.clone(), None),
@@ -337,6 +352,13 @@ pub fn insert_body(draft: &NewEventDraft) -> Result<Map<String, Value>, InsertEr
         }
         body.insert("colorId".into(), Value::String(id.clone()));
     }
+    if draft.meet {
+        let request = draft
+            .meet_request
+            .as_deref()
+            .ok_or(InsertError::Draft(PatchError::MeetUnready))?;
+        body.insert("conferenceData".into(), call::meet_request_body(request));
+    }
     Ok(body)
 }
 
@@ -394,7 +416,8 @@ pub fn add_repeat(
 /// Notifications go whole, as the draft lists them, and only when they differ from Google's in more
 /// than order; a colour goes as one of Google's eleven, or `null` for the calendar's own (INFERRED:
 /// PATCH clears a field sent as null, probe E15b). Neither goes onto a copy they can't be checked
-/// against ([`check_draft_extras`]).
+/// against ([`check_draft_extras`]). A video call goes as [`call::meet_value`] says (C18): a request
+/// for a new Meet call, or `null` to remove one, only where the copy holds otherwise.
 pub fn build_patch(
     fresh: &Value,
     draft: &EventPatchDraft,
@@ -497,6 +520,10 @@ fn patch_onto(
             body.insert("colorId".into(), Value::String(id.clone()));
         }
         _ => {}
+    }
+    // The call on the copy it goes to: a series' own for every occurrence, an occurrence's for one.
+    if let Some(call) = call::meet_value(fresh, draft)? {
+        body.insert("conferenceData".into(), call);
     }
     if let Some(draft_time) = &draft.time {
         // Against Google's current start and end, so the half the user didn't change is sent exactly
@@ -918,38 +945,6 @@ pub fn timing_still_matches(seen: &SeenTimes, fresh: &Value) -> DeleteCheck {
     }
 }
 
-/// Whether a description is formatted rather than plain text. Editing it in a plain-text box would
-/// strip the formatting, so a formatted one is read-only until the rich-text layer (C19). Errs
-/// towards "formatted": a plain description that merely looks like markup is only made read-only.
-pub fn description_is_html(s: &str) -> bool {
-    for (i, c) in s.char_indices() {
-        let rest = &s[i + c.len_utf8()..];
-        match c {
-            // A tag: `<b>`, `</p>`, `<a href=…>`, `<br/>`.
-            '<' => {
-                let name = rest.strip_prefix('/').unwrap_or(rest);
-                if name.starts_with(|n: char| n.is_ascii_alphabetic()) && name.contains('>') {
-                    return true;
-                }
-            }
-            // An entity: `&amp;`, `&nbsp;`, `&#39;`.
-            '&' => {
-                if let Some(end) = rest.find(';').filter(|e| (1..=8).contains(e)) {
-                    let entity = &rest[..end];
-                    let numeric = entity
-                        .strip_prefix('#')
-                        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
-                    if numeric || entity.chars().all(|c| c.is_ascii_alphabetic()) {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
 // --- comparing one field the way Google means it ---
 
 /// A text field, with absent read as empty (Google omits empty ones).
@@ -1000,6 +995,9 @@ fn field_eq(key: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
         // In any order, the defaults however Google writes them (C13): by value, a list handed back
         // reordered would read as not landed after a lost answer, and as a conflict on the next save.
         "reminders" => reminders_eq(a, b),
+        // By the call it is (C18): by value, PM's request for a call would never match the call
+        // Google made of it, so a save would never read as landed (G4).
+        "conferenceData" => call::same_call(a, b),
         // A list or an object (`recurrence`…) by value: read as text, any two would be ""
         // and equal, so a changed one would never be a conflict (G4, found by C8's survey; the guest
         // list and the notifications, the ones PM sends, have their own arms above).
@@ -1043,7 +1041,7 @@ mod tests {
     use super::*;
     use crate::calendar_recur::wire::{DayCode, RepeatEnds, RepeatPattern, RepeatRule};
     use crate::calendar_write::dto::{
-        GuestOp, GuestState, NewGuest, ShowAs, TimeDraft, Visibility,
+        GuestOp, GuestState, MeetChange, NewGuest, ShowAs, TimeDraft, Visibility,
     };
     use serde_json::json;
 
@@ -1110,13 +1108,16 @@ mod tests {
     }
 
     /// Google's fields stay Google's: nothing outside the patchable set is ever in a body, however the
-    /// draft is built. C13 flips the colour to sendable on purpose; a label never is.
+    /// draft is built. C13 flips the colour to sendable on purpose; a label never is. C18 flips the
+    /// video call: a request for a new Meet call, under the session's id.
     #[test]
     fn nothing_but_the_patchable_fields_is_ever_sent() {
         let draft = EventPatchDraft {
             summary: Some("x".into()),
             location: Some("".into()),
             description: Some("notes".into()),
+            // The gate's to read, never a body key (C19).
+            replace_formatting: true,
             time: Some(TimeDraft::AllDay {
                 first_day: "2026-10-13".into(),
                 last_day: "2026-10-13".into(),
@@ -1134,6 +1135,10 @@ mod tests {
             guests_can_see_other_guests: Some(false),
             reminders: Some(own(&[("popup", 10)])),
             colour: Some(ColourDraft::Colour { id: "9".into() }),
+            meet: Some(MeetChange::Add),
+            meet_request: Some("r1".into()),
+            // Never a body key: it goes as a request of its own (C18d).
+            calendar: Some("cal-b".into()),
         };
         let body = build_patch(&unlabelled(), &draft).unwrap();
         for key in body.keys() {
@@ -1141,9 +1146,10 @@ mod tests {
         }
         assert_eq!(
             body.len(),
-            13,
-            "every patchable field, the guests', notifications and colour included"
+            14,
+            "every patchable field, the guests', notifications, colour and call included"
         );
+        assert_eq!(body["conferenceData"], call::meet_request_body("r1"));
         for never in [
             "eventType",
             "recurringEventId",
@@ -1388,6 +1394,67 @@ mod tests {
         landed["summary"] = "Dentist (moved)".into();
         landed["transparency"] = "transparent".into();
         assert!(already_applied(&landed, &body));
+    }
+
+    /// C18: a save that asked for a call reads as landed on any live Meet call Google holds (a
+    /// whole-value compare would never match PM's request against Google's answer, G4), and on its
+    /// own request Google failed (that write landed: the failure is said apart); not on another
+    /// request's failure, nor on no call. Two copies of Google's are compared by the call they hold.
+    #[test]
+    fn a_save_reads_an_asked_for_call_as_landed() {
+        let body: Map<String, Value> =
+            [("conferenceData".to_string(), call::meet_request_body("r1"))]
+                .into_iter()
+                .collect();
+        let ready = with_key(
+            &fresh(),
+            "conferenceData",
+            json!({ "conferenceId": "abc", "conferenceSolution": { "key": { "type": "hangoutsMeet" } } }),
+        );
+        assert!(already_applied(&ready, &body));
+        let failed = |request: &str| {
+            with_key(
+                &fresh(),
+                "conferenceData",
+                json!({ "createRequest": { "requestId": request,
+                        "conferenceSolutionKey": { "type": "hangoutsMeet" },
+                        "status": { "statusCode": "failure" } } }),
+            )
+        };
+        assert!(already_applied(&failed("r1"), &body));
+        assert!(!already_applied(&failed("r0"), &body));
+        assert!(!already_applied(&fresh(), &body));
+        // Someone added a call in Google since the editor opened: a conflict, never a second call.
+        assert_eq!(
+            update_check(&fresh(), &ready, &body),
+            UpdateCheck::Conflict(vec!["conferenceData".into()])
+        );
+        assert_eq!(update_check(&ready, &ready, &body), UpdateCheck::Proceed);
+        // A removal lands where Google holds no call.
+        let removing: Map<String, Value> = [("conferenceData".to_string(), Value::Null)]
+            .into_iter()
+            .collect();
+        assert!(already_applied(&fresh(), &removing));
+        assert!(!already_applied(&ready, &removing));
+        // The draft's request goes into the body under its own id; one Google already holds sends
+        // nothing.
+        let adding = EventPatchDraft {
+            meet: Some(MeetChange::Add),
+            meet_request: Some("r1".into()),
+            ..Default::default()
+        };
+        assert_eq!(build_patch(&fresh(), &adding).unwrap(), body);
+        assert!(build_patch(&ready, &adding).unwrap().is_empty());
+        assert!(
+            build_patch(
+                &fresh(),
+                &EventPatchDraft {
+                    meet_request: None,
+                    ..adding.clone()
+                }
+            ) == Err(PatchError::MeetUnready),
+            "a call asked for without the session's id sends nothing"
+        );
     }
 
     /// C13 review round 1: a copy holding part of a save is told apart from one holding none of it,
@@ -1745,6 +1812,8 @@ mod tests {
             guests_can_see_other_guests: None,
             reminders: None,
             colour: None,
+            meet: false,
+            meet_request: None,
         }
     }
 
@@ -1778,6 +1847,8 @@ mod tests {
             guests_can_modify: Some(true),
             reminders: Some(own(&[("popup", 10)])),
             colour: Some(ColourDraft::Colour { id: "3".into() }),
+            meet: true,
+            meet_request: Some("r1".into()),
             ..repeating(
                 timed("2026-10-26", "10:00", "2026-10-26", "11:00"),
                 weekly_on(&[DayCode::Mon]),
@@ -1792,6 +1863,7 @@ mod tests {
             [
                 "attendees",
                 "colorId",
+                "conferenceData",
                 "description",
                 "end",
                 "guestsCanModify",
@@ -1832,15 +1904,50 @@ mod tests {
             "reminders",
             "colorId",
             "eventLabelId",
+            "conferenceData",
         ] {
             assert!(!once.contains_key(absent), "{absent}");
         }
     }
 
-    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4) and widened by C12d and C13 on
-    /// purpose: a create sends a save's fields before guests, the rule, the guests' four, then the
-    /// notifications and colour (never a label), exactly; so it may send whatever a save that makes a
-    /// one-off repeat may.
+    /// C18b: a call is asked for exactly when the draft asks, under the request id the create
+    /// command put in; asked for without one, nothing is built.
+    #[test]
+    fn insert_body_asks_for_a_call_only_when_the_draft_does() {
+        let plain = new_event(timed("2026-10-26", "10:00", "2026-10-26", "11:00"));
+        let body = insert_body(&NewEventDraft {
+            meet_request: Some("r1".into()),
+            ..plain.clone()
+        })
+        .unwrap();
+        assert!(
+            !body.contains_key("conferenceData"),
+            "an id without the ask"
+        );
+        let asked = NewEventDraft {
+            meet: true,
+            ..plain
+        };
+        let body = insert_body(&NewEventDraft {
+            meet_request: Some("r1".into()),
+            ..asked.clone()
+        })
+        .unwrap();
+        assert_eq!(body["conferenceData"], call::meet_request_body("r1"));
+        assert!(
+            insert_body(&asked) == Err(InsertError::Draft(PatchError::MeetUnready)),
+            "no id, no body"
+        );
+        assert_eq!(
+            InsertError::Draft(PatchError::MeetUnready).to_string(),
+            "PM couldn't get the video call ready, so nothing was sent. Try again."
+        );
+    }
+
+    /// C11 §3.3's tripwire, restated for C12 (critiques C1-H4, C2-M4) and widened by C12d, C13 and
+    /// C18 on purpose: a create sends a save's fields before guests, the rule, the guests' four, then
+    /// the notifications and colour (never a label), and a call, exactly; so it may send whatever a
+    /// save that makes a one-off repeat may.
     #[test]
     fn creatable_is_the_c11_list_guests_notifications_and_colour() {
         assert_eq!(
@@ -1859,7 +1966,8 @@ mod tests {
                 "guestsCanInviteOthers",
                 "guestsCanSeeOtherGuests",
                 "reminders",
-                "colorId"
+                "colorId",
+                "conferenceData"
             ]
         );
         let mut creatable = CREATABLE.to_vec();
@@ -2459,31 +2567,6 @@ mod tests {
             .unwrap();
             assert!(!body.contains_key("transparency"));
             assert!(!body.contains_key("visibility"), "{visibility:?}");
-        }
-    }
-
-    #[test]
-    fn formatted_descriptions_are_recognised() {
-        for html in [
-            "<b>Agenda</b>",
-            "line one<br>line two",
-            "see <a href=\"https://x\">this</a>",
-            "</p>",
-            "fish &amp; chips",
-            "it&#39;s",
-            "a&nbsp;b",
-        ] {
-            assert!(description_is_html(html), "{html}");
-        }
-        for plain in [
-            "a < b and c > d",
-            "Q&A at 3",
-            "5<6",
-            "just notes",
-            "",
-            "café ☕ <",
-        ] {
-            assert!(!description_is_html(plain), "{plain}");
         }
     }
 

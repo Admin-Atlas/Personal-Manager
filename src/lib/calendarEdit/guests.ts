@@ -335,23 +335,32 @@ function recipients(list: readonly Person[], own: Set<string>): Set<string> {
  *  PATCH: guests added are invited and guests taken off are told; when the change is `shared` (it
  *  touches anything guests see, not only the user's own fields) everyone still on it hears too.
  *  `cutShort`: Google didn't send the whole list, so a shared change reaches "at least" these. Null
- *  when nobody would be emailed and nothing was hidden. */
+ *  when nobody would be emailed and nothing was hidden. `moves`: the same Save puts the event on
+ *  another calendar (C18d), which tells everyone on it then once more, as the backend's
+ *  `Reach::of_transfer` counts it: each of them already invited hears of a change, and the emails
+ *  grow by one each. */
 export function changeNotice(
   before: readonly Person[],
   after: readonly Person[],
   shared: boolean,
   cutShort: boolean,
   me: string | null = null,
+  moves = false,
 ): GuestNotice | null {
   const own = ownOf([before, after], me);
   const was = recipients(before, own);
   const now = recipients(after, own);
+  const told = shared || moves;
   const removed = [...was].filter((a) => !now.has(a));
   const invited = [...now].filter((a) => !was.has(a));
-  const updated = shared ? [...now].filter((a) => was.has(a)) : [];
+  const updated = told ? [...now].filter((a) => was.has(a)) : [];
   const people = updated.length + invited.length + removed.length;
+  // The PATCH's own emails (one each, the user's own fields reaching nobody), and the calendar
+  // change's: one to everyone on it then.
+  const patched = shared ? people : invited.length + removed.length;
+  const emails = patched + (moves ? now.size : 0);
   // A change to only the user's own fields emails nobody, however much of the list Google sent.
-  const complete = !cutShort || !shared;
+  const complete = !cutShort || !told;
   if (people === 0 && complete) return null;
   return {
     updated: updated.length,
@@ -360,15 +369,17 @@ export function changeNotice(
     told_cancelled: 0,
     cancelled: false,
     people,
-    emails: people,
+    emails,
     complete,
   };
 }
 
 /** Who deleting a mirror row would tell: its guests but the user and rooms (by address, since the
- *  mirror has no room flag), when the user organises it; null when nobody. */
+ *  mirror has no room flag), when the user organises it; null when nobody. A birthday or an event
+ *  Gmail added tells nobody, as the backend's `Reach` has it (C20 §4.4): only an ordinary event's
+ *  delete asks. */
 export function deleteNotice(row: CalendarEvent, me: string | null = null): GuestNotice | null {
-  if (!row.organizer_self) return null;
+  if (!row.organizer_self || (row.event_type ?? "default") !== "default") return null;
   const list = (row.attendees ?? []).map((a) => ({
     email: a.email,
     // The organiser of an event the calendar organises is the calendar itself.

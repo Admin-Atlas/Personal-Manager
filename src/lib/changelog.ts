@@ -24,6 +24,20 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.160.0-alpha",
+    date: "2026-10-31",
+    highlights: [
+      "Google Meet comes to PM's events. In Edit, add a Meet video call to an event you organise, or remove it, for one occurrence of a repeating event or all of them, and join the call or copy its link from there. New events can have a call too, in the full editor and in quick create, wherever the calendar offers Meet. If your Google Calendar adds Meet when you invite guests, PM does too, and you can turn it off before you save. A call from another service is shown and kept as it is.",
+      "Duplicate an event from its details or from Edit, and change the copy before it's created, on any calendar you can create events on, another account's included. As in Google Calendar, the copy has no video call until you add one, and you're asked whether to email its guests.",
+      "Put an event you organise on another calendar you own on the same Google account, from the Calendar row in Edit. One Save changes the event and its calendar together and asks once whether to email its guests, and the notice says how to put it back. A repeating event goes whole: choose “All events” and every occurrence moves together. To put an event on another account's calendar, duplicate it there and delete the original.",
+      "An event's details now show the formatting of its Google description: bold, italic and underlined text, numbered and bulleted lists, and links. Before, a description written in Google Calendar could show on one line, or as an empty box. Email links open your mail app, and PM keeps more of a long description, saying so when the rest is only in Google Calendar.",
+      "You can format a description yourself now, when you create an event in the full editor or change one: bold, italic, underline, bulleted and numbered lists, links and remove formatting, each with its shortcut (hover to see it). Pasting brings in text only, and Ctrl+click (⌘-click on a Mac) opens a link. A description with formatting PM can't edit, such as a table or coloured text, shows what PM can of it, and you can replace it with plain text. A duplicate keeps the original's description and formatting, ready to change before you save.",
+      "Birthdays and events Gmail added can now be changed in PM where Google allows it: a birthday's name, notifications and colour, and its date if you added it in Google Calendar; a Gmail event's busy or free, visibility, notifications, colour and your reply. Everything else on them is greyed, with a line saying why. You can delete them too, without being asked about emailing anyone: a birthday goes for every year at once, and deleting it doesn't change Google Contacts. A birthday can't be dragged, and PM says so by the pointer. Focus time, out of office and working locations still can't be changed in PM, and PM now says so in those words.",
+      "On a calendar shared with you to view only, an event's details now offer to ask the owner for edit access when PM knows who owns it: PM opens an email in your mail app for you to send.",
+      "The calendar's help is clearer too: in help mode, an event's details, the editor, the new-event box, the which-occurrences question and a delete each explain themselves. As before, anything that changes an event needs editing turned on for that account in Settings → Connectors.",
+    ],
+  },
+  {
     version: "3.159.2-alpha",
     date: "2026-10-31",
     highlights: [

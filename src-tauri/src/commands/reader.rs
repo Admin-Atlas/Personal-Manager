@@ -13,23 +13,84 @@ use crate::error::{Error, Result};
 use crate::ingest;
 use crate::{pathguard, vault, AppState};
 
-/// Open a URL in the system browser, but ONLY if it's http/https — never a `file:`, app, or custom
-/// scheme, so a stray or injected href can't launch a local handler (the inputs are app constants and
-/// Drive-supplied links, treated as untrusted — rule #6).
-fn open_external_url(url: &str) -> Result<()> {
+/// What a mail link the mail app didn't open is refused with. The webview's mail links match these
+/// words exactly to add the address they were for (`src/components/calendar/parts/useMailLink.ts`),
+/// so the two change together.
+const MAIL_APP_FAILED: &str = "PM couldn't open your mail app.";
+
+/// What PM opens for a link: a web address as it is, or a new message to an email address. A mail
+/// link's subject, body and other fields are dropped: some mail apps attach a file from this computer
+/// when a link asks them to. Anything else (a `file:`, app or custom scheme) is refused, so a stray or
+/// injected href can't launch a local handler (the inputs are app constants, and links from Google,
+/// Drive and event descriptions, treated as untrusted — rule #6).
+fn link_to_open(url: &str) -> Result<String> {
+    if url
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+    {
+        return mail_to(&url[7..])
+            .ok_or_else(|| Error::Other("That doesn't look like an email address.".into()));
+    }
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| Error::Other("That doesn't look like a valid link.".into()))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(Error::Other("Only http(s) links can be opened.".into()));
+        return Err(Error::Other(
+            "Only web and email links can be opened.".into(),
+        ));
     }
-    // By the error's kind only: a launcher's message repeats its command line, the link included,
-    // and a sign-in link carries one-time state.
-    open::that(parsed.as_str())
-        .map_err(|e| Error::Other(format!("Couldn't open the link ({:?}).", e.kind())))
+    Ok(parsed.into())
 }
 
-/// Open an arbitrary http(s) URL in the system browser. The webview can't open `target="_blank"`
-/// links itself (no shell/opener plugin), so the frontend's app-wide link handler routes them here.
+/// A new message to a mail link's addresses, from what follows its `mailto:`: the addresses before
+/// any `?` or `#`, each `local@domain`, comma-separated. Nothing else gets through, an empty path
+/// and a `%` included (neither address part takes one, so an encoded line break or `?` can't carry
+/// what the query does).
+fn mail_to(rest: &str) -> Option<String> {
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    path.split(',')
+        .all(is_mail_address)
+        .then(|| format!("mailto:{path}"))
+}
+
+/// One "@" between a local part of RFC 5322's atom characters and dots, and a domain of two or more
+/// labels of ASCII letters, digits and "-": the addresses `descriptionHtml.ts`'s `linkFromTyped` makes.
+/// No whitespace, control character or `%` in either.
+fn is_mail_address(address: &str) -> bool {
+    let Some((local, domain)) = address.split_once('@') else {
+        return false;
+    };
+    let label = |l: &str| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    !local.is_empty()
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".!#$&'*+=?^_`{|}~-".contains(c))
+        && domain.split('.').count() >= 2
+        && domain.split('.').all(label)
+}
+
+/// What a launch that failed says. By the error's kind only: a launcher's message repeats its
+/// command line, the link included, and a sign-in link carries one-time state.
+fn open_failed(link: &str, kind: std::io::ErrorKind) -> Error {
+    if link.starts_with("mailto:") {
+        eprintln!("open link: the mail app didn't open ({kind:?})");
+        Error::Other(MAIL_APP_FAILED.into())
+    } else {
+        Error::Other(format!("Couldn't open the link ({kind:?})."))
+    }
+}
+
+/// Open a web link in the system browser, or a mail link in the mail app (`link_to_open`).
+fn open_external_url(url: &str) -> Result<()> {
+    let link = link_to_open(url)?;
+    open::that(&link).map_err(|e| open_failed(&link, e.kind()))
+}
+
+/// Open a web or email link: a web address in the system browser, an email address as a new message
+/// in the mail app. The webview can't open `target="_blank"` links itself (no shell/opener plugin),
+/// so the frontend's app-wide link handler routes them here, and an event description's mail links
+/// come here too (C19). Every caller: `useExternalLinks` (web only), an event's Join the call, Open in
+/// Google Calendar and its Meet link (addresses Google sent), a sign-in page and Proton Drive's
+/// install page (PM's own), and a description's links; `open_source` reaches only web addresses.
 /// On the blocking pool, not the main thread: a launcher can wait until the browser it started quits
 /// (xdg-open does on a desktop it doesn't know), and PM would be frozen until then.
 #[tauri::command]
@@ -317,6 +378,12 @@ fn classify_source_ref(external_ref: &str) -> SourceRefKind {
     }
 }
 
+/// What a reveal that failed says. By the error's kind only, as [`open_failed`]: a launcher's message
+/// repeats its command line, and here that's the local file's path.
+fn reveal_failed(app: &str, kind: std::io::ErrorKind) -> Error {
+    Error::Other(format!("Couldn't open {app} ({kind:?})."))
+}
+
 /// Reveal a local file in the OS file manager, SELECTING it (not opening it — that would launch the
 /// file's default app). The path is validated to exist and passed as a single non-shell argument, so a
 /// stored path can't inject further arguments. Local-only; the http(s) guard covers web links elsewhere.
@@ -332,7 +399,7 @@ fn reveal_in_file_manager(path: &str) -> Result<()> {
         std::process::Command::new("explorer")
             .arg(format!("/select,{}", p.display()))
             .spawn()
-            .map_err(|e| Error::Other(format!("Couldn't open the file manager: {e}")))?;
+            .map_err(|e| reveal_failed("the file manager", e.kind()))?;
         return Ok(());
     }
     #[cfg(target_os = "macos")]
@@ -341,15 +408,14 @@ fn reveal_in_file_manager(path: &str) -> Result<()> {
             .arg("-R")
             .arg(p)
             .spawn()
-            .map_err(|e| Error::Other(format!("Couldn't open Finder: {e}")))?;
+            .map_err(|e| reveal_failed("Finder", e.kind()))?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         // No portable "select the file" on Linux; open the containing folder instead.
         let dir = p.parent().unwrap_or(p);
-        open::that(dir)
-            .map_err(|e| Error::Other(format!("Couldn't open the file manager: {e}")))?;
+        open::that(dir).map_err(|e| reveal_failed("the file manager", e.kind()))?;
         return Ok(());
     }
     #[allow(unreachable_code)]
@@ -531,12 +597,104 @@ mod reader_tests {
 mod tests {
     use super::*;
 
+    /// What `link_to_open` refuses with, or "" for a link it opens.
+    fn refusal(url: &str) -> String {
+        link_to_open(url)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The pure rule, so nothing is launched: a web address opens as it is; a mail link opens as a
+    /// new message to its addresses alone; everything else is refused before any launch, so a stray
+    /// or injected href can't open a local handler.
     #[test]
-    fn open_external_url_allows_only_http_schemes() {
-        // Rejected before any launch — a stray/injected href can't open a local handler.
-        assert!(open_external_url("file:///etc/passwd").is_err());
-        assert!(open_external_url("javascript:alert(1)").is_err());
-        assert!(open_external_url("not a url").is_err());
-        // The http/https success path is deliberately not exercised (it would launch a browser).
+    fn links_open_only_on_the_web_or_to_an_address() {
+        let opens = |url: &str| link_to_open(url).ok();
+        assert_eq!(
+            opens("https://example.com/a?b=1#c").as_deref(),
+            Some("https://example.com/a?b=1#c")
+        );
+        assert_eq!(
+            opens("HTTP://Example.com").as_deref(),
+            Some("http://example.com/")
+        );
+        // A mail link's fields go: some mail apps attach a file when a link asks them to.
+        assert_eq!(
+            opens("mailto:a@example.com?subject=x&attach=/etc/passwd").as_deref(),
+            Some("mailto:a@example.com")
+        );
+        assert_eq!(
+            opens("MAILTO:Ann.Lee+cal@Mail.Example.co.uk#top").as_deref(),
+            Some("mailto:Ann.Lee+cal@Mail.Example.co.uk")
+        );
+        assert_eq!(
+            opens("mailto:a@example.com,b@example.org").as_deref(),
+            Some("mailto:a@example.com,b@example.org")
+        );
+
+        let not_an_address = "That doesn't look like an email address.";
+        for url in [
+            "mailto:",
+            "mailto:?subject=x",
+            "mailto:a%0D%0Ab@example.com",
+            "mailto:a%40example.com",
+            "mailto:a@example.com%0Abcc",
+            "mailto:a b@example.com",
+            "mailto:a\u{0}b@example.com",
+            "mailto:a\"b@example.com",
+            "mailto:@example.com",
+            "mailto:a@",
+            "mailto:a@example",
+            "mailto:a@example..com",
+            "mailto:a@exa_mple.com",
+            "mailto:a@b@example.com",
+            "mailto:a@example.com,",
+            "mailto:a@example.com,,b@example.org",
+            "mailto:a@exämple.com",
+        ] {
+            assert_eq!(refusal(url), not_an_address, "a bad mail link opened");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "tel:+15550100",
+            "data:text/html,x",
+            " mailto:a@example.com",
+        ] {
+            assert_eq!(
+                refusal(url),
+                "Only web and email links can be opened.",
+                "a link that is neither web nor mail opened"
+            );
+        }
+        assert_eq!(refusal("not a url"), "That doesn't look like a valid link.");
+        // The launch itself is deliberately not exercised (it would open a browser or mail app).
+    }
+
+    /// A mail app that didn't open says so in the exact words the webview adds the address to; a
+    /// browser keeps its words, and neither repeats the link.
+    #[test]
+    fn a_launch_that_failed_says_which_app() {
+        let kind = std::io::ErrorKind::NotFound;
+        assert_eq!(
+            open_failed("mailto:a@example.com", kind).to_string(),
+            MAIL_APP_FAILED
+        );
+        assert_eq!(MAIL_APP_FAILED, "PM couldn't open your mail app.");
+        assert_eq!(
+            open_failed("https://example.com/secret", kind).to_string(),
+            "Couldn't open the link (NotFound)."
+        );
+    }
+
+    /// A reveal that failed says which app, never the launcher's message, which repeats the path.
+    #[test]
+    fn a_reveal_that_failed_names_no_path() {
+        let launch = std::io::Error::new(std::io::ErrorKind::NotFound, "gio open /home/me/tax.pdf");
+        assert_eq!(
+            reveal_failed("the file manager", launch.kind()).to_string(),
+            "Couldn't open the file manager (NotFound)."
+        );
     }
 }

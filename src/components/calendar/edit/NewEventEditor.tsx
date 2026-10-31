@@ -41,6 +41,21 @@
 // all-day puts a list of the event's own back to the defaults, and says so. A notification row that
 // can't be committed stops every way to save, as a date a field couldn't read does. Quick create has
 // neither row, as Google's has none (INFERRED).
+//
+// It can have a Google Meet call (C18b): the video-call row sits after the guests, as when editing,
+// where the calendar offers Meet. Until the user touches it, it follows Google: on with the first
+// guest when the account's "Automatically add Google Meet video conferences to events I create" is
+// on, off again when no guest is left (`meetDefault`), and another calendar decides it afresh.
+// Touched, it stays, except on a calendar without Meet, which turns it off and says so.
+//
+// It can open on a copy of an event (Duplicate, C18c, `copyOf`): the copy's fields are the seed, so
+// closing it unchanged asks nothing and sends nothing; a line under the bar says what it copies and
+// what it doesn't. Its call starts off and stays so until pressed, whatever the setting, as Google's
+// Duplicate makes none; its description is copied unchanged.
+//
+// The description is formatted with Google Calendar's buttons, as when editing (C19d). A copy's
+// description with formatting PM can't write back shows what PM can of it, with "Replace with plain
+// text…", and is created exactly as Google holds it unless replaced.
 
 import {
   useCallback,
@@ -54,6 +69,7 @@ import {
 import { flushSync } from "react-dom";
 import type { CalendarOverview, GuestNotice, Notify, WriteOutcome } from "../../../lib/types";
 import {
+  COPY_CALL_OFF_NOTE,
   NEW_EVENT_BASE,
   NO_BAD_DATES,
   changedFields,
@@ -67,6 +83,7 @@ import {
   guestNotice,
   halfInstant,
   hasBadDate,
+  lengthOnCalendar,
   newEventLength,
   refusedDateId,
   remindersAfterKindSwitch,
@@ -77,11 +94,16 @@ import {
 } from "../../../lib/calendarEdit/eventDraft";
 import { kindNoteText, type KindSwitchNote } from "../../../lib/calendarEdit/reminders";
 import {
+  parseDescription,
+  replacementDescription,
+} from "../../../lib/calendarEdit/descriptionHtml";
+import {
   ambiguousText,
   CALLOUT_TONE,
   createText,
   heldCreateText,
   problemText,
+  reasonText,
   retryAfter,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
@@ -89,6 +111,10 @@ import {
   createdWhere,
   createNotes,
   lengthFor,
+  meetDefault,
+  meetOffered,
+  meetOffText,
+  meetOnCalendar,
   targetById,
   type CreateTargets,
 } from "../../../lib/calendarEdit/createTargets";
@@ -99,8 +125,10 @@ import { deviceTimeZoneOrNull } from "../../../theme";
 import { Button, Callout, ConfirmDialog, Dialog } from "../../ui";
 import { CalendarPicker } from "./CalendarPicker";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
+import { DescriptionEditor, DescriptionView, ReplaceQuestion } from "./DescriptionEditor";
 import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
+import { MeetField } from "./MeetField";
 import { NotifyPrompt } from "./NotifyPrompt";
 import { ReminderList } from "./ReminderList";
 import {
@@ -115,6 +143,7 @@ import {
 } from "./EventFields";
 import { createEvent, noteCreateResult, noteHeldCreate, type CreateSent } from "./useEventWrites";
 import { useRepeatView } from "./useRepeat";
+import { useMailLink } from "../parts/useMailLink";
 
 interface Props {
   /** The fields it starts with (`newEventSeed`): closing unchanged from these asks nothing. */
@@ -139,7 +168,17 @@ interface Props {
    *  locked on Check again under the same token, the words of a token that ended unproven, and a
    *  date its field couldn't read, still refusing. */
   handover?: CreateHandover;
+  /** A copy of an event (Duplicate, C18c): `seed` holds its fields. */
+  copyOf?: CopyOf;
   onClose: () => void;
+}
+
+/** What the editor says of a copy it opens on (C18c): the original's title and what the copy leaves
+ *  out (`EventCopy`, the fields aside). */
+export interface CopyOf {
+  title: string;
+  notes: string[];
+  callNote: string | null;
 }
 
 /** What quick create hands the full editor (C10c): nothing is sent on the way. */
@@ -150,9 +189,13 @@ export interface CreateHandover {
   held: { token: string; sent: CreateSent } | null;
   /** A token that ended there without Google showing the event made: its words carry on here. */
   unproven: Unproven | null;
-  /** Whether the user picked Show as, or changed the time, there. */
+  /** Whether the user picked Show as, or changed the time, or pressed Google Meet, there. */
   showAsTouched: boolean;
   timeTouched: boolean;
+  meetTouched: boolean;
+  /** The event's own length (a range dragged, or one changed there), which an all-day draft can't
+   *  show; `null` when it has none and takes the length of the calendar it's on. */
+  length: number | null;
   /** Text quick create's date field couldn't read: it stands here as the start's (Start date or
    *  First day), refusing a save until that field is given a date, as it did there. */
   badDate: string | null;
@@ -208,6 +251,7 @@ export function NewEventEditor({
   shapeOf,
   focusRef,
   handover,
+  copyOf,
   onClose,
 }: Props) {
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
@@ -234,14 +278,52 @@ export function NewEventEditor({
   // with (a range dragged on the grid, or quick create's, is the user's, C17), else the account's
   // default.
   const lengthRef = useRef(
-    newEventLength(startDraft) ??
-      newEventLength(seed) ??
+    handover?.length ??
+      newEventLength(startDraft) ??
       lengthFor(overview, targetById(targets, startCalendar)),
   );
-  // Whether the user has changed the time: until then, another calendar brings its own length.
-  const timeTouched = useRef(handover?.timeTouched ?? false);
-  // Whether the user has picked Show as: until then, it follows the kind (all day free).
-  const showAsTouched = useRef(handover?.showAsTouched ?? false);
+  // Whether the user has changed the time: until then, another calendar brings its own length. A
+  // copy's time is the original's, as Google holds it (C18 §7.1), so it starts as changed: another
+  // calendar never makes it the account's default length.
+  const timeTouched = useRef(handover?.timeTouched ?? copyOf !== undefined);
+  // Whether `lengthRef` is the event's own rather than an account's default: an all-day copy has
+  // none to keep, so going timed on another calendar takes that account's length (review round 2).
+  // Quick create says whether what it hands over has one: a range dragged and then ticked all day
+  // does, which the draft no longer shows (review round 3).
+  const ownLength = useRef(
+    handover
+      ? handover.length !== null
+      : copyOf !== undefined && newEventLength(startDraft) !== null,
+  );
+  // Whether the user has picked Show as: until then, it follows the kind (all day free). A copy's is
+  // the original's, so it starts as picked, and all day and back keeps it, as editing the original
+  // would.
+  const showAsTouched = useRef(handover?.showAsTouched ?? copyOf !== undefined);
+  // The draft's defaults are the ones a kind switch put there, untouched since: switching back puts
+  // the seed's list back (`remindersAfterKindSwitch`). Only a copy's seed has a list of its own.
+  const kindResetRef = useRef(false);
+  // Whether the user has pressed the video-call row (here or in quick create): until then, it
+  // follows Google's setting and the guest list (`meetDefault`). A copy starts as pressed: Google's
+  // Duplicate ignores the setting (Workspace admin help 9898950).
+  const meetTouched = useRef(handover?.meetTouched ?? copyOf !== undefined);
+  // Another calendar turned the call off, offering no Meet: said under the row until it next changes.
+  const [meetNote, setMeetNote] = useState<string | null>(null);
+  // A copy's word that the original's call isn't copied: under the row until it's pressed.
+  const [copyCallNote, setCopyCallNote] = useState<string | null>(copyOf?.callNote ?? null);
+  // A copy's description as Google holds it (the copy's seed, never the draft), C19d: one with
+  // formatting PM can't write back shows what PM can of it, with "Replace with plain text…", and
+  // goes to Google unchanged unless replaced. A new event sends whatever the draft holds, so the
+  // replacement is the draft's alone: nothing else needs telling.
+  const copiedDescription = useMemo(
+    () => (copyOf ? parseDescription(seed.description) : null),
+    [copyOf, seed.description],
+  );
+  const [askReplace, setAskReplace] = useState(false);
+  const [replaced, setReplaced] = useState(false);
+  const descriptionId = useId();
+  const descriptionBoxId = useId();
+  const formattingReasonId = useId();
+  const mail = useMailLink("new event");
   // Handed over while PM may already have made it: locked on what was sent, saying so; or after a
   // token ended unproven there, still saying that.
   const handedHeld: Held | null = handover?.held
@@ -421,7 +503,10 @@ export function NewEventEditor({
   function lengthOf(t: Timed): number {
     const s = halfInstant(NEW_EVENT_BASE, t, "start");
     const e = halfInstant(NEW_EVENT_BASE, t, "end");
-    if (s !== null && e !== null && e - s >= 60_000) lengthRef.current = e - s;
+    if (s !== null && e !== null && e - s >= 60_000) {
+      if (e - s !== lengthRef.current) ownLength.current = true;
+      lengthRef.current = e - s;
+    }
     return lengthRef.current;
   }
 
@@ -460,6 +545,7 @@ export function NewEventEditor({
    *  day came from the start date follows it. */
   function changeTime(next: EditorFields) {
     timeTouched.current = true;
+    if (next.time.kind === "timed") lengthOf(next.time);
     setDraft(followStart(draftRef.current, next));
   }
 
@@ -467,18 +553,20 @@ export function NewEventEditor({
   function changeKind(zone: string) {
     const was = draftRef.current;
     const switched = switchNewKind(was, seed, zone, lengthRef.current, showAsTouched.current);
-    // The seed is on the calendar's defaults (`newEventSeed`), so defaults on the draft stay the
-    // defaults whoever put them there: no switch's reset to remember.
-    const r = remindersAfterKindSwitch(seed, switched, true, false);
+    // A new event's seed is on the calendar's defaults (`newEventSeed`); a copy's has the original's
+    // list, which switching back puts back, as the event editor does.
+    const r = remindersAfterKindSwitch(seed, switched, true, kindResetRef.current);
+    kindResetRef.current = r.reset;
     changeTime(r.draft);
     setRemindersNote(r.note);
   }
 
   /** Another calendar. While the time is still the seed's, the end follows that account's length
-   *  (and back again), as Google's own length would. The calendar organises the event, so its own
-   *  address typed as a guest on another one comes off the list, said under the box: GuestField
-   *  refuses adding it, and the backend counts it as the event's own, never one Google invites (C13
-   *  review round 1). */
+   *  (and back again), as Google's own length would; after that a length on screen stays
+   *  (`lengthOnCalendar`). The calendar organises the event, so its own address typed as a guest on
+   *  another one comes off the list, said under the box: GuestField refuses adding it, and the backend
+   *  counts it as the event's own, never one Google invites (C13 review round 1). The video call
+   *  follows the new calendar (`meetOnCalendar`, C18b). */
   function pickCalendar(id: string) {
     setCalendarId(id);
     const target = targetById(targets, id);
@@ -495,8 +583,24 @@ export function NewEventEditor({
       lengthRef.current = length;
       const t = next.time;
       if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
+    } else {
+      const usual = lengthFor(overviewRef.current, target);
+      lengthRef.current = lengthOnCalendar(next, ownLength.current, lengthRef.current, usual);
     }
+    const call = meetOnCalendar(overviewRef.current, target, next, meetTouched.current);
+    if (call.meet !== next.meet) next = { ...next, meet: call.meet };
+    setMeetNote(call.off && target ? meetOffText(target.calendar.name) : null);
     if (next !== was) setDraft(next);
+  }
+
+  /** The guest list changed: an untouched video call follows it, on with the first guest where the
+   *  account's setting adds Meet, off when none is left (C18b). */
+  function changeGuests(guests: EditorFields["guests"]) {
+    const next = { ...draftRef.current, guests };
+    const meet = meetTouched.current
+      ? next.meet
+      : meetDefault(overviewRef.current, targetById(targets, calendarRef.current), guests);
+    setDraft(meet === next.meet ? next : { ...next, meet });
   }
 
   /** Whether the backend has said `fields`' repeat can be saved, for exactly its rule and start (a
@@ -701,6 +805,8 @@ export function NewEventEditor({
         onClose={requestClose}
         chrome="bar"
         title="New event"
+        helpId="calendar-new-event"
+        subtitle={copyOf ? `A copy of “${copyOf.title.trim() || "(no title)"}”.` : undefined}
         closeLabel="Close"
         closeDisabled={saving}
         widthClassName="max-w-lg"
@@ -733,13 +839,20 @@ export function NewEventEditor({
             </Callout>
           )}
 
+          {/* What a copy leaves out of the original (C18c). */}
+          {copyOf?.notes.map((n) => (
+            <p key={n} className="text-xs text-ink3">
+              {n}
+            </p>
+          ))}
+
           <div className="flex flex-col items-start gap-1">
             <span className="text-sm text-ink2">Calendar</span>
             <CalendarPicker
               targets={targets}
               value={calendarId}
               onChange={pickCalendar}
-              privateDraft={draft.visibility === "private"}
+              privateDraft={draft.visibility === "private" || draft.visibility === "confidential"}
               hidden={hidden}
               colorOf={colorOf}
               shapeOf={shapeOf}
@@ -841,10 +954,28 @@ export function NewEventEditor({
             notice={guestNote}
             onChange={(guests) => {
               setGuestNote(null);
-              setDraft({ ...draftRef.current, guests });
+              changeGuests(guests);
             }}
             onPerms={(guest_perms) => setDraft({ ...draftRef.current, guest_perms })}
             onReject={setBadGuest}
+          />
+
+          {/* A new event has no call yet: the row only asks for one (C18b). */}
+          <MeetField
+            call={null}
+            value={draft.meet}
+            offered={meetOffered(target)}
+            disabled={locked}
+            // A copy's note asks for a new call only where there's one to add.
+            note={
+              meetNote ?? (copyCallNote && !meetOffered(target) ? COPY_CALL_OFF_NOTE : copyCallNote)
+            }
+            onChange={(meet) => {
+              meetTouched.current = true;
+              setMeetNote(null);
+              setCopyCallNote(null);
+              setDraft({ ...draftRef.current, meet });
+            }}
           />
 
           <TextRow
@@ -869,6 +1000,7 @@ export function NewEventEditor({
             }
             onChange={(reminders) => {
               setRemindersNote(null);
+              kindResetRef.current = false;
               setDraft({ ...draftRef.current, reminders });
             }}
             onInvalid={(bad) => {
@@ -887,13 +1019,46 @@ export function NewEventEditor({
             />
           </div>
 
-          <TextRow
-            label="Description"
-            multiline
-            value={draft.description}
-            disabled={locked}
-            onChange={(description) => setDraft({ ...draft, description })}
-          />
+          <div className="flex flex-col gap-1">
+            {/* Text, not a label element: the box is a div, which a label can't name. Clicking it
+                still puts the caret in the box (critique C2-L7). */}
+            <span
+              id={descriptionId}
+              className="text-sm text-ink2"
+              onClick={() => document.getElementById(descriptionBoxId)?.focus()}
+            >
+              Description
+            </span>
+            {copiedDescription && !copiedDescription.supported && !replaced ? (
+              // A copy's description PM can't write back goes as Google holds it, formatting kept
+              // (C18 critique C2-L12), showing what PM can of it until the user replaces it.
+              <>
+                <DescriptionView
+                  doc={copiedDescription.doc}
+                  labelledBy={descriptionId}
+                  describedBy={formattingReasonId}
+                  onReplace={locked ? undefined : () => setAskReplace(true)}
+                  onMail={mail.open}
+                />
+                <p id={formattingReasonId} className="text-xs leading-relaxed text-ink4">
+                  {reasonText("unsupported_formatting")}
+                </p>
+              </>
+            ) : (
+              <DescriptionEditor
+                id={descriptionBoxId}
+                value={draft.description}
+                onChange={(description) => setDraft({ ...draftRef.current, description })}
+                disabled={locked}
+                labelledBy={descriptionId}
+                autoFocus={replaced}
+                onMail={mail.open}
+              />
+            )}
+            <p role="status" className="text-xs text-st-due">
+              {mail.failure ?? ""}
+            </p>
+          </div>
 
           <div className="flex flex-wrap items-center gap-4">
             <ShowAsControl
@@ -909,6 +1074,10 @@ export function NewEventEditor({
               disabled={locked}
               onChange={(visibility) => setDraft({ ...draft, visibility })}
               privateOff={noPrivate}
+              // Only a copy of an event that has Google's older choice holds it (C18c).
+              confidential={
+                seed.visibility === "confidential" || draft.visibility === "confidential"
+              }
             />
           </div>
 
@@ -931,6 +1100,21 @@ export function NewEventEditor({
             onClose={closeCustom}
           />
         )}
+        {/* "Replace with plain text…", nested the same way. */}
+        <ReplaceQuestion
+          open={askReplace}
+          copy
+          onKeep={() => setAskReplace(false)}
+          onReplace={() => {
+            setAskReplace(false);
+            if (!copiedDescription) return;
+            setDraft({
+              ...draftRef.current,
+              description: replacementDescription(seed.description),
+            });
+            setReplaced(true);
+          }}
+        />
         {/* The email question, nested the same way: Escape and Back close only it. */}
         {prompt && (
           <NotifyPrompt

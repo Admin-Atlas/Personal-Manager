@@ -1,0 +1,1004 @@
+{
+  "about": "C19 (#884): Google event descriptions both sides read. `html` is whether a description is formatted rather than plain lines (the webview's looksLikeHtml, Rust's is_html). `supported` is whether PM's editor can write it back with nothing Google shows lost (the webview's parseDescription). `pm_can_edit` is the backend's laxer check (Rust's pm_can_edit: every tag one the editor writes, no comment, declaration or cut tag), which every supported row must pass, so the backend is never stricter than the webview. `legacy` is the names a browser reads without their ; (the webview's LEGACY, Rust's LEGACY_NAMES). `hrefs` is link addresses as written in an attribute, each `kept` when the webview's reader can write such a link back, the verdict Rust's pm_can_edit_unseen must give too. Synthesised strings only: nothing here is copied from a real person's calendar.",
+  "legacy": [
+    "AElig",
+    "AMP",
+    "Aacute",
+    "Acirc",
+    "Agrave",
+    "Aring",
+    "Atilde",
+    "Auml",
+    "COPY",
+    "Ccedil",
+    "ETH",
+    "Eacute",
+    "Ecirc",
+    "Egrave",
+    "Euml",
+    "GT",
+    "Iacute",
+    "Icirc",
+    "Igrave",
+    "Iuml",
+    "LT",
+    "Ntilde",
+    "Oacute",
+    "Ocirc",
+    "Ograve",
+    "Oslash",
+    "Otilde",
+    "Ouml",
+    "QUOT",
+    "REG",
+    "THORN",
+    "Uacute",
+    "Ucirc",
+    "Ugrave",
+    "Uuml",
+    "Yacute",
+    "aacute",
+    "acirc",
+    "acute",
+    "aelig",
+    "agrave",
+    "amp",
+    "aring",
+    "atilde",
+    "auml",
+    "brvbar",
+    "ccedil",
+    "cedil",
+    "cent",
+    "copy",
+    "curren",
+    "deg",
+    "divide",
+    "eacute",
+    "ecirc",
+    "egrave",
+    "eth",
+    "euml",
+    "frac12",
+    "frac14",
+    "frac34",
+    "gt",
+    "iacute",
+    "icirc",
+    "iexcl",
+    "igrave",
+    "iquest",
+    "iuml",
+    "laquo",
+    "lt",
+    "macr",
+    "micro",
+    "middot",
+    "nbsp",
+    "not",
+    "ntilde",
+    "oacute",
+    "ocirc",
+    "ograve",
+    "ordf",
+    "ordm",
+    "oslash",
+    "otilde",
+    "ouml",
+    "para",
+    "plusmn",
+    "pound",
+    "quot",
+    "raquo",
+    "reg",
+    "sect",
+    "shy",
+    "sup1",
+    "sup2",
+    "sup3",
+    "szlig",
+    "thorn",
+    "times",
+    "uacute",
+    "ucirc",
+    "ugrave",
+    "uml",
+    "uuml",
+    "yacute",
+    "yen",
+    "yuml"
+  ],
+  "hrefs": [
+    { "href": "https://example.com/", "kept": true },
+    { "href": "http://example.com", "kept": true },
+    { "href": "HTTPS://EXAMPLE.COM", "kept": true },
+    { "href": "https://例え.example/パス", "kept": true },
+    { "href": "https://x.example/it's", "kept": true },
+    { "href": "mailto:ann@example.com", "kept": true },
+    { "href": "tel:+15550100", "kept": true },
+    { "href": "TEL:(555)-0100;ext=4", "kept": false },
+    { "href": "tel:(555)-0100,4#", "kept": true },
+    { "href": "www.example.org/path", "kept": true },
+    { "href": "example.com?x=1", "kept": true },
+    { "href": "example.com/a#b", "kept": true },
+    { "href": "ann@example.com", "kept": true },
+    { "href": "https://zoom.us/j/1?pwd=x&uname=y", "kept": true },
+    { "href": "https://x.example/?a=1&region=eu&section=2&copy=3&para=4&notify=5", "kept": true },
+    { "href": "https://x.example/?a=1&amp;b=2", "kept": true },
+    { "href": "https://x.example/?a&b", "kept": true },
+    { "href": "https://x.example/?q=a&#top", "kept": true },
+    { "href": "https://x.example/?q=a&", "kept": true },
+    { "href": "https://x.example/?a=1&copy", "kept": false },
+    { "href": "https://x.example/?a=1&amp", "kept": false },
+    { "href": "https://x.example/?a=1&copy&b=2", "kept": false },
+    { "href": "https://x.example/?a=&check;", "kept": false },
+    { "href": "/foo", "kept": false },
+    { "href": "foo", "kept": false },
+    { "href": "example", "kept": false },
+    { "href": "#a", "kept": false },
+    { "href": "?x=1", "kept": false },
+    { "href": "//x.com", "kept": false },
+    { "href": "example.com:8080/path", "kept": false },
+    { "href": "ann@example", "kept": false },
+    { "href": "a@b@example.com", "kept": false },
+    { "href": "tel:abc", "kept": false },
+    { "href": "tel:", "kept": false },
+    { "href": "http:", "kept": false },
+    { "href": "https:example.com", "kept": false },
+    { "href": "sms:1", "kept": false },
+    { "href": "javascript:alert(1)", "kept": false },
+    { "href": "https://x.example/a b", "kept": false },
+    { "href": "https://x.example/a　b", "kept": false },
+    { "href": "https://x.example/a﻿b", "kept": false },
+    { "href": "https://x.example/a\u0085b", "kept": false },
+    { "href": "", "kept": false }
+  ],
+  "tags": [
+    "a",
+    "b",
+    "br",
+    "div",
+    "em",
+    "html-blob",
+    "i",
+    "li",
+    "ol",
+    "p",
+    "span",
+    "strong",
+    "u",
+    "ul"
+  ],
+  "rows": [
+    {
+      "description": "Plain line one\nline two",
+      "html": false,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "plain lines"
+    },
+    {
+      "description": "a < b & c",
+      "html": false,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "markup characters as words"
+    },
+    {
+      "description": "Tom &amp; Jerry",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a reference alone is formatting"
+    },
+    {
+      "description": "&#x27;quoted&#x27;",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a hex reference"
+    },
+    {
+      "description": "x&sup2;",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a name with a digit"
+    },
+    {
+      "description": "<b>Agenda</b><br><i>one</i> <u>two</u>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "marks"
+    },
+    {
+      "description": "<strong><b>Both</b></strong> <em>it</em>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "aliases, the same mark nested"
+    },
+    {
+      "description": "<html-blob>Line<br>Line two</html-blob>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "Google's wrapper"
+    },
+    {
+      "description": "<html-blob><u></u><u></u>Hi</html-blob>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "empty pairs"
+    },
+    {
+      "description": "<a href=\"https://example.com/?a=1&amp;b=2\" target=\"_blank\" id=\"ow12\" __is_owner=\"true\">site</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "Google's link bookkeeping"
+    },
+    {
+      "description": "<a href=\"https://example.com\" id=\"ow1\"__is_owner=\"true\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "no space between attributes"
+    },
+    {
+      "description": "<span style=\"background-color: var(--textfield-surface); color: var(--on-surface);\">x</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "Google's colour variables"
+    },
+    {
+      "description": "<span style=\"font-weight: 700\">x</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "reads as bold"
+    },
+    {
+      "description": "<span style=\"color: red\">x</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a colour"
+    },
+    {
+      "description": "<p>One</p><p><br></p><p>Three</p>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "paragraphs, an empty line"
+    },
+    {
+      "description": "<ul><li>a</li><li>b</li></ul><ol><li>c</li></ol>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "lists"
+    },
+    {
+      "description": "Line<div>Two</div><div><br></div><div>Four</div>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "engine lines"
+    },
+    {
+      "description": "<table><tr><td>a</td></tr></table>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a table"
+    },
+    {
+      "description": "<h2>Title</h2>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a heading"
+    },
+    {
+      "description": "<img src=\"https://example.com/x.png\">",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "an image"
+    },
+    {
+      "description": "<font color=\"red\">x</font>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a font"
+    },
+    {
+      "description": "a<!-- note -->b",
+      "html": false,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a comment with no tag or reference beside it isn't formatting: plain text, kept byte for byte"
+    },
+    {
+      "description": "<script>alert(1)</script>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "never shown"
+    },
+    {
+      "description": "<b onclick=\"x()\">a</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an unknown attribute"
+    },
+    {
+      "description": "<a href=\"javascript:alert(1)\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "not a web or mail address"
+    },
+    {
+      "description": "<a href=\"www.example.org/path\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "no scheme (Google's own shape): read as https://, and written so"
+    },
+    {
+      "description": "<a href=\"//example.com\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "protocol-relative"
+    },
+    {
+      "description": "<a href=\"/relative\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "relative"
+    },
+    {
+      "description": "<a href=\"data:text/html,x\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "data:"
+    },
+    {
+      "description": "<a href=\"&#106;avascript:alert(1)\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "decoded once, then refused"
+    },
+    {
+      "description": "<p align=\"center\">x</p>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an attribute that draws"
+    },
+    {
+      "description": "<b>a<i>b</b>c</i>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "misnested"
+    },
+    {
+      "description": "<p>a<ul><li>b</li></ul></p>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a list inside a paragraph"
+    },
+    {
+      "description": "<b id=\"x>y\">a</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "> in a quoted value"
+    },
+    {
+      "description": "<b>a</b> <i class=\"x",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "ends inside a tag"
+    },
+    {
+      "description": "See <https://example.com>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "an address in angle brackets: its words, until E11-1 says how Google draws it"
+    },
+    {
+      "description": "<b>a</b></ x>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "</ without a letter"
+    },
+    {
+      "description": "<?xml version=\"1.0\"?><b>x</b>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a declaration"
+    },
+    {
+      "description": "<li>loose</li>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "kept as Google holds it"
+    },
+    {
+      "description": "<a href=\"mailto:someone@example.com\">mail</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a mail link"
+    },
+    {
+      "description": "<b>&lt;b&gt;</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an escaped tag stays words"
+    },
+    {
+      "description": "<B>Upper</B><BR>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "case"
+    },
+    {
+      "description": "<a href=\" https://example.com\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a leading space"
+    },
+    {
+      "description": "<p dir=\"rtl\">x</p>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "direction draws"
+    },
+    {
+      "description": "See <https://example.com/j/1>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a meeting address the way invitations from other apps write it"
+    },
+    {
+      "description": "Ann <ann@example.com>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a name and address"
+    },
+    {
+      "description": "<b>x</b> <https://example.com>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "an address in angle brackets beside formatting"
+    },
+    {
+      "description": "<a@b.com>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "an email address in angle brackets"
+    },
+    {
+      "description": "<p>a<o:p></o:p></p>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "Outlook's empty element: an unknown name, which browsers draw nothing for"
+    },
+    {
+      "description": "<a href=\"example.com\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a bare domain: read as https://example.com"
+    },
+    {
+      "description": "<a href=\"tel:+15550100\">call</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a phone link, kept"
+    },
+    {
+      "description": "<a href=\"sms:1\">x</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "any other scheme"
+    },
+    {
+      "description": "<span class=\"x\">a</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a class may draw something, until E11-0 shows it doesn't"
+    },
+    {
+      "description": "<a href=\"https://drive.google.com/file/d/REDACTED/view\" class=\"pastedDriveLink-0\">Notes</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a pasted Drive link's class"
+    },
+    {
+      "description": "<b title=\"x\">a</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a title draws a tooltip"
+    },
+    {
+      "description": "<b style=\"font-weight: normal\" id=\"docs-internal-guid-1\">plain</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "Google Docs' paste wrapper: shows plain"
+    },
+    {
+      "description": "<i style=\"font-style: normal\">x</i>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "italic turned off"
+    },
+    {
+      "description": "<span style=\"font-weight: bold !important\">x</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "!important"
+    },
+    {
+      "description": "<span style=\"text-decoration: underline\">x</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "reads as underline"
+    },
+    {
+      "description": "<span style=\"font-family: Arial\">x</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a font"
+    },
+    {
+      "description": "<div dir=\"ltr\">x</div>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "direction on a line"
+    },
+    {
+      "description": "line<br/>two",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a break written with a slash"
+    },
+    {
+      "description": "a<br class=\"x\">b",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an attribute on a break"
+    },
+    {
+      "description": "a</br>b",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "browsers read </br> as <br>"
+    },
+    {
+      "description": "<b/>x",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a slash on anything but a break means nothing: a bold x"
+    },
+    {
+      "description": "<b>a</b>\nb",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a raw line break in formatting, until E11-1 says how Google draws it"
+    },
+    {
+      "description": "<ul>\n<li>a</li>\n</ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "raw line breaks between blocks"
+    },
+    {
+      "description": "<html-blob><br></html-blob>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an empty line in Google's wrapper"
+    },
+    {
+      "description": "<a href=\"https://www.google.com/url?q=https://example.com/a&amp;sa=D&amp;source=calendar&amp;usg=REDACTED\">agenda</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a link through Google's redirect"
+    },
+    {
+      "description": "<ul><li>a<ul><li>b</li></ul></li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a list inside an item"
+    },
+    {
+      "description": "<ul><li>a</li><ul><li>b</li></ul></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a list inside a list"
+    },
+    {
+      "description": "<span>&nbsp;</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a no-break space"
+    },
+    {
+      "description": "<b><li>x</li></b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an item inside formatting"
+    },
+    {
+      "description": "<ul><li><b>a<li>b</li></b></li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an item closing one through formatting browsers carry on"
+    },
+    {
+      "description": "<a href=\"https://a.example\">x<a href=\"https://b.example\">y</a></a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a link inside a link"
+    },
+    {
+      "description": "<a href=\"https://a.example\">x<a href=\"https://b.example\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a link opening inside an open one, which browsers close first"
+    },
+    {
+      "description": "<p>a<ul><li>b</li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a list opening inside an open paragraph, which browsers close first"
+    },
+    {
+      "description": "<b>a<i>b</b>c",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an end tag that closes what's inside it (browsers carry the italic on)"
+    },
+    {
+      "description": "<ul><li><b>a<li>b</li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an item that closes the one before through bold, which browsers carry into it"
+    },
+    {
+      "description": "<ul><li><span>a<li>b</li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an item that closes the one before through an element that draws nothing"
+    },
+    {
+      "description": "&#X27;quoted",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a hex reference with a capital X"
+    },
+    {
+      "description": "<b>a</b><!-- note -->b",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a comment in formatting: it may be a marker another app reads"
+    },
+    {
+      "description": "x &foo; y",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a name PM doesn't know still reads as formatting, and shows as written; a browser may know it, so a save could change it (C19 review 1)"
+    },
+    {
+      "description": "<b>a</b> <u class=x",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "ends inside a tag, with no quote open (C19c)"
+    },
+    {
+      "description": "<b title=\"x><h2>\">a</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a tag after a > in a quoted value is part of the value; the title fails closed (C19c)"
+    },
+    {
+      "description": "<b>&check;</b> <b>&comma;</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "HTML 5's names PM leaves as written, which browsers draw as characters (C19 review 1)"
+    },
+    {
+      "description": "<b>&copy 2026</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an old name without its ;, which browsers still draw as a character (C19 review 1)"
+    },
+    {
+      "description": "<a href=\"https://x.example?a=1&amp\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an old name without its ; in an address (C19 review 1)"
+    },
+    {
+      "description": "<b>a&#13;b</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a carriage return written as a reference: browsers draw a space, a save would make a line (C19 review 1)"
+    },
+    {
+      "description": "<a href=https://example.com/?q=\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an unquoted value holding a quote: it opens nothing (C19 review 1)"
+    },
+    {
+      "description": "<b id=x=\">y</b>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an unquoted value holding = and a quote (C19 review 1)"
+    },
+    {
+      "description": "<b id=x=\"><table><tr><td>a</td></tr></table>\">y</b>",
+      "html": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "after an unquoted value, a table is a table (C19 review 1)"
+    },
+    {
+      "description": "<b>a</b><div><b><br></b></div><div>c</div>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "an empty line made in bold, as Bold, Enter, Enter leaves it in both engines (C19 review 1)"
+    },
+    {
+      "description": "<a href=\"https://x.example/?a=1&region=eu&section=2&copy=3\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "old names run on or before = in an address stay as written, in browsers too: the same link (review 2)"
+    },
+    {
+      "description": "<a href=\"https://x.example/?a=1&copy\">y</a>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "an old name ending an address, which browsers draw as a character (review 2)"
+    },
+    {
+      "description": "<span data-note=\"a&b;c\">x</span> <span data-note=\"R&copy\">y</span>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "references in an attribute PM drops change nothing it keeps (review 2)"
+    },
+    {
+      "description": "See <www.example.com> for details",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets a browser would hide: kept as words, and no formatting (review 2)"
+    },
+    {
+      "description": "Dial in: <Room 4>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets a browser would hide: kept as words, and no formatting (review 2)"
+    },
+    {
+      "description": "<ul style=\"font-weight:bold\"><li>x</li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a bold list holds its items inside a mark, which PM never writes (review 2)"
+    },
+    {
+      "description": "<ul style=\"color:var(--on-surface)\"><li>x</li></ul>",
+      "html": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "a list's theme colour draws nothing PM must keep (review 2)"
+    },
+    {
+      "description": "Ask <José> about it",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: a name outside ASCII is no tag to Markdown (review 3)"
+    },
+    {
+      "description": "Meet at <Building A, Room B> today",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "<Ask Bob!> first",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Meet <Room \"A\">",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: a quote with no \"=\" before it (review 3)"
+    },
+    {
+      "description": "Contact <John Smith, PM> please",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Ask <John O'Brien> today",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Dial in: <Room A, B>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "See <Room A/B>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: a \"/\" not right before the \">\" (review 3)"
+    },
+    {
+      "description": "see <your name here?>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Call <Ann Lee, Bob Ray> now",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "<a href=\"https://zoom.us/j/1\";>Join</a>",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a link with a stray character is still the link a browser draws, read-only (review 3)"
+    },
+    {
+      "description": "<style 1>p{}</style>x",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a name the reader hides stays hidden whatever follows it (review 3)"
+    },
+    {
+      "description": "<Option 2> Thursday 3pm\nOption 3 Friday",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets opening a line, whose name opens a block of HTML to Markdown: the formatted view shows what Markdown drops (review 4)"
+    },
+    {
+      "description": "<Form A, B> please sign\nby Friday",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets opening a line, whose name opens a block of HTML to Markdown: the formatted view shows what Markdown drops (review 4)"
+    },
+    {
+      "description": "x <Option 2> y",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "the same words in a line: Markdown shows them (review 4)"
+    },
+    {
+      "description": "<Option 2 Thursday",
+      "html": false,
+      "markup": true,
+      "pm_can_edit": true,
+      "supported": true,
+      "why": "no \">\", so plain lines, that Markdown still reads as a block of HTML and drops (review 4)"
+    }
+  ]
+}

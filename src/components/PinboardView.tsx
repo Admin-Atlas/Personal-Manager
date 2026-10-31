@@ -72,7 +72,18 @@ import { DateField } from "./DateField";
 // The status vocabulary + the "what does a pre-status row read as" fallback live with the project
 // milestone list, so the two surfaces can never drift into offering different options.
 import { MILESTONE_STATUSES, milestoneStatus } from "./MilestoneList";
-import { Button, ConfirmDialog, Modal, SegmentedControl, Select, Textarea, Tooltip } from "./ui";
+import { MOD, SHIFT } from "../lib/setupGuide";
+import {
+  BulletIcon,
+  Button,
+  ConfirmDialog,
+  Modal,
+  NumberIcon,
+  SegmentedControl,
+  Select,
+  Textarea,
+  Tooltip,
+} from "./ui";
 
 /** The live filing state of a note's ingested document, keyed by `note:<widgetId>`. */
 type DocStatus = { reviewed: boolean; project: string };
@@ -785,10 +796,8 @@ export function PinboardView() {
   );
 }
 
-// Platform-aware modifier glyphs so each formatting tooltip names the real shortcut.
-const IS_MAC = typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
-const MOD = IS_MAC ? "⌘" : "Ctrl+";
-const SHIFT = IS_MAC ? "⇧" : "Shift+";
+// Each formatting tooltip names the real shortcut through the platform's modifier glyphs (MOD,
+// SHIFT), shared with the event description's toolbar.
 
 /** One formatting-toolbar button: a pictogram, a label, the keyboard shortcut it mirrors (shown in
  *  the tooltip and wired in NoteBody's onKeyDown), and the pure edit it applies. */
@@ -1361,38 +1370,8 @@ const NoteBody = memo(function NoteBody({
   );
 });
 
-function BulletIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2}>
-      <circle cx="4" cy="6" r="1.4" fill="currentColor" stroke="none" />
-      <circle cx="4" cy="12" r="1.4" fill="currentColor" stroke="none" />
-      <circle cx="4" cy="18" r="1.4" fill="currentColor" stroke="none" />
-      <line x1="9" y1="6" x2="20" y2="6" strokeLinecap="round" />
-      <line x1="9" y1="12" x2="20" y2="12" strokeLinecap="round" />
-      <line x1="9" y1="18" x2="20" y2="18" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function NumberIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2}>
-      <line x1="10" y1="6" x2="20" y2="6" strokeLinecap="round" />
-      <line x1="10" y1="12" x2="20" y2="12" strokeLinecap="round" />
-      <line x1="10" y1="18" x2="20" y2="18" strokeLinecap="round" />
-      <text x="1" y="8.5" fontSize="7" fill="currentColor" stroke="none">
-        1
-      </text>
-      <text x="1" y="14.5" fontSize="7" fill="currentColor" stroke="none">
-        2
-      </text>
-      <text x="1" y="20.5" fontSize="7" fill="currentColor" stroke="none">
-        3
-      </text>
-    </svg>
-  );
-}
-
+// The bulleted and numbered list icons are shared with the event description's toolbar
+// (ui/FormatIcons.tsx); the checklist is the note's alone.
 function CheckboxIcon() {
   return (
     <svg

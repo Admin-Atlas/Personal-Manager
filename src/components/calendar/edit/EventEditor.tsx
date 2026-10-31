@@ -3,14 +3,15 @@
 
 // The event editor (#884): change one Google event you organise, a repeating one or one with guests
 // included, and invitations: your reply and note, your own notifications, colour and busy or free,
-// and the rest when the organiser lets guests change it (C14c). For an occurrence the choices
-// dialog asks which occurrences first, and a change Google would email guests about asks whether
-// it should. It opens on Google's fresh copy (never the mirror, which clips text), greys out
+// and the rest when the organiser lets guests change it (C14c); birthdays and events Gmail added,
+// as far as Google allows, a birthday's date as one whole day and never with an email question
+// (C20). For an occurrence the choices dialog asks which occurrences first, and a change Google
+// would email guests about asks whether it should. It opens on Google's fresh copy (never the mirror, which clips text), greys out
 // whatever the backend says can't change and says why, and saves only the fields the user changed.
 // If the event changed in Google meanwhile on a field this save also sends, nothing is overwritten:
 // the editor reloads Google's copy, keeps the user's other changes, and names the fields where
-// Google's version now shows. A dirty draft asks before it is thrown away (closing, Escape, or
-// Delete).
+// Google's version now shows. A dirty draft asks before it is thrown away (closing, Escape, Delete,
+// or Duplicate, which closes it for a copy read from Google afresh, C18c).
 //
 // Guests (C12): the list, Optional, take off, and the three guest permissions, as Google Calendar
 // has them, with suggestions from people already in the user's calendars. Send or Don't send has no
@@ -53,12 +54,31 @@
 // (the guest list too) without touching what a later Save compares. What stays the organiser's is
 // greyed out with their reason; how it repeats always is, whatever they let guests change. Where
 // they let guests change it, Google's warning says a guest's change may not last.
+//
+// And its Google Meet call (C18), after the guests: "Add Google Meet video conferencing" where the
+// calendar offers Meet, Join and Remove once it has one, another service's call shown and kept. A
+// call Google is still making after the save is said in the saved notice.
+//
+// Its calendar (C18d), above the title in place of "Saving to …", on an event you organise on a
+// calendar you own: the other calendars you own on the same account, as Google web's Calendar row
+// lists them; another account's is Duplicate's (Q13). One Save sends the other changes first, then
+// the calendar, with one email question for both. Saved, the notice says where it is now; if the
+// other changes landed and the calendar didn't, the editor reloads Google's copy, says why, and
+// keeps the calendar chosen, so Save tries it alone. A new repeat goes in a Save of its own. A
+// repeating event goes whole (C18e): the choices offer "All events" only, and the line under the row
+// says so.
+//
+// Its description (C19d) is formatted in place, with Google Calendar's buttons. One with formatting
+// PM can't write back (a table, a colour) shows what PM can of it, with "Replace with plain text…",
+// and only a save after that choice may replace it. A description is compared by what it shows, so
+// one only opened is never sent.
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type {
   Calendar,
   CalendarEvent,
+  CalendarOverview,
   EditLoad,
   EventForEdit,
   EventPatchDraft,
@@ -97,6 +117,7 @@ import {
   repeatSeed,
   seedDraft,
   toChanges,
+  withReplace,
   type BadDates,
   type EditorFields,
 } from "../../../lib/calendarEdit/eventDraft";
@@ -111,20 +132,34 @@ import {
 import {
   A11_NOTE,
   ambiguousText,
+  CALENDAR_ALONE,
+  CALENDAR_WHOLE,
+  calendarRowText,
   CALLOUT_TONE,
+  changedText,
   earlierChangeText,
-  listFields,
   loadText,
+  movedEarlierHeldText,
+  movedEarlierText,
+  movedEarlierUnreadText,
+  notMovedText,
+  notMovedUnreadText,
   notOrganizerText,
   outcomeText,
   problemText,
   reasonText,
   rebasedText,
   repeatTheirsText,
+  specialKind,
   type Tone,
 } from "../../../lib/calendarEdit/editReasons";
+import { createdWhere, type CreateTargets } from "../../../lib/calendarEdit/createTargets";
 import { conflictOf, isRepeating, type Picked } from "../../../lib/calendarEdit/saveChoices";
-import { descriptionText } from "../../../lib/calendarEdit/descriptionText";
+import {
+  parseDescription,
+  replacementDescription,
+  sameDescription,
+} from "../../../lib/calendarEdit/descriptionHtml";
 import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import { guestsWithReply, replyHeld, withReply } from "../../../lib/calendarEdit/rsvp";
 import { deviceTimeZoneOrNull, useDepth } from "../../../theme";
@@ -132,7 +167,10 @@ import { Button, Callout, ConfirmDialog, Dialog, Skeleton } from "../../ui";
 import { CustomRecurrenceDialog } from "./CustomRecurrenceDialog";
 import { EventColorPicker } from "./EventColorPicker";
 import { GuestField } from "./GuestField";
+import { MeetField } from "./MeetField";
 import { NotifyPrompt } from "./NotifyPrompt";
+import { CalendarPicker } from "./CalendarPicker";
+import { DescriptionEditor, DescriptionView, ReplaceQuestion } from "./DescriptionEditor";
 import { ReminderList } from "./ReminderList";
 import { RsvpControl } from "./RsvpControl";
 import {
@@ -145,6 +183,7 @@ import {
   ZonePanel,
   type Timed,
 } from "./EventFields";
+import { useMailLink } from "../parts/useMailLink";
 import { SaveChoicesDialog, type ChoicesView } from "./SaveChoicesDialog";
 import { useRepeatView, type RepeatState } from "./useRepeat";
 import {
@@ -169,11 +208,23 @@ interface Props {
   suggestions: readonly GuestSuggestion[];
   /** A milestone linked to this event, which moves with it. */
   milestone: Milestone | null;
-  /** The colour PM draws a calendar in: the colour list's "Calendar colour". */
+  /** The colour PM draws a calendar in: the colour list's "Calendar colour", and the Calendar row's
+   *  dots. */
   colorOf: (calendarId: string) => string;
+  /** Where events can go (C10's), for the Calendar row (C18d): null while the calendars load. */
+  targets: CreateTargets | null;
+  /** The calendar overview, for the names of the calendars and whether one chosen shows here. */
+  overview: CalendarOverview | null;
+  /** Calendars hidden in the calendar list: still on offer, and said. */
+  hidden: ReadonlySet<string>;
+  shapeOf: (calendarId: string) => number | undefined;
   /** Delete from the editor: it closes, and the calendar asks as the popover's Delete does. The row
    *  passed carries what the editor showed (Google's fresh copy), which the delete compares. */
   onDelete?: (row: CalendarEvent) => void;
+  /** Duplicate from the editor (C18c): it closes, and the calendar opens a copy of `row`, read from
+   *  Google afresh. Offered only with `canDuplicate`. */
+  onDuplicate?: (row: CalendarEvent) => void;
+  canDuplicate?: boolean;
   onClose: () => void;
 }
 
@@ -238,18 +289,33 @@ const firstDay = (t: TimeDraft) => (t.kind === "timed" ? t.start_date : t.first_
 /** Said under the Repeat row of an occurrence whose repeating event PM couldn't read. */
 export const UNREADABLE_REPEAT = "PM couldn't read how this repeats, so it can't change it here.";
 
+/** Why a description shows read-only: formatting PM can't edit. */
+const FORMATTING_REASON = reasonText("unsupported_formatting");
+
 export function EventEditor({
-  row,
-  calendar,
+  row: opened,
+  calendar: openedCalendar,
   account,
   suggestions,
   milestone,
   colorOf,
+  targets,
+  overview,
+  hidden,
+  shapeOf,
   onDelete,
+  onDuplicate,
+  canDuplicate = false,
   onClose,
 }: Props) {
   const { showPower } = useDepth();
   const deviceZone = useMemo(() => deviceTimeZoneOrNull(), []);
+  // Where a calendar change that landed earlier put it (`moved_earlier`): the editor goes on there,
+  // on the row it has now, with the user's changes.
+  const [movedTo, setMovedTo] = useState<{ id: string; calendar_id: string } | null>(null);
+  const row = useMemo(() => (movedTo ? { ...opened, ...movedTo } : opened), [opened, movedTo]);
+  const calendar =
+    (movedTo && overview?.calendars.find((c) => c.id === movedTo.calendar_id)) || openedCalendar;
   // The row is the safer sign of a repeating event: the series is null when Google's copy of it
   // couldn't be read.
   const rowRepeats = isRepeating(row);
@@ -274,7 +340,14 @@ export function EventEditor({
   const [saving, setSaving] = useState(false);
   // An earlier save's answer never came: it may be in Google already.
   const [uncertain, setUncertain] = useState(false);
-  const [askDiscard, setAskDiscard] = useState<"close" | "delete" | null>(null);
+  // An earlier save's other changes landed and its calendar change didn't (C18d): they're in Google
+  // already, so discarding loses only the calendar change and what was changed since.
+  const [partlySaved, setPartlySaved] = useState(false);
+  // A save landed something and Google's copy couldn't be read afterwards: the session has moved on,
+  // and a repeating event's occurrences may have new ids, so this editor sends nothing more (a Save
+  // on the old row can read as the event deleted). Closing and opening it again is what's left.
+  const [mustReopen, setMustReopen] = useState(false);
+  const [askDiscard, setAskDiscard] = useState<"close" | "delete" | "duplicate" | null>(null);
   const [zonePick, setZonePick] = useState<"both" | "start" | "end" | null>(null);
   // The choices dialog for a repeating event (null = closed).
   const [asking, setAsking] = useState<Asking | null>(null);
@@ -314,15 +387,33 @@ export function EventEditor({
   // The Custom dialog, while open: no save goes from behind it.
   const customRef = useRef(false);
   const [customOpen, setCustomOpenState] = useState(false);
+  // "Replace with plain text…" (C19d): asked, then chosen. Chosen, the description PM couldn't edit
+  // is the editor's to change, and a save that sends it says so (`withReplace`), until Google's copy
+  // replaces it after a conflict. The box takes focus once it shows.
+  const [askReplace, setAskReplace] = useState(false);
+  const [replaced, setReplaced] = useState(false);
+  const [justReplaced, setJustReplaced] = useState(false);
   // Focus returns here whenever the choices close or a save stays open: the button was blurred
   // before the dialog opened, so the dialog's own restore has nowhere to go back to.
   const saveRef = useRef<HTMLButtonElement>(null);
-  const refocusSave = () => setTimeout(() => saveRef.current?.focus(), 0);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  // Save can be held by then (`mustReopen`, a repeat being checked), and takes no focus: Cancel does.
+  const refocusSave = () =>
+    setTimeout(() => (saveRef.current?.disabled ? cancelRef : saveRef).current?.focus(), 0);
 
   const setDraft = (next: EditorFields) => {
     draftRef.current = next;
     setDraftState(next);
   };
+  // The calendar it's to be on (C18d): its own until another is chosen, and kept across a reload
+  // after a save that landed without it, so Save tries it again. Readable at once, as the draft is.
+  const calendarRef = useRef(row.calendar_id);
+  const [calendarId, setCalendarIdState] = useState(row.calendar_id);
+  const setCalendarId = (id: string) => {
+    calendarRef.current = id;
+    setCalendarIdState(id);
+  };
+  const moving = () => calendarRef.current !== row.calendar_id;
   const setCustomOpen = (open: boolean) => {
     customRef.current = open;
     setCustomOpenState(open);
@@ -330,6 +421,9 @@ export function EventEditor({
 
   // A repeating event: its row says so, or Google sent its series.
   const repeating = rowRepeats || !!loaded?.series;
+  // A birthday or an event Gmail added (C20): Google's own list for its kind, never someone else's
+  // allow-list, and no email question.
+  const special = specialKind(row.event_type) !== null;
   // What the backend is asked of the Repeat row's rule. A one-off's, at its own start: where it
   // really starts, or why it can't be saved, and nothing saves until it has said so. A repeating
   // event's own rule isn't asked (its words came with it); another one is, for its words only, from
@@ -348,7 +442,8 @@ export function EventEditor({
 
   useEffect(() => {
     let alive = true;
-    openForEdit(row.id)
+    // The row it was opened on: going on elsewhere (`movedTo`) keeps the draft, and reads for itself.
+    openForEdit(opened.id)
       .then((load) => {
         if (!alive) return;
         if (load.outcome !== "ready") {
@@ -373,7 +468,7 @@ export function EventEditor({
     return () => {
       alive = false;
     };
-  }, [row.id, rowRepeats]);
+  }, [opened.id, rowRepeats]);
 
   /** Commit whatever the focused field holds, so the draft read next is the one on screen. */
   function commitFocused() {
@@ -392,21 +487,24 @@ export function EventEditor({
   }
 
   const isDirty = () =>
-    !!loaded && !!draftRef.current && changedFields(loaded.base, draftRef.current).length > 0;
+    !!loaded &&
+    !!draftRef.current &&
+    (changedFields(loaded.base, draftRef.current).length > 0 || moving());
+
+  /** Whether leaving the editor (closing, Delete, Duplicate) loses something, so it asks first: a
+   *  changed draft, or text in the guest box that isn't an address, a date a field couldn't read or
+   *  a notification row that can't be committed, which never reached the draft. */
+  const unsaved = () =>
+    isDirty() ||
+    hasBadDate(badDatesRef.current) ||
+    badGuestRef.current !== null ||
+    badRemindersRef.current;
 
   const requestClose = () => {
     if (saving || promptRef.current) return;
     commitFocused();
-    // Text in the guest box that isn't an address, or a notification row that can't be
-    // committed, never reached the draft: it would be lost too.
-    if (
-      isDirty() ||
-      hasBadDate(badDatesRef.current) ||
-      badGuestRef.current !== null ||
-      badRemindersRef.current
-    ) {
-      setAskDiscard("close");
-    } else onClose();
+    if (unsaved()) setAskDiscard("close");
+    else onClose();
   };
 
   /** The row a delete from here compares: what the editor showed, not a possibly older mirror row,
@@ -428,8 +526,17 @@ export function EventEditor({
   const requestDelete = () => {
     if (!onDelete || saving || promptRef.current) return;
     commitFocused();
-    if (isDirty()) setAskDiscard("delete");
+    if (unsaved()) setAskDiscard("delete");
     else onDelete(deleteRow());
+  };
+
+  /** Duplicate (C18c): the copy is read from Google afresh, so the row as clicked is enough. Changes
+   *  not saved here are asked about first, as Delete does. */
+  const requestDuplicate = () => {
+    if (!onDuplicate || saving || promptRef.current) return;
+    commitFocused();
+    if (unsaved()) setAskDiscard("duplicate");
+    else onDuplicate(row);
   };
 
   /** A reply from "Going?" (C14c), sent at once and apart from the draft. Once Google holds it the
@@ -493,19 +600,33 @@ export function EventEditor({
     return endAfterStart(loaded.base, moved, length, loaded.event);
   }
 
-  /** Google changed the event on a field this save sends: take its copy, keep the rest. */
-  async function rebaseAfterConflict(head: string) {
+  /** Google changed the event on a field this save sends: take its copy, keep the rest. After a
+   *  save that landed something (`landed`: fields with their calendar change refused, C18d, or a
+   *  calendar change found landed earlier), the fields are Google's already, so `head` says it all
+   *  unless Google's copy differs from the draft somewhere. A read that fails then never takes
+   *  `head`'s place: the fields did land, and the read's own words can say nothing changed, or that
+   *  the event is gone when the save gave its occurrences new ids. It holds this editor too
+   *  (`mustReopen`). `landed` holds the row to read, its words for a read that fails, and its words
+   *  for a draft with nothing left to send. */
+  async function rebaseAfterConflict(
+    head: string,
+    landed: { id: string; unread: string; held: string } | null = null,
+  ) {
     if (!loaded || !draftRef.current) return;
+    const unread = (text: string) => {
+      if (landed) setMustReopen(true);
+      setBanner(landed ? { tone: "warn", text: landed.unread } : { tone: "error", text });
+    };
     let fresh: EditLoad;
     try {
-      fresh = await openForEdit(row.id);
+      fresh = await openForEdit(landed?.id ?? row.id);
     } catch (e) {
-      // A conflict means nothing was written, so this save isn't in doubt.
-      setBanner({ tone: "error", text: message(e) });
+      // A conflict means nothing was written, so that save isn't in doubt.
+      unread(message(e));
       return;
     }
     if (fresh.outcome !== "ready") {
-      setBanner({ tone: "error", text: loadText(fresh) });
+      unread(loadText(fresh));
       return;
     }
     const seed = repeatSeed(fresh.series, rowRepeats || !!fresh.series);
@@ -543,7 +664,39 @@ export function EventEditor({
     });
     setDraft(next);
     if (note !== undefined) setRemindersNote(note);
-    setBanner({ tone: "warn", text: rebasedText(head, r.overwritten, r.lost_guests) });
+    // The mark stays only while the draft holds the user's own replacement, unsaved. Google's
+    // description in its place shows read-only again, with Replace; a replacement that landed is
+    // Google's copy now, so the mark goes with it, and a table someone puts there later asks for
+    // Replace afresh rather than taking the spent one.
+    if (
+      r.overwritten.includes("description") ||
+      sameDescription(r.base.description, next.description)
+    ) {
+      setReplaced(false);
+    }
+    const kept = landed !== null && r.overwritten.length === 0 && r.lost_guests.length === 0;
+    const held = landed && kept && changedFields(r.base, next).length === 0;
+    setBanner({
+      tone: "warn",
+      text: held ? landed.held : kept ? head : rebasedText(head, r.overwritten, r.lost_guests),
+    });
+  }
+
+  /** A calendar change that landed earlier, found by this Save with more to send (`moved_earlier`):
+   *  nothing of the draft went, and its session has ended. The editor goes on on the row the event
+   *  has now, Google's copy there its new base and the user's changes unsaved on it, as a conflict
+   *  leaves them, and the next Save sends them. */
+  async function goOnWhereItLanded(outcome: Extract<WriteOutcome, { outcome: "moved_earlier" }>) {
+    const name = calendarName(outcome.calendar);
+    setMovedTo({ id: outcome.row_id, calendar_id: outcome.calendar });
+    setCalendarId(outcome.calendar);
+    setUncertain(false);
+    setPartlySaved(false);
+    await rebaseAfterConflict(movedEarlierText(name, outcome.warnings), {
+      id: outcome.row_id,
+      unread: movedEarlierUnreadText(name, outcome.warnings),
+      held: movedEarlierHeldText(name, outcome.warnings),
+    });
   }
 
   /** A time change by the user. A rule picked in this editor whose day came from the start date
@@ -613,7 +766,14 @@ export function EventEditor({
       refocus(focused);
       return;
     }
-    const changes = toChanges(loaded.base, current);
+    // Another calendar goes with the rest, after it (C18d): Google's one Save, one question. A
+    // description the user replaced with plain text says so, in the very changes both the choices
+    // and the save are asked for (C19d).
+    const elsewhere = moving();
+    const changes = {
+      ...withReplace(toChanges(loaded.base, current), replaced),
+      ...(elsewhere ? { calendar: calendarRef.current } : {}),
+    };
     if (Object.keys(changes).length === 0) {
       onClose();
       return;
@@ -632,8 +792,12 @@ export function EventEditor({
       return;
     }
     // Who this would email, counted as the backend counts: asked before anything is sent, as
-    // Google's own question is. Nobody, and it goes (the backend has the last word either way).
-    const notice = guestNotice(loaded.base, current, loaded.event.guests_omitted, account);
+    // Google's own question is, another calendar telling the guests too. Nobody, and it goes (the
+    // backend has the last word either way). A birthday or a Gmail event emails nobody, whoever is
+    // on it (C20 §4.4).
+    const notice = special
+      ? null
+      : guestNotice(loaded.base, current, loaded.event.guests_omitted, account, elsewhere);
     if (notice) setPrompt({ what, picked: null, notice, again: false });
     else await send(what, null, null, null);
   }
@@ -711,6 +875,33 @@ export function EventEditor({
           await rebaseFromChoices(outcomeText(c.result).text);
           return;
         }
+        // A calendar change that landed unseen, found by the choices: there's nothing left to
+        // choose. All of the draft is in Google's copy there, and the editor closes on it; or there's
+        // more to send, from the row it has now.
+        if (c.result.outcome === "saved") {
+          noteSaved(
+            what.title,
+            c.result,
+            null,
+            what.from,
+            false,
+            false,
+            undefined,
+            movedOf(c.result),
+          );
+          onClose();
+          return;
+        }
+        if (c.result.outcome === "moved_earlier") {
+          setSaving(true);
+          try {
+            await goOnWhereItLanded(c.result);
+          } finally {
+            setSaving(false);
+            refocusSave();
+          }
+          return;
+        }
         setBanner(outcomeText(c.result));
         refocusSave();
         return;
@@ -759,6 +950,15 @@ export function EventEditor({
 
   /** Send the save, for `picked` when the choices were asked, with Send or Don't send (`notify`)
    *  for the numbers `asked` when the save would email guests, and act on what came back. */
+  /** Where a save put the event, for its notice: the backend's to say, from Google's answer (C18d). */
+  const movedOf = (outcome: Extract<WriteOutcome, { outcome: "saved" }>) =>
+    outcome.calendar
+      ? {
+          to: calendarName(outcome.calendar) ?? "the calendar you chose",
+          from: calendar?.name ?? "its calendar",
+        }
+      : null;
+
   async function send(
     what: Omit<Asking, "view">,
     picked: Picked | null,
@@ -783,7 +983,8 @@ export function EventEditor({
       switch (outcome.outcome) {
         case "saved":
           // "Does not repeat" leaves one event, never a repeating one. The row and the answer
-          // sent go with it, for an Undo the backend offers (C16d).
+          // sent go with it, for an Undo the backend offers (C16d). Where it went is the
+          // backend's to say, from Google's answer (C18d).
           noteSaved(
             what.title,
             outcome,
@@ -792,6 +993,7 @@ export function EventEditor({
             what.changes.recurrence?.kind === "once",
             picked?.asAll ?? false,
             { rowId: row.id, sent: notify },
+            movedOf(outcome),
           );
           stayOpen = false;
           onClose();
@@ -846,6 +1048,22 @@ export function EventEditor({
         case "conflict":
           await rebaseAfterConflict(outcomeText(outcome).text);
           return;
+        // The other changes landed and the calendar change didn't (C18d): Google's copy is read
+        // again (the session moved on), the calendar chosen kept, so Save tries it alone.
+        case "not_moved": {
+          setPartlySaved(true);
+          const name = calendar?.name ?? null;
+          const head = notMovedText(outcome.message, name, outcome.warnings);
+          await rebaseAfterConflict(head, {
+            id: row.id,
+            unread: notMovedUnreadText(outcome.message, name, outcome.warnings),
+            held: head,
+          });
+          return;
+        }
+        case "moved_earlier":
+          await goOnWhereItLanded(outcome);
+          return;
         // `ambiguous`: only creating an event answers it, never a save; read as a save it would be
         // unconfirmed.
         case "unconfirmed":
@@ -880,22 +1098,58 @@ export function EventEditor({
   const title = (draft?.summary ?? row.summary).trim() || "(no title)";
   const perms = loaded?.permissions;
   const may = (f: Parameters<typeof canEdit>[1]) => !!perms && canEdit(perms, f) && !saving;
+  /** A calendar's name, from the overview; null for one PM no longer has. */
+  const calendarName = (id: string) => overview?.calendars.find((c) => c.id === id)?.name ?? null;
+  // Once Google's copy has opened: an event that couldn't be read can't be copied either.
+  const showDuplicate = canDuplicate && !!onDuplicate && !!loaded;
   const timeOff = deviceZone === null;
   const check = loaded && draft ? checkDraft(loaded.base, draft, loaded.event) : null;
+  // The description (C19d): edited in place, formatting and all, unless it has formatting PM can't
+  // write back. The backend says so of what it can tell (a table, a heading); the webview's reading
+  // is stricter (a link it can't open, a colour), and says so itself. Either way it shows what PM
+  // can of it (Google's copy as the editor last read it, never the draft), with "Replace with plain
+  // text…", until the user replaces it.
+  const baseDescription = loaded?.base.description;
+  const shownDescription = useMemo(
+    () => (baseDescription === undefined ? [] : parseDescription(baseDescription).doc),
+    [baseDescription],
+  );
+  const draftDescription = draft?.description;
+  const draftEditable = useMemo(
+    () => draftDescription === undefined || parseDescription(draftDescription).supported,
+    [draftDescription],
+  );
+  const formattingHeld = !!perms?.reasons.includes("unsupported_formatting");
+  const formattingBlocked = !replaced && (formattingHeld || !draftEditable);
+  const descriptionLive =
+    !formattingBlocked && (!!perms?.description || (replaced && formattingHeld));
+  // Only the webview refused it: the backend left the description open, so its words come from here.
+  const formattingSaid = formattingBlocked && !formattingHeld && !!perms?.description;
+  const descriptionId = useId();
+  const descriptionBoxId = useId();
+  const formattingReasonId = useId();
+  const mail = useMailLink(row.id);
   // Someone else's event says the reply is the user's only where this copy can send one (C14
-  // critique C2-L1).
+  // critique C2-L1). The formatting reason goes once the user replaced the description.
   const reasons = [
-    ...(perms?.reasons.map((r) =>
-      r === "not_organizer" ? notOrganizerText(perms.respond, true) : reasonText(r),
-    ) ?? []),
+    ...(perms?.reasons
+      .filter((r) => !(replaced && r === "unsupported_formatting"))
+      .map((r) =>
+        r === "not_organizer" ? notOrganizerText(perms.respond, true) : reasonText(r),
+      ) ?? []),
+    ...(formattingSaid ? [FORMATTING_REASON] : []),
     ...(timeOff && perms?.time ? [NO_ZONE] : []),
   ];
-  // Someone else's event: its reply on top, and how it repeats always theirs (C14c).
-  const theirs = loaded?.event.organizer_self === false;
+  // Someone else's event: its reply on top, and how it repeats always theirs (C14c). Not a Gmail
+  // event's placeholder organiser: Google's list for its kind says what changes (C20).
+  const theirs = !special && loaded?.event.organizer_self === false;
   const heldTimed = loaded?.base.time.kind === "timed" ? loaded.base.time : null;
   const zoneFallback = heldTimed?.start_zone ?? calendar?.time_zone ?? deviceZone;
   const timeEditable = may("time") && !timeOff;
-  const dirty = loaded && draft ? changedFields(loaded.base, draft).length > 0 : false;
+  // Another calendar chosen is a change too (C18d), though not a field.
+  const calendarMoved = calendarId !== row.calendar_id;
+  const changed = loaded && draft ? changedFields(loaded.base, draft) : [];
+  const dirty = changed.length > 0 || calendarMoved;
   const timed = draft?.time.kind === "timed" ? draft.time : null;
   // The End list resolves every quarter hour, so it's worked out once per time change.
   const endChoices = useMemo(
@@ -921,6 +1175,44 @@ export function EventEditor({
   const repeatHolds =
     !repeating && (repeat.state.state === "loading" || repeat.state.state === "refused");
 
+  // The Calendar row (C18d): an event you organise on a calendar you own, with another you own on
+  // the same account to put it on. Owned only, on both sides, as Google's help puts it ("a
+  // calendar you own", critique C1-M5): the list holds only owned calendars, and the event's own
+  // must be among them. The backend checks the same before anything is read.
+  const ownAccount = useMemo(() => {
+    const group = targets?.groups.find((g) => g.account.id === calendar?.source_id);
+    if (!group) return null;
+    return {
+      account: group.account,
+      targets: group.targets.filter((t) => t.calendar.access_role === "owner"),
+    };
+  }, [targets, calendar]);
+  const calendarRow =
+    !!perms?.calendar &&
+    !!ownAccount &&
+    ownAccount.targets.length > 1 &&
+    ownAccount.targets.some((t) => t.calendar.id === row.calendar_id);
+  // One at a time, as the backend takes them (critique C2-H1): a new repeat holds the calendar,
+  // and another calendar holds the repeat.
+  const repeatChanged =
+    !!loaded && !!draft && !sameRepeat(draft.recurrence, loaded.base.recurrence);
+  const calendarLines: string[] = [];
+  if (calendarRow && ownAccount) {
+    const groups = targets?.groups.length ?? 0;
+    calendarLines.push(
+      calendarRowText(ownAccount.account.email || ownAccount.account.label, groups > 1),
+    );
+    const where = calendarMoved && overview ? createdWhere(overview, hidden, calendarId) : null;
+    if (where && hidden.has(calendarId) && where.hidden) {
+      calendarLines.push(
+        `${where.name} is hidden in your calendar list, so the event won't show until you show that calendar again.`,
+      );
+    }
+    // A repeating event goes whole (C18e): the choices then offer "All events" only.
+    if (calendarMoved && repeating) calendarLines.push(CALENDAR_WHOLE);
+    if (repeatChanged) calendarLines.push(CALENDAR_ALONE);
+  }
+
   return (
     <>
       <Dialog
@@ -928,8 +1220,12 @@ export function EventEditor({
         onClose={requestClose}
         chrome="bar"
         title="Edit event"
+        helpId="calendar-editor"
+        // The Calendar row says where it is when it's shown (C18d).
         subtitle={
-          calendar ? `Saving to ${calendar.name}${account ? ` · ${account}` : ""}` : undefined
+          calendar && !calendarRow
+            ? `Saving to ${calendar.name}${account ? ` · ${account}` : ""}`
+            : undefined
         }
         closeLabel="Close"
         closeDisabled={saving}
@@ -938,20 +1234,32 @@ export function EventEditor({
         footer={
           <>
             {perms?.delete && onDelete && (
-              <span className="mr-auto">
-                <Button variant="danger" onClick={requestDelete} disabled={saving}>
+              <span className={showDuplicate ? undefined : "mr-auto"}>
+                <Button variant="danger" onClick={requestDelete} disabled={saving || mustReopen}>
                   Delete
                 </Button>
               </span>
             )}
-            <Button variant="tertiary" onClick={requestClose} disabled={saving}>
+            {/* After Delete, the left group's last; alone, it takes its place (critique C2-L6). */}
+            {showDuplicate && (
+              <span className="mr-auto">
+                <Button
+                  variant="tertiary"
+                  onClick={requestDuplicate}
+                  disabled={saving || mustReopen}
+                >
+                  Duplicate
+                </Button>
+              </span>
+            )}
+            <Button ref={cancelRef} variant="tertiary" onClick={requestClose} disabled={saving}>
               Cancel
             </Button>
             <Button
               ref={saveRef}
               variant="primary"
               onClick={() => void save()}
-              disabled={!loaded || saving || repeatHolds}
+              disabled={!loaded || saving || mustReopen || repeatHolds}
             >
               {saving ? "Saving…" : "Save"}
             </Button>
@@ -986,13 +1294,37 @@ export function EventEditor({
                   forWhom={calendar && !calendar.is_primary ? calendar.name : null}
                   note={loaded.event.reply?.note ?? ""}
                   title={title}
-                  disabled={saving}
+                  disabled={saving || mustReopen}
                   onReply={onReply}
                 />
               </div>
             )}
             {theirs && loaded.event.guests_can_modify && (
               <p className="text-xs leading-relaxed text-ink3">{A11_NOTE}</p>
+            )}
+
+            {calendarRow && ownAccount && (
+              <div className="flex flex-col items-start gap-1">
+                <span className="text-sm text-ink2">Calendar</span>
+                <CalendarPicker
+                  targets={{ groups: [ownAccount], off: [] }}
+                  value={calendarId}
+                  onChange={setCalendarId}
+                  privateDraft={
+                    draft.visibility === "private" || draft.visibility === "confidential"
+                  }
+                  hidden={hidden}
+                  colorOf={colorOf}
+                  shapeOf={shapeOf}
+                  disabled={saving || repeatChanged}
+                  listName="Calendars this event can go on"
+                />
+                {calendarLines.map((line) => (
+                  <p key={line} className="text-xs leading-relaxed text-ink4">
+                    {line}
+                  </p>
+                ))}
+              </div>
             )}
 
             <TextRow
@@ -1019,6 +1351,8 @@ export function EventEditor({
               onSwitchKind={() => zoneFallback && changeKind(zoneFallback)}
               canSwitchKind={!!zoneFallback}
               onPickZone={setZonePick}
+              // A birthday's date is one whole day (C20): one Date field, no All day switch.
+              oneDay={!!perms?.one_day}
               repeat={
                 <RepeatRow
                   value={draft.recurrence}
@@ -1034,7 +1368,9 @@ export function EventEditor({
                       ? repeatTheirsText(repeating)
                       : repeating && !series
                         ? UNREADABLE_REPEAT
-                        : undefined
+                        : calendarMoved
+                          ? CALENDAR_ALONE
+                          : undefined
                   }
                   standing={standing}
                   // Its own right, never the time's: a guest may move an occurrence where the
@@ -1101,6 +1437,14 @@ export function EventEditor({
               onReject={setBadGuest}
             />
 
+            <MeetField
+              call={loaded.event.call}
+              value={draft.meet}
+              offered={loaded.event.meet_offered}
+              disabled={!may("meet")}
+              onChange={(meet) => draftRef.current && setDraft({ ...draftRef.current, meet })}
+            />
+
             <TextRow
               label="Location"
               value={draft.location}
@@ -1136,22 +1480,47 @@ export function EventEditor({
               />
             </div>
 
-            {loaded.event.description_html ? (
-              <div className="flex flex-col gap-1">
-                <span className="text-sm text-ink2">Description</span>
-                <p className="whitespace-pre-wrap rounded-[var(--radius-sm)] border border-border2 px-3 py-2 text-sm text-ink3">
-                  {descriptionText(draft.description)}
-                </p>
-              </div>
-            ) : (
-              <TextRow
-                label="Description"
-                multiline
-                value={draft.description}
-                disabled={!may("description")}
-                onChange={(description) => setDraft({ ...draft, description })}
-              />
-            )}
+            <div className="flex flex-col gap-1">
+              {/* Text, not a label element: the box is a div, which a label can't name. Clicking
+                  it still puts the caret in the box (critique C2-L7). */}
+              <span
+                id={descriptionId}
+                className="text-sm text-ink2"
+                onClick={() => document.getElementById(descriptionBoxId)?.focus()}
+              >
+                Description
+              </span>
+              {descriptionLive ? (
+                <DescriptionEditor
+                  id={descriptionBoxId}
+                  value={draft.description}
+                  // Into the latest draft: a blur before a save reports after other changes.
+                  onChange={(description) =>
+                    draftRef.current && setDraft({ ...draftRef.current, description })
+                  }
+                  disabled={saving}
+                  labelledBy={descriptionId}
+                  autoFocus={justReplaced}
+                  onMail={mail.open}
+                />
+              ) : (
+                <DescriptionView
+                  doc={shownDescription}
+                  labelledBy={descriptionId}
+                  describedBy={reasons.includes(FORMATTING_REASON) ? formattingReasonId : undefined}
+                  // Not on a description locked or kept by the organiser: its reason says why.
+                  onReplace={
+                    formattingBlocked && !saving && (formattingHeld || perms?.description)
+                      ? () => setAskReplace(true)
+                      : undefined
+                  }
+                  onMail={mail.open}
+                />
+              )}
+              <p role="status" className="text-xs text-st-due">
+                {mail.failure ?? ""}
+              </p>
+            </div>
 
             <div className="flex flex-wrap items-center gap-4">
               <ShowAsControl
@@ -1187,7 +1556,11 @@ export function EventEditor({
             )}
 
             {reasons.map((r) => (
-              <p key={r} className="text-xs leading-relaxed text-ink4">
+              <p
+                key={r}
+                id={r === FORMATTING_REASON ? formattingReasonId : undefined}
+                className="text-xs leading-relaxed text-ink4"
+              >
                 {r}
               </p>
             ))}
@@ -1197,9 +1570,7 @@ export function EventEditor({
                 {row.uid && <div className="break-all">UID: {row.uid}</div>}
                 {row.updated && <div>Updated: {row.updated}</div>}
                 <div>
-                  {dirty
-                    ? `Changed: ${listFields(changedFields(loaded.base, draft))}`
-                    : "No changes yet"}
+                  {dirty ? `Changed: ${changedText(changed, calendarMoved)}` : "No changes yet"}
                 </div>
               </div>
             )}
@@ -1222,6 +1593,20 @@ export function EventEditor({
             onClose={() => setCustomOpen(false)}
           />
         )}
+        {/* "Replace with plain text…", nested the same way: Escape closes only it. Nothing is sent
+            until Save, so Cancel, or closing the editor, keeps the formatting. */}
+        <ReplaceQuestion
+          open={askReplace}
+          onKeep={() => setAskReplace(false)}
+          onReplace={() => {
+            setAskReplace(false);
+            const now = draftRef.current;
+            if (!now) return;
+            setDraft({ ...now, description: replacementDescription(baseDescription ?? "") });
+            setReplaced(true);
+            setJustReplaced(true);
+          }}
+        />
         {/* The email question, nested the same way: Escape and Back close only it. */}
         {prompt && (
           <NotifyPrompt
@@ -1253,9 +1638,19 @@ export function EventEditor({
       <ConfirmDialog
         open={askDiscard !== null}
         title={
-          askDiscard === "delete" ? "Discard your changes and delete?" : "Discard your changes?"
+          askDiscard === "delete"
+            ? "Discard your changes and delete?"
+            : askDiscard === "duplicate"
+              ? "Discard your changes and duplicate?"
+              : "Discard your changes?"
         }
-        confirmLabel={askDiscard === "delete" ? "Discard and delete" : "Discard"}
+        confirmLabel={
+          askDiscard === "delete"
+            ? "Discard and delete"
+            : askDiscard === "duplicate"
+              ? "Discard and duplicate"
+              : "Discard"
+        }
         cancelLabel="Keep editing"
         danger
         onClose={() => setAskDiscard(null)}
@@ -1263,12 +1658,17 @@ export function EventEditor({
           const next = askDiscard;
           setAskDiscard(null);
           if (next === "delete" && onDelete) onDelete(deleteRow());
+          else if (next === "duplicate" && onDuplicate) onDuplicate(row);
           else onClose();
         }}
       >
         {uncertain
           ? "PM couldn't confirm whether your last save reached Google. Refresh the calendar to check."
-          : "Nothing has been saved to Google yet."}
+          : movedTo
+            ? `The event is on ${calendar?.name ?? "the calendar you chose"} already. Only what you’ve changed since is discarded.`
+            : partlySaved
+              ? "Your other changes are already saved to Google. Only the calendar change, and anything you’ve changed since, is discarded."
+              : "Nothing has been saved to Google yet."}
       </ConfirmDialog>
     </>
   );

@@ -1772,9 +1772,10 @@ mod tests {
     #[test]
     fn a_plan_with_a_key_its_write_may_not_send_never_starts() {
         let (_, mut plan) = this_case();
-        // Guests are a key a save may send now (C12); a video call isn't.
+        // Guests are a key a save may send now (C12), and a video call (C18); attachments never
+        // are (a LATER card).
         if let Op::Patch { body, .. } = &mut plan.steps[0].op {
-            body.insert("conferenceData".into(), json!({}));
+            body.insert("attachments".into(), json!([]));
         }
         assert_eq!(Run::new(plan).err(), Some(Unfit));
     }
@@ -1798,8 +1799,9 @@ mod tests {
         let (_, solo) = this_case();
         assert!(!solo.needs_notify() && Run::new(solo).is_ok());
         // A new event with a guest and nobody's answer, sent or sent again (C12d).
-        let Some(Op::Insert { calendar, id, body }) =
-            create_plan().steps.first().map(|s| s.op.clone())
+        let Some(Op::Insert {
+            calendar, id, body, ..
+        }) = create_plan().steps.first().map(|s| s.op.clone())
         else {
             panic!("a create plan inserts");
         };
@@ -1844,6 +1846,7 @@ mod tests {
             Method::Insert => ok(tail.clone()),
             Method::Patch => ok(at_etag(case.master.json(), "\"m2\"")),
             Method::Delete => deleted(),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => panic!("nothing to look at: {}", r.url),
         });
         assert_eq!(
@@ -1994,6 +1997,7 @@ mod tests {
         let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
             Method::Insert => ok(tail.clone()),
             Method::Patch => status(Verdict::Conflict),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(renamed.clone()),
             Method::Delete => deleted(),
         });
@@ -2108,6 +2112,7 @@ mod tests {
             let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
                 Method::Insert => ok(tail.clone()),
                 Method::Patch => after_5xx(refusal.clone()),
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => ok(cut.clone()),
                 Method::Delete => deleted(),
             });
@@ -2129,6 +2134,7 @@ mod tests {
                         lost()
                     }
                 }
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => ok(old.clone()),
                 Method::Delete => deleted(),
             });
@@ -2146,6 +2152,7 @@ mod tests {
         let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
             Method::Insert => ok(tail.clone()),
             Method::Patch => Answer::Lost { retried: true },
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(old.clone()),
             Method::Delete => deleted(),
         });
@@ -2176,6 +2183,7 @@ mod tests {
                         retried.clone()
                     }
                 }
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => ok(newer.clone()),
                 Method::Delete => deleted(),
             });
@@ -2244,6 +2252,7 @@ mod tests {
                             wi += 1;
                             a
                         }
+                        Method::Transfer => unreachable!("a series run never changes a calendar"),
                         Method::Get => {
                             let a = if gi < 3 {
                                 gets[pick(g, gi, gets.len())].clone()
@@ -2392,6 +2401,9 @@ mod tests {
                                 on.push(etag);
                                 a
                             }
+                            Method::Transfer => {
+                                unreachable!("a series run never changes a calendar")
+                            }
                             Method::Get => {
                                 let a = if gi < 3 {
                                     gets[pick(g, gi, gets.len())].clone()
@@ -2460,6 +2472,7 @@ mod tests {
                     Answer::Unsent(Unsent::Offline)
                 }
             }
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(if to(r, TAIL) {
                 tail.clone()
             } else {
@@ -2548,6 +2561,7 @@ mod tests {
                             proved |= shows_tail(&a);
                             a
                         }
+                        Method::Transfer => unreachable!("a series run never changes a calendar"),
                         Method::Get => {
                             let a = if gi < 3 {
                                 gets[pick(g, gi, gets.len())].clone()
@@ -2737,6 +2751,7 @@ mod tests {
             let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
                 Method::Insert => ok(tail.clone()),
                 Method::Patch => answer.clone(),
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => ok(old.clone()),
                 Method::Delete => deleted(),
             });
@@ -2771,6 +2786,7 @@ mod tests {
             move |r: &RequestPlan| match r.method {
                 Method::Insert => ok(tail.clone()),
                 Method::Patch => patch.clone(),
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => ok(daily.clone()),
                 Method::Delete => deleted(),
             }
@@ -2812,6 +2828,7 @@ mod tests {
         let cut = landed(case.master.json(), &plan.steps[1], "\"m2\"");
         let (ran, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
             Method::Insert => status(Verdict::Duplicate),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(tail.clone()),
             Method::Patch => ok(cut.clone()),
             Method::Delete => deleted(),
@@ -2850,6 +2867,7 @@ mod tests {
                     ok(tail.clone())
                 }
             }
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => status(Verdict::Gone),
             Method::Patch => ok(cut.clone()),
             Method::Delete => deleted(),
@@ -2908,6 +2926,8 @@ mod tests {
                 guests_can_see_other_guests: None,
                 reminders: None,
                 colour: None,
+                meet: false,
+                meet_request: None,
             })
             .unwrap();
         let own = crate::calendar_write::attendees::Own::default();
@@ -3311,6 +3331,7 @@ mod tests {
                 Method::Insert => ok(tail.clone()),
                 Method::Patch => status(refusal.clone()),
                 Method::Delete => deleted(),
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => panic!("nothing to look at"),
             });
             assert_eq!(
@@ -3368,6 +3389,7 @@ mod tests {
                 Method::Insert => ok(tail.clone()),
                 Method::Patch => ok(case.master.json().clone()),
                 Method::Delete => deleted(),
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => panic!("nothing to look at"),
             });
             assert_eq!(sent.len(), 3);
@@ -3407,6 +3429,7 @@ mod tests {
             let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove).unwrap();
             let (settled, sent, _) = drive(&mut settle, |r| match r.method {
                 Method::Get if to(r, "abc") => ok(at_etag(case.master.json(), "\"m7\"")),
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => ok(tail.clone()),
                 _ => deleted(),
             });
@@ -3453,6 +3476,7 @@ mod tests {
         });
         match r.method {
             Method::Insert => ok(tail.clone()),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(json!({ "items": [occurrence] })),
             Method::Patch if to(r, "abc") => {
                 ok(landed(case.master.json(), &plan.steps[1], "\"m2\""))
@@ -3473,6 +3497,7 @@ mod tests {
             Method::Insert => ok(tail.clone()),
             Method::Patch => ok(case.master.json().clone()),
             Method::Delete => status(Verdict::Gone),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => panic!("nothing to look at"),
         });
         assert!(matches!(
@@ -3502,6 +3527,7 @@ mod tests {
                     deleted()
                 }
             }
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(at_etag(&tail, "\"t2\"")),
         });
         assert!(matches!(
@@ -3522,6 +3548,7 @@ mod tests {
             Method::Insert => ok(tail.clone()),
             Method::Patch => ok(case.master.json().clone()),
             Method::Delete => status(Verdict::Conflict),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(theirs.clone()),
         });
         assert!(matches!(
@@ -3545,6 +3572,7 @@ mod tests {
             Method::Insert => ok(tail.clone()),
             Method::Patch => ok(case.master.json().clone()),
             Method::Delete => status(Verdict::ReadOnly),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => panic!("nothing to look at"),
         });
         assert_eq!(
@@ -3700,6 +3728,7 @@ mod tests {
         let (ran, sent, waits) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
             Method::Insert => ok(tail.clone()),
             Method::Patch => ok(cut.clone()),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(json!({ "items": [] })),
             Method::Delete => deleted(),
         });
@@ -3731,6 +3760,7 @@ mod tests {
         let (_, sent, _) = drive(&mut Run::new(plan).unwrap(), |r| match r.method {
             Method::Insert => ok(tail.clone()),
             Method::Patch if to(r, "abc") => ok(cut.clone()),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(items.clone()),
             _ => lost(),
         });
@@ -3944,6 +3974,7 @@ mod tests {
         let mut settle = Settle::new(plan, &ran, SettleAction::Remove).unwrap();
         let (settled, sent, _) = drive(&mut settle, |r| match r.method {
             Method::Get if to(r, "abc") => ok(at_etag(case.master.json(), "\"m7\"")),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(tail.clone()),
             Method::Delete => deleted(),
             _ => panic!("no write but the delete: {r:?}"),
@@ -3965,6 +3996,7 @@ mod tests {
         let (settled, sent, _) = drive(&mut settle, |r| match r.method {
             Method::Get if to(r, "abc") => ok(old.clone()),
             Method::Patch => ok(at_etag(&old, "\"m8\"")),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(tail.clone()),
             Method::Delete => deleted(),
             Method::Insert => panic!("never an insert"),
@@ -4010,6 +4042,7 @@ mod tests {
         let mut settle = Settle::new(plan, &ran, SettleAction::Remove).unwrap();
         let (settled, sent, _) = drive(&mut settle, |r| match r.method {
             Method::Get if to(r, TAIL) => ok(tail.clone()),
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => {
                 gets += 1;
                 ok(if gets == 1 {
@@ -4152,6 +4185,7 @@ mod tests {
             let mut gets = 0;
             let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove).unwrap();
             let (settled, sent, _) = drive(&mut settle, |r| match r.method {
+                Method::Transfer => unreachable!("a series run never changes a calendar"),
                 Method::Get => {
                     gets += 1;
                     ok(if gets == 1 {
@@ -4177,6 +4211,7 @@ mod tests {
         let mut gets = 0;
         let mut settle = Settle::new(plan.clone(), &ran, SettleAction::Remove).unwrap();
         let (settled, sent, _) = drive(&mut settle, |r| match r.method {
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => {
                 gets += 1;
                 ok(if gets == 1 { old.clone() } else { cut.clone() })
@@ -4199,6 +4234,7 @@ mod tests {
                     at_etag(&old, "\"m9\"")
                 })
             }
+            Method::Transfer => unreachable!("a series run never changes a calendar"),
             Method::Get => ok(tail.clone()),
             Method::Patch => status(Verdict::Conflict),
             Method::Delete => deleted(),

@@ -48,6 +48,8 @@ export {
 export { Dialog, type DialogProps, type DialogChrome, type DialogTone } from "./Dialog";
 export { Toggle, type ToggleProps } from "./Toggle";
 export { Tooltip, type TooltipProps } from "./Tooltip";
+// Formatting toolbars' pictograms: the Pinboard note's and the event description's.
+export { BulletIcon, ClearFormatIcon, LinkIcon, NumberIcon } from "./FormatIcons";
 export { ConfirmDialog, type ConfirmDialogProps } from "./ConfirmDialog";
 export { NavItem, type NavItemProps } from "./NavItem";
 export { Popover } from "./Popover";

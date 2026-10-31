@@ -10,6 +10,7 @@ import type {
   LocalGpuResidency,
   LocalReleaseSettings,
   AiProviderStatus,
+  AccessAsk,
   AppLockStatus,
   BackupEntry,
   BackupEvent,
@@ -1005,6 +1006,11 @@ export const reorderMilestones = (project: string, orderedIds: number[]) =>
  *  every registered calendar (with its selection). Migrates a legacy single-account Google connection
  *  on first call. */
 export const calendarOverview = () => invoke<CalendarOverview>("calendar_overview");
+
+/** Open an email in the mail app asking a view-only calendar's owner for edit access (C20b). PM's
+ *  calendar id only; the backend decides whom to ask and what the email says. Sends nothing itself. */
+export const requestCalendarAccess = (calendarId: string) =>
+  invoke<AccessAsk>("request_calendar_access", { calendarId });
 
 /** Tick/untick one calendar (by its `calendars.id`) for syncing. */
 export const setCalendarSelected = (calendarId: string, selected: boolean) =>

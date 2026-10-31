@@ -49,6 +49,10 @@ pub struct Change {
     /// A new rule, or none at all (C11).
     pub rule: Option<RuleChange>,
     pub delete: bool,
+    /// A video call added or removed (C18).
+    pub meet: bool,
+    /// Another calendar of the same account (C18e): the whole repeating event goes there.
+    pub calendar: bool,
 }
 
 /// A change to how the series repeats, as far as the choice cares (C11).
@@ -108,6 +112,9 @@ impl Change {
             visibility: body.contains_key("visibility"),
             guest_permissions: permissions.iter().any(|k| body.contains_key(*k)),
             rule: rule_change(draft, master),
+            meet: body.contains_key("conferenceData"),
+            // Never a body key: the shell has dropped a change to the event's own calendar.
+            calendar: draft.calendar.is_some(),
             ..Change::default()
         };
         if let (Some(draft_time), true) = (&draft.time, body.contains_key("start")) {
@@ -172,6 +179,12 @@ pub enum ScopeReason {
     RuleIsSeriesWide,
     /// What guests may do is the whole series' (C12 critiques C1-M7, C2-L11).
     GuestPermissionsAreSeriesWide,
+    /// A video call goes on one occurrence or all of them, never a split's new part (C18 Q4).
+    CallFollowing,
+    /// A repeating event goes to another calendar whole, never one occurrence of it (C18e).
+    CalendarIsSeriesWide,
+    /// Nor from one occurrence on: PM doesn't cut a repeating event across two calendars (C18 Q2).
+    CalendarFollowing,
 }
 
 /// Shown on the row as is, in the planners' own words for the same refusals.
@@ -184,6 +197,9 @@ impl fmt::Display for ScopeReason {
             ScopeReason::GuestPermissionsAreSeriesWide => {
                 SeriesRefusal::GuestPermissionsAreSeriesWide.fmt(f)
             }
+            ScopeReason::CallFollowing => SeriesRefusal::CallFollowing.fmt(f),
+            ScopeReason::CalendarIsSeriesWide => SeriesRefusal::CalendarIsSeriesWide.fmt(f),
+            ScopeReason::CalendarFollowing => SeriesRefusal::CalendarFollowing.fmt(f),
         }
     }
 }
@@ -221,6 +237,20 @@ pub fn scope_options(change: &Change, first: bool, text_only: Option<&TextOnly>)
     // absent when the rule changes", shown refused with its reason instead, C11 §0.4).
     if change.rule.is_some() {
         this = Row::Refused(ScopeReason::RuleIsSeriesWide);
+    }
+    // A split's new part never carries a call (DECISIONS 17-10 #3), so a call goes on this
+    // occurrence or every one (C18 Q4). From the first occurrence "this and following" is every one.
+    if change.meet && !first {
+        following = Row::Refused(ScopeReason::CallFollowing);
+    }
+    // A repeating event goes to another calendar whole (the plan's "'This' is absent when the
+    // calendar changes"); PM doesn't cut one across two calendars, whose parts would escape the
+    // checks a "this and following" change relies on, each of them on one calendar (C18 Q2).
+    if change.calendar {
+        this = Row::Refused(ScopeReason::CalendarIsSeriesWide);
+        if !first {
+            following = Row::Refused(ScopeReason::CalendarFollowing);
+        }
     }
     // A new time moves the series' rule, which a rule PM can only show can't be. A new rule replaces
     // the old one whole, so it doesn't stand in the way then (C11 §9.2). A move between all-day and
@@ -429,6 +459,87 @@ mod tests {
             delete.following,
             Row::Refused(ScopeReason::TextOnly(custom))
         );
+    }
+
+    /// C18 Q4: a call change offers "This event" and "All events"; "This and following" past the
+    /// first occurrence is refused in its own words, and from the first it is every occurrence.
+    #[test]
+    fn a_call_change_refuses_this_and_following_after_the_first() {
+        let call = change(EventPatchDraft {
+            meet: Some(crate::calendar_write::dto::MeetChange::Add),
+            meet_request: Some("r1".into()),
+            ..Default::default()
+        });
+        assert!(call.meet && !call.fields, "a call, nothing else");
+        assert_eq!(
+            scope_options(&call, false, None),
+            ScopeOptions {
+                this: Row::Offered,
+                following: Row::Refused(ScopeReason::CallFollowing),
+                all: Row::Offered
+            }
+        );
+        assert_eq!(scope_options(&call, true, None).following, Row::AsAll);
+        assert_eq!(
+            ScopeReason::CallFollowing.to_string(),
+            SeriesRefusal::CallFollowing.to_string()
+        );
+        // Removing a call the occurrence doesn't have changes nothing.
+        let none = change(EventPatchDraft {
+            meet: Some(crate::calendar_write::dto::MeetChange::Remove),
+            ..Default::default()
+        });
+        assert_eq!(none, Change::default());
+    }
+
+    /// C18e §9.1: a calendar change offers "All events" only: "This event" is refused, "This and
+    /// following" too past the first occurrence, from which it is every occurrence. A title beside
+    /// it changes nothing about that.
+    #[test]
+    fn a_calendar_change_offers_all_events_only() {
+        let calendar = change(EventPatchDraft {
+            calendar: Some("cal2".into()),
+            ..Default::default()
+        });
+        assert!(
+            calendar
+                == Change {
+                    calendar: true,
+                    ..Default::default()
+                },
+            "the calendar, nothing else"
+        );
+        let with_title = change(EventPatchDraft {
+            calendar: Some("cal2".into()),
+            summary: Some("Retro".into()),
+            ..Default::default()
+        });
+        for c in [calendar, with_title] {
+            assert!(
+                scope_options(&c, false, None)
+                    == ScopeOptions {
+                        this: Row::Refused(ScopeReason::CalendarIsSeriesWide),
+                        following: Row::Refused(ScopeReason::CalendarFollowing),
+                        all: Row::Offered
+                    },
+                "all events only"
+            );
+            let first = scope_options(&c, true, None);
+            assert!(first.this == Row::Refused(ScopeReason::CalendarIsSeriesWide));
+            assert!(first.following == Row::AsAll && first.all == Row::Offered);
+        }
+        for (reason, refusal) in [
+            (
+                ScopeReason::CalendarIsSeriesWide,
+                SeriesRefusal::CalendarIsSeriesWide,
+            ),
+            (
+                ScopeReason::CalendarFollowing,
+                SeriesRefusal::CalendarFollowing,
+            ),
+        ] {
+            assert_eq!(reason.to_string(), refusal.to_string());
+        }
     }
 
     /// A refused row says why in the planners' words for the same refusal.

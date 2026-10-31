@@ -85,6 +85,15 @@ describe("SaveChoicesDialog", () => {
     expect(screen.getByRole("dialog", { name: "Delete repeating event" })).toBeTruthy();
   });
 
+  // Help mode (C20b §11): a change and a delete both explain the choices.
+  it("carries the which-occurrences help, for a change and a delete", () => {
+    open();
+    expect(screen.getByRole("dialog").getAttribute("data-help")).toBe("calendar-choices");
+    cleanup();
+    open({ kind: "delete" });
+    expect(screen.getByRole("dialog").getAttribute("data-help")).toBe("calendar-choices");
+  });
+
   it("picks This event and focuses Back, so Enter on open sends nothing", () => {
     const { onChoose, onClose } = open();
     expect(radio(/^This event/).checked).toBe(true);

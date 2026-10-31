@@ -38,10 +38,10 @@ use super::super::time;
 use super::diff::{Expect, Removes};
 use super::plan::{
     all_plan, cancel_exception, cancelled_points, cut_step, draft_fields, exceptions_from,
-    insert_step, keeps_formatting, last_kept, not_carried, own_exceptions, rest_start, snapshot,
-    split_unchanged_since_opened, start_of, tail_body, unchanged_since_opened, when_nodes_in,
-    NotPlanned, Op, Recheck, SeriesInput, SeriesPlan, SeriesWarning, Shows, SplitCut, Stage, Step,
-    Undo, TAIL_WATCH,
+    insert_step, keeps_what_pm_cant_edit, last_kept, not_carried, own_exceptions, rest_start,
+    snapshot, split_unchanged_since_opened, start_of, tail_body, unchanged_since_opened,
+    when_nodes_in, NotPlanned, Op, Recheck, SeriesInput, SeriesPlan, SeriesWarning, Shows,
+    SplitCut, Stage, Step, Undo, TAIL_WATCH,
 };
 use super::scope::{RuleChange, Scope};
 use super::{
@@ -569,7 +569,7 @@ pub(super) fn plan_all_rule(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    keeps_formatting(master_json, draft)?;
+    keeps_what_pm_cant_edit(master, input, draft)?;
     every_line_readable(master)?;
     // The draft's time is read against the occurrence as Google holds it now, and a new rule moves
     // the times whatever the draft says: it must still be where the user saw it (R2).
@@ -845,7 +845,7 @@ pub(super) fn plan_split_rule(
 ) -> Result<SeriesPlan, NotPlanned> {
     let (instance, master_json) = (input.fresh.instance.json(), input.fresh.master.json());
     let opened = input.opened.master.ok_or(SeriesRefusal::NoBase)?;
-    keeps_formatting(master_json, draft)?;
+    keeps_what_pm_cant_edit(master, input, draft)?;
     // The new part takes the draft's notifications and colour, checked as a save onto the series'
     // own copy is (C13).
     check_draft_extras(master_json, Some(instance), draft)?;
@@ -3606,10 +3606,18 @@ mod tests {
             && g.complete));
     }
 
-    /// A formatted description is never saved over as plain text, whatever the rule.
+    /// Formatting PM can't edit is never saved over, whatever the rule, unless the user replaced the
+    /// very description the occurrence showed (C19 §5.5, critique C1-M6); formatting the editor
+    /// writes is no reason to refuse.
     #[test]
-    fn a_rule_change_keeps_a_formatted_description() {
-        let case = Case::new(
+    fn a_rule_change_keeps_formatting_pm_cant_edit() {
+        let table = json!("<table><tr><td>Agenda</td></tr></table>");
+        let plain = Case::new(with(weekly(), "description", table.clone()), monday_19());
+        let showing = Case::new(
+            with(weekly(), "description", table.clone()),
+            with(monday_19(), "description", table),
+        );
+        let bold = Case::new(
             with(weekly(), "description", json!("<b>Agenda</b>")),
             monday_19(),
         );
@@ -3620,9 +3628,100 @@ mod tests {
                     recurrence: Some(recurrence),
                     ..Default::default()
                 };
+                let replacing = EventPatchDraft {
+                    replace_formatting: true,
+                    ..notes.clone()
+                };
+                for (case, draft) in [(&plain, &notes), (&plain, &replacing), (&showing, &notes)] {
+                    assert_eq!(
+                        case.edit(scope, draft.clone()),
+                        Err(NotPlanned::Refused(SeriesRefusal::FormattedDescription))
+                    );
+                }
+                assert!(
+                    showing.edit(scope, replacing.clone()).is_ok(),
+                    "replacing the description the user saw"
+                );
+                assert!(
+                    bold.edit(scope, notes.clone()).is_ok(),
+                    "bold is the editor's"
+                );
+            }
+        }
+    }
+
+    /// C19 review 1: a series description the user never saw (the occurrence shows its own) is
+    /// saved over only when it holds nothing but formatting PM writes, attributes and all: the
+    /// webview's stricter check never read it. And a replace reaches the series' description only
+    /// when the occurrence showed it as opened, not only as Google holds it now.
+    #[test]
+    fn a_series_description_the_user_never_saw_keeps_what_pm_cant_edit() {
+        let notes = |recurrence: Option<RepeatDraft>| EventPatchDraft {
+            description: Some("Room 3".into()),
+            recurrence,
+            ..Default::default()
+        };
+        let under = |held: &str| {
+            Case::new(
+                with(weekly(), "description", json!(held)),
+                with(monday_19(), "description", json!("Room 2")),
+            )
+        };
+        for scope in [Scope::All, Scope::Following] {
+            for recurrence in [None, Some(RepeatDraft::Rule { rule: daily() })] {
+                let draft = notes(recurrence);
+                for held in [
+                    "<span style=\"color: red\">Urgent</span> agenda",
+                    "<p dir=\"rtl\">x</p>",
+                    "<span class=\"x\">x</span>",
+                    "<b style=\"font-weight: bold; color: red\">x</b>",
+                    "<a href=\"sms:1\">text me</a>",
+                    "<a href=\"javascript:alert(1)\">x</a>",
+                    "<a href=\"javascript&#58;alert(1)\">x</a>",
+                    "<a href=\"https://example.com\" title=\"x\">x</a>",
+                ] {
+                    assert_eq!(
+                        under(held).edit(scope, draft.clone()),
+                        Err(NotPlanned::Refused(SeriesRefusal::FormattedDescription)),
+                        "{held}"
+                    );
+                }
+                for held in [
+                    "<b>Agenda</b> <i>one</i><br><u>two</u>",
+                    "<a href=\"https://example.com/?a=1&amp;b=2\" target=\"_blank\" id=\"ow1\" \
+                     __is_owner=\"true\">site</a>",
+                    "<a href=\"www.example.org\">site</a>",
+                    "<a href=\"tel:+15550100\">call</a>",
+                    "<span style=\"background-color: var(--textfield-surface); color: \
+                     var(--on-surface);\">x</span>",
+                    "<span style=\"font-weight: 700\">x</span>",
+                    "<ul><li data-x=\"1\" aria-label=\"y\">x</li></ul>",
+                ] {
+                    assert!(under(held).edit(scope, draft.clone()).is_ok(), "{held}");
+                }
+            }
+        }
+        // Opened showing one table; the occurrence now shows the series' own: the replace is of
+        // another description, so it is a conflict, never a save over the series'.
+        let t2 = json!("<table><tr><td>Two</td></tr></table>");
+        let mut raced = Case::new(
+            with(weekly(), "description", t2.clone()),
+            with(monday_19(), "description", t2),
+        );
+        raced.opened_instance = fresh(with(
+            monday_19(),
+            "description",
+            json!("<table><tr><td>One</td></tr></table>"),
+        ));
+        for scope in [Scope::All, Scope::Following] {
+            for recurrence in [None, Some(RepeatDraft::Rule { rule: daily() })] {
+                let replacing = EventPatchDraft {
+                    replace_formatting: true,
+                    ..notes(recurrence)
+                };
                 assert_eq!(
-                    case.edit(scope, notes),
-                    Err(NotPlanned::Refused(SeriesRefusal::FormattedDescription))
+                    raced.edit(scope, replacing),
+                    Err(NotPlanned::Conflict(vec!["description".into()]))
                 );
             }
         }

@@ -30,6 +30,8 @@ interface Props {
   disabled?: boolean;
   /** Quick create's size: a smaller button with the calendar's name only, and a shorter list. */
   compact?: boolean;
+  /** The list's name for a screen reader: what its calendars are for (C18 critique C2-L5). */
+  listName?: string;
 }
 
 /** Why an account's calendars aren't on offer, as one line. */
@@ -55,6 +57,7 @@ export function CalendarPicker({
   shapeOf,
   disabled = false,
   compact = false,
+  listName = "Calendars that can take a new event",
 }: Props) {
   const { showMeta } = useDepth();
   const [open, setOpen] = useState(false);
@@ -101,7 +104,7 @@ export function CalendarPicker({
       onOpenChange={setOpen}
       escapeClipping
       withinDialog
-      ariaLabel="Calendars that can take a new event"
+      ariaLabel={listName}
       panelClassName="max-w-sm"
       trigger={({ open: expanded, toggle }) => (
         <Button
@@ -184,10 +187,16 @@ export function CalendarPicker({
                   />
                   <SourceDot color={colorOf(id)} shapeIndex={shapeOf(id)} />
                   <span className="truncate">{t.calendar.name}</span>
-                  {hidden.has(id) && <span className="ml-auto text-xs text-ink4">hidden</span>}
+                  {/* The marks are part of the radio's name: the comma, heard and not seen, keeps
+                      them apart from the calendar's own. */}
+                  {hidden.has(id) && (
+                    <span className="ml-auto text-xs text-ink4">
+                      <span className="sr-only">,</span> hidden
+                    </span>
+                  )}
                   {noPrivate && (
                     <span className="ml-auto shrink-0 text-xs text-ink4">
-                      Can't hold private events
+                      <span className="sr-only">,</span> Can't hold private events
                     </span>
                   )}
                 </label>

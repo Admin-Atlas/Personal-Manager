@@ -15,19 +15,25 @@
 
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CalendarEvent, WriteOutcome } from "../../../lib/types";
+import type { AccessAsk, Calendar, CalendarEvent, WriteOutcome } from "../../../lib/types";
 
 const eventFlags = vi.fn();
+const openUrl = vi.fn();
 
 vi.mock("../../../lib/ipc", () => ({
   eventFlags: (...a: unknown[]) => eventFlags(...a),
-  openUrl: vi.fn(),
+  openUrl: (...a: unknown[]) => openUrl(...a),
 }));
 
 // The description is untrusted provider text and renders through the real sanitising boundary in the
-// app; here it is stubbed so the test doesn't drag react-markdown in for a fixture with no body.
-vi.mock("../../../lib/markdown", () => ({
-  Markdown: ({ children }: { children: string }) => <div>{children}</div>,
+// app; here the Markdown view is stubbed (its own suites drive it), so a test can see which view drew
+// a description and hand the pop-up the links Markdown would make. The rest of the module is real:
+// the codec's link rule asks its `safeUrl`.
+const plainMarkdown = ({ children }: { children: string }) => <div>{children}</div>;
+const markdownView = vi.fn(plainMarkdown);
+vi.mock("../../../lib/markdown", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  Markdown: (props: { children: string }) => markdownView(props),
 }));
 
 vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
@@ -51,8 +57,10 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
+import { JOIN_FAILED, OPEN_FAILED } from "../../../lib/calendarEdit/editReasons";
 import {
   CalendarEventPopover,
+  type PopoverAsk,
   type PopoverEditing,
   type PopoverRsvp,
 } from "./CalendarEventPopover";
@@ -101,7 +109,24 @@ function chip(label: string): HTMLElement {
 
 beforeEach(() => {
   eventFlags.mockResolvedValue([]);
+  openUrl.mockResolvedValue(undefined);
+  markdownView.mockImplementation(plainMarkdown);
 });
+
+/** One of `provider`'s calendars, for the description's view. */
+function calendarOf(provider: string): Calendar {
+  return {
+    id: "c1",
+    source_id: `${provider}:me@example.com`,
+    provider,
+    remote_id: "me@example.com",
+    name: "Me",
+    color: null,
+    selected: true,
+    is_primary: true,
+    quiet: false,
+  } as Calendar;
+}
 
 afterEach(() => {
   cleanup();
@@ -493,7 +518,15 @@ describe("CalendarEventPopover", () => {
         color="#000"
         milestone={null}
         onClose={() => {}}
-        editing={{ canEdit: true, canDelete: true, reason: null, onEdit, onDelete }}
+        editing={{
+          canEdit: true,
+          canDelete: true,
+          canDuplicate: false,
+          reason: null,
+          onEdit,
+          onDelete,
+          onDuplicate: () => {},
+        }}
       />,
     );
     fireEvent.click(getByRole("button", { name: "Edit" }));
@@ -513,9 +546,11 @@ describe("CalendarEventPopover", () => {
         editing={{
           canEdit: true,
           canDelete: false,
+          canDuplicate: false,
           reason: "Google has locked this event's title, time, place and description.",
           onEdit,
           onDelete,
+          onDuplicate: () => {},
         }}
       />,
     );
@@ -533,15 +568,61 @@ describe("CalendarEventPopover", () => {
         editing={{
           canEdit: false,
           canDelete: false,
+          canDuplicate: false,
           reason: "Someone else organises this event.",
           onEdit,
           onDelete,
+          onDuplicate: () => {},
         }}
       />,
     );
     expect(queryByRole("button", { name: "Edit" })).toBeNull();
     expect(queryByRole("button", { name: "Delete" })).toBeNull();
     expect(getByText("Someone else organises this event.")).toBeTruthy();
+  });
+
+  // C18c: Duplicate sits before Edit, taking the push to the right from whichever came first.
+  it("Duplicate shows only when offered and calls onDuplicate", () => {
+    const onDuplicate = vi.fn();
+    const editing = (canDuplicate: boolean, canEdit: boolean): PopoverEditing => ({
+      canEdit,
+      canDelete: true,
+      canDuplicate,
+      reason: null,
+      onEdit: () => {},
+      onDelete: () => {},
+      onDuplicate,
+    });
+    const shown = (edit: PopoverEditing) => (
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+        editing={edit}
+      />
+    );
+    const { getByRole, queryByRole, rerender } = render(shown(editing(false, true)));
+    expect(queryByRole("button", { name: "Duplicate" })).toBeNull();
+    expect(getByRole("button", { name: "Edit" }).className).toContain("ml-auto");
+    rerender(shown(editing(true, true)));
+    const duplicate = getByRole("button", { name: "Duplicate" });
+    expect(duplicate.className).toContain("ml-auto");
+    expect(getByRole("button", { name: "Edit" }).className).not.toContain("ml-auto");
+    // Before Edit and Delete, in the row's order.
+    const names = Array.from(getByRole("dialog").querySelectorAll("button")).map(
+      (b) => b.textContent,
+    );
+    expect(names.indexOf("Duplicate")).toBeLessThan(names.indexOf("Edit"));
+    fireEvent.click(duplicate);
+    expect(onDuplicate).toHaveBeenCalledOnce();
+    // Nothing to edit: Delete follows Duplicate, which still pushes right.
+    rerender(shown(editing(true, false)));
+    expect(getByRole("button", { name: "Delete" }).className).not.toContain("ml-auto");
+    // Still a non-modal dialog, as the event's details are.
+    expect(getByRole("dialog").getAttribute("aria-modal")).toBeNull();
   });
 
   // A description is shown line by line: the wrapper's class is what index.css gives `pre-line`
@@ -562,6 +643,251 @@ describe("CalendarEventPopover", () => {
         el?.textContent === "Agenda\n1. intro\n2. demo" && el.tagName === "DIV" && !el.className,
     );
     expect(text.closest(".pm-event-desc")).not.toBeNull();
+  });
+
+  describe("a description's formatting (C19b)", () => {
+    /** The pop-up showing `description` on one of `provider`'s calendars. */
+    function shown(
+      description: string,
+      provider: string | null,
+      over: Partial<CalendarEvent> = {},
+    ) {
+      const view = render(
+        <CalendarEventPopover
+          event={calendarEvent({ description, ...over })}
+          anchor={rect(100)}
+          calendar={provider === null ? null : calendarOf(provider)}
+          color="#000"
+          milestone={null}
+          onClose={() => {}}
+        />,
+      );
+      const box = view.container.ownerDocument.querySelector(".pm-event-desc") as HTMLElement;
+      return { ...view, box, rich: box.querySelector(".pm-rich") };
+    }
+
+    it("a_google_description_shows_its_formatting", () => {
+      // Before C19b, Markdown dropped the tags and this was an empty box.
+      const { rich } = shown("<ul><li>One</li><li><b>Two</b></li></ul>", "google");
+      expect(rich).not.toBeNull();
+      expect([...rich!.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["One", "Two"]);
+      expect(rich!.querySelector("li > b")?.textContent).toBe("Two");
+      expect(markdownView).not.toHaveBeenCalled();
+    });
+
+    it("a reference alone is formatting Google wrote", () => {
+      const { rich } = shown("Tom &amp; Jerry", "google");
+      expect(rich?.textContent).toBe("Tom & Jerry");
+    });
+
+    // Outlook's, a feed's, and Google's own plain text keep the Markdown path, whose address links
+    // are what they always were (DECISIONS 10-10).
+    it.each([
+      ["an_outlook_description_keeps_its_address_links", "See <https://zoom.us/j/1>", "microsoft"],
+      ["a feed's formatting", "<b>Agenda</b>", "ics"],
+      ["a calendar PM can't name", "<b>Agenda</b>", null],
+      ["a_plain_google_description_renders_as_before", "Agenda\n1. intro\n**not bold**", "google"],
+      ["Teams' address in angle brackets", "Click here to join<https://example.com/j/1>", "google"],
+      ["a guest's address in angle brackets", "Ann <ann@example.com>", "google"],
+      ["an Outlook element only", "<o:p>Room 4</o:p>", "google"],
+    ])("%s draws through Markdown", (_name, description, provider) => {
+      const { rich } = shown(description, provider);
+      expect(rich).toBeNull();
+      expect(markdownView).toHaveBeenCalledWith({ children: description, plainLines: true });
+    });
+
+    // C19 review 1: Markdown drops a block of HTML it doesn't know, words and all, where Google
+    // shows the words.
+    it.each([
+      ["<center>Hello</center>", ["Hello"]],
+      ["<html><body>Hello there</body></html>", ["Hello there"]],
+      ['<font color="red">\nHello\n</font>\nafter', ["Hello", "after"]],
+      // Review round 4: no element, but a line Markdown reads as one and drops.
+      ["<Option 2> Thursday 3pm\nOption 3 Friday", ["<Option 2> Thursday 3pm", "Option 3 Friday"]],
+      ["<Form A, B> please sign\nby Friday", ["<Form A, B> please sign", "by Friday"]],
+    ])("a google description of other elements shows its words: %j", (description, words) => {
+      const { rich } = shown(description, "google");
+      for (const word of words) expect(rich?.textContent).toContain(word);
+      expect(markdownView).not.toHaveBeenCalled();
+    });
+
+    it("a bare address inside bold is a link", () => {
+      const { rich } = shown("<b>Join at https://example.com/j/1</b>", "google");
+      const link = rich?.querySelector("b > a");
+      expect(link?.getAttribute("href")).toBe("https://example.com/j/1");
+      expect(link?.getAttribute("target")).toBe("_blank");
+    });
+
+    it("says where the rest of a cut description is", () => {
+      const rest = (provider: string | null, cut: boolean) => {
+        const { box, unmount } = shown("Long", provider, { description_cut: cut });
+        const said = box.textContent;
+        unmount();
+        return said;
+      };
+      expect(rest("google", true)).toBe("LongThe rest is in Google Calendar.");
+      expect(rest("microsoft", true)).toBe("LongThe rest is in Outlook.");
+      expect(rest("ics", true)).toBe("LongThe rest is in the calendar it comes from.");
+      expect(rest("google", false)).toBe("Long");
+    });
+
+    it("a mail link opens the mail app, and says so with the address when it can't", async () => {
+      openUrl.mockRejectedValue("PM couldn't open your mail app.");
+      const { rich, getByRole } = shown(
+        '<a href="mailto:ann@example.com?subject=Hi">Email us</a>',
+        "google",
+      );
+      expect(getByRole("status").textContent).toBe("");
+      await act(async () => {
+        expect(fireEvent.click(rich!.querySelector("a")!)).toBe(false);
+      });
+      // The whole link goes; the backend keeps the address alone.
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com?subject=Hi");
+      expect(getByRole("status").textContent).toBe(
+        "PM couldn't open your mail app. The address is ann@example.com.",
+      );
+      // A try that works takes the line away.
+      openUrl.mockResolvedValue(undefined);
+      await act(async () => {
+        fireEvent.click(rich!.querySelector("a")!);
+      });
+      expect(getByRole("status").textContent).toBe("");
+    });
+
+    it("a mail link the backend refuses says the backend's words", async () => {
+      openUrl.mockRejectedValue("That doesn't look like an email address.");
+      const { rich, getByRole } = shown('<a href="mailto:a%0Ab@example.com">x</a>', "google");
+      await act(async () => {
+        fireEvent.click(rich!.querySelector("a")!);
+      });
+      expect(getByRole("status").textContent).toBe("That doesn't look like an email address.");
+    });
+
+    it("a line about one event's mail link never shows on the next", async () => {
+      openUrl.mockRejectedValue("PM couldn't open your mail app.");
+      const props = {
+        anchor: rect(100),
+        calendar: calendarOf("google"),
+        color: "#000",
+        milestone: null,
+        onClose: () => {},
+      };
+      const description = '<a href="mailto:ann@example.com">Email us</a>';
+      const { container, getByRole, rerender } = render(
+        <CalendarEventPopover event={calendarEvent({ id: "e1", description })} {...props} />,
+      );
+      await act(async () => {
+        fireEvent.click(container.ownerDocument.querySelector(".pm-rich a")!);
+      });
+      expect(getByRole("status").textContent).not.toBe("");
+      // The keyboard path re-points the mounted panel at another chip.
+      rerender(
+        <CalendarEventPopover event={calendarEvent({ id: "e2", description })} {...props} />,
+      );
+      expect(getByRole("status").textContent).toBe("");
+    });
+
+    it("Markdown's mail links open the same way, and no link loads inside PM's window", async () => {
+      markdownView.mockImplementation(() => (
+        <div>
+          <a href="mailto:ann@example.com">Ann</a>
+          <a href="/somewhere">relative</a>
+          <a href="">emptied</a>
+          <a href="https://example.com" target="_blank" rel="noreferrer">
+            web
+          </a>
+        </div>
+      ));
+      const { box } = shown("Mail Ann <ann@example.com>", "microsoft");
+      const link = (words: string) =>
+        [...box.querySelectorAll("a")].find((a) => a.textContent === words)!;
+      await act(async () => {
+        expect(fireEvent.click(link("Ann"))).toBe(false);
+      });
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith("mailto:ann@example.com");
+      expect(fireEvent.click(link("relative"))).toBe(false);
+      expect(fireEvent.click(link("emptied"))).toBe(false);
+      // A web link is useExternalLinks' to open, so the pop-up leaves its default alone.
+      expect(fireEvent.click(link("web"))).toBe(true);
+      expect(openUrl).toHaveBeenCalledTimes(1);
+    });
+
+    // C19 review 1: a middle-click sends `auxclick`, never `click`, and its default loads the link
+    // in PM's own window (WebKitGTK showed an error page in place of the app for a mail link).
+    it("a middle-click never loads a link inside PM's window", () => {
+      const middle = (target: Element) =>
+        target.dispatchEvent(
+          new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+        );
+      markdownView.mockImplementation(() => (
+        <div>
+          <a href="mailto:ann@example.com">Ann</a>
+          <a href="/somewhere">relative</a>
+          <a href="">emptied</a>
+          <a href="https://example.com" target="_blank" rel="noreferrer">
+            web
+          </a>
+        </div>
+      ));
+      const { box, unmount } = shown("Mail Ann <ann@example.com>", "microsoft");
+      const link = (words: string) =>
+        [...box.querySelectorAll("a")].find((a) => a.textContent === words)!;
+      for (const words of ["Ann", "relative", "emptied"]) {
+        expect(middle(link(words)), words).toBe(false);
+      }
+      expect(openUrl).not.toHaveBeenCalled();
+      unmount();
+      // The formatted view's mail link, and an address written in its words.
+      const { rich } = shown(
+        '<b><a href="mailto:ann@example.com">Email us</a> or bob@example.com</b>',
+        "google",
+      );
+      const mails = rich!.querySelectorAll('a[href^="mailto:"]');
+      expect(mails.length).toBe(2);
+      for (const mail of mails) expect(middle(mail)).toBe(false);
+      expect(openUrl).not.toHaveBeenCalled();
+    });
+
+    // Review round 2: no webview opens it by itself and `useExternalLinks` hears the first button
+    // only, so without this a middle-click does nothing, where Google Calendar's page opens a tab.
+    // The formatted view sits inside the details: two guards hear it, and it opens once.
+    it("a middle-click opens a web link in the browser, once", () => {
+      const press = (target: Element, button: number) =>
+        target.dispatchEvent(
+          new MouseEvent("auxclick", { bubbles: true, cancelable: true, button }),
+        );
+      const web = "https://example.com/a";
+      markdownView.mockImplementation(() => (
+        <a href={web} target="_blank" rel="noreferrer">
+          web
+        </a>
+      ));
+      const markdown = shown("See it", "microsoft");
+      const inMarkdown = markdown.box.querySelector("a")!;
+      expect(press(inMarkdown, 1)).toBe(false);
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith(web);
+      // Not the other buttons: a right-click's own menu is its default.
+      expect(press(inMarkdown, 2)).toBe(true);
+      expect(openUrl).toHaveBeenCalledTimes(1);
+      markdown.unmount();
+      openUrl.mockClear();
+      const { rich } = shown(`<b><a href="${web}">site</a></b>`, "google");
+      expect(press(rich!.querySelector("a")!, 1)).toBe(false);
+      expect(openUrl).toHaveBeenCalledExactlyOnceWith(web);
+    });
+
+    it("a middle-click whose browser didn't open is no unhandled failure", async () => {
+      openUrl.mockRejectedValue("PM couldn't open that.");
+      const { rich } = shown('<a href="https://example.com/a">site</a><b>x</b>', "google");
+      await act(async () => {
+        rich!
+          .querySelector("a")!
+          .dispatchEvent(
+            new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+          );
+      });
+      expect(openUrl).toHaveBeenCalledTimes(1);
+    });
   });
 
   // The call and the event in Google open in the default browser; each link can be copied instead,
@@ -594,6 +920,54 @@ describe("CalendarEventPopover", () => {
     } finally {
       Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
     }
+  });
+
+  // Review round 1 of PR 1: Join the call that didn't open says so, pointing to Copy link, and only
+  // for the event it was pressed on.
+  it("Join the call that didn't open says so", async () => {
+    openUrl.mockRejectedValueOnce("Couldn't open the link (NotFound).");
+    const call = "https://meet.google.com/abc-defg-hij";
+    const popover = (id: string) => (
+      <CalendarEventPopover
+        event={calendarEvent({ id, conference_url: call })}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />
+    );
+    const { getByRole, findByText, queryByText, rerender } = render(popover("e1"));
+    expect(queryByText(JOIN_FAILED)).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Join the call →" }));
+    expect(openUrl).toHaveBeenCalledWith(call);
+    expect((await findByText(JOIN_FAILED)).getAttribute("role")).toBe("status");
+    rerender(popover("e2"));
+    expect(queryByText(JOIN_FAILED)).toBeNull();
+  });
+
+  // Review round 1 of PR 1: "Open in Google Calendar" that didn't open says so too, as Join does.
+  it("Open in Google Calendar that didn't open says so", async () => {
+    openUrl.mockRejectedValueOnce("Couldn't open the link (NotFound).");
+    const page = "https://www.google.com/calendar/event?eid=abc";
+    const popover = (id: string) => (
+      <CalendarEventPopover
+        event={calendarEvent({ id, html_link: page })}
+        anchor={rect(100)}
+        calendar={calendarOf("google")}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />
+    );
+    const { getByRole, findByText, queryByText, rerender } = render(popover("e1"));
+    // Its status line is there before anything fails, empty.
+    expect(getByRole("status").textContent).toBe("");
+    fireEvent.click(getByRole("button", { name: "Open in Google Calendar" }));
+    expect(openUrl).toHaveBeenCalledWith(page);
+    expect((await findByText(OPEN_FAILED)).getAttribute("role")).toBe("status");
+    rerender(popover("e2"));
+    expect(queryByText(OPEN_FAILED)).toBeNull();
   });
 
   it("offers no link to copy when the event has none", () => {
@@ -652,9 +1026,11 @@ describe("CalendarEventPopover", () => {
     const editing = (rsvp?: PopoverRsvp[]): PopoverEditing => ({
       canEdit: false,
       canDelete: false,
+      canDuplicate: false,
       reason: null,
       onEdit: () => {},
       onDelete: () => {},
+      onDuplicate: () => {},
       rsvp,
     });
     function popover(edit?: PopoverEditing, event = calendarEvent(), onClose = () => {}) {
@@ -781,5 +1157,183 @@ describe("CalendarEventPopover", () => {
         (globalThis as { ResizeObserver?: unknown }).ResizeObserver = real;
       }
     });
+  });
+});
+
+// Asking a view-only calendar's owner for edit access (#884, C20b): a button after the reason, and a
+// status line under it that is there, empty, from the start (a region that appears with its words
+// isn't announced, critique C2-L2).
+describe("CalendarEventPopover: asking for edit access", () => {
+  const READ_ONLY =
+    "This calendar is shared with you to view only, so its events can't be changed here.";
+  const PERMISSION = "“Make changes and see event details”";
+  const editingWith = (ask: PopoverAsk | null): PopoverEditing => ({
+    canEdit: false,
+    canDelete: false,
+    canDuplicate: false,
+    reason: READ_ONLY,
+    onEdit: () => {},
+    onDelete: () => {},
+    onDuplicate: () => {},
+    ask,
+  });
+  const askOf = (over: Partial<PopoverAsk> = {}): PopoverAsk => ({
+    owner: "boss@x.org",
+    connected: false,
+    own: "me@x.org",
+    calendar: "Team",
+    onAsk: vi.fn(() => Promise.resolve<AccessAsk>({ outcome: "opened", owner: "boss@x.org" })),
+    ...over,
+  });
+  const shown = (ask: PopoverAsk | null, event = calendarEvent()) => (
+    <CalendarEventPopover
+      event={event}
+      anchor={rect(100)}
+      calendar={null}
+      color="#000"
+      milestone={null}
+      onClose={() => {}}
+      editing={editingWith(ask)}
+    />
+  );
+  const button = (view: ReturnType<typeof render>) =>
+    view.getByRole("button", { name: "Ask boss@x.org for edit access" });
+
+  it("a view-only calendar's reason offers Ask {owner} for edit access", () => {
+    const view = render(shown(askOf()));
+    const ask = button(view);
+    // In the reason's own line, after its words.
+    expect(ask.closest("p")?.textContent).toBe(`${READ_ONLY} Ask boss@x.org for edit access`);
+    expect(ask.getAttribute("type")).toBe("button");
+    expect(ask.className).toContain("[overflow-wrap:anywhere]");
+    // Its status line is there already, empty, and wraps a long address too.
+    const status = view.getByRole("status");
+    expect(status.textContent).toBe("");
+    expect(status.className).toContain("[overflow-wrap:anywhere]");
+  });
+
+  it("clicking it asks once and then says the email was opened, naming the owner", async () => {
+    const ask = askOf();
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(ask.onAsk).toHaveBeenCalledOnce();
+    expect(view.getByRole("status").textContent).toBe(
+      `PM asked your system to open an email to boss@x.org in your mail app. If nothing opened, write to boss@x.org and ask for ${PERMISSION}.`,
+    );
+    // The button stays for another try.
+    expect(button(view).getAttribute("aria-disabled")).toBeNull();
+    await act(async () => fireEvent.click(button(view)));
+    expect(ask.onAsk).toHaveBeenCalledTimes(2);
+  });
+
+  // Review round 1 of PR 1: a second try that ends the same way is said again. The line empties
+  // while it asks, so the live region's words change and the retry is seen to happen.
+  it("a second try empties the status line while it asks", async () => {
+    let answer: (a: AccessAsk) => void = () => {};
+    const ask = askOf({
+      onAsk: vi.fn(() => new Promise<AccessAsk>((r) => (answer = r))),
+    });
+    const view = render(shown(ask));
+    const noMail: AccessAsk = { outcome: "no_mail_app", owner: "boss@x.org" };
+    const words = `PM couldn't open your mail app. Write to boss@x.org and ask for ${PERMISSION} on “Team”.`;
+    fireEvent.click(button(view));
+    await act(async () => answer(noMail));
+    expect(view.getByRole("status").textContent).toBe(words);
+    fireEvent.click(button(view));
+    expect(view.getByRole("status").textContent).toBe("");
+    await act(async () => answer(noMail));
+    expect(view.getByRole("status").textContent).toBe(words);
+  });
+
+  it("a second click while asking does nothing", async () => {
+    let answer: (a: AccessAsk) => void = () => {};
+    const ask = askOf({
+      onAsk: vi.fn(() => new Promise<AccessAsk>((r) => (answer = r))),
+    });
+    const view = render(shown(ask));
+    fireEvent.click(button(view));
+    expect(button(view).getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(button(view));
+    expect(ask.onAsk).toHaveBeenCalledOnce();
+    await act(async () => answer({ outcome: "no_owner" }));
+    expect(view.getByRole("status").textContent).toBe(
+      "PM can't tell who to ask for this calendar now. If its sharing just changed, refresh the calendar.",
+    );
+    expect(button(view).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("no mail app says to write to the owner, naming the permission and the calendar", async () => {
+    const ask = askOf({
+      onAsk: () => Promise.resolve<AccessAsk>({ outcome: "no_mail_app", owner: "boss@x.org" }),
+    });
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(view.getByRole("status").textContent).toBe(
+      `PM couldn't open your mail app. Write to boss@x.org and ask for ${PERMISSION} on “Team”.`,
+    );
+  });
+
+  it("an ask the backend refuses says its words", async () => {
+    const ask = askOf({
+      onAsk: () => Promise.reject("PM can only open this email from its main window."),
+    });
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(view.getByRole("status").textContent).toBe(
+      "PM couldn't open the email: PM can only open this email from its main window.",
+    );
+    expect(button(view).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("a connected owner gets the share hint and no button", () => {
+    const view = render(shown(askOf({ connected: true })));
+    expect(view.queryByRole("button", { name: /^Ask / })).toBeNull();
+    expect(view.queryAllByRole("status")).toHaveLength(0);
+    expect(view.getByText(new RegExp(`^${READ_ONLY}`)).textContent).toBe(
+      `${READ_ONLY} boss@x.org is connected to PM too: open Google Calendar as boss@x.org and share this calendar with me@x.org, choosing ${PERMISSION}.`,
+    );
+    // A long address wraps here too.
+    expect(view.getByText(/is connected to PM too/).className).toContain(
+      "[overflow-wrap:anywhere]",
+    );
+    // Without this account's address, "this account".
+    cleanup();
+    const other = render(shown(askOf({ connected: true, own: null })));
+    expect(other.getByRole("dialog").textContent).toContain(
+      "share this calendar with this account, choosing",
+    );
+  });
+
+  it("no ask without one, and the answer goes with the event it was for", async () => {
+    const plain = render(shown(null));
+    expect(plain.getByText(READ_ONLY)).toBeTruthy();
+    expect(plain.queryByRole("button", { name: /^Ask / })).toBeNull();
+    cleanup();
+    // Re-pointed at another event (the keyboard path), the last one's answer never shows.
+    const ask = askOf();
+    const view = render(shown(ask));
+    await act(async () => fireEvent.click(button(view)));
+    expect(view.getByRole("status").textContent).not.toBe("");
+    view.rerender(shown(ask, calendarEvent({ id: "e2" })));
+    expect(view.getByRole("status").textContent).toBe("");
+  });
+
+  // Help mode (C20b §11, critiques C1-L6, C2-L6): the calendar view's panel explains itself,
+  // whatever it offers; Focus › Upcoming's (no `editing`) keeps the help around it.
+  it("carries the event help in the calendar view, and none of its own elsewhere", () => {
+    const view = render(shown(null));
+    expect(view.getByRole("dialog").getAttribute("data-help")).toBe("calendar-event");
+    cleanup();
+    const upcoming = render(
+      <CalendarEventPopover
+        event={calendarEvent()}
+        anchor={rect(100)}
+        calendar={null}
+        color="#000"
+        milestone={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(upcoming.getByRole("dialog").hasAttribute("data-help")).toBe(false);
   });
 });

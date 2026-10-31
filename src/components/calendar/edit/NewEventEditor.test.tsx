@@ -36,7 +36,12 @@ import type {
   WriteOutcome,
 } from "../../../lib/types";
 import { CREATE_LOST } from "../../../lib/calendarEdit/editReasons";
-import { toNewEvent, type EditorFields } from "../../../lib/calendarEdit/eventDraft";
+import {
+  COPY_CALL_NOTE,
+  COPY_CALL_OFF_NOTE,
+  toNewEvent,
+  type EditorFields,
+} from "../../../lib/calendarEdit/eventDraft";
 import { createTargets } from "../../../lib/calendarEdit/createTargets";
 import type { GuestSuggestion } from "../../../lib/calendarEdit/guests";
 import type { CreateAnswer } from "./useEventWrites";
@@ -81,7 +86,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
   useTheme: () => ({ system: "slate", depth: "standard" }),
 }));
 
-import { NewEventEditor, type CreateHandover } from "./NewEventEditor";
+import { NewEventEditor, type CopyOf, type CreateHandover } from "./NewEventEditor";
 
 const ME = "gcal:me@x.com";
 const WORK = "gcal:work@x.com";
@@ -136,6 +141,8 @@ const overview: CalendarOverview = {
   editing: { [ME]: "on", [WORK]: "on" },
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
+  auto_meet: {},
+  ask_access: {},
 };
 
 const seed: EditorFields = {
@@ -154,6 +161,7 @@ const seed: EditorFields = {
   recurrence: { kind: "once" },
   guests: [],
   guest_perms: { modify: false, invite_others: true, see_others: true },
+  meet: false,
   reminders: { use_default: true, overrides: [] },
   colour: { kind: "calendar" },
   show_as: "busy",
@@ -176,6 +184,7 @@ const sentFor = (summary: string, calendarId = PERSONAL) => ({
     guests: [],
     reminders: null,
     colour: null,
+    meet: false,
   } as NewEventDraft,
 });
 
@@ -259,20 +268,25 @@ function open(
     /** Inside <StrictMode>, as the app's development build runs: every effect set up twice. */
     strict?: boolean;
     suggestions?: GuestSuggestion[];
+    overview?: CalendarOverview;
+    /** A copy to open on (Duplicate, C18c), its fields the seed. */
+    copy?: { fields: EditorFields; of: CopyOf };
   } = {},
 ) {
   const onClose = over.onClose ?? vi.fn();
+  const shown = over.overview ?? overview;
   const editor = (
     <NewEventEditor
-      seed={seed}
-      targets={createTargets(overview)}
+      seed={over.copy?.fields ?? seed}
+      targets={createTargets(shown)}
       calendarId={over.calendarId ?? PERSONAL}
-      overview={overview}
+      overview={shown}
       hidden={over.hidden ?? new Set()}
       suggestions={over.suggestions ?? []}
       colorOf={() => "var(--accent)"}
       shapeOf={() => undefined}
       handover={over.handover}
+      copyOf={over.copy?.of}
       onClose={onClose}
     />
   );
@@ -295,6 +309,8 @@ const handed = (draft: EditorFields, over: Partial<CreateHandover> = {}): Create
   unproven: null,
   showAsTouched: false,
   timeTouched: false,
+  meetTouched: false,
+  length: null,
   badDate: null,
   openCustom: false,
   ...over,
@@ -320,6 +336,14 @@ function pickCalendar(from: string, to: string) {
 }
 
 describe("NewEventEditor", () => {
+  // Help mode (C20b §11): the full editor's create mode explains a new event.
+  it("carries the new event's help", () => {
+    open();
+    expect(screen.getByRole("dialog", { name: "New event" }).getAttribute("data-help")).toBe(
+      "calendar-new-event",
+    );
+  });
+
   it("with no zone, the time controls and Save are disabled, and it says nothing can be saved", async () => {
     deviceZone = null;
     open();
@@ -353,13 +377,14 @@ describe("NewEventEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     // The calendar, every field of the draft, and no token: nobody to notify, no repeat, no guests,
-    // the calendar's notifications and colour (C13).
+    // the calendar's notifications and colour (C13), and no video call asked for (C18b).
     expect(createEvent.mock.calls).toEqual([[PERSONAL, sentFor("Dentist").draft, null, null]]);
     expect(Object.keys(createEvent.mock.calls[0][1]).sort()).toEqual([
       "colour",
       "description",
       "guests",
       "location",
+      "meet",
       "recurrence",
       "reminders",
       "show_as",
@@ -2156,5 +2181,550 @@ describe("NewEventEditor, notifications and colour", () => {
       screen.getByText("Notifications went back to Family's defaults for timed events."),
     ).toBeTruthy();
     expect(screen.queryByText(/Personal's defaults/)).toBeNull();
+  });
+});
+
+// --- a video call on new events (C18b) ---
+
+/** Personal and Work offer Google Meet, Family doesn't; Personal's account adds Meet to the events
+ *  it creates (`auto`), Work's doesn't. */
+const meetOverview = (auto: Record<string, boolean> = { [ME]: true }): CalendarOverview => ({
+  ...overview,
+  calendars: overview.calendars.map((c) =>
+    c.id === FAMILY ? c : { ...c, conference_types: ["hangoutsMeet"] },
+  ),
+  auto_meet: auto,
+});
+
+const videoCall = () => screen.getByRole("group", { name: "Video call" });
+const addMeet = () =>
+  within(videoCall()).getByRole("button", { name: "Add Google Meet video conferencing" });
+const dontAdd = () => within(videoCall()).getByRole("button", { name: "Don't add the video call" });
+const meetAsked = () =>
+  within(videoCall()).queryByText(
+    "Google Meet video conferencing. Google makes the link when you save.",
+  ) !== null;
+
+describe("NewEventEditor video call (C18b)", () => {
+  // Critique C2-H2: Google adds Meet "when you add invitees", so the setting turns the row on with
+  // the first guest, and off again when none is left, while it's untouched.
+  it("the account's setting turns the row on with the first guest", () => {
+    open({ overview: meetOverview() });
+    expect(meetAsked()).toBe(false);
+    expect(addMeet()).toBeTruthy();
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Remove b@example.org" }));
+    expect(meetAsked()).toBe(false);
+    // The user's own address invites nobody, so no call.
+    addGuest("me@x.com");
+    expect(meetAsked()).toBe(false);
+    cleanup();
+    // Off in Google: a guest brings no call.
+    open({ overview: meetOverview({ [ME]: false }) });
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(false);
+  });
+
+  it("Save asks for the call", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ overview: meetOverview() });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(addMeet());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls).toEqual([
+      [PERSONAL, { ...sentFor("Dentist").draft, meet: true }, null, null],
+    ]);
+  });
+
+  it("the row is off while what was sent may be in Google", async () => {
+    createEvent.mockResolvedValue(ambiguous);
+    open({ overview: meetOverview() });
+    fireEvent.change(title(), { target: { value: "Dentist" } });
+    fireEvent.click(addMeet());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("button", { name: "Check again" });
+    expect(dontAdd()).toHaveProperty("disabled", true);
+  });
+
+  it("a calendar change re-seeds an untouched row", () => {
+    open({ overview: meetOverview({ [ME]: true, [WORK]: false }) });
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+    pickCalendar("Personal", "Work");
+    expect(meetAsked(), "Work's account adds none").toBe(false);
+    pickCalendar("Work", "Personal");
+    expect(meetAsked()).toBe(true);
+  });
+
+  it("a touched row stays, except on a calendar without Meet, which says so", () => {
+    open({ overview: meetOverview({ [ME]: false, [WORK]: false }) });
+    fireEvent.click(addMeet());
+    pickCalendar("Personal", "Work");
+    expect(meetAsked(), "touched: kept where Meet is offered").toBe(true);
+    pickCalendar("Work", "Family");
+    expect(meetAsked()).toBe(false);
+    expect(
+      within(videoCall()).getByText("Family doesn't offer Google Meet, so the video call is off."),
+    ).toBeTruthy();
+    expect(within(videoCall()).queryByRole("button")).toBeNull();
+    pickCalendar("Family", "Personal");
+    expect(screen.queryByText(/doesn't offer Google Meet/)).toBeNull();
+    expect(meetAsked(), "the call isn't brought back").toBe(false);
+    // Turned off by hand, a guest doesn't bring it back either.
+    cleanup();
+    open({ overview: meetOverview() });
+    addGuest("b@example.org");
+    fireEvent.click(dontAdd());
+    addGuest("c@example.org");
+    expect(meetAsked()).toBe(false);
+  });
+
+  it("the hand-over carries the call, and whether it was pressed", () => {
+    // Pressed in quick create: no guest needed, and a guest added here doesn't change it.
+    open({
+      overview: meetOverview({ [ME]: false }),
+      handover: handed({ ...seed, summary: "Dentist", meet: true }, { meetTouched: true }),
+    });
+    expect(meetAsked()).toBe(true);
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+    cleanup();
+    // Untouched there: it follows the guests here.
+    open({
+      overview: meetOverview(),
+      handover: handed({ ...seed, summary: "Dentist" }),
+    });
+    expect(meetAsked()).toBe(false);
+    addGuest("b@example.org");
+    expect(meetAsked()).toBe(true);
+  });
+});
+
+// --- a copy of an event (Duplicate, C18c) ---
+
+/** A copy of "Retro" with `fields` over the seed's, and what it says. */
+const copyOf = (
+  fields: Partial<EditorFields> = {},
+  of: Partial<CopyOf> = {},
+): { fields: EditorFields; of: CopyOf } => ({
+  fields: { ...seed, summary: "Retro", location: "Room 2", ...fields },
+  of: { title: "Retro", notes: [], callNote: null, ...of },
+});
+
+const guestOf = (email: string): EditorFields["guests"][number] => ({
+  email,
+  name: null,
+  response: null,
+  optional: false,
+  organizer: false,
+  self: false,
+  room: false,
+});
+
+describe("NewEventEditor opened on a copy (C18c)", () => {
+  it("a copy says what it copies and what it doesn't", () => {
+    open({
+      copy: copyOf(
+        {},
+        {
+          notes: [
+            "The original repeats (Weekly on Monday); the copy doesn't. Choose Repeat to set it.",
+          ],
+        },
+      ),
+    });
+    const dialog = screen.getByRole("dialog", { name: "New event" });
+    expect(within(dialog).getByText("A copy of “Retro”.")).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        "The original repeats (Weekly on Monday); the copy doesn't. Choose Repeat to set it.",
+      ),
+    ).toBeTruthy();
+    expect(title().value).toBe("Retro");
+  });
+
+  // Google's Duplicate makes no video call whatever the setting (Workspace admin help 9898950).
+  it("a copy's call starts off even when the setting is on, and says why", () => {
+    open({
+      overview: meetOverview(),
+      copy: copyOf({ guests: [guestOf("b@example.org")] }, { callNote: COPY_CALL_NOTE }),
+    });
+    expect(meetAsked()).toBe(false);
+    expect(within(videoCall()).getByText(COPY_CALL_NOTE)).toBeTruthy();
+    addGuest("c@example.org");
+    pickCalendar("Personal", "Work");
+    pickCalendar("Work", "Personal");
+    expect(meetAsked(), "neither a guest nor a calendar turns it on").toBe(false);
+    fireEvent.click(addMeet());
+    expect(meetAsked()).toBe(true);
+    expect(within(videoCall()).queryByText(COPY_CALL_NOTE)).toBeNull();
+  });
+
+  it("closing an untouched copy asks nothing and sends nothing", () => {
+    const { onClose } = open({ copy: copyOf({ guests: [guestOf("b@example.org")] }) });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Discard this new event?" })).toBeNull();
+    expect(onClose).toHaveBeenCalled();
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  // C12d's question: Google invites the copy's guests only once the user says whether it emails.
+  it("a copy with guests asks Send / Don't send before creating", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ copy: copyOf({ guests: [guestOf("b@example.org")] }) });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const prompt = await screen.findByRole("dialog", { name: "Send invitation emails to guests?" });
+    expect(createEvent).not.toHaveBeenCalled();
+    fireEvent.click(within(prompt).getByRole("radio", { name: /^Don't send/ }));
+    fireEvent.click(within(prompt).getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1]).toMatchObject({
+      summary: "Retro",
+      location: "Room 2",
+      guests: [{ email: "b@example.org", optional: false }],
+      meet: false,
+    });
+    expect(createEvent.mock.calls[0][3]).toEqual({ notify: "none", asked: ONE_INVITED });
+  });
+
+  // Q13: Duplicate is the way to another account's calendar.
+  it("a copy can go to another account's calendar", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ copy: copyOf() });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][0]).toBe(WORK_CAL);
+    expect(createEvent.mock.calls[0][1].summary).toBe("Retro");
+  });
+
+  // Review round 2 of PR 1: an all-day copy has no length of its own, so going timed takes the length
+  // of the account it's on now, as a new event there would.
+  it("an all-day copy going timed on another calendar takes that account's length", () => {
+    const time: EditorFields["time"] = {
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-12",
+    };
+    open({ copy: copyOf({ time }) });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  it("an all-day copy going timed on the calendar it started on takes that account's length", () => {
+    const time: EditorFields["time"] = {
+      kind: "all_day",
+      first_day: "2026-10-12",
+      last_day: "2026-10-12",
+    };
+    open({ copy: copyOf({ time }) });
+    pickCalendar("Personal", "Work");
+    pickCalendar("Work", "Personal");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("10:00");
+  });
+
+  it("a new event all day and timed again on another calendar takes that account's length", () => {
+    open();
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  // Review round 3 of PR 1: what the event's length is, when all day hides it.
+  const endAfterAllDayOnWork = () => {
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    return screen.getByLabelText<HTMLSelectElement>("End time").value;
+  };
+  const allDay = {
+    kind: "all_day",
+    first_day: "2026-10-12",
+    last_day: "2026-10-12",
+  } as EditorFields["time"];
+
+  it("a dragged range handed over all day keeps its length on another calendar", () => {
+    open({
+      handover: handed({ ...seed, time: allDay }, { timeTouched: true, length: 45 * 60_000 }),
+    });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:45");
+  });
+
+  it("an all-day handover with no length of its own takes the length of the calendar it came on", () => {
+    open({
+      handover: handed({ ...seed, time: allDay }, { calendarId: WORK_CAL, timeTouched: true }),
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  it("a length on screen stays through another calendar, then all day and back", () => {
+    open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "10:00" } });
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:00");
+    pickCalendar("Personal", "Work");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:00");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("10:00");
+  });
+
+  it("a length the user changed is theirs through all day on another calendar", () => {
+    open();
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "10:30" } });
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "09:30" } });
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:00");
+    expect(endAfterAllDayOnWork()).toBe("10:30");
+  });
+
+  // Only the end changed, with no start move to note it: all day and back still keeps it.
+  it("an end the user changed is kept through all day and back", () => {
+    open();
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "10:30" } });
+    expect(endAfterAllDayOnWork()).toBe("10:30");
+  });
+
+  // Its own length stays: a timed copy all day and back on another account's calendar.
+  it("a timed copy keeps its own length through All day and back on another calendar", () => {
+    const time = { ...seed.time, end_time: "12:00" } as EditorFields["time"];
+    open({ copy: copyOf({ time }) });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("12:00");
+  });
+
+  // Review round 1 of PR 1: a copy's time is the original's (C18 §7.1), never the default length of
+  // the account whose calendar is picked.
+  it("a copy keeps its own end on another calendar, and back", async () => {
+    createEvent.mockResolvedValue(saved);
+    const time = { ...seed.time, end_time: "12:00" } as EditorFields["time"];
+    const { onClose } = open({ copy: copyOf({ time }) });
+    const end = () => screen.getByLabelText<HTMLSelectElement>("End time");
+    expect(end().value).toBe("12:00");
+    pickCalendar("Personal", "Work");
+    expect(end().value).toBe("12:00");
+    pickCalendar("Work", "Personal");
+    expect(end().value).toBe("12:00");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].time).toMatchObject({ end_time: "12:00" });
+  });
+
+  // Review round 1 of PR 1: all day and back puts the copy's own notifications and busy or free
+  // back, as the event editor does with the original's.
+  it("a copy's notifications and busy or free come back after All day and back", async () => {
+    createEvent.mockResolvedValue(saved);
+    const reminders = { use_default: false, overrides: [{ method: "popup", minutes: 10 }] };
+    const copy = copyOf({ reminders, show_as: "free" });
+    const { onClose } = open({ copy });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByRole("textbox", { name: "How many: 10 minutes before" })).toBeTruthy();
+    expect(screen.queryByText(/Notifications went back/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    const sent = createEvent.mock.calls[0][1];
+    expect(sent.reminders).toEqual(toNewEvent(copy.fields).reminders);
+    expect(sent.show_as).toBe("free");
+  });
+
+  // Review round 1 of PR 1: Google's older choice shows as what's sent, never as the first option.
+  it("a confidential copy shows Confidential", () => {
+    open({ copy: copyOf({ visibility: "confidential" }) });
+    expect(screen.getByLabelText<HTMLSelectElement>("Visibility").value).toBe("confidential");
+    cleanup();
+    open({ copy: copyOf() });
+    const options = [...screen.getByLabelText<HTMLSelectElement>("Visibility").options];
+    expect(options.some((o) => o.value === "confidential")).toBe(false);
+  });
+
+  // Review round 1 of PR 1: a calendar without Meet has no Add to press, so the note doesn't ask.
+  it("a copy's call note asks for a new call only where Meet is offered", () => {
+    open({ overview: meetOverview(), copy: copyOf({}, { callNote: COPY_CALL_NOTE }) });
+    expect(within(videoCall()).getByText(COPY_CALL_NOTE)).toBeTruthy();
+    pickCalendar("Personal", "Family");
+    expect(within(videoCall()).getByText(COPY_CALL_OFF_NOTE)).toBeTruthy();
+    expect(within(videoCall()).queryByText(COPY_CALL_NOTE)).toBeNull();
+    expect(within(videoCall()).queryByRole("button")).toBeNull();
+    pickCalendar("Family", "Personal");
+    expect(within(videoCall()).getByText(COPY_CALL_NOTE)).toBeTruthy();
+  });
+
+  // Critique C2-L12: a formatted description goes as Google holds it. Formatting PM writes back is
+  // edited in place (C19d), and an untouched copy sends it byte for byte, Google's wrapper and all.
+  it("a copy's formatted description is edited in place and sent unchanged when untouched", async () => {
+    createEvent.mockResolvedValue(saved);
+    const html = "<html-blob><strong>Bring</strong> the form</html-blob>";
+    const { onClose } = open({ copy: copyOf({ description: html }) });
+    const box = description();
+    expect(box.querySelector("b")?.textContent).toBe("Bring");
+    expect(screen.getByRole("toolbar", { name: "Description formatting" })).toBeTruthy();
+    fireEvent.blur(box);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe(html);
+  });
+
+  // Review round 1 of PR 1: no event exists yet, so nothing goes from Google Calendar and closing
+  // keeps no formatting; the original is never touched, and the question says so.
+  it("Replace on a copy says the original keeps its formatting", () => {
+    open({ copy: copyOf({ description: "<table><tr><td>Room</td></tr></table>" }) });
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    expect(ask.textContent).toContain(
+      "The original keeps its formatting; this copy won't have it.",
+    );
+    expect(ask.textContent).not.toMatch(/goes from Google Calendar/);
+    expect(ask.textContent).not.toMatch(/close the editor to keep it/);
+  });
+
+  // C19d: one PM can't write back shows what PM can of it, with Replace, which is the copy's own.
+  it("a copy's description PM can't edit shows what PM can of it, with Replace", async () => {
+    createEvent.mockResolvedValue(saved);
+    const html = "<table><tr><td>Room</td><td>4.12</td></tr></table>";
+    const { onClose } = open({ copy: copyOf({ description: html }) });
+    expect(screen.queryByRole("textbox", { name: "Description" })).toBeNull();
+    const view = screen.getByRole("group", { name: "Description" });
+    expect(view.textContent).toBe("Room 4.12");
+    expect(view.getAttribute("aria-describedby")).toBe(
+      screen.getByText(/This description has formatting PM can't edit/).id,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Replace" }));
+    const box = description();
+    expect(document.activeElement).toBe(box);
+    expect(screen.queryByText(/This description has formatting PM can't edit/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe("Room 4.12");
+  });
+
+  // C19 review 1: words the copy showed as words ("&lt;b&gt;") stay words, never live markup.
+  it("Replace on a copy keeps words Google showed as words", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({
+      copy: copyOf({ description: "<h2>Use &lt;b&gt;bold&lt;/b&gt; tags</h2>" }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Replace" }));
+    expect(description().textContent).toBe("Use <b>bold</b> tags");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe("Use &lt;b&gt;bold&lt;/b&gt; tags");
+  });
+
+  it("Replace isn't offered while the copy is being created", async () => {
+    const answer = later();
+    createEvent.mockReturnValue(answer.promise);
+    open({ copy: copyOf({ description: "<h2>Agenda</h2>" }) });
+    expect(screen.getByRole("button", { name: "Replace with plain text…" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(createEvent).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Replace with plain text…" })).toBeNull();
+    expect(createEvent.mock.calls[0][1].description).toBe("<h2>Agenda</h2>");
+    await act(async () => answer.answer(saved));
+  });
+
+  it("an untouched copy with a description PM can't edit sends it as Google holds it", async () => {
+    createEvent.mockResolvedValue(saved);
+    const html = '<p style="color: red">Red</p>';
+    const { onClose } = open({ copy: copyOf({ description: html }) });
+    // "Keep the formatting" closes only the question.
+    fireEvent.click(screen.getByRole("button", { name: "Replace with plain text…" }));
+    const ask = screen.getByRole("dialog", { name: "Replace the description with plain text?" });
+    fireEvent.click(within(ask).getByRole("button", { name: "Keep the formatting" }));
+    expect(screen.getByRole("dialog", { name: "New event" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Description" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe(html);
+  });
+});
+
+// --- the description (C19d) ---
+
+/** The description's box. */
+const description = () => screen.getByRole("textbox", { name: "Description" });
+
+/** What the user typed into the box, as the engine leaves it, then the input event it fires. */
+function typeInto(box: HTMLElement, ...nodes: (Node | string)[]) {
+  box.replaceChildren(...nodes);
+  fireEvent.input(box);
+}
+
+/** An element made by hand, never by parsing. */
+function h(tag: string, ...children: (Node | string)[]) {
+  const made = document.createElement(tag);
+  made.append(...children);
+  return made;
+}
+
+describe("NewEventEditor's description (C19d)", () => {
+  it("a_new_event_sends_formatting_and_plain_lines_as_written", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open();
+    fireEvent.change(title(), { target: { value: "Plan" } });
+    typeInto(description(), h("b", "Agenda"), h("ul", h("li", "one & two")));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe(
+      "<b>Agenda</b><ul><li>one &amp; two</li></ul>",
+    );
+
+    cleanup();
+    createEvent.mockResolvedValue(saved);
+    const second = open();
+    fireEvent.change(title(), { target: { value: "Plan" } });
+    // WebKit's lines: a div per Enter.
+    typeInto(description(), "first", h("div", "second"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(second.onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[1][1].description).toBe("first\nsecond");
+  });
+
+  it("an_emptied_description_is_sent_as_nothing", async () => {
+    createEvent.mockResolvedValue(saved);
+    const { onClose } = open({ copy: copyOf({ description: "<b>Bring</b> the form" }) });
+    // What an engine leaves when everything is deleted.
+    typeInto(description(), h("br"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(createEvent.mock.calls[0][1].description).toBe("");
+  });
+
+  it("clicking the Description text puts the caret in the box", () => {
+    open();
+    fireEvent.click(screen.getByText("Description", { selector: "span" }));
+    expect(document.activeElement).toBe(description());
+  });
+
+  it("the box stands still while a save is out", async () => {
+    const answer = later();
+    createEvent.mockReturnValue(answer.promise);
+    open();
+    fireEvent.change(title(), { target: { value: "Plan" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(createEvent).toHaveBeenCalled());
+    expect(description().getAttribute("contenteditable")).toBe("false");
+    expect(description().getAttribute("aria-disabled")).toBe("true");
+    for (const button of within(
+      screen.getByRole("toolbar", { name: "Description formatting" }),
+    ).getAllByRole("button")) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
+    await act(async () => answer.answer(saved));
   });
 });

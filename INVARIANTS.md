@@ -307,8 +307,11 @@ that *has* a scheme (`is-absolute-url` rejects `//host`), so it never sees one.
 **Co-signers.** Anything added to `REHYPE_PLUGINS` goes *before* `rehypeSanitize`, which stays last.
 Any edit to `safeUrl` keeps the `[/\\][/\\]` guard ahead of every allowance below it. A new surface
 that renders ingested or model-authored content renders it through `<Markdown>` rather than
-reproducing a `urlTransform` of its own. `markdown.test.ts` pins the rule and the `/path`
-counter-case; `markdown.render.test.tsx` pins the resulting `href` and `src` at the DOM, so a
+reproducing a `urlTransform` of its own. The one exception is a Google event's description, which
+renders through `RichDescription` over `descriptionHtml.ts` (C19): it parses nothing as HTML, builds
+React elements from an allow-list, and gives an `href` only to an address `linkTarget` takes
+(absolute http, https or mailto, unchanged by `safeUrl`). `markdown.test.ts` pins the rule and the
+`/path` counter-case; `markdown.render.test.tsx` pins the resulting `href` and `src` at the DOM, so a
 regression is a red test rather than a review miss.
 
 ### I-20 · A re-key carries the vault's owner forward; only a confirmed transfer changes it — **Enforced**
@@ -374,6 +377,31 @@ to the fence's `WRITE_COMMANDS` and the ESLint rule with its wrapper (the fence 
 and sends through `google_io`. AI editing (Stage 4) is a deliberate design of
 its own, with the user approving each change before it is sent, and it changes this entry and the
 fence on purpose rather than routing around them.
+
+### I-23 · Nothing in the page parses HTML or writes an HTML string into it — **Enforced**
+
+No code in `src/` hands text to an HTML parser (`DOMParser`, `createContextualFragment`,
+`setHTML`, `parseHTMLUnsafe`) or writes markup into the page (`innerHTML`, `outerHTML`,
+`insertAdjacentHTML`, `document.write`, `srcdoc`, `dangerouslySetInnerHTML`, `execCommand`'s
+`insertHTML`); `createElement` and `execCommand` take only literal names. Google's formatted event
+descriptions (#884, C19) are read by a character tokenizer (`src/lib/calendarEdit/descriptionTokens.ts`)
+and the codec over it (`descriptionHtml.ts`), and are drawn as React elements or DOM nodes made one
+by one. The `no-restricted-syntax` rule in `eslint.config.js` (`HTML_SINKS`) fails the lint on any
+of them in shipped code, the calendar editor's hook included; only `*.test.{ts,tsx}` files are
+exempt, in a block of their own. `src/lib/htmlSinkFence.test.ts` lints each form through ESLint's
+own API.
+
+**Why.** Each is an XSS sink CodeQL reads, and its highs block merges: CodeQL alert #31 came from
+an inert `DOMParser` parse of a description, because the same field also takes text the user typed.
+An inert parse is still a parse, and the next "quick" `innerHTML` for formatting would reopen it.
+
+**Co-signers.** A new reader of formatted text extends the tokenizer and draws React elements or
+nodes made one by one, never a parse. A new sink the rule doesn't name gets a selector in
+`HTML_SINKS` and a case in the fence test. A link the drawn view (`RichDescription`) makes carries only
+an address `descriptionHtml.ts`'s `linkTarget` takes (absolute http, https or mailto, unchanged by
+`markdown.tsx`'s `safeUrl`, I-19). The editor's box also holds a phone number `keptLink` keeps, so the
+link survives a save, and its click guard never opens one. Neither ever draws a string the user is
+still typing.
 
 ---
 

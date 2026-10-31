@@ -950,7 +950,30 @@ export interface CalendarOverview {
   /** Google's default length for a new event, in minutes, keyed by account id like `editing`. An
    *  account missing here has none stored yet: a new event then lasts an hour. */
   default_length: Record<string, number>;
+  /** Each Google account's "Automatically add Google Meet video conferences to events I create",
+   *  keyed by account id like `editing` (C18b). An account missing here has none stored yet: a new
+   *  event then starts with no call. */
+  auto_meet: Record<string, boolean>;
+  /** Whom to ask for edit access, keyed by PM's calendar id (C20b): only calendars shared with you
+   *  to view only, with an owner PM can name. The backend decides; the view only offers it. */
+  ask_access: Record<string, AskOwner>;
 }
+
+/** Whom to ask for edit access to one calendar shared with you to view only (`calendar_ask`). */
+export interface AskOwner {
+  /** The owner's address, as Google gave it. */
+  owner: string;
+  /** The owner is one of the Google accounts connected to PM: the view says how to share the
+   *  calendar from there, rather than opening an email to themselves. */
+  connected: boolean;
+}
+
+/** What asking a calendar's owner for edit access came to (`requestCalendarAccess`). PM opens an
+ *  email in the mail app and sends nothing itself. */
+export type AccessAsk =
+  | { outcome: "opened"; owner: string }
+  | { outcome: "no_mail_app"; owner: string }
+  | { outcome: "no_owner" };
 
 /** Calendar editing for one Google account (`calendar_editing::EditingStatus`). `paused` is the
  *  user's own "Turn off editing" in PM (Google still allows it); `needs_consent` means editing was
@@ -1561,6 +1584,10 @@ export interface CalendarEvent {
   /** From the unified-view list only, as `can_delete`: whether its start and end may change, the
    *  backend's own rule, so the calendar never offers a drag the move would refuse (C16a). */
   can_retime?: boolean;
+  /** From the listed rows (the unified view's and the agenda's): PM's copy kept only the first
+   *  8,000 characters of the description, so the pop-up says where the rest is (C19). Absent when
+   *  it kept all of it. */
+  description_cut?: boolean;
 }
 
 // --- Calendar editing (#884; mirrors `calendar_write::dto`) ---
@@ -1581,13 +1608,29 @@ export type ReadOnlyReason =
   | "organizer_only_guests"
   /** A one-off in PM that has since become a repeating event in Google. */
   | "became_repeating"
+  /** Focus time, out of office, a working location, or a kind of Google event PM doesn't know. */
   | "special_type"
+  /** A birthday or other special date: only its name, notifications, colour and, where it was
+   *  added in Google Calendar, its date may change (C20). */
+  | "special_date_fields"
+  /** A special date linked to a contact: Google Contacts owns its day (C20). */
+  | "date_from_contacts"
+  /** The calendar owner's own birthday: their Google Account owns its day (C20). */
+  | "date_from_profile"
+  /** Gmail added it: only its busy or free, visibility, notifications, colour and the user's reply
+   *  may change (C20). */
+  | "from_gmail_fields"
   | "locked"
-  | "html_description"
+  /** The description has formatting PM can't edit, such as a table or coloured text: it stays as
+   *  Google holds it unless the user replaces it with plain text (C19). */
+  | "unsupported_formatting"
   /** A Google Calendar label sets its colour, and PM doesn't change labels (C13). */
   | "label_read_only"
   /** Google holds a notification PM can't read, so the list stays as it is (C13). */
-  | "reminders_unreadable";
+  | "reminders_unreadable"
+  /** The event's video call is another service's, or a kind PM doesn't make: shown and kept
+   *  (C18). */
+  | "other_call";
 
 export type ShowAs = "busy" | "free";
 
@@ -1654,7 +1697,11 @@ export interface UndoOffer {
 export interface EventPatchDraft {
   summary?: string | null;
   location?: string | null;
+  /** Plain lines, or formatting as PM's editor writes it (Google's own subset). "" clears it. */
   description?: string | null;
+  /** The user chose "Replace with plain text…": a description whose formatting PM can't edit may
+   *  change. Only beside the description it replaces; on its own it reopens nothing (C19). */
+  replace_formatting?: boolean;
   time?: TimeDraft | null;
   show_as?: ShowAs | null;
   visibility?: EventVisibility | null;
@@ -1673,6 +1720,29 @@ export interface EventPatchDraft {
   reminders?: RemindersDraft | null;
   /** Its colour (C13). */
   colour?: ColourChoice | null;
+  /** Add or remove its Google Meet call (C18); omitted leaves the call as it is. Never the
+   *  request's id: the backend puts in its own. */
+  meet?: MeetChange | null;
+  /** Another calendar of the same Google account to put the event on, by PM's calendar id
+   *  (C18d); omitted, or its own calendar, leaves it where it is. */
+  calendar?: string | null;
+}
+
+/** Adding or removing a Google Meet call (C18). Only Meet: PM never makes another service's. */
+export type MeetChange = "add" | "remove";
+/** Whose video call an event has: Google Meet, another service's (a Calendar add-on), or a kind PM
+ *  doesn't make (Google's old Hangouts, a bare link). */
+export type CallKind = "meet" | "add_on" | "other";
+/** How far Google has got with the call: a request may still be pending, or have failed. */
+export type CallState = "ready" | "pending" | "failed";
+/** The event's video call, as Google holds it: never its phone details or notes (C18). */
+export interface CallForEdit {
+  kind: CallKind;
+  /** The service's name ("Google Meet", "Zoom Meeting"), "" when Google gives none. Text only. */
+  name: string;
+  /** The link to join by video (https), or null while there is none. */
+  join: string | null;
+  state: CallState;
 }
 
 /** Whether Google emails the guests about a change: Send is "all", Don't send "none" (C12).
@@ -1742,6 +1812,7 @@ export interface NewEventDraft {
   summary: string;
   time: TimeDraft;
   location: string;
+  /** Plain lines, or formatting as PM's editor writes it. */
   description: string;
   show_as: ShowAs;
   visibility: EventVisibility;
@@ -1759,6 +1830,8 @@ export interface NewEventDraft {
   reminders: RemindersDraft | null;
   /** One of Google's eleven colours (C13): null on the calendar's, and it has none of its own. */
   colour: ColourChoice | null;
+  /** Ask Google for a new Google Meet call (C18b). The backend mints the request's id. */
+  meet: boolean;
 }
 
 // --- Repeat rules (#884, C11; mirrors `calendar_recur::wire`) ---
@@ -1840,10 +1913,18 @@ export interface FieldPermissions {
   /** Its notifications and its colour (C13). */
   reminders: boolean;
   colour: boolean;
+  /** May add or remove a Google Meet call (C18). */
+  meet: boolean;
+  /** May go to another calendar of the same account: the organiser's, never a locked event's
+   *  (C18d). The save checks the calendar chosen. */
+  calendar: boolean;
   delete: boolean;
   /** The user may reply (Yes, No, Maybe). No field of the editor's: the reply sits apart from
    *  them, and never makes a draft to save (C14). */
   respond: boolean;
+  /** The time may change only to one whole day, all day (a birthday, C20): the When block shows one
+   *  date. Narrows `time`; no field of its own. */
+  one_day: boolean;
   reasons: ReadOnlyReason[];
 }
 
@@ -1851,8 +1932,8 @@ export interface FieldPermissions {
 export interface EventForEdit {
   summary: string;
   location: string;
+  /** As Google holds it, plain lines or formatted: the editor reads which (`looksLikeHtml`, C19d). */
   description: string;
-  description_html: boolean;
   time: TimeDraft;
   /** Google's exact start and end of a timed event (RFC 3339), null for all-day: which of a repeated
    *  hour's two times an untouched half is, for the pre-save check. */
@@ -1884,6 +1965,10 @@ export interface EventForEdit {
   reply: ReplyForEdit | null;
   /** The calendar this copy is on organises the event (Google's `organizer.self`). */
   organizer_self: boolean;
+  /** Its video call as Google holds it, null for none (C18). */
+  call: CallForEdit | null;
+  /** The event's calendar offers Google Meet (C18). */
+  meet_offered: boolean;
 }
 
 /** What opening the editor came to. `session` names it in later saves. */
@@ -1946,7 +2031,9 @@ export type SeriesWarning =
   /** It stops repeating: only the occurrence on `day` stays, as an event of its own. */
   | { warning: "becomes_one_event"; day: string }
   /** This many occurrences changed on their own fall on days a new repeat skips: their changes go. */
-  | { warning: "changes_lost"; count: number };
+  | { warning: "changes_lost"; count: number }
+  /** Every occurrence goes to the calendar PM calls `to` (C18e). */
+  | { warning: "changes_calendar"; to: string };
 
 /** One of "This event", "This and following" and "All events". `token` names the plan in the save;
  *  `guests`, who Google would email with Send, left out when nobody (C12). */
@@ -1981,14 +2068,20 @@ export type SeriesScope = "this" | "following" | "all";
  *  applied a one-event save without keeping all of it (a colour it wouldn't clear beside a new
  *  title, say), so the event is as Google holds it (C13 review round 1). `kept_own_reply`: a reply
  *  to every occurrence landed, and the occurrences `left_behind` names, answered on their own
- *  before, kept their own answer (C14). */
+ *  before, kept their own answer (C14). `call_pending`: saved, and Google is still making the video
+ *  call asked for; `call_failed`: saved, but Google didn't make it (C18). `links_left_behind`: on
+ *  the other calendar it became a new event in Google, so a milestone or reminder to prepare linked
+ *  to it stays with the old one (C18d). */
 export type WriteWarning =
   | "mirror_refresh_pending"
   | "left_on_old_series"
   | "outside_mirror"
   | "milestone_not_offered"
   | "partly_applied"
-  | "kept_own_reply";
+  | "kept_own_reply"
+  | "call_pending"
+  | "call_failed"
+  | "links_left_behind";
 
 /** A milestone PM may move to the new part of a repeating event: its date (YYYY-MM-DD) before the
  *  change. */
@@ -2056,6 +2149,9 @@ export type WriteOutcome =
        *  that Google answered and that changed only the core fields, notifications or colour
        *  (C16a, C16d). Left out otherwise. */
       undo?: UndoOffer;
+      /** PM's id of the calendar the event is on now, when the save put it on another one (C18d):
+       *  from what Google holds, never from what the editor chose. Left out otherwise. */
+      calendar?: string;
     }
   | { outcome: "no_change" }
   /** Something must be chosen first; nothing was sent. `scope`: which occurrences (none was named,
@@ -2090,7 +2186,21 @@ export type WriteOutcome =
    *  first and sends it again, under the same id, only if Google still doesn't show it, so a
    *  second copy is very unlikely. PM's own token, never the event's id. */
   | { outcome: "ambiguous"; retry_token: string }
-  | { outcome: "failed"; message: string };
+  | { outcome: "failed"; message: string }
+  /** The other changes in a save landed and the calendar change didn't, for `message` (C18d): the
+   *  editor reads Google's copy again before anything more is sent. Only a save answers it.
+   *  `warnings`: what those changes have to say beside "saved" (a call Google didn't make, say), as
+   *  a save's are; left out when nothing. */
+  | { outcome: "not_moved"; message: string; warnings?: WriteWarning[] }
+  /** A calendar change that landed unseen, found on `calendar` by a Save holding more than Google's
+   *  copy there (review round 1 of PR 1): the session has ended, the event's row is `row_id` now, and
+   *  what the user changed since is still theirs to save. Only a save answers it. */
+  | {
+      outcome: "moved_earlier";
+      row_id: string;
+      calendar: string;
+      warnings?: WriteWarning[];
+    };
 
 /** A delete still waiting out its Undo window, for a webview that reloaded. */
 export interface HeldDeleteInfo {

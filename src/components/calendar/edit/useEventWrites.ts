@@ -1105,7 +1105,9 @@ export function noteSeriesNotice(text: string) {
  *  leaves one event; `asAll`: the "this and following" row picked saved every occurrence
  *  (`Picked.asAll`). `more`, from an editor: the row it saved and the Send / Don't send it went
  *  with, so a save the backend offers an Undo for shows it for its seconds (C16d), the words
- *  saying when an Undo would email the guests again. */
+ *  saying when an Undo would email the guests again. `moved`: the names of the calendar the save
+ *  put the event on (`to`, from the backend's answer) and the one it was on (C18d): the notice says
+ *  where it is now and how to put it back, as there's no Undo for that (Q3). */
 export function noteSaved(
   summary: string,
   outcome: WriteOutcome,
@@ -1114,12 +1116,16 @@ export function noteSaved(
   stops = false,
   asAll = false,
   more?: { rowId: string; sent: Notify | null },
+  moved: { to: string; from: string } | null = null,
 ) {
   if (outcome.outcome !== "saved") return;
   const offer = outcome.undo;
   // Only an editor's save, which names its row, shows an offer.
   if (!more || !offer) {
-    put({ id: nextNotice++, ...savedNotice(summary, outcome, scope, from, stops, asAll) });
+    put({
+      id: nextNotice++,
+      ...savedNotice(summary, outcome, scope, from, stops, asAll, null, moved),
+    });
     offerMoves(outcome);
     return;
   }
