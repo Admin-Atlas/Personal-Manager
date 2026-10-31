@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.161.0-alpha",
+    date: "2026-10-31",
+    highlights: [
+      "Remove an invitation from your calendar: click an event you're invited to and choose Remove. Google tells the organiser you declined, a repeating one goes all at once, and you can undo it for a few seconds. Birthdays and events Gmail added still say Delete, and tell no one.",
+    ],
+  },
+  {
     version: "3.160.0-alpha",
     date: "2026-10-31",
     highlights: [
