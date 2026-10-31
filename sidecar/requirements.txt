@@ -59,7 +59,7 @@
 #     fastembed release allows pillow 13 — qdrant/fastembed#830 (open, unmerged at 0.9.0).
 #   defusedxml — hardens the stdlib XML parser (openpyxl's fallback) against entity-expansion / XXE
 #     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
-markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.8
+markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.9
 fastembed==0.9.0
 faster-whisper==1.2.1
 av<19
