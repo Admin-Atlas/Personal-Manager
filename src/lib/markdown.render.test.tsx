@@ -195,9 +195,46 @@ describe("plain typed lines (an event's description)", () => {
     expect(parseDescription(line).markup).toBe(false);
   });
 
+  // Review round 5 of PR 1: a comment or declaration alone on its lines is hidden by both readers, so
+  // nothing is at risk and the rest keeps Markdown's reading.
+  it.each([
+    ["Team lunch\n\n<!-- booking 42 -->", "Team lunch", "booking"],
+    ["Agenda\n<!-- internal note -->\nNext steps", "Next steps", "internal"],
+    ["<!-- a\nnote -->\nHello", "Hello", "note"],
+    ["   <!-- note -->\nHello", "Hello", "note"],
+    ["    <!-- note -->\nHello", "Hello", "note"],
+    ["- <!-- note -->\nHello", "Hello", "note"],
+    ["> <!-- note -->\nHello", "Hello", "note"],
+    ['<?xml version="1.0"?>\nHello', "Hello", "xml"],
+    ["<!DOCTYPE note>\nHello", "Hello", "note"],
+    ["<![CDATA[ note ]]>\nHello", "Hello", "note"],
+  ])("keeps Markdown for what both readers hide: %j", (line, words, hidden) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent).toContain(words);
+    expect(container.textContent).not.toContain(hidden);
+    expect(parseDescription(line).markup).toBe(false);
+  });
+
+  it("a comment alone on a line leaves the rest to Markdown's reading", () => {
+    const line = "Agenda:\n- one\n- **two**\n<!-- c -->";
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.querySelector("li strong")?.textContent).toBe("two");
+    expect(parseDescription(line).markup).toBe(false);
+  });
+
   // Review round 4 of PR 1: a line Markdown reads as a block of HTML goes whole, so the formatted view
   // draws the description, whose words these hold.
   it.each([
+    // Where a browser ends it and Markdown reads on, or words follow on its last line (round 5).
+    ["<!-- a --!> Thursday -->", "Thursday"],
+    ["<!-- a --!>\nThursday\n-->", "Thursday"],
+    ["<? a > Thursday ?>", "Thursday"],
+    ["<![CDATA[ a > Thursday ]]>", "Thursday"],
+    ["<? a >\nThursday ?>", "Thursday"],
+    ["<![CDATA[ a >\nThursday ]]>", "Thursday"],
+    ["<!-- a\nb --> Thursday", "Thursday"],
+    // A list ends the comment for Markdown, and the block that opens then takes the next line.
+    ["- <!-- a\n<Option 2> -->\nThursday", "Thursday"],
     ["<Option 2> Thursday 3pm\nOption 3 Friday", "Thursday 3pm"],
     ["<Form A, B> please sign\nby Friday", "please sign"],
     ["<Details A, B> Thursday", "Thursday"],

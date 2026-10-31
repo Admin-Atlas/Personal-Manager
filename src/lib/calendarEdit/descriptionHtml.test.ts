@@ -955,6 +955,32 @@ describe("drawing (C19b)", () => {
     ["Options:\n- <Option 2> Thursday", true],
     ["<Option 2 Thursday", true],
     ["<!-- note --> Thursday", true],
+    // A comment or declaration with nothing after it loses nothing (review round 5); one that Markdown
+    // ends elsewhere than a browser, or that never ends, may.
+    ["Team lunch\n\n<!-- booking 42 -->", false],
+    ["Agenda\n<!-- internal note -->\nNext steps", false],
+    ["Agenda:\n- one\n- **two**\n<!-- c -->", false],
+    ["<!-- booking 42 -->", false],
+    ["<!-- note --> \t\r\nHello", false],
+    ["<!-- a\nb -->\nHello", false],
+    ["<!-->\nHello", false],
+    ['<?xml version="1.0"?>\nHello', false],
+    ["<!DOCTYPE note>\nHello", false],
+    ["<![CDATA[ note ]]>\nHello", false],
+    ["<!-- a --!> Thursday -->", true],
+    ["<!-- a --!>\nThursday\n-->", true],
+    ["<? a > Thursday ?>", true],
+    ["<![CDATA[ a > Thursday ]]>", true],
+    ["<? a >\nThursday ?>", true],
+    ["<![CDATA[ a >\nThursday ]]>", true],
+    ["<!-- a\nb --> Thursday", true],
+    ["<!-- note", true],
+    ["<? note", true],
+    ["<!DOCTYPE note", true],
+    ["<![CDATA[ note", true],
+    ["<!-- note -->\n<Option 2> Thursday", true],
+    ["- <!-- a\n<Option 2> -->\nThursday", true],
+    ["<!-- a\n<!-- b -->\nc", true],
     ["x <Option 2> y", false],
     ["Thursday: <Option 2>", false],
     ["<Options 2> Thursday", false],
@@ -1206,6 +1232,9 @@ describe("costs", () => {
     ["items", "<ul>" + "<li>a</li>".repeat(140_000)],
     // A line's edge after many empty marks.
     ["empty marks, then lines", "a" + "<b></b>".repeat(50_000) + "<div>x</div>".repeat(50_000)],
+    // Lines of comments, and a comment opening on every line of one end.
+    ["comments alone on lines", "<!-- a -->\n".repeat(100_000)],
+    ["comments sharing an end", "<!-- a\n".repeat(100_000) + "-->"],
   ])("reading_is_linear: %s", (_name, description) => {
     // Each pass timed on its own, so a busy machine running every suite at once keeps the margin a
     // quadratic reader would blow through many times over.

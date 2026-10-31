@@ -434,15 +434,40 @@ function opensMarkdownBlock(s: string, at: number): boolean {
   return c === "" || " \t\n\r>".includes(c) || s.startsWith("/>", end);
 }
 
+/** Just past the comment or declaration at `at` if a browser and Markdown end it at the same place, so
+ *  both hide the same text; otherwise -1. A browser ends `<?` and `<![CDATA[` at their first ">" and a
+ *  comment at "--!>" too, where Markdown reads on to "?>", "]]>" or "-->". One that never ends is more
+ *  likely words than a comment, so -1 too, as for anything else that opens a block (a named tag). */
+function endHiddenAlike(s: string, at: number): number {
+  const after = s[at + 1] ?? "";
+  if (after !== "?" && after !== "!") return -1;
+  const end = after === "?" ? afterChar(s, at, ">") : afterDeclaration(s, at);
+  let closer = ">";
+  if (after === "?") closer = "?>";
+  else if (s.startsWith("<!--", at)) closer = "-->";
+  else if (s.startsWith("<![CDATA[", at)) closer = "]]>";
+  return s.startsWith(closer, end - closer.length) ? end : -1;
+}
+
 /** Whether Markdown drops a line of `description` that a browser shows, so only the formatted view
  *  keeps its words: `<Option 2> Thursday` opening a line reads as a block of HTML there, gone with the
  *  words after it, while the reader calls it words (`readsAsWords`), as Markdown does anywhere else on
- *  a line. Each line is looked at once. */
+ *  a line. A comment or declaration with nothing after it on its last line is hidden by both, so it
+ *  loses nothing and the description stays Markdown's. Another block opening inside one flips: a list
+ *  or quote can end the comment there for Markdown, and that block takes the lines after it. Each line
+ *  is looked at once, and each end searched for once, past the lines it covers. */
 export function markdownDropsALine(description: string): boolean {
   const isLineEnd = (c: string) => c === "\n" || c === "\r";
+  let hiddenTo = 0;
   for (let at = 0; at < description.length; at++) {
     const content = next(description, at, (c) => !isLineMark(c));
-    if (description[content] === "<" && opensMarkdownBlock(description, content)) return true;
+    if (description[content] === "<" && opensMarkdownBlock(description, content)) {
+      const end = content < hiddenTo ? -1 : endHiddenAlike(description, content);
+      if (end < 0) return true;
+      const rest = next(description, end, (c) => c !== " " && c !== "\t");
+      if (rest < description.length && !isLineEnd(description[rest])) return true;
+      hiddenTo = end;
+    }
     at = next(description, content, isLineEnd);
   }
   return false;
