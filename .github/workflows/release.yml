@@ -352,8 +352,8 @@ jobs:
   # sidecar/requirements.lock` — so this is also the proof that the universal lock's
   # markers select correctly on all three platforms, and that every artifact each one
   # needs is covered by a hash. It used to install requirements.txt, which left the
-  # shipped resolution untested. `--no-deps` because the lock overrides fastembed's
-  # pillow cap (sidecar.rs `provision` says why); it also means pip no longer reports a
+  # shipped resolution untested. `--no-deps` because an override can resolve the
+  # lock past a dependency's bound (sidecar.rs `provision` says why); it also means pip no longer reports a
   # dependency the markers failed to select, so the import line is what catches one.
   python-smoke:
     needs: guards

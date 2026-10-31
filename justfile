@@ -140,8 +140,8 @@ deny:
 # `--disable-pip`: audit the pinned versions as written instead of pip-installing the locks into a
 # throwaway venv first. pip-audit allows it only for hashed requirements, which every lock line is,
 # and it does not resolve anything, so it audits exactly the lock. Installing them was also how the
-# audit broke: the base lock overrides fastembed's `pillow<13` (sidecar/requirements-override.txt),
-# which pip's resolver refuses. Like the install it replaces, it reads the lines whose markers
+# audit broke: an override in sidecar/requirements-override.txt (fastembed's `pillow<13`, until
+# fastembed 0.9.1) is a lock pip's resolver refuses. Like the install it replaces, it reads the lines whose markers
 # match the auditing interpreter (3.12 in CI).
 pip-audit:
     pip-audit --disable-pip -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock

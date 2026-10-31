@@ -40,8 +40,8 @@ def _needs_fastembed(reason):
     instead, so a run meant to exercise the pinned fastembed can't pass by skipping. pr.yml's
     python job sets it for its second run, against a venv built with `pip install --require-hashes
     --no-deps -r sidecar/requirements.lock`, on any PR that touches sidecar/. `--no-deps` is not
-    optional: the lock overrides fastembed's `pillow<13` (sidecar/requirements-override.txt), so
-    without it pip refuses the lock. Locally, build the venv the same way, then
+    optional: whenever sidecar/requirements-override.txt lifts a dependency's bound, pip refuses
+    the lock without it. Locally, build the venv the same way, then
     `PM_REQUIRE_FASTEMBED=1 <venv>/bin/python sidecar/test_pm_sidecar.py`, inside the capped
     systemd-run scope on the Linux dev machine."""
     if os.environ.get("PM_REQUIRE_FASTEMBED") == "1":

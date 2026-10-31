@@ -1,7 +1,7 @@
 {
   "name": "pm",
   "private": true,
-  "version": "3.159.1-alpha",
+  "version": "3.159.2-alpha",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
@@ -58,5 +58,8 @@
     "typescript-eslint": "^8.72.1",
     "vite": "^8.3.5",
     "vitest": "^5.0.5"
+  },
+  "overrides": {
+    "minimatch": "^11.0.3"
   }
 }

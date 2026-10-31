@@ -101,7 +101,7 @@ export function parseHeader(text) {
 /**
  * The base lock's override file: stamped, and narrow. Each line of it REPLACES every requirement on
  * that package in the resolution, a dependency's declared bounds included — that is its whole job
- * (fastembed's `pillow<13`). So a base lock resolved without it must fail, and the file may only
+ * (fastembed 0.9.0's `pillow<13` was the first). So a base lock resolved without it must fail, and the file may only
  * name packages requirements.txt pins at the same version: a range, or a package nobody pins by
  * name, would be a silent hole in bounds that nobody reviews.
  */
