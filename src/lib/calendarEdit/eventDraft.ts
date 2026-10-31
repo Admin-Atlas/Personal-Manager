@@ -795,6 +795,18 @@ export function newEventLength(d: EditorFields): number | null {
   return s !== null && e !== null && e - s >= 60_000 ? e - s : null;
 }
 
+/** The length to keep once another calendar is picked for a draft whose time the user has changed.
+ *  Theirs stays (`own`), and so does one on screen, whichever account it came from; a draft showing
+ *  none, all day or under a minute, takes the usual length of the account it's on now (`usual`). */
+export function lengthOnCalendar(
+  d: EditorFields,
+  own: boolean,
+  length: number,
+  usual: number,
+): number {
+  return own || newEventLength(d) !== null ? length : usual;
+}
+
 const hhmm = (minutes: number) =>
   `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 

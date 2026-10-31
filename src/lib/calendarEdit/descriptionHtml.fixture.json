@@ -871,6 +871,102 @@
       "pm_can_edit": true,
       "supported": true,
       "why": "a list's theme colour draws nothing PM must keep (review 2)"
+    },
+    {
+      "description": "Ask <José> about it",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: a name outside ASCII is no tag to Markdown (review 3)"
+    },
+    {
+      "description": "Meet at <Building A, Room B> today",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "<Ask Bob!> first",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Meet <Room \"A\">",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: a quote with no \"=\" before it (review 3)"
+    },
+    {
+      "description": "Contact <John Smith, PM> please",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Ask <John O'Brien> today",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Dial in: <Room A, B>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "See <Room A/B>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: a \"/\" not right before the \">\" (review 3)"
+    },
+    {
+      "description": "see <your name here?>",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "Call <Ann Lee, Bob Ray> now",
+      "html": true,
+      "markup": false,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "words in angle brackets: an attribute name CommonMark doesn't allow (review 3)"
+    },
+    {
+      "description": "<a href=\"https://zoom.us/j/1\";>Join</a>",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": true,
+      "supported": false,
+      "why": "a link with a stray character is still the link a browser draws, read-only (review 3)"
+    },
+    {
+      "description": "<style 1>p{}</style>x",
+      "html": true,
+      "markup": true,
+      "pm_can_edit": false,
+      "supported": false,
+      "why": "a name the reader hides stays hidden whatever follows it (review 3)"
     }
   ]
 }

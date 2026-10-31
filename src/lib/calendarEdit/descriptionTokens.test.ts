@@ -302,26 +302,80 @@ describe("tokens", () => {
     ["<first_last>", "<first_last>"],
     ["<a,b>", "<a,b>"],
     ["<x.y a=&lt;>", "<x.y a=<>"],
+    // Review round 3: a name outside ASCII, and anything after a name that CommonMark's tag doesn't
+    // allow, whichever character it is and wherever in the attribute it comes.
+    ["Ask <José> about it", "<José>"],
+    ["Meet at <Building A, Room B> today", "<Building A, Room B>"],
+    ["<Ask Bob!> first", "<Ask Bob!>"],
+    ['Meet <Room "A">', '<Room "A">'],
+    ["Contact <John Smith, PM> please", "<John Smith, PM>"],
+    ["Ask <John O'Brien> today", "<John O'Brien>"],
+    ["Dial in: <Room A, B>", "<Room A, B>"],
+    ["See <Room A/B>", "<Room A/B>"],
+    ["see <your name here?>", "<your name here?>"],
+    ["Call <Ann Lee, Bob Ray> now", "<Ann Lee, Bob Ray>"],
+    ["<Room / >", "<Room / >"],
+    ['<Room a="b"c>', '<Room a="b"c>'],
+    ["<Room a=b`c>", "<Room a=b`c>"],
+    ["<Room a=>", "<Room a=>"],
+    ["<Room =x>", "<Room =x>"],
+    ["<Room\fA>", "<Room\fA>"],
+    ["<Room\n\nA>", "<Room\n\nA>"],
+    ["<Room\n \nA>", "<Room\n \nA>"],
+    ['<Room a="b\n\nc">', '<Room a="b\n\nc">'],
+    // Its end tag: Markdown allows nothing but whitespace after the name.
+    ["x </José> y", "</José>"],
+    ["x </Room 4> y", "</Room 4>"],
+    ["x </first.last> y", "</first.last>"],
+    ["x </Room\n\n> y", "</Room\n\n>"],
+    // A browser reads this name as `br\`, not `br`: no break to lose, and Markdown shows it.
+    ["<br\\>after", "<br\\>"],
   ])("words_in_angle_brackets_stay_words: %j", (html, literalText) => {
     const got = tokens(html);
     expect(got).toContainEqual(literal(literalText));
-    expect(got.some((token) => token.kind === "start")).toBe(false);
+    expect(got.some((token) => token.kind === "start" || token.kind === "end")).toBe(false);
   });
 
-  // A quote, "=" or "<" where an attribute starts is HTML's own reading of a tag with something odd
-  // in it, and any other name holds to what it's written as.
+  // A name the reader knows is the element a browser draws, whatever follows it (review 3); any other
+  // holds to what Markdown reads as a tag, and drops too.
   it.each([
     ['<b "x>y</b>', "b"],
     ["<b =x>y</b>", "b"],
     ["<b title=x <h2>y</b>", "b"],
     ["<b _x>y</b>", "b"],
+    ["<b :x>y</b>", "b"],
+    ["<b 'x>y</b>", "b"],
+    ["<b 4>x</b>", "b"],
+    ["<b 1>x</b>", "b"],
+    ['<a href="https://zoom.us/j/1";>Join</a>', "a"],
+    ['<a href="https://zoom.us/j/1", target="_blank">Join</a>', "a"],
+    ['<div style="color:red";>Hello</div>', "div"],
+    ['<span style="font-weight:bold";>Hi</span>', "span"],
+    ["<style 1>p{}</style>x", "style"],
+    ["<td 1>x</td>", "td"],
+    ["<hr 1>", "hr"],
     ["<o:p>y</o:p>", "o:p"],
     ["<html-blob>y</html-blob>", "html-blob"],
     ["<Room>y</Room>", "room"],
     ["<Room A>y</Room>", "room"],
+    ["<Room/>y", "room"],
+    ["<Room A />y", "room"],
+    ["<Room\nA>y", "room"],
+    ["<Room _x>z", "room"],
+    ["<Room :x.y-1>z", "room"],
+    ['<Room a="b>c">y', "room"],
+    ["<Room a='b' c = d e>y", "room"],
     ["<h2 id=x>y</h2>", "h2"],
   ])("a_tag_stays_a_tag: %j", (html, name) => {
     expect(tokens(html)[0]).toMatchObject({ kind: "start", name });
+  });
+
+  it("the_content_of_a_never_shown_element_with_something_odd_in_its_tag_is_never_read", () => {
+    expect(tokens("<style 1>p{}</style>x")).toEqual([
+      start("style", [["1", ""]]),
+      end("style"),
+      text("x"),
+    ]);
   });
 
   it.each(["Q&A, R&D, AT&T", "&#; &#x;", "&amp; &lt;b&gt; &eacute;", "</b title='&check;'>"])(
@@ -350,13 +404,9 @@ describe("tokens", () => {
       literal("<http://x?a=1&b=2>"),
       literal("<a@b.com>"),
     ]);
-    // Whitespace before the ">" makes it a tag again, and a tag holding "@" in a value is a tag.
-    expect(tokens("<https://x y>")).toEqual([
-      start("https:", [
-        ["x", ""],
-        ["y", ""],
-      ]),
-    ]);
+    // Whitespace before the ">" stops it being an address, but it's no tag to Markdown either, and a
+    // tag holding "@" in a value is a tag.
+    expect(tokens("<https://x y>")).toEqual([literal("<https://x y>")]);
     expect(tokens('<a href="mailto:x@y">m</a>')).toEqual([
       start("a", [["href", "mailto:x@y"]]),
       text("m"),
@@ -364,10 +414,11 @@ describe("tokens", () => {
     ]);
     // Outlook's "<o:p>" has a colon but no address: an element.
     expect(tokens("<o:p></o:p>")).toEqual([start("o:p"), end("o:p")]);
-    // An end tag never is one: browsers draw nothing for it.
+    // Nor is an end tag an address, but these are no tags to Markdown either (review 3): their words
+    // show, in place of nothing and a flip to the formatted view.
     expect(tokens("</https://x></ann@example.com>")).toEqual([
-      end("https:"),
-      end("ann@example.com"),
+      literal("</https://x>"),
+      literal("</ann@example.com>"),
     ]);
   });
 
@@ -379,8 +430,11 @@ describe("tokens", () => {
   });
 
   it("names_lower_case_only_ascii_letters", () => {
-    // The Kelvin sign lower-cases to "k" in JavaScript but not in HTML's tokenizer.
-    expect(tokens(`<BLOC${KELVIN}QUOTE>`)).toEqual([start(`bloc${KELVIN}quote`)]);
+    // The Kelvin sign lower-cases to "k" in JavaScript but not in HTML's tokenizer: never `blockquote`,
+    // and as a name outside ASCII, words.
+    expect(tokens(`<BLOC${KELVIN}QUOTE>`)).toEqual([literal(`<BLOC${KELVIN}QUOTE>`)]);
+    // Upper case is the same name to both.
+    expect(tokens("<BLOCKQUOTE 1>")).toMatchObject([{ kind: "start", name: "blockquote" }]);
   });
 
   // One pass that never steps back: inputs built to make a backtracking reader quadratic finish
@@ -401,6 +455,16 @@ describe("tokens", () => {
     "<a ".repeat(100_000) + ">",
     "<a@b".repeat(100_000) + ">",
     "<https:".repeat(100_000),
+    // Telling words from a tag (review 3): a run of what looks like attributes, and of what can
+    // separate them, before what makes it words, and a tag each time.
+    `<Room ${"a ".repeat(200_000)}!>`,
+    `<Room ${" ".repeat(400_000)}!>`,
+    `<Room ${"\n".repeat(400_000)}!>`,
+    `<Room\n${" ".repeat(400_000)}!>`,
+    `</Room ${" ".repeat(400_000)}!>`,
+    `<Room ${"a='b' ".repeat(80_000)}!>`,
+    "<Room a=b> ".repeat(40_000),
+    "<Room a, b> ".repeat(40_000),
   ])("reading_is_linear (%#)", (html) => {
     const started = performance.now();
     tokens(html);

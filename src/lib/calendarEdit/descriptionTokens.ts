@@ -21,7 +21,8 @@
 // element named "https:", which would make the address vanish. Whether Google draws it as words or as a
 // link is probe E11-1's; the readers treat it as formatting PM can't write back until then. So too any
 // other words in angle brackets that Markdown reads as words and a browser as an unknown element
-// ("<www.example.com>", "<first.last>", "<Room 4>"): a plain-text event never loses them.
+// ("<www.example.com>", "<José>", "<Room 4>", "<Room A, B>"): a plain-text event never loses them. A
+// name the reader knows ("<a href=…;>", "<b 4>") stays the element a browser draws (`KNOWN`).
 //
 // One pass that never steps back, so a hostile description costs linear time.
 
@@ -98,6 +99,44 @@ export const BLOCKS: ReadonlySet<string> = new Set([
   "table",
   "tr",
   "ul",
+]);
+
+/** Elements with no content or end tag. */
+export const VOID: ReadonlySet<string> = new Set([
+  "area",
+  "base",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "keygen",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
+
+/** The names the reader has a rule for, the tags PM writes among them (a test holds `EDITABLE_TAGS`
+ *  to it): always elements (`readsAsWords`), as a browser reads them. HTML defines more, but those are
+ *  words where Markdown says so: `<Code 1234>`, `<Option 2>`. */
+export const KNOWN: ReadonlySet<string> = new Set([
+  ...HIDDEN,
+  ...BLOCKS,
+  ...VOID,
+  "a",
+  "b",
+  "br",
+  "em",
+  "html-blob",
+  "i",
+  "span",
+  "strong",
+  "td",
+  "th",
+  "u",
 ]);
 
 /** HTML 4's Latin-1 names, in code-point order from U+00A0: "&eacute;" is how an API writer that
@@ -300,13 +339,13 @@ function read(description: string, note: Note): Token[] {
       out.push(CUT); // the text ends inside the tag: it and the rest are dropped
       return out;
     }
-    if (closing) {
-      out.push({ kind: "end", name }); // an end tag's attributes mean nothing
+    if (readsAsWords(name, html.slice(j, tag.end - 1), closing)) {
+      out.push({ kind: "literal", text: decoded(html.slice(i, tag.end), note, mayBeDrawn) });
       i = tag.end;
       continue;
     }
-    if (readsAsWords(name, tag.attrs)) {
-      out.push({ kind: "literal", text: decoded(html.slice(i, tag.end), note, mayBeDrawn) });
+    if (closing) {
+      out.push({ kind: "end", name }); // an end tag's attributes mean nothing
       i = tag.end;
       continue;
     }
@@ -346,17 +385,63 @@ class Ahead {
   }
 }
 
-/** Whether a tag is words in angle brackets, as Markdown reads them, rather than an element: a name
- *  holding ASCII punctuation but "-" and ":" ("<www.example.com>", "<first.last>"), or an attribute
- *  starting with something no attribute a person writes starts with ("<Room 4>", "<Room #4>"). A
- *  browser would hide them as an unknown element, and Google's text can hold them unescaped. A quote,
- *  "=" or "<" there is HTML's own reading of a tag with something odd in it, so it stays one. */
-function readsAsWords(name: string, attrs: readonly Attr[]): boolean {
-  if (!/^[a-z0-9:\u0080-￿-]+$/.test(name)) return true;
-  return attrs.some(({ name: attr }) => {
-    const first = attr[0] ?? "";
-    return !isAlpha(first) && !"_:\"'=<".includes(first);
-  });
+/** Whether a tag is words in angle brackets, as Markdown reads them, rather than an element. A browser
+ *  would hide them as an unknown element, and Google's text can hold them unescaped. A name the reader
+ *  knows is always an element, whatever follows it: a browser draws `<a href="…";>` as a link and
+ *  `<b 4>` as bold, and skips `<style 1>`'s content. Any other name is an element only where Markdown
+ *  reads a tag too (and drops it): a name of ASCII letters, digits, "-" or ":" (Outlook's `<o:p>`,
+ *  which Markdown doesn't read but no one writes as words), and after it `rest`, all there is before
+ *  the ">", as CommonMark allows. So `<Room>` and `<Room A>` are elements, and `<José>`, `<first.last>`,
+ *  `<Room 4>` and `<Room A, B>` words. */
+function readsAsWords(name: string, rest: string, closing: boolean): boolean {
+  if (KNOWN.has(name)) return false;
+  if (!/^[a-z0-9:-]+$/.test(name)) return true;
+  if (BLANK_LINE.test(rest)) return true; // it ends Markdown's paragraph, so no tag holds one
+  return closing ? afterGap(rest, 0) !== rest.length : !isTagRest(rest);
+}
+
+const BLANK_LINE = /\n[ \t]*\n/;
+/** What CommonMark's tags allow between their parts: a space, a tab or a line ending. (A form feed
+ *  ends a name in HTML, but not in CommonMark.) */
+const isGapChar = (c: string) => c === " " || c === "\t" || c === "\n";
+
+/** Past the spaces, tabs and line endings from `from`. */
+function afterGap(s: string, from: number): number {
+  let i = from;
+  while (i < s.length && isGapChar(s[i])) i++;
+  return i;
+}
+
+const isAttrStart = (c: string) => isAlpha(c) || c === "_" || c === ":";
+const isAttrChar = (c: string) => isAttrStart(c) || isDigit(c) || c === "." || c === "-";
+
+/** Whether what follows a tag's name, up to its ">", is CommonMark's: attributes each after a gap, a
+ *  name `[A-Za-z_:][A-Za-z0-9:._-]*` with perhaps a value (quoted, or with none of whitespace, quotes,
+ *  "=", "<", ">" or "`"), then perhaps a "/" right before the ">". In one pass, over text no other tag
+ *  shares. */
+function isTagRest(rest: string): boolean {
+  let i = 0;
+  for (;;) {
+    const at = afterGap(rest, i);
+    if (at === rest.length) return true;
+    if (rest[at] === "/") return at + 1 === rest.length;
+    if (at === i || !isAttrStart(rest[at])) return false;
+    i = at + 1;
+    while (i < rest.length && isAttrChar(rest[i])) i++;
+    const equals = afterGap(rest, i);
+    if (rest[equals] !== "=") continue;
+    const value = afterGap(rest, equals + 1);
+    const quote = rest[value];
+    if (quote === '"' || quote === "'") {
+      const close = rest.indexOf(quote, value + 1);
+      if (close < 0) return false;
+      i = close + 1;
+    } else {
+      i = value;
+      while (i < rest.length && !isGapChar(rest[i]) && !"\"'=<>`".includes(rest[i])) i++;
+      if (i === value) return false;
+    }
+  }
 }
 
 /** The first index from `from` whose character passes `test`, or the length. */

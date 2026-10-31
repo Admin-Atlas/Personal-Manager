@@ -83,6 +83,7 @@ import {
   guestNotice,
   halfInstant,
   hasBadDate,
+  lengthOnCalendar,
   newEventLength,
   refusedDateId,
   remindersAfterKindSwitch,
@@ -192,6 +193,9 @@ export interface CreateHandover {
   showAsTouched: boolean;
   timeTouched: boolean;
   meetTouched: boolean;
+  /** The event's own length (a range dragged, or one changed there), which an all-day draft can't
+   *  show; `null` when it has none and takes the length of the calendar it's on. */
+  length: number | null;
   /** Text quick create's date field couldn't read: it stands here as the start's (Start date or
    *  First day), refusing a save until that field is given a date, as it did there. */
   badDate: string | null;
@@ -274,8 +278,8 @@ export function NewEventEditor({
   // with (a range dragged on the grid, or quick create's, is the user's, C17), else the account's
   // default.
   const lengthRef = useRef(
-    newEventLength(startDraft) ??
-      newEventLength(seed) ??
+    handover?.length ??
+      newEventLength(startDraft) ??
       lengthFor(overview, targetById(targets, startCalendar)),
   );
   // Whether the user has changed the time: until then, another calendar brings its own length. A
@@ -284,7 +288,13 @@ export function NewEventEditor({
   const timeTouched = useRef(handover?.timeTouched ?? copyOf !== undefined);
   // Whether `lengthRef` is the event's own rather than an account's default: an all-day copy has
   // none to keep, so going timed on another calendar takes that account's length (review round 2).
-  const ownLength = useRef(timeTouched.current && newEventLength(startDraft) !== null);
+  // Quick create says whether what it hands over has one: a range dragged and then ticked all day
+  // does, which the draft no longer shows (review round 3).
+  const ownLength = useRef(
+    handover
+      ? handover.length !== null
+      : copyOf !== undefined && newEventLength(startDraft) !== null,
+  );
   // Whether the user has picked Show as: until then, it follows the kind (all day free). A copy's is
   // the original's, so it starts as picked, and all day and back keeps it, as editing the original
   // would.
@@ -535,6 +545,7 @@ export function NewEventEditor({
    *  day came from the start date follows it. */
   function changeTime(next: EditorFields) {
     timeTouched.current = true;
+    if (next.time.kind === "timed") lengthOf(next.time);
     setDraft(followStart(draftRef.current, next));
   }
 
@@ -551,10 +562,11 @@ export function NewEventEditor({
   }
 
   /** Another calendar. While the time is still the seed's, the end follows that account's length
-   *  (and back again), as Google's own length would. The calendar organises the event, so its own
-   *  address typed as a guest on another one comes off the list, said under the box: GuestField
-   *  refuses adding it, and the backend counts it as the event's own, never one Google invites (C13
-   *  review round 1). The video call follows the new calendar (`meetOnCalendar`, C18b). */
+   *  (and back again), as Google's own length would; after that a length on screen stays
+   *  (`lengthOnCalendar`). The calendar organises the event, so its own address typed as a guest on
+   *  another one comes off the list, said under the box: GuestField refuses adding it, and the backend
+   *  counts it as the event's own, never one Google invites (C13 review round 1). The video call
+   *  follows the new calendar (`meetOnCalendar`, C18b). */
   function pickCalendar(id: string) {
     setCalendarId(id);
     const target = targetById(targets, id);
@@ -571,8 +583,9 @@ export function NewEventEditor({
       lengthRef.current = length;
       const t = next.time;
       if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
-    } else if (!ownLength.current) {
-      lengthRef.current = lengthFor(overviewRef.current, target);
+    } else {
+      const usual = lengthFor(overviewRef.current, target);
+      lengthRef.current = lengthOnCalendar(next, ownLength.current, lengthRef.current, usual);
     }
     const call = meetOnCalendar(overviewRef.current, target, next, meetTouched.current);
     if (call.meet !== next.meet) next = { ...next, meet: call.meet };

@@ -27,7 +27,7 @@ import {
   type DescNode,
   type Mark,
 } from "./descriptionHtml";
-import { LEGACY, asciiLower, isAlpha, isSpace } from "./descriptionTokens";
+import { KNOWN, LEGACY, asciiLower, isAlpha, isSpace } from "./descriptionTokens";
 
 const t = (text: string): DescNode => ({ kind: "text", text });
 const BR: DescNode = { kind: "br" };
@@ -262,6 +262,46 @@ describe("the shared fixture", () => {
 
   it("the_editable_tags_are_the_fixtures", () => {
     expect([...EDITABLE_TAGS]).toEqual(fixture.tags);
+  });
+
+  // A tag PM writes is never read as words, whatever follows its name (review 3).
+  it("the_editable_tags_are_all_known_names", () => {
+    for (const tag of EDITABLE_TAGS) expect(KNOWN.has(tag), tag).toBe(true);
+  });
+});
+
+describe("words in angle brackets (review 3)", () => {
+  const shown = (doc: DescDoc): string =>
+    JSON.stringify(doc)
+      .match(/"text":"[^"]*"/g)!
+      .join(" ");
+
+  // What the reader builds a view from, were one of these ever beside formatting.
+  it.each([
+    ["Ask <José> about it", "<José>"],
+    ["<b>Dial in</b>: <Room A, B>", "<Room A, B>"],
+    ["<b>Ask</b> <John O'Brien> today", "<John O'Brien>"],
+  ])("the_words_show_in_the_formatted_view: %j", (description, words) => {
+    expect(shown(parseDescription(description).doc)).toContain(words);
+  });
+
+  it.each([
+    '<a href="https://zoom.us/j/1";>Join</a>',
+    '<a href="https://zoom.us/j/1", target="_blank">Join</a>',
+  ])("a_link_with_a_stray_character_is_the_link_a_browser_draws: %j", (description) => {
+    const parsed = parseDescription(description);
+    expect(parsed.supported).toBe(false);
+    expect(parsed.markup).toBe(true);
+    expect(JSON.stringify(parsed.doc)).toContain('"href":"https://zoom.us/j/1"');
+    expect(shown(parsed.doc)).toContain("Join");
+    expect(shown(parsed.doc)).not.toContain("zoom");
+  });
+
+  it("a_never_shown_element_with_something_odd_in_its_tag_stays_never_shown", () => {
+    const parsed = parseDescription("<style 1>p{}</style>x");
+    expect(parsed.supported).toBe(false);
+    expect(shown(parsed.doc)).not.toContain("p{}");
+    expect(shown(parsed.doc)).toContain("x");
   });
 });
 
@@ -892,6 +932,17 @@ describe("drawing (C19b)", () => {
     ["Contact <first.last> please", false],
     ["<example.com>", false],
     ["<b>Dial in</b>: <Room 4>", true],
+    ["Ask <José> about it", false],
+    ["Meet at <Building A, Room B> today", false],
+    ["<Ask Bob!> first", false],
+    ['Meet <Room "A">', false],
+    ["Contact <John Smith, PM> please", false],
+    ["Ask <John O'Brien> today", false],
+    ["Dial in: <Room A, B>", false],
+    ["See <Room A/B>", false],
+    ["see <your name here?>", false],
+    ["Call <Ann Lee, Bob Ray> now", false],
+    ["x </José> y", false],
     ["a < b and c > d", false],
     ["a<!-- note -->b", false],
     ["", false],

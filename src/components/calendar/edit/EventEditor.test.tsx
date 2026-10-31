@@ -3983,6 +3983,24 @@ describe("EventEditor, its calendar", () => {
   // Review round 2 of PR 1: what landed gave a repeating event's occurrences new ids, so the row the
   // editor is on can be dead: nothing more goes from here, where a Save would read as the event
   // deleted. Its words stop offering Save, and Cancel still closes.
+  // Review round 3 of PR 1: the likeliest way here, offline, offers no Try again above a held Save.
+  it("not moved and unread offline says to open it again, never to try again", async () => {
+    saveEdit.mockResolvedValueOnce({
+      outcome: "not_moved",
+      message:
+        "PM couldn't reach Google to change its calendar. Try again when you're back online.",
+    });
+    await openOn();
+    pick("Personal", "Side");
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Retro" } });
+    openForEdit.mockRejectedValueOnce(new Error("offline"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const said = await screen.findByText(new RegExp(NOT_MOVED_UNREAD));
+    expect(said.textContent).toBe(
+      `Your other changes are saved, but it's still on Personal. PM couldn't reach Google to change its calendar. ${NOT_MOVED_UNREAD}`,
+    );
+  });
+
   it("not moved and unread holds the editor until it's opened again", async () => {
     saveEdit.mockResolvedValueOnce({
       outcome: "not_moved",
@@ -3993,7 +4011,7 @@ describe("EventEditor, its calendar", () => {
     const onDuplicate = vi.fn();
     const onClose = await openOn(
       event(),
-      ALL,
+      { ...ALL, respond: true },
       BOTH,
       PERSONAL,
       vi.fn(),
@@ -4020,8 +4038,13 @@ describe("EventEditor, its calendar", () => {
       expect(button.disabled, name).toBe(true);
       fireEvent.click(button);
     }
+    // A reply from here would go on a row that can be dead too: a repeating event's old occurrence.
+    const reply = screen.getByRole<HTMLButtonElement>("button", { name: "Yes" });
+    expect(reply.disabled).toBe(true);
+    fireEvent.click(reply);
     await act(async () => {});
     expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(respond).not.toHaveBeenCalled();
     expect(onDelete).not.toHaveBeenCalled();
     expect(onDuplicate).not.toHaveBeenCalled();
     fireEvent.click(cancel);

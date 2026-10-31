@@ -601,31 +601,25 @@ export function EventEditor({
   }
 
   /** Google changed the event on a field this save sends: take its copy, keep the rest. After a
-   *  save whose calendar change alone didn't land (`saved`, C18d), the fields are Google's already,
-   *  so `head` says it all unless Google's copy differs from the draft somewhere. A read that fails
-   *  then never takes `head`'s place: the fields did land, and the read's own words can say nothing
-   *  changed, or that the event is gone when the save gave its occurrences new ids. It holds this
-   *  editor too (`mustReopen`). `moved`: a calendar change that landed earlier, read on the row it
-   *  has there, its words for a read that fails and for a draft with nothing left to send. */
+   *  save that landed something (`landed`: fields with their calendar change refused, C18d, or a
+   *  calendar change found landed earlier), the fields are Google's already, so `head` says it all
+   *  unless Google's copy differs from the draft somewhere. A read that fails then never takes
+   *  `head`'s place: the fields did land, and the read's own words can say nothing changed, or that
+   *  the event is gone when the save gave its occurrences new ids. It holds this editor too
+   *  (`mustReopen`). `landed` holds the row to read, its words for a read that fails, and its words
+   *  for a draft with nothing left to send. */
   async function rebaseAfterConflict(
     head: string,
-    saved = false,
-    moved: { id: string; unread: string; held: string } | null = null,
+    landed: { id: string; unread: string; held: string } | null = null,
   ) {
     if (!loaded || !draftRef.current) return;
     const unread = (text: string) => {
-      if (saved) setMustReopen(true);
-      setBanner(
-        moved
-          ? { tone: "warn", text: moved.unread }
-          : saved
-            ? { tone: "warn", text: notMovedUnreadText(head) }
-            : { tone: "error", text },
-      );
+      if (landed) setMustReopen(true);
+      setBanner(landed ? { tone: "warn", text: landed.unread } : { tone: "error", text });
     };
     let fresh: EditLoad;
     try {
-      fresh = await openForEdit(moved?.id ?? row.id);
+      fresh = await openForEdit(landed?.id ?? row.id);
     } catch (e) {
       // A conflict means nothing was written, so that save isn't in doubt.
       unread(message(e));
@@ -680,11 +674,11 @@ export function EventEditor({
     ) {
       setReplaced(false);
     }
-    const kept = saved && r.overwritten.length === 0 && r.lost_guests.length === 0;
-    const held = moved && kept && changedFields(r.base, next).length === 0;
+    const kept = landed !== null && r.overwritten.length === 0 && r.lost_guests.length === 0;
+    const held = landed && kept && changedFields(r.base, next).length === 0;
     setBanner({
       tone: "warn",
-      text: held ? moved.held : kept ? head : rebasedText(head, r.overwritten, r.lost_guests),
+      text: held ? landed.held : kept ? head : rebasedText(head, r.overwritten, r.lost_guests),
     });
   }
 
@@ -698,7 +692,7 @@ export function EventEditor({
     setCalendarId(outcome.calendar);
     setUncertain(false);
     setPartlySaved(false);
-    await rebaseAfterConflict(movedEarlierText(name, outcome.warnings), true, {
+    await rebaseAfterConflict(movedEarlierText(name, outcome.warnings), {
       id: outcome.row_id,
       unread: movedEarlierUnreadText(name, outcome.warnings),
       held: movedEarlierHeldText(name, outcome.warnings),
@@ -1056,13 +1050,17 @@ export function EventEditor({
           return;
         // The other changes landed and the calendar change didn't (C18d): Google's copy is read
         // again (the session moved on), the calendar chosen kept, so Save tries it alone.
-        case "not_moved":
+        case "not_moved": {
           setPartlySaved(true);
-          await rebaseAfterConflict(
-            notMovedText(outcome.message, calendar?.name ?? null, outcome.warnings),
-            true,
-          );
+          const name = calendar?.name ?? null;
+          const head = notMovedText(outcome.message, name, outcome.warnings);
+          await rebaseAfterConflict(head, {
+            id: row.id,
+            unread: notMovedUnreadText(outcome.message, name, outcome.warnings),
+            held: head,
+          });
           return;
+        }
         case "moved_earlier":
           await goOnWhereItLanded(outcome);
           return;

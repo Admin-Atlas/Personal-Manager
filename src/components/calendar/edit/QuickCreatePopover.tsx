@@ -61,6 +61,7 @@ import {
   endTimeChoices,
   followStart,
   halfInstant,
+  lengthOnCalendar,
   newEventLength,
   switchNewKind,
   toNewEvent,
@@ -147,6 +148,9 @@ export interface LeftDraft {
   draft: EditorFields;
   calendarId: string;
   timeTouched: boolean;
+  /** The event's own length (a range dragged, or one changed there), which an all-day draft can't
+   *  show; `null` when it has none and takes the length of the calendar it's on. */
+  length: number | null;
   /** Whether Google Meet was pressed (C18b). */
   meetTouched: boolean;
   /** Text the date field couldn't read, still refusing a save. */
@@ -228,13 +232,18 @@ export function QuickCreatePopover({
   // The event's length, kept while its start moves or it goes all day and back: its own to begin
   // with (a range dragged on the grid is the user's, C17), else the account's default.
   const lengthRef = useRef(
-    newEventLength(startDraft) ??
-      newEventLength(seed) ??
+    resume?.length ??
+      newEventLength(startDraft) ??
       lengthFor(overview, targetById(targets, firstCalendar)),
   );
   // Whether the user has changed the time (or dragged it out on the grid): until then, another
   // calendar brings its own length.
   const timeTouched = useRef(resume?.timeTouched ?? timeChosen);
+  // Whether `lengthRef` is the event's own rather than an account's default: one with none to keep
+  // takes the length of the calendar it's on when it goes timed (`lengthOnCalendar`).
+  const ownLength = useRef(
+    resume ? resume.length !== null : timeChosen && newEventLength(startDraft) !== null,
+  );
   // Whether the user has pressed Google Meet: until then, it follows Google (`meetOnCalendar`).
   const meetTouched = useRef(resume?.meetTouched ?? false);
   // Another calendar turned the call off, offering no Meet: said with the notes until it next
@@ -390,6 +399,7 @@ export function QuickCreatePopover({
               draft: d,
               calendarId: calendarRef.current,
               timeTouched: timeTouched.current,
+              length: ownLength.current ? lengthRef.current : null,
               meetTouched: meetTouched.current,
               badDate: badDateRef.current,
             };
@@ -480,7 +490,10 @@ export function QuickCreatePopover({
   function lengthOf(t: Timed): number {
     const s = halfInstant(NEW_EVENT_BASE, t, "start");
     const e = halfInstant(NEW_EVENT_BASE, t, "end");
-    if (s !== null && e !== null && e - s >= 60_000) lengthRef.current = e - s;
+    if (s !== null && e !== null && e - s >= 60_000) {
+      if (e - s !== lengthRef.current) ownLength.current = true;
+      lengthRef.current = e - s;
+    }
     return lengthRef.current;
   }
 
@@ -492,11 +505,13 @@ export function QuickCreatePopover({
    *  day came from the start date follows it. */
   function changeTime(time: TimeDraft) {
     timeTouched.current = true;
+    if (time.kind === "timed") lengthOf(time);
     setDraft(followStart(draftRef.current, { ...draftRef.current, time }));
   }
 
-  /** Another calendar. While the time is still the seed's, the end follows that account's length.
-   *  The video call follows the calendar (`meetOnCalendar`, C18b). */
+  /** Another calendar. While the time is still the seed's, the end follows that account's length;
+   *  after that a length on screen stays (`lengthOnCalendar`). The video call follows the calendar
+   *  (`meetOnCalendar`, C18b). */
   function pickCalendar(id: string) {
     setCalendarId(id);
     const target = targetById(targets, id);
@@ -507,6 +522,9 @@ export function QuickCreatePopover({
       lengthRef.current = length;
       const t = next.time;
       if (t.kind === "timed") next = { ...next, time: endAfterStart(NEW_EVENT_BASE, t, length) };
+    } else {
+      const usual = lengthFor(overviewRef.current, target);
+      lengthRef.current = lengthOnCalendar(next, ownLength.current, lengthRef.current, usual);
     }
     const call = meetOnCalendar(overviewRef.current, target, next, meetTouched.current);
     if (call.meet !== next.meet) next = { ...next, meet: call.meet };
@@ -538,6 +556,7 @@ export function QuickCreatePopover({
       showAsTouched: false,
       timeTouched: timeTouched.current,
       meetTouched: meetTouched.current,
+      length: ownLength.current ? lengthRef.current : null,
       // Read after the blur above, so a date typed and not yet read is refused there too: the field
       // put back the date it had, which the full editor must not save in its place.
       badDate: badDateRef.current,

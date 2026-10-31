@@ -68,7 +68,9 @@ import {
   moveFailedText,
   moveLabel,
   moveOfferText,
+  NOT_MOVED_UNREAD,
   notMovedText,
+  notMovedUnreadText,
   notOrganizerText,
   outcomeText,
   partialText,
@@ -551,6 +553,51 @@ describe("another calendar (C18d)", () => {
     // Saved for every occurrence on its own calendar: as before.
     expect(savedNotice("Gym", { outcome: "saved", warnings: [] }, "all").text).toBe(
       "Saved “Gym” for every occurrence. To change it back, edit it again.",
+    );
+  });
+
+  // Review round 3 of PR 1: with Save held, no message offers it. A backend message that offers
+  // another go has a row here: a test in Rust looks each one up in this file, word for word.
+  it.each([
+    [
+      "Its guests changed in Google just now, so PM didn't change its calendar. Save again to answer for them.",
+      "Its guests changed in Google just now, so PM didn't change its calendar.",
+    ],
+    [
+      "PM lost touch with Google, and the event is still on its calendar. Try again.",
+      "PM lost touch with Google, and the event is still on its calendar.",
+    ],
+    [
+      "PM couldn't reach Google to change its calendar. Try again when you're back online.",
+      "PM couldn't reach Google to change its calendar.",
+    ],
+    [
+      "PM couldn't get this account's Google sign-in ready to change its calendar. Try again in a moment.",
+      "PM couldn't get this account's Google sign-in ready to change its calendar.",
+    ],
+    [
+      "PM couldn't ask Google about this event, so its calendar didn't change. Try again.",
+      "PM couldn't ask Google about this event, so its calendar didn't change.",
+    ],
+    ["PM couldn't change its calendar. Try again.", "PM couldn't change its calendar."],
+    // What offers nothing stays whole, and a sentence that isn't an offer isn't mistaken for one.
+    ["Google is busy right now.", "Google is busy right now."],
+    [
+      "Google needs you to sign in to this account again.",
+      "Google needs you to sign in to this account again.",
+    ],
+  ])("a held save's words offer no other go: %j", (message, reason) => {
+    expect(notMovedUnreadText(message, "Home")).toBe(
+      `Your other changes are saved, but it's still on Home. ${reason} ${NOT_MOVED_UNREAD}`,
+    );
+  });
+
+  it("a held save's words leave the calendar's name and the warnings alone", () => {
+    expect(notMovedUnreadText("Try again.", "St. Try again. Club", ["call_failed"])).toBe(
+      `Your other changes are saved, but it's still on St. Try again. Club. Google didn't make the video call. Add it again from Edit, or in Google Calendar. ${NOT_MOVED_UNREAD}`,
+    );
+    expect(notMovedUnreadText("Try again.", null)).toBe(
+      `Your other changes are saved, but its calendar didn't change. ${NOT_MOVED_UNREAD}`,
     );
   });
 

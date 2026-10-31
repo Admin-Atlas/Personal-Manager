@@ -692,7 +692,9 @@ export function notMovedText(
 ): string {
   const still = calendar ? `it's still on ${calendar}` : "its calendar didn't change";
   const said = warningWords(warnings).words;
-  return [`Your other changes are saved, but ${still}.`, message, ...said].join(" ");
+  return [`Your other changes are saved, but ${still}.`, message, ...said]
+    .filter((sentence) => sentence !== "")
+    .join(" ");
 }
 
 /** A calendar change PM lost the answer to had landed, found by a Save with more to send
@@ -739,11 +741,22 @@ export function movedEarlierUnreadText(
 export const NOT_MOVED_UNREAD =
   "PM couldn't read the event again afterwards, so close it and open it again before changing anything more.";
 
-/** `head`, what that save came to, then `NOT_MOVED_UNREAD`. Save is held then, since nothing here is
- *  known to match Google, or may even be the row the event has now: a change of guests' "Save again"
- *  (the backend's `TRANSFER_GUESTS_CHANGED`) goes, as opening it again is how it's answered. */
-export function notMovedUnreadText(head: string): string {
-  return `${head.replace(" Save again to answer for them.", "")} ${NOT_MOVED_UNREAD}`;
+/** A sentence of a `not_moved` message that offers another go at the Save. A test in Rust holds the
+ *  backend to this: each such sentence it can send opens with these words, with a row of its own in
+ *  this file's test. */
+const RETRY_SENTENCE = /(^|\. )(?:Try|Save) again[^.]*\./g;
+
+/** What that save came to (`notMovedText`), then `NOT_MOVED_UNREAD`. Save is held then, since nothing
+ *  here is known to match Google, or may even be the row the event has now: the message's offer of
+ *  another go at it goes, as opening the event again is how it's answered. Only the message is
+ *  searched: a calendar's name is the user's. */
+export function notMovedUnreadText(
+  message: string,
+  calendar: string | null,
+  warnings: readonly WriteWarning[] = [],
+): string {
+  const reason = message.replace(RETRY_SENTENCE, (_, before: string) => (before ? "." : "")).trim();
+  return `${notMovedText(reason, calendar, warnings)} ${NOT_MOVED_UNREAD}`;
 }
 
 /** Join on a video call when the browser didn't open: the link can still be copied beside it. */

@@ -22,6 +22,7 @@ import { safeUrl } from "../markdown";
 import {
   BLOCKS,
   HIDDEN,
+  VOID,
   asciiLower,
   isAlpha,
   isDigit,
@@ -82,8 +83,10 @@ export const MAX_DEPTH = 32;
  *  (Outlook's `<o:p>`). Markdown drops a block of HTML it doesn't know whole (`<center>`,
  *  `<html><body>…`), words and all, so only the formatted view shows such a description's words. An
  *  address in angle brackets is never an element (`literal`), so Outlook's and Teams' plain text keeps
- *  the Markdown path, and nor are other words Markdown shows (`<www.example.com>`, `<Room 4>`). A word
- *  Markdown reads as a tag and drops (`<Room>`) is dropped here too: no words are lost by the flip. */
+ *  the Markdown path, and nor are other words Markdown shows (`<www.example.com>`, `<Room 4>`,
+ *  `<José>`, `<Room A, B>`). A word Markdown reads as a tag and drops (`<Room>`) is dropped here too.
+ *  The one way a word goes with the flip is a name the reader knows with something odd after it
+ *  (`<Table 4>`), which Markdown shows and a browser draws as that element (`readsAsWords`). */
 const isMarkup = (name: string) => !name.includes(":");
 
 // --- telling formatting from plain text ---
@@ -310,22 +313,6 @@ const BLOCK_TAGS = new Map<string, Block>([
 ]);
 /** Unwrapped, and written back without them: they draw nothing themselves. */
 const SPANS: ReadonlySet<string> = new Set(["span", "html-blob"]);
-const VOID: ReadonlySet<string> = new Set([
-  "area",
-  "base",
-  "col",
-  "embed",
-  "hr",
-  "img",
-  "input",
-  "keygen",
-  "link",
-  "meta",
-  "param",
-  "source",
-  "track",
-  "wbr",
-]);
 /** Elements the HTML tree builder stops at when an `li` looks for the item it closes. */
 const LIST_STOPS: ReadonlySet<string> = new Set(
   [...BLOCKS].filter((name) => name !== "div" && name !== "p" && name !== "address"),

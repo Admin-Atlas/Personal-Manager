@@ -310,6 +310,7 @@ const handed = (draft: EditorFields, over: Partial<CreateHandover> = {}): Create
   showAsTouched: false,
   timeTouched: false,
   meetTouched: false,
+  length: null,
   badDate: null,
   openCustom: false,
   ...over,
@@ -2433,6 +2434,64 @@ describe("NewEventEditor opened on a copy (C18c)", () => {
     pickCalendar("Personal", "Work");
     fireEvent.click(screen.getByRole("switch", { name: "All day" }));
     expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  // Review round 3 of PR 1: what the event's length is, when all day hides it.
+  const endAfterAllDayOnWork = () => {
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    return screen.getByLabelText<HTMLSelectElement>("End time").value;
+  };
+  const allDay = {
+    kind: "all_day",
+    first_day: "2026-10-12",
+    last_day: "2026-10-12",
+  } as EditorFields["time"];
+
+  it("a dragged range handed over all day keeps its length on another calendar", () => {
+    open({
+      handover: handed({ ...seed, time: allDay }, { timeTouched: true, length: 45 * 60_000 }),
+    });
+    pickCalendar("Personal", "Work");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:45");
+  });
+
+  it("an all-day handover with no length of its own takes the length of the calendar it came on", () => {
+    open({
+      handover: handed({ ...seed, time: allDay }, { calendarId: WORK_CAL, timeTouched: true }),
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("09:30");
+  });
+
+  it("a length on screen stays through another calendar, then all day and back", () => {
+    open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "10:00" } });
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:00");
+    pickCalendar("Personal", "Work");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:00");
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+    expect(screen.getByLabelText<HTMLSelectElement>("Start time").value).toBe("09:00");
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("10:00");
+  });
+
+  it("a length the user changed is theirs through all day on another calendar", () => {
+    open();
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "10:30" } });
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "09:30" } });
+    expect(screen.getByLabelText<HTMLSelectElement>("End time").value).toBe("11:00");
+    expect(endAfterAllDayOnWork()).toBe("10:30");
+  });
+
+  // Only the end changed, with no start move to note it: all day and back still keeps it.
+  it("an end the user changed is kept through all day and back", () => {
+    open();
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "10:30" } });
+    expect(endAfterAllDayOnWork()).toBe("10:30");
   });
 
   // Its own length stays: a timed copy all day and back on another account's calendar.

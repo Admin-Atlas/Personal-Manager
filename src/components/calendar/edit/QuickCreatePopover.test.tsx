@@ -407,6 +407,7 @@ describe("QuickCreatePopover", () => {
       showAsTouched: false,
       timeTouched: true,
       meetTouched: false,
+      length: null,
       badDate: null,
       openCustom: false,
     });
@@ -605,6 +606,108 @@ describe("QuickCreatePopover", () => {
       start_time: "14:00",
       end_time: "14:30",
     });
+  });
+
+  // Review round 3 of PR 1: what the event's length is, when all day hides it, here and on the way
+  // to the full editor and back from another tab.
+  const pickWork = () => {
+    fireEvent.click(screen.getByRole("button", { name: "Calendar: Personal" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Work" }), { detail: 1 });
+  };
+  const allDayToggle = () => fireEvent.click(screen.getByRole("switch", { name: "All day" }));
+  const handedLength = (onMore: ReturnType<typeof vi.fn>) => {
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    return onMore.mock.lastCall![0];
+  };
+
+  it("a dragged range ticked all day hands over its length", () => {
+    const { onMore } = open({ placement: "beside", timeTouched: true });
+    allDayToggle();
+    expect(handedLength(onMore)).toMatchObject({
+      timeTouched: true,
+      length: 3_600_000,
+      draft: { time: { kind: "all_day" } },
+    });
+  });
+
+  it("a slot clicked and ticked all day hands over no length of its own", () => {
+    const { onMore } = open({ placement: "beside" });
+    allDayToggle();
+    expect(handedLength(onMore)).toMatchObject({ timeTouched: true, length: null });
+  });
+
+  it("an end the user changed is handed over as theirs", () => {
+    const { onMore } = open();
+    fireEvent.change(screen.getByLabelText("End time"), { target: { value: "10:30" } });
+    allDayToggle();
+    expect(handedLength(onMore).length).toBe(90 * 60_000);
+  });
+
+  it("a start the user moved, its length still the account's, hands over no length of its own", () => {
+    const { onMore } = open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
+    expect(handedLength(onMore).length).toBeNull();
+  });
+
+  it("all day on another calendar and back takes that account's length", () => {
+    const { onDraft } = open();
+    allDayToggle();
+    pickWork();
+    allDayToggle();
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({
+      start_time: "09:00",
+      end_time: "09:30",
+    });
+  });
+
+  it("a dragged range, all day on another calendar and back, keeps its own", () => {
+    const { onDraft } = open({ placement: "beside", timeTouched: true });
+    allDayToggle();
+    pickWork();
+    allDayToggle();
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({ end_time: "10:00" });
+  });
+
+  it("a length on screen stays through another calendar, then all day and back", () => {
+    const { onDraft } = open();
+    fireEvent.change(screen.getByLabelText("Start time"), { target: { value: "11:00" } });
+    pickWork();
+    allDayToggle();
+    allDayToggle();
+    expect(onDraft.mock.lastCall![0].time).toMatchObject({
+      start_time: "09:00",
+      end_time: "10:00",
+    });
+  });
+
+  it("a draft back from the tab, all day, keeps its length or takes its calendar's", async () => {
+    const left = {
+      seed,
+      draft: {
+        ...seed,
+        summary: "Dentist",
+        time: { kind: "all_day", first_day: "2026-10-12", last_day: "2026-10-12" },
+      } as EditorFields,
+      calendarId: WORK_CAL,
+      timeTouched: true,
+      meetTouched: false,
+      badDate: null,
+    };
+    for (const [length, end] of [
+      [45 * 60_000, "09:45"],
+      [null, "09:30"],
+    ] as const) {
+      const { onDraft, onLeave, unmount } = open({
+        calendarId: WORK_CAL,
+        resume: { ...left, length },
+      });
+      allDayToggle();
+      expect(onDraft.mock.lastCall![0].time).toMatchObject({ end_time: end });
+      // And it goes back to the tab with what it came with, all day again.
+      allDayToggle();
+      await leave(unmount);
+      expect(onLeave.mock.lastCall![0].length).toBe(length);
+    }
   });
 
   // C17: a range dragged out on the grid keeps its own length through All day and back, never the
@@ -1014,6 +1117,7 @@ describe("QuickCreatePopover", () => {
           },
           calendarId: PERSONAL,
           timeTouched: true,
+          length: null,
           meetTouched: false,
           badDate: "31-02-2026",
         },
@@ -1035,6 +1139,7 @@ describe("QuickCreatePopover", () => {
         draft,
         calendarId: PERSONAL,
         timeTouched: false,
+        length: null,
         meetTouched: false,
         badDate: null,
       },
@@ -1108,6 +1213,7 @@ describe("QuickCreatePopover", () => {
         draft,
         calendarId: PERSONAL,
         timeTouched: true,
+        length: null,
         meetTouched: false,
         badDate: "31-02-2026",
       },
@@ -1343,6 +1449,7 @@ describe("QuickCreatePopover", () => {
       showAsTouched: false,
       timeTouched: false,
       meetTouched: false,
+      length: null,
       badDate: null,
       openCustom: true,
     });
@@ -1446,6 +1553,7 @@ describe("QuickCreatePopover video call (C18b)", () => {
         draft,
         calendarId: WORK_CAL,
         timeTouched: true,
+        length: null,
         meetTouched: true,
         badDate: null,
       },

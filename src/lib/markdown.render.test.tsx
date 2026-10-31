@@ -13,6 +13,7 @@
 
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
+import { tokens } from "./calendarEdit/descriptionTokens";
 import { Markdown } from "./markdown";
 
 afterEach(cleanup);
@@ -155,6 +156,53 @@ describe("plain typed lines (an event's description)", () => {
       const { container } = render(<Markdown plainLines>{line}</Markdown>);
       expect(container.textContent).toContain(words);
     }
+  });
+
+  // Review round 3 of PR 1: the description's reader calls a name it doesn't know an element only
+  // where this drops the tag too, so the flip to the formatted view loses no words. The two readers
+  // are held to each other, for what each is.
+  const asWords = (line: string) => tokens(line).some((token) => token.kind === "literal");
+  it.each([
+    ["Ask <José> about it", "José"],
+    ["Meet at <Building A, Room B> today", "Building A, Room B"],
+    ["<Ask Bob!> first", "Ask Bob!"],
+    ['Meet <Room "A">', 'Room "A"'],
+    ["Contact <John Smith, PM> please", "John Smith, PM"],
+    ["Ask <John O'Brien> today", "John O'Brien"],
+    ["Dial in: <Room A, B>", "Room A, B"],
+    ["See <Room A/B>", "Room A/B"],
+    ["see <your name here?>", "your name here?"],
+    ["Call <Ann Lee, Bob Ray> now", "Ann Lee, Bob Ray"],
+    ["x <Room / > y", "Room / "],
+    ['x <Room a="b"c> y', 'Room a="b"c'],
+    ["x <Room a=b`c> y", "Room a=b"],
+    ["x <Room a=> y", "Room a="],
+    ["x <Room =x> y", "Room =x"],
+    ["x </José> y", "José"],
+    ["x </Room 4> y", "Room 4"],
+    ["x </first.last> y", "first.last"],
+    ["x <first.last> y", "first.last"],
+  ])("shows what the description's reader calls words: %j", (line, words) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent).toContain(words);
+    expect(asWords(line)).toBe(true);
+  });
+
+  it.each([
+    "x <Room> y",
+    "x <Room A> y",
+    "x <Room/> y",
+    "x <Room A /> y",
+    "x <Room _a> y",
+    "x <Room :a.b-1> y",
+    'x <Room a="b>c"> y',
+    "x <Room a='b' c = d e> y",
+    "x </Room> y",
+    "x </Room > y",
+  ])("drops what the description's reader calls an element: %j", (line) => {
+    const { container } = render(<Markdown plainLines>{line}</Markdown>);
+    expect(container.textContent?.trim()).toBe("x  y");
+    expect(asWords(line)).toBe(false);
   });
 
   it("keeps an indented line as text", () => {

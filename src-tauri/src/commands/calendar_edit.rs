@@ -23857,6 +23857,84 @@ mod tests {
         }
     }
 
+    /// Review round 3 of PR 1: a save the webview holds after a re-read that failed
+    /// (`notMovedUnreadText`) takes out of a `not_moved` message the sentence that offers another
+    /// go. Every such sentence the backend can send opens with the words its `RETRY_SENTENCE`
+    /// knows, and its message has a row in that file's test, word for word: a rewording can't
+    /// bring "Save again" back above a held Save unseen.
+    #[test]
+    fn the_webview_knows_each_offer_of_another_go_in_not_moved() {
+        let words = include_str!("../../../src/lib/calendarEdit/editReasons.ts");
+        let rows = include_str!("../../../src/lib/calendarEdit/editReasons.test.ts");
+        assert!(
+            words.contains(r"const RETRY_SENTENCE = /(^|\. )(?:Try|Save) again[^.]*\./g;"),
+            "the webview's rule for a retry sentence changed: this test's two openings go with it"
+        );
+        let refused = [
+            OFFLINE.to_string(),
+            NOT_SENT.to_string(),
+            format!("{ASK_FAILED}: a cause"),
+        ]
+        .map(|message| WriteOutcome::Failed { message });
+        let answers = [
+            WriteOutcome::Busy,
+            WriteOutcome::Conflict { fields: Vec::new() },
+            WriteOutcome::Reauth,
+            WriteOutcome::NoChange,
+        ];
+        let reasons = every_reason();
+        let read_only = reasons
+            .iter()
+            .map(|reason| WriteOutcome::ReadOnly { reason: *reason });
+        let messages: Vec<String> = [
+            TRANSFER_OTHER_GOOGLE,
+            TRANSFER_NOT_SYNCED,
+            TRANSFER_NOT_OWNED,
+            TRANSFER_TOO_MANY,
+            TRANSFER_INVITED,
+            TRANSFER_REFUSED,
+            TRANSFER_LOST,
+            TRANSFER_UNREACHABLE,
+            TRANSFER_GUESTS_CHANGED,
+            TRANSFER_DISCONNECTED,
+            TRANSFER_WITH_REPEAT,
+        ]
+        .map(str::to_string)
+        .into_iter()
+        .chain(refused.iter().chain(answers.iter()).map(transfer_words))
+        .chain(read_only.map(|outcome| transfer_words(&outcome)))
+        .chain(
+            [
+                SeriesRefusal::CalendarIsSeriesWide,
+                SeriesRefusal::CalendarFollowing,
+                SeriesRefusal::TransferSplit,
+            ]
+            .iter()
+            .map(ToString::to_string),
+        )
+        .collect();
+        let offers = |s: &str| {
+            let lower = s.to_lowercase();
+            lower.contains("try again") || lower.contains("save again")
+        };
+        let mut found = 0;
+        for message in messages.iter().filter(|message| offers(message)) {
+            found += 1;
+            for sentence in message.split_inclusive(". ").filter(|s| offers(s)) {
+                assert!(
+                    sentence.starts_with("Try again") || sentence.starts_with("Save again"),
+                    "“{message}” offers another go in words the webview's rule doesn't take out"
+                );
+            }
+            assert!(
+                rows.contains(&format!("\"{message}\"")),
+                "“{message}” has no row in the webview's test of a held save's words"
+            );
+        }
+        // Six today: the rule above has something to hold.
+        assert_eq!(found, 6);
+    }
+
     /// C19 critique C2-M1: the reason for formatting PM can't edit is the same sentence on both
     /// sides, since a row of the choices says the backend's and the editor its own.
     #[test]
