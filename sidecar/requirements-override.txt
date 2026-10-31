@@ -13,8 +13,5 @@
 # The lock is still complete, since uv resolved every dependency, and every line is still
 # hash-checked.
 #
-#   pillow — 13.0.0 carries the fixes for the image-decoder advisories published from 2026-10-17;
-#     fastembed 0.9.0 declares `pillow<13` on every Python, though its code runs on 13 and PM calls
-#     only its text models. Remove this line once a fastembed release allows pillow 13
-#     (qdrant/fastembed#830, open and unmerged at 0.9.0). Keep the file even when it is empty.
-pillow==13.0.0
+#   (none) — the last override, `pillow==13.0.0` past fastembed 0.9.0's `pillow<13`, left when
+#     fastembed 0.9.1 allowed pillow 13 (qdrant/fastembed#830). Keep the file even when it is empty.

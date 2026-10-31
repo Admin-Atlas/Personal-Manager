@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.159.2-alpha",
+    date: "2026-10-31",
+    highlights: [
+      "Under-the-hood tidying: updates to the parts of PM that read your documents and make them searchable, to how it watches your local folders, and to a few of the building blocks underneath. The first time PM starts after this update it sets up its document engine again by itself, along with photo text recognition and the map's extra layout if you've added them. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.159.1-alpha",
     date: "2026-10-29",
     highlights: [

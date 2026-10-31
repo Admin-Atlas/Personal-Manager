@@ -173,13 +173,13 @@
       }
     },
     "fastembed": {
-      "versions": ["0.9.0"],
+      "versions": ["0.9.1"],
       "licence": "Apache-2.0",
-      "stamp": "37b3881cdf666040598f36c2a0a10c91",
+      "stamp": "9c8e141915b72475c6683bf361c5022a",
       "evidence": {
-        "expression": null,
-        "license": "Apache-2.0",
-        "classifiers": ["License :: OSI Approved :: Apache Software License"]
+        "expression": "Apache-2.0",
+        "license": null,
+        "classifiers": []
       }
     },
     "faster-whisper": {
@@ -326,9 +326,9 @@
       }
     },
     "mammoth": {
-      "versions": ["1.11.0"],
+      "versions": ["1.13.0"],
       "licence": "BSD-2-Clause",
-      "stamp": "9ead2e01e0bfc7d2070598366b470e09",
+      "stamp": "c3e7039fa1ec10f229feff6f28d1e583",
       "evidence": {
         "expression": null,
         "license": "BSD-2-Clause",
@@ -347,9 +347,9 @@
       "note": "Classifier only; the project's LICENSE is the MIT text."
     },
     "markitdown": {
-      "versions": ["0.1.8"],
+      "versions": ["0.1.9"],
       "licence": "MIT",
-      "stamp": "667d44e36f6fd04f474f8e934b61c8f7",
+      "stamp": "b30f2a148f1edebb0f0be5cc49a927aa",
       "evidence": {
         "expression": "MIT",
         "license": null,

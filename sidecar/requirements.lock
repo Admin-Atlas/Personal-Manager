@@ -21,8 +21,8 @@
 #
 # pm-lock: 1
 # pm-python-floor: 3.11
-# pm-input: sidecar/requirements.txt@sha256:30c86bfc9acd7aec0b87b8642b409887618b6a6e216442b06547adf379a45106
-# pm-override: sidecar/requirements-override.txt@sha256:0ad677b8821f238240c27ef7f64a9d1b4972ddd7bc97df048dc8601feedd9bd3
+# pm-input: sidecar/requirements.txt@sha256:9249bd0823b4471400d3ec0599a53b0cc8194cd4a197312fa0ac2c34b2ea6fd6
+# pm-override: sidecar/requirements-override.txt@sha256:ffde719623bc0dfb41c30b6bd3ca4a2d112bb8c9f23cc7bed96f1355c4cf5f24
 anyio==4.14.2 \
     --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494 \
     --hash=sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f
@@ -62,6 +62,7 @@ certifi==2026.10.19 \
     # via
     #   httpcore
     #   httpx
+    #   markitdown
     #   requests
 cffi==2.1.1 ; platform_python_implementation != 'PyPy' \
     --hash=sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e \
@@ -454,9 +455,9 @@ et-xmlfile==2.0.0 \
     --hash=sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa \
     --hash=sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54
     # via openpyxl
-fastembed==0.9.0 \
-    --hash=sha256:273d408edec8c0f161711d8f6e44e4a5b559d18e8edf6bf805415d55dc772846 \
-    --hash=sha256:bc3beadb46ecb3580ab832d12670be7ecb937f80adfcb7b77b03f7eef76c394a
+fastembed==0.9.1 \
+    --hash=sha256:8b4b2881ea85a4d36e8f284466671437b3fed869c33cdc71d6f6c48ddff115c7 \
+    --hash=sha256:95042ac7f685bda6697861066d49f8b119fbde8b75ed5162bbb7e84e2dad0e1d
     # via -r sidecar/requirements.txt
 faster-whisper==1.2.1 \
     --hash=sha256:79a66ad50688c0b794dd501dc340a736992a6342f7f95e5811be60b5224a26a7
@@ -715,17 +716,17 @@ magika==0.6.3 ; sys_platform != 'win32' \
     --hash=sha256:e57f75674447b20cab4db928ae58ab264d7d8582b55183a0b876711c2b2787f3 \
     --hash=sha256:eda443d08006ee495e02083b32e51b98cb3696ab595a7d13900d8e2ef506ec9d
     # via markitdown
-mammoth==1.11.0 \
-    --hash=sha256:a0f59e442f34d5b6447f4b0999306cbf3e67aaabfa8cb516f878fb1456744637 \
-    --hash=sha256:c077ab0d450bd7c0c6ecd529a23bf7e0fa8190c929e28998308ff4eada3f063b
+mammoth==1.13.0 \
+    --hash=sha256:b359bee7bc00caba47dacc64286928133dd947917bab852eea01d0c8d8997296 \
+    --hash=sha256:dd7629fa9d0a5e82207b3f481a9dcb8308fb43f6206258e062f11121efba9991
     # via markitdown
 markdownify==1.2.3 \
     --hash=sha256:1a176f05522c8a2cb1dd3ab9d307dcdadbed5c26ae717855bfc42b3b6d38d937 \
     --hash=sha256:a189a0bedfd14009030fde5f85bb6f77c56897cb839b5c25315dd7d4e3e290ba
     # via markitdown
-markitdown==0.1.8 \
-    --hash=sha256:17188ad827ea79fc264c7b1ca8cf5a242a16278d84cc32f2edc475dbe92812ed \
-    --hash=sha256:de7375a50578a39bcbbf13b48c67d99033d988e0ae8ad25af46ed432dbe4cbab
+markitdown==0.1.9 \
+    --hash=sha256:52f59c48bea9cf887224c56247f648d68beb7aa7af5a12d414748210c83c20ea \
+    --hash=sha256:8f692236fc104b9251e1b86bdea969c6a1617174fe37eebb78ac6fa62a2894f0
     # via -r sidecar/requirements.txt
 mmh3==5.3.0 \
     --hash=sha256:00105934e7d52f80b4364282918c37e2cc3cf9868ef4052016cbc39d8711c3f4 \
@@ -1209,7 +1210,6 @@ pillow==13.0.0 \
     --hash=sha256:ff3fe9eb621fbb9db4c4be33ab946f6bac5f98ab50ca8d3260503653656c961b \
     --hash=sha256:ffea6b2986a797c84b6d1d27d4f43e0b83c73fc16281a930891cd237cf0d08fe
     # via
-    #   --override sidecar/requirements-override.txt
     #   -r sidecar/requirements.txt
     #   fastembed
     #   pdfplumber

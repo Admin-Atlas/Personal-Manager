@@ -209,7 +209,7 @@ jobs:
       # set, with a missing fastembed a failure rather than a skip. About 550 MB and a minute, and
       # the embedding test downloads the 67 MB English model, so only when sidecar/ changed.
       # Installed exactly as the app installs it, `--no-deps` included (sidecar.rs `provision`
-      # says why: the lock overrides fastembed's pillow cap).
+      # says why: an override can resolve the lock past a dependency's bound).
       - name: Sidecar unit tests (the locked dependencies, sidecar changes only)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

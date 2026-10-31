@@ -108,8 +108,8 @@ function main() {
   const baseInputHash = sha256(read(BASE_INPUT));
   const overrideHash = sha256(read(BASE_OVERRIDE));
 
-  // `--override` on the base compile only: it lifts a dependency's declared bound (fastembed's
-  // `pillow<13`, see that file's header). The optional locks inherit the result through the
+  // `--override` on the base compile only: it lifts a dependency's declared bound (see that
+  // file's header). The optional locks inherit the result through the
   // base-lock constraint below rather than taking the override themselves.
   const base = compile({
     label: BASE_LOCK,

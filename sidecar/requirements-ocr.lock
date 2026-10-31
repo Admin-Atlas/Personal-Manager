@@ -22,7 +22,7 @@
 # pm-lock: 1
 # pm-python-floor: 3.11
 # pm-input: sidecar/requirements-optional.txt@sha256:bbfc9c5804fc0d4f7c282c010593a6968eec9738d2847a9deb41fc6a9d84486c
-# pm-constraint: sidecar/requirements.lock@sha256:2cf1d3390e6ae556647f39daa398d8a6f0075b1087adeea23fdc0dfe94d31ba6
+# pm-constraint: sidecar/requirements.lock@sha256:84db4c74fb30d80a6bd3fd80691b9ae79f95f9d4141e1ea34659c024e089f188
 # pm-pins: rapidocr==3.10.0 pi-heif==1.4.0
 antlr4-python3-runtime==4.9.3 \
     --hash=sha256:f224469b4168294902bb1efa80a8bf7855f24c99aef99cbefc1bcd3cce77881b

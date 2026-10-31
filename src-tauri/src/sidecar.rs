@@ -1136,10 +1136,9 @@ impl SidecarManager {
         // whatever PyPI served that day — in the one process that opens untrusted PDFs, Office
         // documents and images. The flag is also fail-closed in a second, useful way: it makes pip
         // reject a lock that is not FULLY pinned, so a partially-regenerated file cannot install.
-        // `--no-deps`: the lock is resolved past one dependency's declared bound. fastembed 0.9.0
-        // says `pillow<13`, but only pillow 13 carries the decoder fixes published from 2026-10-17
-        // (see sidecar/requirements-override.txt), so pip's own resolver would refuse the lock. The
-        // lock needs no resolving here anyway: uv resolved every dependency into it, and
+        // `--no-deps`: an override in sidecar/requirements-override.txt resolves the lock past a
+        // dependency's declared bound (fastembed 0.9.0's `pillow<13` until 0.9.1 lifted it), and
+        // pip's own resolver would then refuse the lock. The lock needs no resolving here anyway: uv resolved every dependency into it, and
         // `just requirements-lock` fails one that has drifted from its inputs. Every line is still
         // pinned and hash-checked; what pip no longer does is notice a dependency MISSING from the
         // lock, which only a hand-edited lock could produce. The optional installs and CI's
@@ -4195,8 +4194,9 @@ mod tests {
     #[test]
     fn every_lock_install_is_hash_checked_and_resolves_nothing() {
         // `--require-hashes`: an artifact whose digest is not in the lock is refused. `--no-deps`:
-        // pip must not re-resolve, because the base lock overrides fastembed 0.9.0's `pillow<13`
-        // and pip's resolver refuses it (ResolutionImpossible) — every install would fail.
+        // pip must not re-resolve: whenever the base lock overrides a dependency's bound (as it did
+        // fastembed 0.9.0's `pillow<13`), pip's resolver refuses it (ResolutionImpossible) and
+        // every install would fail.
         assert!(LOCK_INSTALL_FLAGS.contains(&"--require-hashes"));
         assert!(LOCK_INSTALL_FLAGS.contains(&"--no-deps"));
     }
