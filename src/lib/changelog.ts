@@ -24,6 +24,21 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.161.2-alpha",
+    date: "2026-11-01",
+    release: true,
+    highlights: [
+      "You can now change your Google calendars from PM. Turn on editing for an account in Settings › Connectors and PM can create events (+ New event, Shift+C for a quick one, or click or drag on the calendar), change them, move and resize them by dragging, and delete them, with a few seconds to Undo. Nothing changes on any account until you turn editing on, and PM reads Google's latest copy first, so a change made somewhere else isn't overwritten.",
+      "Repeating events and guests work as they do in Google Calendar. PM asks whether you mean this event, this and the following events, or all events. New events can repeat, and you can change how one repeats. Add guests, mark them optional and choose what they may do; PM asks each time whether Google should email them, and says how many emails that is.",
+      "Invitations can be answered from PM: choose Yes, No or Maybe, add a note, and set your own notifications, colour and Busy or Free. Remove takes one off your calendar, and Google tells the organiser you declined. Events you've declined are struck through.",
+      "Events can do much more: Google Meet calls, Duplicate, moving to another calendar you own, notifications, Google's eleven colours, and formatted descriptions with bold, lists and links. Birthdays and events Gmail added can be changed where Google allows it, and a calendar shared with you to view only can offer to email its owner for edit access.",
+      "The calendar itself got better too. Changes made in Google show within about half a minute while PM is open, events past midnight fill their hours, events show the colours you gave them in Google, and a sideways swipe moves one day, or as many as you choose in Settings.",
+      "Running AI on your own machine is simpler. Settings › Local AI starts with the model PM would run on your computer and four steps to get it going, with honest speed estimates. Models that think before they answer now work properly on Ollama, with a Thinking button in chat. On battery, PM can hand your work to your cloud model and give your graphics card's memory back, and the sidebar says what each model is doing right now.",
+      "Signing in is sturdier. Disconnecting Google Calendar no longer cuts off Drive or your backups on the same account, Advanced Protection accounts need their Cloud project pasted only once, and while you sign in, Settings shows the link so you can use another browser. Open data folder no longer freezes PM on some Linux desktops.",
+      "Under the hood: security fixes for how PM reads photos and makes secure connections, a safer update on Windows and Mac, and fresher versions of the parts that read your documents. The first time PM starts after this update, it reinstalls its document engine once.",
+    ],
+  },
+  {
     version: "3.161.1-alpha",
     date: "2026-11-01",
     highlights: [
