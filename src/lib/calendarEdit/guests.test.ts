@@ -24,7 +24,6 @@ import {
   moveNotice,
   notifyOf,
   notifyQuestion,
-  REPLY_GLYPH,
   replyOf,
   responseLabel,
   sameAddress,
@@ -116,7 +115,6 @@ describe("replies", () => {
       [null, null],
     ];
     for (const [word, want] of rows) expect([word, replyOf(word)]).toEqual([word, want]);
-    expect(REPLY_GLYPH).toEqual({ yes: "✓", no: "✗", maybe: "?", awaiting: "" });
   });
 
   it("are labelled as the event popover always labelled them", () => {

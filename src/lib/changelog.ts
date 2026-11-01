@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.161.1-alpha",
+    date: "2026-11-01",
+    highlights: [
+      "It's easier to see how each guest answered. The event editor now says “declined”, “accepted”, “maybe” or “no reply” beside a guest, where a declined guest's small ✗ looked like the button that takes them off the list. In an event's details, a long address no longer cuts off the answer after it.",
+    ],
+  },
+  {
     version: "3.161.0-alpha",
     date: "2026-10-31",
     highlights: [

@@ -1144,6 +1144,16 @@ describe("CalendarEventPopover", () => {
       expect(view.getByRole("button", { name: "No" }).getAttribute("aria-pressed")).toBe("true");
     });
 
+    it("cuts a long address short, never the answer after it", () => {
+      const view = render(
+        popover(editing([copy()]), calendarEvent({ attendees: [me("declined")] })),
+      );
+      const answer = view.getByText("— declined");
+      expect(answer.className).toContain("shrink-0");
+      expect(answer.closest(".truncate")).toBeNull();
+      expect(answer.previousElementSibling?.className).toContain("truncate");
+    });
+
     // C14 critiques C1-L4, C2-L3: anything that changes the panel's size re-places it, the
     // strip's question and lines included, not only the words and flags it knows of.
     it("re-places the panel whenever its size changes", () => {

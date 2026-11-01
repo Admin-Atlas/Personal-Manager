@@ -174,8 +174,6 @@ export function responseLabel(v: string | null): string | null {
   }
 }
 
-export const REPLY_GLYPH: Record<Reply, string> = { yes: "✓", no: "✗", maybe: "?", awaiting: "" };
-
 const REPLY_ORDER: readonly Reply[] = ["yes", "no", "maybe", "awaiting"];
 
 /** `k` guests, in words. */

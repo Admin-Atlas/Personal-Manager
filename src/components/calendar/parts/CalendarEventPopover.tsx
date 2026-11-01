@@ -503,10 +503,13 @@ export function CalendarEventPopover({
               {attendees.map((a, i) => {
                 const resp = responseLabel(a.response);
                 return (
-                  <li key={a.email ?? a.name ?? i} className="truncate">
-                    {a.name ?? a.email ?? "(unknown)"}
-                    {a.optional ? " (optional)" : ""}
-                    {resp ? <span className="text-ink4"> — {resp}</span> : null}
+                  <li key={a.email ?? a.name ?? i} className="flex min-w-0 gap-1">
+                    {/* A long address gives way, never the answer after it. */}
+                    <span className="truncate" title={a.email ?? undefined}>
+                      {a.name ?? a.email ?? "(unknown)"}
+                      {a.optional ? " (optional)" : ""}
+                    </span>
+                    {resp ? <span className="shrink-0 text-ink4">— {resp}</span> : null}
                   </li>
                 );
               })}

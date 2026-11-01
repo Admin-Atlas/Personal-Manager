@@ -28,8 +28,6 @@ import {
   isEmail,
   isRoomAddress,
   matchSuggestions,
-  REPLY_GLYPH,
-  replyOf,
   responseLabel,
   sameAddress,
   splitAddresses,
@@ -37,7 +35,7 @@ import {
 } from "../../../lib/calendarEdit/guests";
 import { problemText } from "../../../lib/calendarEdit/editReasons";
 import type { GuestDraft, GuestPerms } from "../../../lib/calendarEdit/eventDraft";
-import { IconButton, Input, VisuallyHidden } from "../../ui";
+import { IconButton, Input } from "../../ui";
 
 interface Props {
   guests: GuestDraft[];
@@ -379,19 +377,16 @@ export function GuestField({
         <ul ref={listRef} aria-label="Guests" className="flex flex-col gap-1">
           {guests.map((g) => {
             const who = g.name?.trim() || g.email;
-            const reply = replyOf(g.response);
             const said = responseLabel(g.response);
             return (
               <li key={addressKey(g.email)} className="flex min-w-0 items-center gap-2">
-                <span aria-hidden="true" className="w-4 shrink-0 text-center text-xs text-ink3">
-                  {reply ? REPLY_GLYPH[reply] : ""}
-                </span>
-                {said && <VisuallyHidden>{said}</VisuallyHidden>}
                 <span className="flex min-w-0 flex-1 items-baseline gap-2">
                   <span className="truncate text-sm text-ink2" title={g.email}>
                     {who}
                   </span>
                   {g.name?.trim() && <span className="truncate text-xs text-ink4">{g.email}</span>}
+                  {/* A word, not a mark: an ✗ here read as this row's own remove button. */}
+                  {said && <span className="shrink-0 text-xs text-ink3">{said}</span>}
                   {(g.organizer || isOrganiser(g.email)) && (
                     <span className="shrink-0 text-xs text-ink4">Organiser</span>
                   )}

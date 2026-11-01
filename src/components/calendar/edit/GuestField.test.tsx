@@ -342,7 +342,9 @@ describe("GuestField, the list", () => {
     expect(screen.getByText("3 guests: 1 yes, 1 no, 1 awaiting")).toBeTruthy();
     const [me, ann] = rows();
     expect(me.textContent).toContain("Organiser");
-    expect(within(ann).getByText("declined").className).toContain("sr-only");
+    // On screen in words: no ✗ mark beside the row's remove button, and nothing hidden.
+    expect(within(ann).getByText("declined").className).not.toContain("sr-only");
+    expect(ann.textContent).not.toContain("✗");
     expect(within(ann).getByText("ann@x.org")).toBeTruthy();
     expect(within(ann).getByText("Ann").getAttribute("title")).toBe("ann@x.org");
   });
