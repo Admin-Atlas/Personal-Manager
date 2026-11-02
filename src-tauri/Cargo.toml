@@ -131,7 +131,7 @@ notify-debouncer-full = "0.7"
 # GPU/VRAM/battery, so GPU/VRAM is hand-rolled in hardware.rs and AC/battery in power_source.rs.
 # default-features off drops the network/component/user probes we don't use — leaner binary and
 # licence surface.
-sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
 # `blocking` is used by python_fetch (macOS interpreter download) from inside spawn_blocking.
