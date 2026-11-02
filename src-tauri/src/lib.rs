@@ -1763,6 +1763,7 @@ pub fn run() {
             commands::delete_project,
             commands::delete_document,
             commands::delete_unreachable_documents,
+            commands::reap_deleted_vault_documents,
             commands::reset_connector_documents,
             commands::list_project_overviews,
             commands::set_project_archived,

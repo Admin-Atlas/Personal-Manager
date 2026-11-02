@@ -122,6 +122,8 @@ pub(super) fn delete_rows(tx: &rusqlite::Connection, document_id: i64) -> Result
     // Read BEFORE the delete — the `photos` row cascades away with the document.
     let photo_original = ingest::saved_photo_original(tx, document_id)?;
     let owns_file = ingest::owns_a_vault_file(source_type.as_deref());
+    // Deleting files never deletes their project (#1024) — only Delete project or Merge does.
+    crate::projects::keep_projects_of(tx, document_id)?;
     ingest::delete_document(tx, document_id)?;
     let nonblank = |s: &String| !s.trim().is_empty();
     Ok(Some(if owns_file {
@@ -219,6 +221,38 @@ pub fn delete_unreachable_documents(
     let deleted = leftovers.len();
     tidy_after_delete(&app, &vault_dir, &vault_root, &manifest_cipher, leftovers);
     Ok(deleted)
+}
+
+/// Drop the documents whose vault file was deleted outside PM (#1024), the way Rebuild's sweep does,
+/// so the Documents list stops showing files that are gone. The list calls this as it loads. Returns
+/// how many went.
+///
+/// Quietly does nothing (`0`) rather than erroring when it can't be sure: while a Rebuild or import
+/// holds `ingest_busy` (a Rebuild sweeps for itself), when any part of the vault couldn't be read
+/// ([`ingest::may_reap`]), and when the walk found no Markdown at all. That last one is a vault folder
+/// that's been moved, emptied or unmounted far more often than a user deleting everything, and an
+/// automatic sweep must not turn it into an empty library. A Rebuild still reaps that case.
+#[tauri::command]
+pub async fn reap_deleted_vault_documents(app: AppHandle) -> Result<usize> {
+    let worker = app.clone();
+    let reaped = spawn_blocking_result("vault reap", move || -> Result<Vec<i64>> {
+        let state = worker.state::<AppState>();
+        let Some(_busy) = BusyGuard::acquire(&state.ingest_busy) else {
+            return Ok(Vec::new());
+        };
+        let (vault, _cipher) = state.markdown_io()?;
+        let (files, unreadable) = ingest::walk_vault_markdown(&vault)?;
+        if !ingest::may_reap(unreadable == 0) || files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = state.conn()?;
+        ingest::sweep_deleted_vault_files(&conn, &vault)
+    })
+    .await?;
+    for id in &reaped {
+        crate::duplicates::forget_document(&app, *id);
+    }
+    Ok(reaped.len())
 }
 
 /// In-chat "Retrieval explain" (card 7H): the same instrumented read the Developer-mode panel runs,

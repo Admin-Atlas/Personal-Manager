@@ -249,9 +249,11 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     // (NULL = Auto / no tag); the old document-derived aggregate is gone.
     // F-19: the overview was driven purely by `documents`, so a project with milestones but ZERO
     // documents vanished from Focus — and, because `run_detection` reads this list, its deadline flags
-    // were pruned as stale. UNION in the document-less projects that still have a reason to surface (a
-    // milestone or a `last_touched` engagement stamp) with `doc_count = 0`; their milestones attach via
-    // the same `milestones_by_project` pass below (that pass was never document-gated).
+    // were pruned as stale. UNION in the document-less projects with `doc_count = 0`; their milestones
+    // attach via the same `milestones_by_project` pass below (that pass was never document-gated).
+    // Every `projects` row counts, not only one with a milestone or an engagement stamp: a project
+    // whose files were all removed is still a project until it is deleted or merged (#1024), and
+    // `keep_projects_of` gives it a row before its last file goes. An empty inbox is not shown.
     // #275: the roster is driven by MEMBERSHIP, not by `documents.project` alone, so a project that
     // exists only as somewhere documents are linked still appears in Focus with an honest file
     // count. Every home membership has a join row (the v46 backfill guarantees it, and
@@ -284,35 +286,36 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
          FROM projects p \
          WHERE NOT EXISTS (SELECT 1 FROM ({memberships}) m2 \
                            WHERE m2.norm = lower(trim(p.name))) \
-           AND (p.last_touched IS NOT NULL \
-                OR p.archived_at IS NOT NULL \
-                OR EXISTS (SELECT 1 FROM project_milestones pm WHERE pm.project_name = p.name)) \
+           AND lower(trim(p.name)) <> lower(:unsorted) \
          ORDER BY name",
         memberships = crate::tags::MEMBERSHIPS_SQL
     ))?;
 
-    let rows = stmt.query_map(named_params![":today": today], |row| {
-        let name: String = row.get(0)?;
-        let doc_count: i64 = row.get(1)?;
-        let last_activity: Option<String> = row.get(2)?;
-        let deadline: Option<String> = row.get(3)?;
-        let size: Option<String> = row.get(4)?;
-        let blocked_by: Option<String> = row.get(5)?;
-        let importance: Option<String> = row.get(6)?;
-        let days_since: Option<f64> = row.get(7)?;
-        let archived: bool = row.get(8)?;
-        Ok((
-            name,
-            doc_count,
-            last_activity,
-            deadline,
-            size,
-            blocked_by,
-            importance,
-            days_since,
-            archived,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        named_params![":today": today, ":unsorted": UNSORTED],
+        |row| {
+            let name: String = row.get(0)?;
+            let doc_count: i64 = row.get(1)?;
+            let last_activity: Option<String> = row.get(2)?;
+            let deadline: Option<String> = row.get(3)?;
+            let size: Option<String> = row.get(4)?;
+            let blocked_by: Option<String> = row.get(5)?;
+            let importance: Option<String> = row.get(6)?;
+            let days_since: Option<f64> = row.get(7)?;
+            let archived: bool = row.get(8)?;
+            Ok((
+                name,
+                doc_count,
+                last_activity,
+                deadline,
+                size,
+                blocked_by,
+                importance,
+                days_since,
+                archived,
+            ))
+        },
+    )?;
 
     let raw: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
@@ -405,6 +408,32 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     }
     Ok(out)
 }
+
+/// Make sure every project `doc_id` belongs to (home and linked) has a `projects` row, so deleting
+/// the document can't take the project with it. Call it BEFORE the delete, in the same transaction.
+///
+/// A project used to exist only while something was filed in it, unless it happened to have a row.
+/// Removing a project's last files (the bulk delete, the connector reset, deleting vault files)
+/// therefore made it vanish from Focus, the pickers and the filing prompt, so the reset's re-fetch
+/// had nowhere to file things back to. A project now goes only when it is deleted or merged. The
+/// inbox is not a project and gets no row: an empty "Unsorted" has nothing to show.
+pub fn keep_projects_of(conn: &Connection, doc_id: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO projects(name) \
+             SELECT m.name FROM ({}) m \
+             WHERE m.document_id = ?1 AND m.norm <> lower(?2) \
+               AND NOT EXISTS (SELECT 1 FROM projects p WHERE lower(trim(p.name)) = m.norm) \
+             GROUP BY m.norm",
+            crate::tags::MEMBERSHIPS_SQL
+        ),
+        params![doc_id, UNSORTED],
+    )?;
+    Ok(())
+}
+
+/// The pre-triage inbox. Not a project the user chose, so it never gets a row of its own.
+const UNSORTED: &str = "Unsorted";
 
 /// Bump a project's `last_touched` to now, creating a bare row if needed. Called when the
 /// user engages a project outside document ingest — sends a message in its scoped chat, or
@@ -1362,6 +1391,57 @@ mod tests {
         let empty = overview_for(&rows, "Empty");
         assert!(empty.archived);
         assert_eq!(empty.doc_count, 0);
+    }
+
+    /// #1024: removing a project's last file used to remove the project — from Focus, the pickers and
+    /// the filing prompt — whenever it had no milestone or engagement stamp. It stays now, with no
+    /// status nagging (no activity date means no Take a look), until it is deleted or merged. The
+    /// inbox gets no row and an empty one isn't shown.
+    #[test]
+    fn a_project_outlives_its_last_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, content_hash, project) \
+             VALUES (1, 'v1', 'h1', 'Atlas'), (2, 'v2', 'h2', 'Unsorted')",
+            [],
+        )
+        .unwrap();
+        crate::tags::set_document_projects(&conn, 1, "Atlas", &["Linked".into()]).unwrap();
+        crate::tags::set_document_projects(&conn, 2, "Unsorted", &[]).unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        for id in [1, 2] {
+            keep_projects_of(&tx, id).unwrap();
+            crate::ingest::delete_document(&tx, id).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Atlas", "Linked"],
+            "both projects stay; the inbox doesn't"
+        );
+        assert_eq!(overview_for(&rows, "Atlas").doc_count, 0);
+        assert_eq!(overview_for(&rows, "Atlas").status, ProjectStatus::OnTrack);
+        let registry = crate::tags::project_names(&conn).unwrap();
+        assert!(
+            registry.contains(&"Atlas".to_string()) && registry.contains(&"Linked".to_string())
+        );
+
+        // Idempotent: a project that already has a row isn't given a second.
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, content_hash, project) VALUES (3, 'v3', 'h3', 'atlas ')",
+            [],
+        )
+        .unwrap();
+        keep_projects_of(&conn, 3).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     /// F-19: a project with milestones but ZERO documents still appears in the overview — so it shows in
