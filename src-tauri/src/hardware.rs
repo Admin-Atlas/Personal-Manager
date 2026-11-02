@@ -341,10 +341,14 @@ fn probe_gpu() -> GpuProbe {
     let mut probe = GpuProbe::default();
     if cfg!(target_arch = "aarch64") {
         // Apple Silicon: the GPU shares system RAM. Size VRAM as the working-set fraction of total.
-        let total_gb = {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            sys.total_memory() as f64 / GIB
+        // A `System` that can't be set up (fallible since sysinfo 0.40) reads as no RAM, the same
+        // answer an unreadable total always gave here.
+        let total_gb = match sysinfo::System::new() {
+            Ok(mut sys) => {
+                sys.refresh_memory();
+                sys.total_memory() as f64 / GIB
+            }
+            Err(_) => 0.0,
         };
         probe.name = Some("Apple Silicon GPU".to_string());
         probe.vendor = Some("Apple".to_string());
