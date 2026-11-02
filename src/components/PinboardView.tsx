@@ -40,7 +40,12 @@ import {
 import { insertTable, moveCell, tableEnter } from "../lib/pinboard/noteTables";
 import { NoteTablePicker } from "./NoteTablePicker";
 import { NoteEditor, type NoteEditorHandle } from "./NoteEditor";
-import { RichNoteEditor, type RichFormat, type RichNoteEditorHandle } from "./RichNoteEditor";
+import {
+  RichNoteEditor,
+  type RichFormat,
+  type RichNoteEditorHandle,
+  type TableAction,
+} from "./RichNoteEditor";
 import { roundTrips } from "../lib/pinboard/richNote";
 import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
 import {
@@ -1080,6 +1085,7 @@ const NoteBody = memo(function NoteBody({
   // shows them too, as it always has.
   const [editing, setEditing] = useState(false);
   const showEditor = editing || !text.trim();
+  const [inTable, setInTable] = useState(false);
 
   // A note opens rich only when the rich editor can hold its text exactly (richNote's `roundTrips`);
   // anything else stays Markdown, so nothing it can't express is ever rewritten. Text the rich editor
@@ -1157,6 +1163,17 @@ const NoteBody = memo(function NoteBody({
     else editorRef.current?.apply((v, s, end) => insertTable(v, s, end, cols, rows));
     setEditing(true);
   };
+  // While the cursor is in a table, the Table button offers that table's rows, columns and removal.
+  const tableMenu =
+    rich && inTable
+      ? {
+          act: (a: TableAction) => {
+            richRef.current?.table(a);
+            setEditing(true);
+          },
+          can: (a: TableAction) => richRef.current?.canTable(a) ?? false,
+        }
+      : undefined;
 
   // The Ingest / filing-status control sits in the top bar (right of the title, left of ✕).
   const ingestControl = !ingested ? (
@@ -1225,6 +1242,7 @@ const NoteBody = memo(function NoteBody({
           value={text}
           onChange={editRich}
           onFocus={() => setEditing(true)}
+          onInTable={setInTable}
           placeholder="Jot something down…"
         />
       ) : (
@@ -1260,7 +1278,11 @@ const NoteBody = memo(function NoteBody({
                   </button>
                 </Tooltip>
               ))}
-              <NoteTablePicker buttonClassName={FORMAT_BUTTON_CLASS} onPick={addTable} />
+              <NoteTablePicker
+                buttonClassName={FORMAT_BUTTON_CLASS}
+                onPick={addTable}
+                table={tableMenu}
+              />
             </div>
           )}
           {/* Right-aligned: colour swatches (edit only) then the size (power). */}

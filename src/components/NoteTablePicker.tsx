@@ -8,6 +8,10 @@
 // It only chooses a size. The table itself is Markdown text, written by noteTables' insertTable
 // through the caller's `onPick`.
 //
+// With the cursor in a table (the document editor says so) the same button opens that table's menu
+// instead, the one Docs puts on a right-click: add a row or column either side, or delete the row,
+// the column or the whole table.
+//
 // The grid escapes the note's clipping (a note card is `overflow-hidden`, and the grid is wider than
 // a small one). Its panel is portalled, so NoteBody treats a press inside any popover panel as a
 // press inside the note, or opening the picker would end the edit.
@@ -15,6 +19,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Popover, Tooltip } from "./ui";
 import { TABLE_PICKER_COLS, TABLE_PICKER_ROWS } from "../lib/pinboard/noteTables";
+import type { TableAction } from "./RichNoteEditor";
 
 const CELL_PX = 16;
 const GAP_PX = 3;
@@ -35,12 +40,25 @@ export function TableIcon() {
   );
 }
 
+const TABLE_MENU: { action: TableAction; label: string }[] = [
+  { action: "rowAbove", label: "Insert row above" },
+  { action: "rowBelow", label: "Insert row below" },
+  { action: "colLeft", label: "Insert column left" },
+  { action: "colRight", label: "Insert column right" },
+  { action: "deleteRow", label: "Delete row" },
+  { action: "deleteCol", label: "Delete column" },
+  { action: "deleteTable", label: "Delete table" },
+];
+
 export function NoteTablePicker({
   onPick,
   buttonClassName,
+  table,
 }: {
   onPick: (cols: number, rows: number) => void;
   buttonClassName: string;
+  /** Set while the cursor is in a table: the button opens that table's menu instead of the grid. */
+  table?: { act: (action: TableAction) => void; can: (action: TableAction) => boolean };
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -49,8 +67,8 @@ export function NoteTablePicker({
       onOpenChange={setOpen}
       escapeClipping
       withinDialog
-      ariaLabel="Insert a table"
-      panelClassName="min-w-0 p-2"
+      ariaLabel={table ? "Table options" : "Insert a table"}
+      panelClassName={table ? "min-w-0 p-1" : "min-w-0 p-2"}
       trigger={({ toggle }) => (
         <Tooltip label="Table">
           <button
@@ -67,7 +85,8 @@ export function NoteTablePicker({
         </Tooltip>
       )}
     >
-      {open && (
+      {open && table && <TableMenu table={table} onDone={() => setOpen(false)} />}
+      {open && !table && (
         <SizeGrid
           onPick={(s) => {
             setOpen(false);
@@ -76,6 +95,62 @@ export function NoteTablePicker({
         />
       )}
     </Popover>
+  );
+}
+
+function TableMenu({
+  table,
+  onDone,
+}: {
+  table: NonNullable<Parameters<typeof NoteTablePicker>[0]["table"]>;
+  onDone: () => void;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  // Read once on open: the cursor can't move while the menu has focus.
+  const [can] = useState(() => new Map(TABLE_MENU.map((m) => [m.action, table.can(m.action)])));
+
+  useEffect(() => {
+    menuRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }, []);
+
+  function onKeyDown(e: KeyboardEvent) {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    e.stopPropagation();
+    const items = [
+      ...menuRef.current!.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+    ];
+    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    const step = e.key === "ArrowDown" ? 1 : -1;
+    items[(at + step + items.length) % items.length]?.focus();
+  }
+
+  return (
+    <div
+      ref={menuRef}
+      role="menu"
+      aria-label="Table"
+      onKeyDown={onKeyDown}
+      className="flex flex-col text-[0.8125rem]"
+    >
+      {TABLE_MENU.map(({ action, label }) => (
+        <button
+          key={action}
+          type="button"
+          role="menuitem"
+          disabled={!can.get(action)}
+          onClick={() => {
+            onDone();
+            table.act(action);
+          }}
+          className={`rounded-[var(--radius-sm)] px-2 py-1 text-left hover:bg-surface focus:bg-surface focus:outline-none disabled:opacity-50 ${
+            action.startsWith("delete") ? "text-st-due" : "text-ink2"
+          } ${action === "deleteRow" ? "mt-1 border-t border-[var(--rule)] pt-1.5" : ""}`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
   );
 }
 

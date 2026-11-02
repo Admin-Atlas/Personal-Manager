@@ -37,11 +37,19 @@ import { keymap } from "prosemirror-keymap";
 import { InputRule, inputRules } from "prosemirror-inputrules";
 import { liftListItem, sinkListItem, splitListItem, wrapInList } from "prosemirror-schema-list";
 import {
+  addColumnAfter,
+  addColumnBefore,
   addRowAfter,
+  addRowBefore,
+  CellSelection,
+  deleteColumn,
+  deleteRow,
+  deleteTable,
   goToNextCell,
   isInTable,
   selectedRect,
   tableEditing,
+  TableMap,
 } from "prosemirror-tables";
 import {
   markerKind,
@@ -52,6 +60,7 @@ import {
   toggleToken,
 } from "../lib/pinboard/richNote";
 import { isRomanToken } from "../lib/pinboard/notesMarkdown";
+import type { Align } from "../lib/pinboard/noteTables";
 import { openUrl } from "../lib/ipc";
 
 export type RichFormat = "bold" | "italic" | "heading" | "bullet" | "number" | "checkbox";
@@ -60,7 +69,15 @@ export interface RichNoteEditorHandle {
   focus: () => void;
   format: (key: RichFormat) => void;
   insertTable: (cols: number, rows: number) => void;
+  /** Change the table the cursor is in (the Table button's menu while the cursor is in a table). */
+  table: (action: TableAction) => void;
+  /** Whether `action` can apply where the cursor is: a table's only row or column can't be deleted
+   *  on its own, only with the table. */
+  canTable: (action: TableAction) => boolean;
 }
+
+export type TableAction =
+  "rowAbove" | "rowBelow" | "colLeft" | "colRight" | "deleteRow" | "deleteCol" | "deleteTable";
 
 // --- list helpers --------------------------------------------------------------------------------
 
@@ -176,11 +193,26 @@ const tabInTable: Command = (state, dispatch) => {
   return true;
 };
 
-/** Enter in a table adds a row under the cursor's and moves down into it, same column. */
+/** Enter in a table adds a row under the cursor's and moves down into it, same column. Enter on an
+ *  empty last row (never the header) removes it and takes you out under the table, the way Enter on
+ *  an empty list item leaves the list, and as Enter in a text table always did. */
 const enterInTable: Command = (state, dispatch) => {
   if (!isInTable(state)) return false;
   if (!dispatch) return true;
   const rect = selectedRect(state);
+  const last = rect.table.lastChild!;
+  if (rect.top === rect.map.height - 1 && rect.map.height > 1 && last.textContent === "") {
+    const tablePos = rect.tableStart - 1;
+    const rowEnd = tablePos + rect.table.nodeSize - 1;
+    const tr = state.tr.delete(rowEnd - last.nodeSize, rowEnd);
+    const after = tablePos + rect.table.nodeSize - last.nodeSize;
+    const next = tr.doc.nodeAt(after);
+    if (!(next?.type === S.nodes.paragraph && next.content.size === 0))
+      tr.insert(after, S.nodes.paragraph.create());
+    tr.setSelection(TextSelection.create(tr.doc, after + 1));
+    dispatch(tr.scrollIntoView());
+    return true;
+  }
   addRowAfter(state, (tr) => {
     const table = tr.doc.nodeAt(rect.tableStart - 1)!;
     let pos = rect.tableStart;
@@ -193,6 +225,94 @@ const enterInTable: Command = (state, dispatch) => {
   });
   return true;
 };
+
+/** A column change that also keeps the table's per-column alignments (`aligns`, from the Markdown
+ *  delimiter row) lined up with its columns; prosemirror-tables knows nothing of them. */
+function columnChange(
+  cmd: Command,
+  edit: (aligns: Align[], left: number, right: number) => void,
+): Command {
+  return (state, dispatch) => {
+    if (!dispatch || !isInTable(state)) return cmd(state);
+    const { table, tableStart, left, right } = selectedRect(state);
+    return cmd(state, (tr) => {
+      const aligns = [...(table.attrs.aligns as Align[])];
+      // A new table has none yet: every column is unaligned until the Markdown says otherwise.
+      while (aligns.length < right) aligns.push("none");
+      edit(aligns, left, right);
+      tr.setNodeAttribute(tableStart - 1, "aligns", aligns);
+      dispatch(tr);
+    });
+  };
+}
+
+/** A row or column delete that leaves the cursor in the cell that took the deleted one's place, as
+ *  Docs does; on its own the cursor would fall out of the table. Deleting every row or column is
+ *  refused, which prosemirror-tables only checks when it runs, so `canTable` asks here. */
+function stayInTable(cmd: Command, axis: "row" | "col"): Command {
+  return (state, dispatch) => {
+    if (!isInTable(state)) return false;
+    const { tableStart, top, left, bottom, right, map: before } = selectedRect(state);
+    const all =
+      axis === "row" ? top === 0 && bottom === before.height : left === 0 && right === before.width;
+    if (all) return false;
+    if (!dispatch) return true;
+    return cmd(state, (tr) => {
+      const table = tr.doc.nodeAt(tableStart - 1)!;
+      const map = TableMap.get(table);
+      const r = Math.min(top, map.height - 1);
+      const c = Math.min(left, map.width - 1);
+      const cell = tableStart + map.map[r * map.width + c];
+      tr.setSelection(TextSelection.near(tr.doc.resolve(cell + 1)));
+      dispatch(tr);
+    });
+  };
+}
+
+const TABLE: Record<TableAction, Command> = {
+  rowAbove: addRowBefore,
+  rowBelow: addRowAfter,
+  colLeft: columnChange(addColumnBefore, (a, left) => a.splice(left, 0, "none")),
+  colRight: columnChange(addColumnAfter, (a, _l, right) => a.splice(right, 0, "none")),
+  deleteRow: stayInTable(deleteRow, "row"),
+  deleteCol: columnChange(stayInTable(deleteColumn, "col"), (a, left, right) =>
+    a.splice(left, right - left),
+  ),
+  deleteTable,
+};
+
+/** Backspace or Delete with every cell selected removes the table, as in Docs; prosemirror-tables on
+ *  its own would only empty the cells. */
+const deleteSelectedTable: Command = (state, dispatch) => {
+  const sel = state.selection;
+  if (!(sel instanceof CellSelection) || !sel.isRowSelection() || !sel.isColSelection())
+    return false;
+  return deleteTable(state, dispatch);
+};
+
+/** The note's first table row is its header (the Markdown has nowhere to say otherwise), so keep the
+ *  cells that way after a row is added above it or the header row is deleted: what's on screen is
+ *  what will be saved. */
+const headerRow = new Plugin({
+  appendTransaction(trs, _old, state) {
+    if (!trs.some((t) => t.docChanged)) return null;
+    const tr = state.tr;
+    state.doc.forEach((block, offset) => {
+      if (block.type !== S.nodes.table) return;
+      let rowPos = offset + 1;
+      block.forEach((row, _o, r) => {
+        const want = r === 0 ? S.nodes.table_header : S.nodes.table_cell;
+        let cellPos = rowPos + 1;
+        row.forEach((cell) => {
+          if (cell.type !== want) tr.setNodeMarkup(cellPos, want, cell.attrs);
+          cellPos += cell.nodeSize;
+        });
+        rowPos += row.nodeSize;
+      });
+    });
+    return tr.docChanged ? tr : null;
+  },
+});
 
 function createTable(cols: number, rows: number): PMNode {
   const row = (header: boolean) =>
@@ -384,6 +504,8 @@ interface Props {
   onChange: (next: string) => void;
   onFocus: () => void;
   placeholder: string;
+  /** Told when the cursor moves into or out of a table, so the toolbar can offer table changes. */
+  onInTable?: (inTable: boolean) => void;
 }
 
 function headingToggle(): Command {
@@ -419,20 +541,28 @@ const keys = keymap({
   ),
   Tab: chainCommands(tabInTable, sinkListItem(S.nodes.list_item), () => true),
   "Shift-Tab": chainCommands(goToNextCell(-1), liftListItem(S.nodes.list_item), lift, () => true),
-  Backspace: backspaceInList,
+  Backspace: chainCommands(deleteSelectedTable, backspaceInList),
+  Delete: deleteSelectedTable,
 });
 
 export const RichNoteEditor = memo(
   forwardRef<RichNoteEditorHandle, Props>(function RichNoteEditor(
-    { value, onChange, onFocus, placeholder: prompt },
+    { value, onChange, onFocus, placeholder: prompt, onInTable },
     ref,
   ) {
     const host = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
     // The text this editor last handed up, so its own change coming back as `value` isn't re-parsed.
     const emitted = useRef(value);
-    const cb = useRef({ onChange, onFocus });
-    cb.current = { onChange, onFocus };
+    const cb = useRef({ onChange, onFocus, onInTable });
+    cb.current = { onChange, onFocus, onInTable };
+    const inTable = useRef(false);
+    const report = (state: EditorState) => {
+      const now = isInTable(state);
+      if (now === inTable.current) return;
+      inTable.current = now;
+      cb.current.onInTable?.(now);
+    };
 
     useImperativeHandle(ref, () => ({
       focus: () => viewRef.current?.focus(),
@@ -455,6 +585,16 @@ export const RichNoteEditor = memo(
         view.dispatch(tr.scrollIntoView());
         view.focus();
       },
+      table: (action) => {
+        const view = viewRef.current;
+        if (!view) return;
+        TABLE[action](view.state, view.dispatch, view);
+        view.focus();
+      },
+      canTable: (action) => {
+        const view = viewRef.current;
+        return !!view && TABLE[action](view.state);
+      },
     }));
 
     useEffect(() => {
@@ -465,6 +605,7 @@ export const RichNoteEditor = memo(
           keys,
           keymap(baseKeymap),
           tableEditing(),
+          headerRow,
           placeholder(prompt),
           new Plugin({
             props: {
@@ -499,6 +640,7 @@ export const RichNoteEditor = memo(
         dispatchTransaction(tr) {
           const next = view.state.apply(tr);
           view.updateState(next);
+          report(next);
           if (!tr.docChanged) return;
           const text = serializeNote(next.doc);
           if (text === emitted.current) return;
@@ -525,6 +667,7 @@ export const RichNoteEditor = memo(
       const at = Math.min(view.state.selection.from, doc.content.size);
       const next = EditorState.create({ doc, plugins: view.state.plugins });
       view.updateState(next.apply(next.tr.setSelection(Selection.near(next.doc.resolve(at)))));
+      report(view.state);
     }, [value]);
 
     return <div ref={host} className="pm-rich-editor min-h-0 flex-1" />;

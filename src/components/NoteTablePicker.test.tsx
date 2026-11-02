@@ -70,4 +70,30 @@ describe("NoteTablePicker", () => {
     const { grid } = openGrid();
     expect(grid.closest("[data-popover-panel]")).not.toBeNull();
   });
+
+  it("opens the table's menu instead while the cursor is in a table", () => {
+    const act = vi.fn();
+    const onPick = vi.fn();
+    render(
+      <NoteTablePicker
+        onPick={onPick}
+        buttonClassName=""
+        table={{ act, can: (a) => a !== "deleteCol" }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Table" }));
+    expect(screen.queryByRole("slider")).toBeNull();
+    const first = screen.getByRole("menuitem", { name: "Insert row above" });
+    expect(document.activeElement).toBe(first);
+    expect(screen.getByRole("menuitem", { name: "Delete column" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    fireEvent.keyDown(first, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "Delete table" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete table" }));
+    expect(act).toHaveBeenCalledWith("deleteTable");
+    expect(onPick).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
 });

@@ -132,6 +132,97 @@ describe("RichNoteEditor", () => {
     expect(onChange).toHaveBeenLastCalledWith("| a   | b   |\n| --- | --- |\n|     |     |");
   });
 
+  it("leaves a table from Enter on an empty last row, dropping that row", () => {
+    const { container, onChange, caretAfter } = mount("| a | b |\n| --- | --- |\n| 1 | 2 |");
+    const pm = container.querySelector(".ProseMirror")!;
+    caretAfter("1");
+    fireEvent.keyDown(pm, { key: "Enter" });
+    expect(onChange).toHaveBeenLastCalledWith(
+      "| a   | b   |\n| --- | --- |\n| 1   | 2   |\n|     |     |",
+    );
+    fireEvent.keyDown(pm, { key: "Enter" });
+    expect(onChange).toHaveBeenLastCalledWith("| a   | b   |\n| --- | --- |\n| 1   | 2   |\n");
+    // The cursor is under the table now: typing goes there.
+    fireEvent.keyDown(pm, { key: "Enter" });
+    expect(onChange).toHaveBeenLastCalledWith("| a   | b   |\n| --- | --- |\n| 1   | 2   |\n\n");
+  });
+
+  it("deletes the table the cursor is in, and its rows and columns", () => {
+    const { ref, onChange, caretAfter } = mount(
+      "before\n| a | b |\n| --- | --- |\n| 1 | 2 |\nafter",
+    );
+    caretAfter("2");
+    act(() => ref.current!.table("colLeft"));
+    expect(onChange).toHaveBeenLastCalledWith(
+      "before\n| a   |     | b   |\n| --- | --- | --- |\n| 1   |     | 2   |\nafter",
+    );
+    act(() => ref.current!.table("deleteCol"));
+    act(() => ref.current!.table("deleteCol"));
+    expect(onChange).toHaveBeenLastCalledWith("before\n| a   |\n| --- |\n| 1   |\nafter");
+    // The table's only column goes only with the table.
+    expect(ref.current!.canTable("deleteCol")).toBe(false);
+    act(() => ref.current!.table("deleteTable"));
+    expect(onChange).toHaveBeenLastCalledWith("before\nafter");
+    expect(ref.current!.canTable("deleteTable")).toBe(false);
+  });
+
+  it("deletes a table from two Backspaces just under it: the first selects every cell", () => {
+    const { container, onChange } = mount("| a |\n| --- |\nafter");
+    const pm = container.querySelector(".ProseMirror") as HTMLElement;
+    const node = [...pm.querySelectorAll("p")].find((p) => p.textContent === "after")!;
+    const range = document.createRange();
+    range.setStart(node.firstChild!, 0);
+    pm.focus();
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    fireEvent.keyDown(pm, { key: "Backspace" });
+    expect(onChange).not.toHaveBeenCalled();
+    // prosemirror-tables turns the selected table into a selection of all of its cells.
+    expect(pm.querySelectorAll(".selectedCell")).toHaveLength(1);
+    fireEvent.keyDown(pm, { key: "Backspace" });
+    expect(onChange).toHaveBeenLastCalledWith("after");
+  });
+
+  it("keeps the first row the header after a row goes in above it", () => {
+    const { ref, container, onChange, caretAfter } = mount("| a |\n| --- |\n| 1 |");
+    caretAfter("a");
+    act(() => ref.current!.table("rowAbove"));
+    expect(onChange).toHaveBeenLastCalledWith("|     |\n| --- |\n| a   |\n| 1   |");
+    const rows = container.querySelectorAll("tr");
+    expect(rows[0].querySelector("th")).not.toBeNull();
+    expect(rows[1].querySelector("th")).toBeNull();
+  });
+
+  it("tells the toolbar when the cursor is in a table", () => {
+    const onInTable = vi.fn();
+    const ref = createRef<RichNoteEditorHandle>();
+    const { container } = render(
+      <RichNoteEditor
+        ref={ref}
+        value={"x\n| a |\n| --- |"}
+        onChange={() => {}}
+        onFocus={() => {}}
+        onInTable={onInTable}
+        placeholder=""
+      />,
+    );
+    const pm = container.querySelector(".ProseMirror") as HTMLElement;
+    const into = (text: string) => {
+      const node = [...pm.querySelectorAll("p, th")].find((n) => n.textContent === text)!;
+      const range = document.createRange();
+      range.setStart(node.firstChild!, 1);
+      pm.focus();
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      document.dispatchEvent(new Event("selectionchange"));
+    };
+    into("a");
+    expect(onInTable).toHaveBeenLastCalledWith(true);
+    into("x");
+    expect(onInTable).toHaveBeenLastCalledWith(false);
+  });
+
   it("takes a new value from outside without echoing it back", () => {
     const { rerender, container, onChange } = mount("one");
     rerender(
