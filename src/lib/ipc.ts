@@ -1410,6 +1410,11 @@ export const syncOneDrive = (email: string | null) =>
 export const reindexOneDrive = (email: string) =>
   invoke<number>("reindex_onedrive", { account: email });
 
+/** Remove every connector-indexed file and its filing, then sync every connector from scratch so
+ *  each comes back new and unsorted (#1019). Refused during a sync, rebuild or import. Resolves to
+ *  how many documents were removed; the re-fetch carries on in the background. Irreversible. */
+export const resetConnectorDocuments = () => invoke<number>("reset_connector_documents");
+
 /** The current background-sync snapshot — used to restore the progress UI on returning to Settings. */
 export const oneDriveSyncStatus = () => invoke<OneDriveSyncState>("onedrive_sync_status");
 

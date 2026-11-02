@@ -437,6 +437,21 @@ pub fn forget_sources(
     Ok(())
 }
 
+/// Empty the manifest — the connector reset's path (#1019). Every item goes, including any the
+/// database no longer mirrors: [`merged_manifest`] would carry those forward and a Rebuild would
+/// restore them, which is exactly the old filing the reset is meant to throw away. Call it after the
+/// rows are gone. A missing manifest, or an empty one, is a clean no-op.
+pub fn forget_all(vault_root: &Path, cipher: &ManifestCipher) -> Result<()> {
+    let Some(mut manifest) = read_manifest(vault_root, cipher)? else {
+        return Ok(());
+    };
+    if !manifest.items.is_empty() {
+        manifest.items.clear();
+        write_manifest(vault_root, cipher, &manifest)?;
+    }
+    Ok(())
+}
+
 /// Re-key sources in the encrypted manifest, in one read-modify-write, so a `source_id` change made
 /// in the DB travels to the portable truth with its classification intact.
 ///
@@ -2801,6 +2816,28 @@ mod tests {
             vec!["b:2".to_string()],
             "an absent id is ignored, the rest go"
         );
+    }
+
+    #[test]
+    fn forget_all_empties_the_manifest_and_is_a_no_op_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("a:1", "A"), item("b:2", "B")],
+            },
+        )
+        .unwrap();
+        forget_all(dir.path(), &cipher).unwrap();
+        let left = read_manifest(dir.path(), &cipher).unwrap().unwrap();
+        assert!(left.items.is_empty());
+
+        let empty = tempfile::tempdir().unwrap();
+        forget_all(empty.path(), &cipher).unwrap();
+        assert!(read_manifest(empty.path(), &cipher).unwrap().is_none());
     }
 
     #[test]

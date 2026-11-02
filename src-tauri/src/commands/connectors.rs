@@ -353,6 +353,95 @@ pub async fn reindex_onedrive(app: AppHandle, account: String) -> Result<usize> 
     sync_onedrive(app, Some(account)).await
 }
 
+/// The rows half of the connector reset (#1019), inside the caller's transaction: every index-only
+/// document goes, with exactly a single delete's cascade (chunks, vectors, memberships, proposals,
+/// locations), and every Drive and OneDrive delta cursor is cleared so the next sync re-enumerates
+/// everything rather than riding a cursor past files PM no longer has. Calendar cursors share the
+/// table and are left alone. Returns the deleted ids.
+fn reset_connector_rows(tx: &rusqlite::Connection) -> Result<Vec<i64>> {
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT id FROM documents WHERE source_type = ?1 ORDER BY id")?;
+        let rows = stmt
+            .query_map(params![ingest::SOURCE_TYPE_INDEX_ONLY], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let mut deleted = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(left) = super::archivist::delete_rows(tx, id)? {
+            deleted.push(left.document_id);
+        }
+    }
+    tx.execute(
+        "UPDATE connector_sources SET cursor = NULL WHERE service IN (?1, ?2)",
+        params![drive::SERVICE, onedrive::SERVICE],
+    )?;
+    Ok(deleted)
+}
+
+/// Reset the connector documents (#1019): remove every file PM indexed from a connected account or
+/// watched folder — its row, its filing (project, links, tags, importance, review state) and its
+/// manifest entry — then sync every connector from scratch, so each file comes back as new, unsorted
+/// and unreviewed. The files at the source are never touched. Returns how many documents went.
+///
+/// Bobby chose "remove and re-fetch" over resetting the filing in place (02-11-2026). The vault half
+/// of the same request is parked: a vault file's filing lives in its own front-matter, so it needs a
+/// rewrite rather than a delete.
+///
+/// **Guarded like a Rebuild, for the same reason [`reindex_drive`] is.** It holds `ingest_busy` for
+/// the destructive part, which makes every UI-started sync and ingest refuse, and refuses itself when
+/// a sync is already running: that pass would finish by writing a FRESH cursor over the cleared one
+/// and then never re-enumerate. Unlike `reindex_drive` this is deliberately "all" — the dialog in
+/// front of it is the ceremony that makes the expensive path a choice.
+#[tauri::command]
+pub async fn reset_connector_documents(app: AppHandle) -> Result<usize> {
+    // Off the async runtime: a large library is thousands of row deletes in one transaction.
+    let worker = app.clone();
+    let deleted = spawn_blocking_result("connector reset", move || -> Result<usize> {
+        let app = worker;
+        let state = app.state::<AppState>();
+        let Some(_busy) = crate::BusyGuard::acquire(&state.ingest_busy) else {
+            return Err(Error::Other(
+                "PM is rebuilding or importing right now. Try the reset again once that's finished."
+                    .into(),
+            ));
+        };
+        if state.sync_active() {
+            return Err(Error::Other(
+                "A sync is running. Wait for it to finish, then reset — a sync finishing after the \
+                 reset would skip the files this is meant to fetch again."
+                    .into(),
+            ));
+        }
+        let (vault_root, manifest_cipher) = state.manifest_io()?;
+        let conn = state.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let deleted = reset_connector_rows(&tx)?;
+        tx.commit()?;
+        // Released before the duplicate watch is touched, for the lock order `delete_document` names.
+        drop(conn);
+        for id in &deleted {
+            crate::duplicates::forget_document(&app, *id);
+        }
+        // After the commit, like every manifest side effect: an entry outliving its row heals itself,
+        // a row outliving its entry does not.
+        index_only::forget_all(&vault_root, &manifest_cipher)?;
+        Ok(deleted.len())
+    })
+    .await?;
+    // The re-fetch, in the background and one connector at a time so the embedder isn't asked to
+    // serve three walks at once. Each core no-ops without accounts or folders, and a failure here is
+    // the ordinary sync failure the Connectors tab already reports — the cleared cursors stay cleared,
+    // so the next sync of any kind re-enumerates.
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = cloud_sync::drive_sync_core(&app2, None, true).await;
+        let _ = cloud_sync::onedrive_sync_core(&app2, None).await;
+        let _ = localfolder::local_sync_core(&app2, None).await;
+    });
+    Ok(deleted)
+}
+
 /// Sync one Drive account (or every account when `account` is `None`) into the index-only store. See
 /// [`cloud_sync::drive_sync_core`] for the behaviour; this is the command the UI's "Sync now" calls.
 ///
@@ -999,6 +1088,52 @@ pub fn resume_onedrive_sync(app: AppHandle) -> Result<bool> {
 mod tests {
     use super::*;
     use GoogleUse::{Backup, Calendar, Drive};
+
+    #[test]
+    fn the_connector_reset_takes_every_pointer_and_every_drive_cursor_and_nothing_else() {
+        // #1019: every index-only document goes and every Drive/OneDrive cursor is cleared, so the
+        // next sync re-fetches all of it. A vault document, a calendar's cursor and the accounts
+        // themselves are not the reset's to touch.
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        conn.execute_batch(
+            "INSERT INTO documents(vault_path, title, content_hash, project, source_type, source_id) \
+             VALUES ('idx://gdrive:a@x.com:f1', 'A', 'h1', 'Atlas', 'index_only', 'gdrive:a@x.com:f1'), \
+                    ('idx://local:k:f2', 'B', 'h2', 'Atlas', 'index_only', 'local:k:f2'), \
+                    ('notes.md', 'C', 'h3', 'Atlas', 'vault', NULL); \
+             INSERT INTO connector_sources(id, provider, service, label, cursor) \
+             VALUES ('gdrive:a@x.com', 'google', 'drive', 'a', '{\"my\":\"t1\"}'), \
+                    ('onedrive:b@x.com', 'microsoft', 'onedrive', 'b', 'delta'), \
+                    ('gcal:a@x.com', 'google', 'calendar', 'a', 'sync-token');",
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let deleted = reset_connector_rows(&tx).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(deleted.len(), 2);
+        let titles: Vec<String> = conn
+            .prepare("SELECT title FROM documents ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(titles, vec!["C".to_string()], "the vault document stays");
+        let cursor = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT cursor FROM connector_sources WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cursor("gdrive:a@x.com"), None);
+        assert_eq!(cursor("onedrive:b@x.com"), None);
+        assert_eq!(cursor("gcal:a@x.com").as_deref(), Some("sync-token"));
+    }
 
     fn creds_for(users: &[GoogleUse]) -> drive::Credentials {
         drive_credentials(&release_plan(&users.iter().copied().collect(), Drive))
