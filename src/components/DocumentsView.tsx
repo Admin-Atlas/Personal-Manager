@@ -11,6 +11,7 @@ import {
   ingestPaths,
   installOptionalOcr,
   listDocuments,
+  listArchivedProjects,
   listProjects,
   onOcrInstall,
   optionalOcrStatus,
@@ -39,9 +40,12 @@ import { formatDateTime } from "../lib/format";
 import {
   readActivityOpen,
   readCopyPhotosToVault,
+  readShowArchived,
   writeActivityOpen,
   writeCopyPhotosToVault,
+  writeShowArchived,
 } from "../lib/documentPrefs";
+import { archivedSet, splitByArchivedHome } from "../lib/archivedProjects";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
 import { useDepth, useTheme } from "../theme";
@@ -121,6 +125,14 @@ interface Props {
 
 export function DocumentsView({ onReviewClick }: Props) {
   const [documents, setDocuments] = useState<Document[]>([]);
+  // Archived projects' files are hidden unless asked for (#1018). Persisted, because the tab router
+  // unmounts this view — see documentPrefs.
+  const [archivedNames, setArchivedNames] = useState<string[]>([]);
+  const [showArchived, setShowArchivedState] = useState(readShowArchived);
+  const setShowArchived = (on: boolean) => {
+    setShowArchivedState(on);
+    writeShowArchived(on);
+  };
   const [status, setStatus] = useState<SidecarStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -476,11 +488,17 @@ export function DocumentsView({ onReviewClick }: Props) {
       const since = landingSeq();
       // A retrieval-config change (new chunking/splitter/model) flags a one-time Rebuild;
       // re-reading here also clears the banner once a rebuild has brought the index in line.
-      // The two reads are independent, so they go out in parallel; a vault-status failure is
-      // tolerated (no banner), while a documents failure surfaces as before.
-      const [docs, vs] = await Promise.all([listDocuments(), vaultStatus().catch(() => null)]);
+      // The reads are independent, so they go out in parallel; a vault-status failure is
+      // tolerated (no banner), and so is an archived-projects failure (nothing hidden), while a
+      // documents failure surfaces as before.
+      const [docs, vs, archived] = await Promise.all([
+        listDocuments(),
+        vaultStatus().catch(() => null),
+        listArchivedProjects().catch(() => [] as string[]),
+      ]);
       setDocuments(mergeLandings(docs, landingsSince(since)));
       setRebuildNeeded(vs?.retrieval_rebuild_needed ?? false);
+      setArchivedNames(archived);
     } catch (e) {
       setError(String(e));
     }
@@ -730,9 +748,14 @@ export function DocumentsView({ onReviewClick }: Props) {
     setSort(nextDocSort(activeSort, key));
   }
 
+  const archivedSplit = useMemo(
+    () => splitByArchivedHome(documents, archivedSet(archivedNames)),
+    [documents, archivedNames],
+  );
+  const archivedCount = archivedSplit.hidden.length;
   const sortedDocuments = useMemo(
-    () => sortDocuments(documents, activeSort),
-    [documents, activeSort],
+    () => sortDocuments(showArchived ? documents : archivedSplit.shown, activeSort),
+    [documents, archivedSplit, showArchived, activeSort],
   );
 
   return (
@@ -1098,56 +1121,78 @@ export function DocumentsView({ onReviewClick }: Props) {
                 "one control, one home". Depth still seeds the set; this takes over from there, and
                 Reset hands it back rather than freezing today's Depth into an explicit choice. */}
             {documents.length > 0 && (
-              // The shared Popover primitive rather than a hand-rolled panel: this was the only
-              // dismissless one left in the tree, so clicking anywhere else on the page left it
-              // hanging open. It brings click-outside, Escape and focus-restore with it. Passed as a
-              // plain node, NOT the function form — the function form hands you `close`, which is
-              // right for a menu of actions and wrong for a list of checkboxes you tick several of.
-              <Popover
-                align="right"
-                ariaLabel="Columns"
-                rootClassName="mb-2 flex justify-end"
-                panelClassName="w-56 p-2"
-                trigger={({ open, toggle }) => (
-                  <Button
-                    variant="tertiary"
-                    size="sm"
-                    onClick={toggle}
-                    aria-expanded={open}
-                    title="Choose which columns this table shows"
-                  >
-                    Columns
-                  </Button>
-                )}
-              >
-                <>
-                  <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
-                  {DOC_COLUMN_KEYS.map((key) => (
-                    <label
-                      key={key}
-                      className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
+              <div className="mb-2 flex items-center justify-between gap-3">
+                {/* Archived projects' files (#1018), beside the list they hide from. Says how many
+                    so a hidden file is never a mystery, and only appears when there are some. */}
+                {archivedCount > 0 ? (
+                  <p className="text-xs text-ink4">
+                    {showArchived
+                      ? `Showing ${archivedCount} file${archivedCount === 1 ? "" : "s"} from archived projects`
+                      : `${archivedCount} file${archivedCount === 1 ? "" : "s"} in archived projects hidden`}
+                    {" · "}
+                    <button
+                      type="button"
+                      onClick={() => setShowArchived(!showArchived)}
+                      className="underline hover:text-ink2"
                     >
-                      <input
-                        type="checkbox"
-                        checked={shows(key)}
-                        onChange={() => setColumns(toggleColumn(columns, key))}
-                      />
-                      {DOC_COLUMN_LABELS[key]}
-                    </label>
-                  ))}
-                  <div className="mt-1 border-t border-rule pt-1">
+                      {showArchived ? "Hide" : "Show"}
+                    </button>
+                  </p>
+                ) : (
+                  <span />
+                )}
+                {/* The shared Popover primitive rather than a hand-rolled panel: this was the only
+                    dismissless one left in the tree, so clicking anywhere else on the page left it
+                    hanging open. It brings click-outside, Escape and focus-restore with it. Passed as
+                    a plain node, NOT the function form — the function form hands you `close`, which
+                    is right for a menu of actions and wrong for a list of checkboxes you tick several
+                    of. */}
+                <Popover
+                  align="right"
+                  ariaLabel="Columns"
+                  rootClassName="flex justify-end"
+                  panelClassName="w-56 p-2"
+                  trigger={({ open, toggle }) => (
                     <Button
                       variant="tertiary"
                       size="sm"
-                      onClick={() => setColumns(null)}
-                      disabled={columnChoice == null}
-                      title="Go back to following your display depth"
+                      onClick={toggle}
+                      aria-expanded={open}
+                      title="Choose which columns this table shows"
                     >
-                      Reset to depth
+                      Columns
                     </Button>
-                  </div>
-                </>
-              </Popover>
+                  )}
+                >
+                  <>
+                    <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
+                    {DOC_COLUMN_KEYS.map((key) => (
+                      <label
+                        key={key}
+                        className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={shows(key)}
+                          onChange={() => setColumns(toggleColumn(columns, key))}
+                        />
+                        {DOC_COLUMN_LABELS[key]}
+                      </label>
+                    ))}
+                    <div className="mt-1 border-t border-rule pt-1">
+                      <Button
+                        variant="tertiary"
+                        size="sm"
+                        onClick={() => setColumns(null)}
+                        disabled={columnChoice == null}
+                        title="Go back to following your display depth"
+                      >
+                        Reset to depth
+                      </Button>
+                    </div>
+                  </>
+                </Popover>
+              </div>
             )}
             {documents.length === 0 ? (
               <p className="text-sm text-ink4">No documents yet.</p>

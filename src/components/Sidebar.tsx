@@ -3,7 +3,8 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { CalendarOverview, Conversation, LocalLlmStatus } from "../lib/types";
-import { calendarOverview, listProjects } from "../lib/ipc";
+import { calendarOverview, listArchivedProjects, listProjects } from "../lib/ipc";
+import { archivedSet, isArchived } from "../lib/archivedProjects";
 import { shortModel } from "../lib/format";
 import { readHidden, readRosterOpen, writeHidden, writeRosterOpen } from "../lib/calendarPrefs";
 import { localEndpointState, LOCAL_STATE_LABEL, LOCAL_STATE_TOKEN } from "../lib/localStatus";
@@ -231,6 +232,9 @@ export function Sidebar({
   // DISTINCT over documents, so the two inputs each cover a gap in the other (see chatNav.ts).
   // Loaded once and refreshed whenever the roster changes, which is when a new project can appear.
   const [knownProjects, setKnownProjects] = useState<string[]>([]);
+  // Archived projects (#1018) leave this section, chats and all; their chats stay reachable from
+  // the project itself, which Focus's Archive folder opens.
+  const [archivedNames, setArchivedNames] = useState<string[]>([]);
   useEffect(() => {
     if (view !== "chat") return;
     let alive = true;
@@ -239,14 +243,21 @@ export function Sidebar({
       .catch(() => {
         /* best-effort: the union still covers every project that has a chat */
       });
+    listArchivedProjects()
+      .then((a) => alive && setArchivedNames(a))
+      .catch(() => {
+        /* best-effort: nothing hidden */
+      });
     return () => {
       alive = false;
     };
   }, [view, conversations]);
-  const projectGroups = useMemo(
-    () => projectChats(conversations, knownProjects),
-    [conversations, knownProjects],
-  );
+  const projectGroups = useMemo(() => {
+    const archived = archivedSet(archivedNames);
+    return projectChats(conversations, knownProjects).filter(
+      (g) => !isArchived(archived, g.project),
+    );
+  }, [conversations, knownProjects, archivedNames]);
   const unscoped = useMemo(() => globalChats(conversations), [conversations]);
   // Settings renders as an overlay over a still-mounted Sidebar, so a read-at-mount would leave the
   // toggle looking broken until the user navigated away and back. Subscribe instead.

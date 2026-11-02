@@ -905,8 +905,16 @@ export const deleteProject = (
 
 // --- Personal Assistant: focus view & projects (Step 5, spec §4) ---
 
-/** Every active project with its triage metadata and derived status. */
+/** Every project with its triage metadata and derived status; archived ones carry `archived`. */
 export const listProjectOverviews = () => invoke<ProjectOverview[]>("list_project_overviews");
+
+/** Archive or unarchive a project (#1018). Reversible; nothing else about it changes. Refresh the
+ *  briefing after, so the project's deadline flags clear (or come back). */
+export const setProjectArchived = (name: string, archived: boolean) =>
+  invoke<void>("set_project_archived", { name, archived });
+
+/** The names of the archived projects. */
+export const listArchivedProjects = () => invoke<string[]>("list_archived_projects");
 
 /** Set/clear a project's triage metadata (the confirm half of the AI loop, or a
  *  hand edit). Blank/omitted fields clear that attribute. */

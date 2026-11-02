@@ -66,3 +66,24 @@ export function writeActivityOpen(open: boolean): void {
     /* best-effort — a private-mode / quota failure just means the fold won't persist */
   }
 }
+
+// Whether the list shows the files of archived projects (#1018). Default OFF — archiving is how
+// you say "out of my way", and the toggle beside the list is the way back. Per machine, like the
+// rest of `pm.documents.*`.
+export const SHOW_ARCHIVED_KEY = "pm.documents.showArchived";
+
+export function readShowArchived(): boolean {
+  try {
+    return localStorage.getItem(SHOW_ARCHIVED_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function writeShowArchived(on: boolean): void {
+  try {
+    localStorage.setItem(SHOW_ARCHIVED_KEY, String(on));
+  } catch {
+    /* best-effort — a private-mode / quota failure just means it won't persist */
+  }
+}
