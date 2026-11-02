@@ -48,9 +48,7 @@ import {
   readConfirmDelete,
   readShowCompletedTimelineItems,
   readShowPastTimelineItems,
-  useNoteMode,
   writeConfirmDelete,
-  writeNoteMode,
   writeShowCompletedTimelineItems,
   writeShowPastTimelineItems,
 } from "../lib/pinboard/prefs";
@@ -1076,20 +1074,18 @@ const NoteBody = memo(function NoteBody({
   const editorRef = useRef<NoteEditorHandle>(null);
   const richRef = useRef<RichNoteEditorHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  // The note is always an editor: the rich one (Docs-style, no Markdown on screen) by default, or the
-  // Markdown one (the text, formatted as you type) when chosen on this device. `editing` is whether
-  // you're working in it, which brings up the format toolbar and the colours; an empty note shows
-  // them too, as it always has.
+  // The note is always an editor: the rich one (Docs-style, no Markdown on screen), or the Markdown
+  // one (the text, formatted as you type) for a note the rich one can't hold exactly. `editing` is
+  // whether you're working in it, which brings up the format toolbar and the colours; an empty note
+  // shows them too, as it always has.
   const [editing, setEditing] = useState(false);
   const showEditor = editing || !text.trim();
-  const mode = useNoteMode();
 
   // A note opens rich only when the rich editor can hold its text exactly (richNote's `roundTrips`);
   // anything else stays Markdown, so nothing it can't express is ever rewritten. Text the rich editor
   // wrote itself is taken as read, so a note never flips editor under someone mid-sentence.
   const richWrote = useRef<string | null>(null);
-  const canRich = useMemo(() => text === richWrote.current || roundTrips(text), [text]);
-  const rich = mode === "rich" && canRich;
+  const rich = useMemo(() => text === richWrote.current || roundTrips(text), [text]);
 
   const editText = useCallback(
     (next: string) => onChange(widget.id, { text: next }),
@@ -1265,31 +1261,6 @@ const NoteBody = memo(function NoteBody({
                 </Tooltip>
               ))}
               <NoteTablePicker buttonClassName={FORMAT_BUTTON_CLASS} onPick={addTable} />
-              <Tooltip
-                label={
-                  !canRich
-                    ? "Shown as Markdown: this note has formatting the rich editor can't keep exactly"
-                    : mode === "markdown"
-                      ? "Edit notes as formatted text"
-                      : "Edit notes as Markdown"
-                }
-              >
-                <button
-                  type="button"
-                  aria-pressed={!rich}
-                  aria-label="Markdown"
-                  disabled={!canRich}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => writeNoteMode(mode === "rich" ? "markdown" : "rich")}
-                  // Its own classes, not FORMAT_BUTTON_CLASS plus overrides: `cn` is a plain joiner, so
-                  // a `w-auto` beside that `w-5` would leave which width wins to stylesheet order.
-                  className={`flex h-5 min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-1 font-mono text-[0.625rem] hover:bg-surface disabled:opacity-60 ${
-                    rich ? "text-ink4 hover:text-ink2" : "bg-surface text-ink2"
-                  }`}
-                >
-                  MD
-                </button>
-              </Tooltip>
             </div>
           )}
           {/* Right-aligned: colour swatches (edit only) then the size (power). */}
