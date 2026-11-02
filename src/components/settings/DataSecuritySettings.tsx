@@ -201,12 +201,12 @@ export function DataSecuritySettings() {
           <p>
             Source code:{" "}
             <a
-              href="https://github.com/Admin-Atlas/Personal-Manager"
+              href="https://github.com/itsAtlas-org/Personal-Manager"
               target="_blank"
               rel="noreferrer"
               className="text-ink3 underline hover:text-ink"
             >
-              github.com/Admin-Atlas/Personal-Manager
+              github.com/itsAtlas-org/Personal-Manager
             </a>
           </p>
         </SectionInfo>

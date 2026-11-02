@@ -21,7 +21,7 @@ import { CHANGELOG } from "../lib/changelog";
 import { guideFor, PLATFORM, type SetupGuideMode } from "../lib/setupGuide";
 import { withCode } from "./withCode";
 
-const REPO_URL = "https://github.com/Admin-Atlas/Personal-Manager";
+const REPO_URL = "https://github.com/itsAtlas-org/Personal-Manager";
 
 interface Props {
   open: boolean;

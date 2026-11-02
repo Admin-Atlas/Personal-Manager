@@ -80,7 +80,7 @@ export interface AppUpdate {
 }
 
 /** The "latest release" page — the manual-download fallback when an auto-update can't apply. */
-const RELEASES_URL = "https://github.com/Admin-Atlas/Personal-Manager/releases/latest";
+const RELEASES_URL = "https://github.com/itsAtlas-org/Personal-Manager/releases/latest";
 
 export function useUpdater(): AppUpdate {
   const [status, setStatus] = useState<UpdateStatus>("idle");

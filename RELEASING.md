@@ -40,8 +40,8 @@ Two actions in this process are irreversible and **belong to the maintainer alon
   back. Preparation **stops** at each human gate and waits.
 - **No agent or contributor**, on their own initiative:
   - merges a release PR,
-  - pushes a `v*` tag (these are also restricted to repo admins by branch/tag
-    protection),
+  - pushes a `v*` tag (no repo rule stops one: the only ruleset covers `main`, so anyone
+    with push rights could, and this rule is the only control),
   - creates a GitHub Release through the web UI.
 - **The maintainer owns** the merge and the tag push, every time.
 

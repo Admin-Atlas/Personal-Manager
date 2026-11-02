@@ -264,7 +264,7 @@ pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
         .timeout(std::time::Duration::from_secs(30))
         .header(
             "HTTP-Referer",
-            "https://github.com/Admin-Atlas/Personal-Manager",
+            "https://github.com/itsAtlas-org/Personal-Manager",
         )
         .header("X-Title", "PM")
         .send()
@@ -342,7 +342,7 @@ async fn fetch_zdr_model_ids() -> Result<HashSet<String>> {
         .timeout(std::time::Duration::from_secs(30))
         .header(
             "HTTP-Referer",
-            "https://github.com/Admin-Atlas/Personal-Manager",
+            "https://github.com/itsAtlas-org/Personal-Manager",
         )
         .header("X-Title", "PM")
         .send()
@@ -556,7 +556,7 @@ where
         // Optional attribution headers OpenRouter recognises.
         .header(
             "HTTP-Referer",
-            "https://github.com/Admin-Atlas/Personal-Manager",
+            "https://github.com/itsAtlas-org/Personal-Manager",
         )
         .header("X-Title", "PM")
         .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -696,7 +696,7 @@ pub async fn complete(
         .bearer_auth(api_key)
         .header(
             "HTTP-Referer",
-            "https://github.com/Admin-Atlas/Personal-Manager",
+            "https://github.com/itsAtlas-org/Personal-Manager",
         )
         .header("X-Title", "PM")
         .json(&body)
