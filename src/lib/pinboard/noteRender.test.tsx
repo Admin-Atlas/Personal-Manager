@@ -6,6 +6,7 @@ import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { Markdown } from "../markdown";
 import { toRenderMarkdown } from "./notesMarkdown";
+import { escapeCell, insertTable } from "./noteTables";
 
 // `notesMarkdown.test.ts` proves what `toRenderMarkdown` EMITS. These prove what the renderer then
 // DOES with it — the two halves had drifted: the transform was appending the two-space hard break
@@ -98,7 +99,7 @@ describe("toRenderMarkdown stays idempotent", () => {
     expect(out).toContain("checked");
   });
 
-  it("keeps the task-list classes the flush-indent CSS relies on", () => {
+  it("keeps the task-list classes the checklist CSS relies on", () => {
     // The `:has()` selectors in index.css are a fallback for renderers that drop these; on an
     // engine without `:has()` support these classes are the ONLY thing carrying the rule.
     const out = html("[] todo");
@@ -154,11 +155,9 @@ describe("round bullets and dash points render as two kinds of list", () => {
   });
 
   it("puts a bullet and a checkbox in ONE list, and marks the non-task item", () => {
-    // The shape the flush-checklist CSS has to cope with. `ul.contains-task-list` gets its left
-    // padding zeroed so a checklist sits at the note's edge, and a plain bullet's disc is drawn in
-    // exactly that padding — so a non-task sibling silently lost its marker and read as a stray line
-    // of prose. The rule that gives it back keys on `li:not(.task-list-item)`, which only works if
-    // remark-gfm marks the task item and leaves the bullet unmarked, in the same list.
+    // The shape a note's vault copy reaches the reader in: a checkbox under a bullet stays in the
+    // bullet's list (both are emitted on the same marker), and remark-gfm marks only the task item,
+    // so the task-list CSS styles the box without taking the bullet's disc away.
     const { container } = render(<Markdown dashLists>{toRenderMarkdown(". a\n[] b")}</Markdown>);
     const lists = container.querySelectorAll("ul");
     expect(lists).toHaveLength(1);
@@ -176,5 +175,39 @@ describe("round bullets and dash points render as two kinds of list", () => {
       const once = toRenderMarkdown(note);
       expect(toRenderMarkdown(once)).toBe(once);
     }
+  });
+});
+
+describe("a note's table renders as a table", () => {
+  it("agrees with the editor on where a cell ends when backslashes precede a pipe", () => {
+    const cells = (note: string) => {
+      const { container } = render(<Markdown dashLists>{toRenderMarkdown(note)}</Markdown>);
+      return [...container.querySelector("table")!.rows[0].cells].map((c) => c.textContent);
+    };
+    expect(cells(`| ${escapeCell("x \\| y")} |\n| --- |`)).toEqual(["x \\| y"]);
+    expect(cells("| x \\\\| y |\n| --- | --- |")).toEqual(["x \\", "y"]);
+  });
+
+  it("renders the picker's empty grid as a table of empty cells", () => {
+    const { container } = render(
+      <Markdown dashLists>{toRenderMarkdown(insertTable("", 0, 0, 3, 2).text)}</Markdown>,
+    );
+    const table = container.querySelector("table");
+    expect(table).not.toBeNull();
+    expect(table!.rows).toHaveLength(2);
+    expect(table!.rows[0].cells).toHaveLength(3);
+  });
+
+  it("keeps the prose either side of a table out of it", () => {
+    const { container } = render(
+      <Markdown dashLists>
+        {toRenderMarkdown("above\n| a | b |\n| --- | --- |\n| 1 | 2 |\nbelow")}
+      </Markdown>,
+    );
+    const table = container.querySelector("table")!;
+    expect(table.rows).toHaveLength(2);
+    expect(table.textContent).not.toContain("above");
+    expect(table.textContent).not.toContain("below");
+    expect(container.textContent).toContain("below");
   });
 });

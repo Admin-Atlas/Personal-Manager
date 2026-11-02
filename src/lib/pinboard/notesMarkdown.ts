@@ -30,10 +30,12 @@
 // round bullets still came out as "-" the transform would read its own output back as dash points.
 
 import { DASH_MARKER } from "../markdownDashLists";
+import { fenceMask } from "./noteFences";
+import { tableLineMask } from "./noteTables";
 
 /** One marker match on a single line: the leading indent, the marker token (no trailing space),
  *  and the content after it. */
-interface MarkerMatch {
+export interface MarkerMatch {
   indent: string;
   token: string;
   content: string;
@@ -58,7 +60,7 @@ const MARKER_RE = /^(\s*)(-|\+|\.|\*|>|\[[ xX]?\]|\d+\.|[ivxlcdmIVXLCDM]+\.)\s+(
  *  PM note, which is what keeps the vault copy portable. */
 const BULLET_MARKER = "*";
 
-function matchMarker(line: string): MarkerMatch | null {
+export function matchMarker(line: string): MarkerMatch | null {
   const m = MARKER_RE.exec(line);
   if (!m) return null;
   return { indent: m[1], token: m[2], content: m[3] };
@@ -111,12 +113,12 @@ function fromRoman(s: string): number | null {
   return i === lower.length && toRoman(n) === lower ? n : null;
 }
 
-function isRomanToken(token: string): boolean {
+export function isRomanToken(token: string): boolean {
   return /^[ivxlcdmIVXLCDM]+\.$/.test(token) && fromRoman(token.slice(0, -1)) != null;
 }
 
 /** The marker that should begin the NEXT item after one whose token is `token`. */
-function nextMarker(token: string): string | null {
+export function nextMarker(token: string): string | null {
   if (token.length === 1 && "-+.*>".includes(token)) return `${token} `;
   if (/^\[[ xX]?\]$/.test(token)) return "[] "; // a continued checkbox is always fresh/unchecked
   if (/^\d+\.$/.test(token)) return `${parseInt(token, 10) + 1}. `;
@@ -163,43 +165,7 @@ export function continueList(value: string, caret: number): ListEdit | null {
   };
 }
 
-// --- fenced code (pure) ----------------------------------------------------------------------
-//
-// Everything in this file rewrites lines by the marker they start with, and inside a fenced code
-// block that is exactly the wrong thing to do: a line there is not a list item, it is a picture of
-// one. The damage is not cosmetic. A `- ` line in a ```diff block is a REMOVED line, and rewriting
-// it to `+ ` turns it into an added one — the snippet now says the opposite of what was pasted, and
-// it says it in the vault copy too, because this output is what `ingestNote` files (F-52).
-//
-// The same blindness made a checkbox inside a fence tickable: `matchTask` saw `[] x` and counted it,
-// but the renderer emits it as literal text with no `<input>`, so every real checkbox after it was
-// off by one and a click ticked the wrong line.
-
-/** An opening or closing fence: up to three spaces, then three-or-more backticks or tildes. */
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-
-/**
- * Which lines are fenced code — the fence lines themselves included, since they are not content
- * either.
- *
- * CommonMark's rules, kept because a note's fences also have to mean the same thing to the renderer
- * downstream: a backtick fence's info string may not contain a backtick (that is what keeps inline
- * code from opening a block), only a fence of the SAME character and at least the same length
- * closes, and an unclosed fence runs to the end of the note rather than being abandoned.
- */
-function fenceMask(lines: readonly string[]): boolean[] {
-  let open: { char: string; len: number } | null = null;
-  return lines.map((line) => {
-    const m = FENCE_RE.exec(line);
-    if (!open) {
-      if (!m || (m[1][0] === "`" && m[2].includes("`"))) return false;
-      open = { char: m[1][0], len: m[1].length };
-      return true;
-    }
-    if (m && m[1][0] === open.char && m[1].length >= open.len && m[2].trim() === "") open = null;
-    return true;
-  });
-}
+// Fenced code is skipped by every rule here; the mask that finds it lives in noteFences.
 
 /** Whether a source line renders as a CONTAINER block — a list item or a blockquote — as opposed to
  *  inline text. The distinction matters for lazy continuation: CommonMark folds an unmarked line that
@@ -230,6 +196,7 @@ function opensContainer(line: string): boolean {
  *    pass stays idempotent.
  *  - a plain prose line that FOLLOWS a list item or quote gets a blank line inserted before it, so
  *    it ends the list instead of being swallowed by the last item (see below).
+ *  - a GFM table's rows pass through untouched, with a blank line kept either side (see noteTables).
  *
  * FENCED CODE PASSES THROUGH BYTE FOR BYTE — see {@link fenceMask}. Every rule above is about what
  * a line MEANS, and inside a fence a line means only itself.
@@ -241,11 +208,21 @@ function opensContainer(line: string): boolean {
 export function toRenderMarkdown(raw: string): string {
   const lines = raw.replace(/\r\n?/g, "\n").split("\n");
   const code = fenceMask(lines);
+  const table = tableLineMask(lines);
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (code[i]) {
       out.push(line);
+      continue;
+    }
+    // A table's rows pass through as typed: the prose rule's hard break means nothing in a row. It
+    // needs a blank line on each side, though — prose touching its first row would be read with it,
+    // and a line touching its last row would be read as one more row.
+    if (table[i]) {
+      if (!table[i - 1] && out.length > 0 && out[out.length - 1].trim() !== "") out.push("");
+      out.push(line);
+      if (!table[i + 1] && i + 1 < lines.length && lines[i + 1].trim() !== "") out.push("");
       continue;
     }
     const m = matchMarker(line);
@@ -583,27 +560,4 @@ export function toggleWrap(
     selStart: pos,
     selEnd: pos,
   };
-}
-
-/**
- * Where to put the caret after an undo/redo swaps a textarea's text out from under it.
- *
- * Restoring the string but leaving the caret at the end feels broken — you undo three seconds of
- * typing mid-paragraph and land at the bottom of the note. The edit is bracketed by whatever the two
- * versions still share, so the caret belongs at the end of the common PREFIX: that's the point the
- * two texts start to differ, i.e. where the change was.
- *
- * The common SUFFIX is what makes it right for a deletion as well as an insertion, and it must be
- * bounded so the two runs can't overlap and count the same characters twice (they would on repeated
- * characters — "aa" → "aaa" shares a 2-char prefix AND a 2-char suffix of a 3-char string).
- */
-export function caretForRestore(from: string, to: string): number {
-  let prefix = 0;
-  const max = Math.min(from.length, to.length);
-  while (prefix < max && from[prefix] === to[prefix]) prefix++;
-  let suffix = 0;
-  while (suffix < max - prefix && from[from.length - 1 - suffix] === to[to.length - 1 - suffix]) {
-    suffix++;
-  }
-  return to.length - suffix;
 }

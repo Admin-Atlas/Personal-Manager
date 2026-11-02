@@ -181,6 +181,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Rebuild",
     body: "Rebuilds how PM searches your library. It re-reads every document, note and chat from your vault and re-splits them with the current settings, then re-reads your connected files (Google Drive, OneDrive, watched folders) from their source so each is indexed on its full contents — not just its saved summary. Each one is rebuilt in place, so search keeps working the whole time, and if PM is closed part-way through it picks up where it left off instead of starting over. Your documents, projects, tags and importance are never changed. Safe to run anytime; large connected sources make it take longer, and anything offline is left as it is and caught up on the next sync.",
   },
+  "documents-view": {
+    title: "All files, Folders or Projects",
+    body: "How the list is laid out. All files is every document in one list. Folders sorts them by where each one came from: a folder for each Google account's Drive, Shared with you, shared drives, each OneDrive, each folder PM watches on this computer, and the files you added to PM yourself, your photos, pinboard notes and chats. Inside a connected account you find the same folders as in the account itself. Projects gives each project a folder; a document in several projects is in each of their folders. Click a folder to open it, and the path at the top to go back up. The files in a folder are listed with the same columns and sorting as All files. PM remembers the layout and the folder you had open on this computer.",
+  },
   "documents-review-banner": {
     title: "Documents to review",
     body: "How many ingested documents are still waiting for you to confirm their project, tags, and importance. Click to jump to the Review queue.",
@@ -681,11 +685,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-note": {
     title: "A note",
-    body: "A sticky note — type anything into it and it saves as you go. Notes are Markdown: start a line with . for a bullet or - for a dash point, 1. for a numbered list, i. for roman numerals, > for an arrow/quote, or [] for a checkbox, and pressing Enter continues the list for you. The note renders itself when you're not editing — click it to write again. Drag the header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
+    body: "A sticky note — type anything into it and it saves as you go. Notes are Markdown: start a line with . for a bullet or - for a dash point, 1. for a numbered list, i. for roman numerals, > for an arrow/quote, or [] for a checkbox, and pressing Enter continues the list for you. A note reads like a document while you write it: the markers turn into bullets, checkboxes, headings and tables as you type them, and Tab, Shift+Tab and Enter work on lists and tables the way they do in Docs. Click a checkbox to tick it. A note with formatting the document view can't keep exactly opens as Markdown instead, where you edit the text itself and only the line you're on shows its markers, so nothing in it is changed. Drag the header to move it, resize from the bottom-right corner, and use the ✕ to remove it. The dots along the bottom tint it a colour so related notes read together.",
   },
   "pinboard-note-format": {
     title: "Format the note",
-    body: "Quick formatting for the note: bold, italic, heading, and bullet / numbered / checklist lists. Each button applies to the selected line(s) — press it again to turn it off. Every button also has a keyboard shortcut (shown when you hover) so you can format without leaving the keyboard.",
+    body: "Quick formatting for the note: bold, italic, heading, and bullet / numbered / checklist lists. Each button applies to the selected line(s) — press it again to turn it off. Every button also has a keyboard shortcut (shown when you hover) so you can format without leaving the keyboard. Table opens a grid: sweep across it (or drag, or use the arrow keys) to choose how many columns and rows, then click to add the table where your cursor is. With the cursor in a table, Table opens that table's menu instead: add a row or column, or delete the row, the column or the whole table. Backspace just under a table selects it and a second Backspace deletes it. In a table, Tab and Shift+Tab move between cells, Tab in the last cell or Enter adds a row, and Enter on an empty last row takes you out of the table. The table is saved as an ordinary Markdown table, so it stays a table when you ingest the note.",
   },
   "pinboard-note-ingest": {
     title: "Ingest as a document",

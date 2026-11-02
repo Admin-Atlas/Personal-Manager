@@ -260,78 +260,303 @@ body {
   margin-right: 0.4rem;
   transform: translateY(1px);
 }
-/* Pinboard notes only (scoped via `.pm-note-md`, so chat / the document reader keep their indented
-   lists): a checklist sits FLUSH with the note's left edge — a lone checkbox shouldn't look
-   pre-indented.
-   NARROWED, twice over, because the original rule applied to any list containing a checkbox at any
-   depth and cost more than it bought:
-     * **Top level only** (`> ul`, a direct child of the render root), which is what "flush with the
-       note's edge" ever meant. A nested checklist is indented BY ITS NESTING and previously needed
-       a second rule to undo the first.
-     * **Only a list that is ENTIRELY checkboxes.** A list holding a bullet as well as a checkbox
-       must keep its padding: `list-style: outside` draws a disc IN that padding, so zeroing it
-       painted the disc outside the box and a plain bullet silently lost its marker — reading as a
-       stray line of prose mid-list. That is a real note (". or this?" then "[] last one"), not an
-       edge case, because a marker change is what splits lists and a bullet followed by a checkbox
-       does not change marker.
-   There is no class-only twin for the second condition — "has a non-task child" is not something a
-   class can say. On an engine without `:has()` the rule simply doesn't apply and every checklist
-   keeps the ordinary list indent, which is the SAFE direction to degrade: a checkbox one notch
-   further in, never a bullet with no bullet.
+/* A pinboard note's live-preview editor (NoteEditor, CodeMirror). Its classes come from
+   lib/pinboard/livePreview: `pm-cm-<kind>` for each mark. Sizes follow `.pm-markdown` above, so a
+   note reads the same as its ingested copy does in the reader. */
+.pm-note-editor .cm-editor {
+  height: 100%;
+  background: transparent;
+  font-size: 0.875rem;
+  color: var(--ink2);
+}
+.pm-note-editor .cm-editor.cm-focused {
+  outline: none;
+}
+.pm-note-editor .cm-scroller {
+  font-family: inherit;
+  line-height: 1.375;
+  overflow: auto;
+}
+.pm-note-editor .cm-content {
+  padding: 0.25rem 0.5rem;
+  caret-color: var(--ink);
+}
+.pm-note-editor .cm-line {
+  padding: 0;
+}
+.pm-note-editor .cm-placeholder {
+  color: var(--ink4);
+}
+.pm-cm-h1,
+.pm-cm-h2,
+.pm-cm-h3,
+.pm-cm-h4,
+.pm-cm-h5,
+.pm-cm-h6 {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-cm-h1 {
+  font-size: 1.25rem;
+}
+.pm-cm-h2 {
+  font-size: 1.125rem;
+}
+.pm-cm-h3 {
+  font-size: 1rem;
+}
+.pm-cm-quote {
+  border-left: 2px solid var(--border2);
+  padding-left: 0.75rem !important;
+  color: var(--ink3);
+  font-style: italic;
+}
+.pm-cm-codeblock,
+.pm-cm-table-src {
+  font-family: var(--mono);
+  font-size: 0.8em;
+}
+.pm-cm-codeblock {
+  background: var(--surface);
+}
+.pm-cm-rule {
+  border-bottom: 1px solid var(--rule);
+}
+.pm-cm-strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-cm-em {
+  font-style: italic;
+}
+.pm-cm-strike {
+  text-decoration: line-through;
+}
+.pm-cm-code {
+  font-family: var(--mono);
+  font-size: 0.8em;
+  background: var(--surface);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+.pm-cm-link {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.pm-cm-marker {
+  color: var(--ink4);
+}
+.pm-cm-done {
+  color: var(--ink3);
+}
+.pm-cm-glyph {
+  display: inline-block;
+  min-width: 0.75rem;
+  color: var(--ink3);
+}
+/* The checkbox is drawn, not a native input: CodeMirror owns every event in the text, and a real
+   <input> would take focus and keyboard input of its own. */
+.pm-cm-box,
+.pm-cm-ticked,
+.pm-rich-task,
+.pm-rich-ticked {
+  display: inline-block;
+  width: 0.8rem;
+  min-width: 0;
+  height: 0.8rem;
+  margin-right: 0.15rem;
+  vertical-align: -0.1rem;
+  border: 1.5px solid var(--ink3);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.pm-cm-ticked,
+.pm-rich-ticked {
+  background: var(--accent);
+  border-color: var(--accent);
+  position: relative;
+}
+.pm-cm-ticked::after,
+.pm-rich-ticked::after {
+  content: "";
+  position: absolute;
+  left: 0.22rem;
+  top: 0.05rem;
+  width: 0.2rem;
+  height: 0.42rem;
+  border: solid var(--accent-ink);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.pm-cm-table {
+  overflow-x: auto;
+  margin: 0.25rem 0;
+}
+.pm-cm-table table {
+  border-collapse: collapse;
+}
+.pm-cm-table th,
+.pm-cm-table td,
+.pm-rich-editor th,
+.pm-rich-editor td {
+  border: 1px solid var(--border2);
+  padding: 0.25rem 0.5rem;
+  min-width: 3rem;
+  height: 1.75rem;
+  text-align: left;
+  vertical-align: top;
+  cursor: text;
+}
+.pm-cm-table th,
+.pm-rich-editor th {
+  color: var(--ink2);
+  font-weight: 600;
+}
 
-   ONE SELECTOR, ON ITS OWN, and that is load-bearing. This shipped as a two-selector list whose
-   second half was `ul:has(…):not(:has(> li:not(:has(> input))))` — a `:has()` inside a `:has()`,
-   which Selectors-4 §5.1 declares invalid, and an invalid selector anywhere in a comma-separated
-   list takes the WHOLE rule down with it. So the working class-only half died alongside it and
-   every checklist silently regained the indent this rule exists to remove. The classes are not a
-   fallback for a missing `:has()` here, they are the primary spelling: `remark-gfm` emits
-   `contains-task-list` on the list and `task-list-item` on each box, `markdown.tsx`'s sanitiser
-   schema admits exactly those two, and `markdown.test.ts` pins that it still does. */
-.pm-note-md .pm-markdown > ul.contains-task-list:not(:has(> li:not(.task-list-item))) {
-  padding-left: 0;
+/* A pinboard note's rich editor (RichNoteEditor, ProseMirror): Docs-style, no Markdown on screen.
+   Sizes follow the live preview's above, so switching editors doesn't move anything. ProseMirror's
+   own required rules are here too (its stylesheet carries colours of its own). */
+.pm-rich-editor {
+  overflow: auto;
 }
-/* Consecutive lists in a NOTE read as one block. Changing the marker character starts a new list in
-   CommonMark, which is exactly what makes the two bullet kinds distinguishable — but it also means
-   six lines typed in a row become three `<ul>`s, and the `ul` margin is four times the `li` one, so
-   the note came back with paragraph-sized gaps its author never typed. The marker change should
-   change the marker, not the spacing. */
-.pm-note-md .pm-markdown ul + ul,
-.pm-note-md .pm-markdown ul + ol,
-.pm-note-md .pm-markdown ol + ul {
-  margin-top: 0.125rem;
+.pm-rich-editor .ProseMirror {
+  position: relative;
+  min-height: 100%;
+  padding: 0.25rem 0.5rem;
+  outline: none;
+  font-size: 0.875rem;
+  line-height: 1.375;
+  color: var(--ink2);
+  white-space: pre-wrap;
+  white-space: break-spaces;
+  word-wrap: break-word;
+  font-variant-ligatures: none;
+  caret-color: var(--ink);
 }
-/* In a note, the box is a real control: clicking it ticks the item (PinboardView maps the click
-   back to the source marker). The sanitizer forces `disabled` on every rendered input — which is
-   right, since the same boundary renders ingested documents — and a disabled input swallows the
-   click instead of letting it reach the note's handler. `pointer-events: none` makes it
-   transparent to hit-testing so the note sees the click and does the toggle itself. Notes only:
-   a checkbox inside an ingested document stays inert. */
-.pm-note-md .pm-markdown li input[type="checkbox"] {
+.pm-rich-editor .ProseMirror p {
+  margin: 0;
+}
+.pm-rich-editor .ProseMirror :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-rich-editor .ProseMirror h1 {
+  font-size: 1.25rem;
+}
+.pm-rich-editor .ProseMirror h2 {
+  font-size: 1.125rem;
+}
+.pm-rich-editor .ProseMirror h3 {
+  font-size: 1rem;
+}
+.pm-rich-editor .ProseMirror :is(h4, h5, h6) {
+  font-size: 0.875rem;
+}
+.pm-rich-editor .ProseMirror strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-rich-editor .ProseMirror blockquote {
+  margin: 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border2);
+  color: var(--ink3);
+  font-style: italic;
+}
+.pm-rich-editor .ProseMirror pre {
+  margin: 0.25rem 0;
+  padding: 0.5rem;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 0.8em;
+  white-space: pre-wrap;
+}
+.pm-rich-editor .ProseMirror code {
+  font-family: var(--mono);
+  font-size: 0.8em;
+  background: var(--surface);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+.pm-rich-editor .ProseMirror pre code {
+  background: transparent;
+  padding: 0;
+}
+.pm-rich-editor .ProseMirror hr {
+  margin: 0.5rem 0;
+  border: 0;
+  border-top: 1px solid var(--rule);
+}
+.pm-rich-editor .ProseMirror hr.ProseMirror-selectednode {
+  border-top-color: var(--accent);
+}
+.pm-rich-link {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.pm-rich-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pm-rich-list .pm-rich-list {
+  padding-left: 1.25rem;
+}
+.pm-rich-list > li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+.pm-rich-item {
+  flex: 1;
+  min-width: 0;
+}
+.pm-rich-marker {
+  flex: none;
+  min-width: 0.75rem;
+  color: var(--ink3);
+  user-select: none;
+}
+.pm-rich-list > li[data-marker="ticked"] > .pm-rich-item > p {
+  color: var(--ink3);
+}
+.pm-rich-empty::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  color: var(--ink4);
   pointer-events: none;
 }
-/* Hanging indent on a checklist item, so a line long enough to wrap continues UNDER ITS OWN TEXT
-   rather than sliding back beneath the checkbox. A plain `ul` gets this free — its disc is a real
-   list marker, drawn outside the content box — but a task item's "marker" is an inline <input> that
-   sits in the text flow, so the second line has nothing holding it out. The negative text-indent
-   pulls the first line (the one carrying the box) back to the edge while the padding holds the rest
-   in. 1.35rem ≈ the box (13px) plus its 0.4rem margin; engines size the native box a little
-   differently, so this is a close fit rather than an exact one. */
-.pm-note-md .pm-markdown li.task-list-item,
-.pm-note-md .pm-markdown li:has(> input[type="checkbox"]) {
-  padding-left: 1.35rem;
-  text-indent: -1.35rem;
+/* Tables: a grid you type in, like a Docs table. prosemirror-tables marks the cells of a selection. */
+.pm-rich-editor .tableWrapper {
+  overflow-x: auto;
+  margin: 0.25rem 0;
 }
-/* ...and STOP there. `text-indent` is inherited, so that negative value ran down into anything
-   nested under a checklist item and pulled the first line of every descendant 1.35rem to the left —
-   far enough to drag a bullet's disc out of its list's padding, where it is not painted. A Tab-
-   indented list under a checkbox therefore came back with its items shifted left and their markers
-   gone, which reads as "the indenting is broken" and is really this one inherited property.
-   The reset goes on the nested list rather than on its items so it also covers a wrapped line, and
-   it is not written twice: it resets an inherited value, so it is correct on any engine whether or
-   not the rule that set the value matched. */
-.pm-note-md .pm-markdown li ul,
-.pm-note-md .pm-markdown li ol {
-  text-indent: 0;
+.pm-rich-editor table {
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.pm-rich-editor td,
+.pm-rich-editor th {
+  position: relative;
+}
+.pm-rich-editor .selectedCell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--accent-soft);
+  opacity: 0.6;
+  pointer-events: none;
+}
+.pm-rich-editor .ProseMirror-hideselection *::selection {
+  background: transparent;
+}
+.pm-rich-editor .ProseMirror-hideselection {
+  caret-color: transparent;
 }
 .pm-markdown strong {
   color: var(--ink);
@@ -410,7 +635,7 @@ body {
 /* These surfaces previously rendered as `whitespace-pre-wrap`, so a model's single newlines showed
    as line breaks. GFM folds a single newline into a space, which would silently reflow every answer
    the model laid out by hand — `pre-line` keeps those breaks while still collapsing runs of spaces.
-   Scoped here so the document reader keeps CommonMark's folding, as `.pm-note-md` does above.
+   Scoped here so the document reader keeps CommonMark's folding.
    `.pm-event-desc` is an event's description (the calendar pop-up): plain text someone typed line by
    line, in Google or a feed, which GFM would fold the same way. */
 .pm-inline-md .pm-markdown p,

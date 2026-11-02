@@ -121,7 +121,7 @@ pub fn scan(data_dir: Option<&std::path::Path>) -> Hardware {
 pub fn total_ram_gb() -> Option<f64> {
     use sysinfo::System;
 
-    let mut sys = System::new();
+    let mut sys = System::new().ok()?;
     sys.refresh_memory();
     match sys.total_memory() {
         0 => None,
@@ -143,7 +143,7 @@ pub fn total_ram_gb() -> Option<f64> {
 pub fn available_ram_gb() -> Option<f64> {
     use sysinfo::System;
 
-    let mut sys = System::new();
+    let mut sys = System::new().ok()?;
     sys.refresh_memory();
     match sys.available_memory() {
         0 => None,
@@ -155,32 +155,37 @@ pub fn available_ram_gb() -> Option<f64> {
 fn fill_ram_cpu_disk(hw: &mut Hardware, data_dir: Option<&std::path::Path>) {
     use sysinfo::System;
 
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.refresh_cpu_all();
+    // Since sysinfo 0.40 a `System` can fail to set up; the disk read below is independent of it,
+    // so a failure here leaves RAM and CPU unknown rather than the whole readout.
+    if let Ok(mut sys) = System::new() {
+        sys.refresh_memory();
+        sys.refresh_cpu_all();
 
-    hw.total_ram_gb = round1(sys.total_memory() as f64 / GIB);
-    hw.available_ram_gb = round1(sys.available_memory() as f64 / GIB);
+        hw.total_ram_gb = round1(sys.total_memory() as f64 / GIB);
+        hw.available_ram_gb = round1(sys.available_memory() as f64 / GIB);
 
-    if let Some(cpu) = sys.cpus().first() {
-        let brand = cpu.brand().trim();
-        if !brand.is_empty() {
-            hw.cpu_brand = Some(brand.to_string());
+        if let Some(cpu) = sys.cpus().first() {
+            let brand = cpu.brand().trim();
+            if !brand.is_empty() {
+                hw.cpu_brand = Some(brand.to_string());
+            }
+        }
+        let threads = sys.cpus().len();
+        if threads > 0 {
+            hw.cpu_threads = u32::try_from(threads).ok();
         }
     }
-    hw.cpu_cores = System::physical_core_count().and_then(|c| u32::try_from(c).ok());
-    let threads = sys.cpus().len();
-    if threads > 0 {
-        hw.cpu_threads = u32::try_from(threads).ok();
-    }
+    hw.cpu_cores = System::physical_core_count()
+        .ok()
+        .and_then(|c| u32::try_from(c).ok());
 
     hw.disk_free_gb = disk_free_gb(data_dir);
 }
 
 /// Free GB on the volume holding `data_dir` (longest matching mount point), else the roomiest volume.
 fn disk_free_gb(data_dir: Option<&std::path::Path>) -> Option<f64> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let list = disks.list();
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
+    let list: &[sysinfo::Disk] = &disks;
     if list.is_empty() {
         return None;
     }
@@ -210,9 +215,8 @@ fn disk_free_gb(data_dir: Option<&std::path::Path>) -> Option<f64> {
 /// the wrong volume is worse than admitting we don't know.
 pub(crate) fn available_bytes(dir: &std::path::Path) -> Option<u64> {
     let target = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
     disks
-        .list()
         .iter()
         .filter(|d| target.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
@@ -337,10 +341,14 @@ fn probe_gpu() -> GpuProbe {
     let mut probe = GpuProbe::default();
     if cfg!(target_arch = "aarch64") {
         // Apple Silicon: the GPU shares system RAM. Size VRAM as the working-set fraction of total.
-        let total_gb = {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            sys.total_memory() as f64 / GIB
+        // A `System` that can't be set up (fallible since sysinfo 0.40) reads as no RAM, the same
+        // answer an unreadable total always gave here.
+        let total_gb = match sysinfo::System::new() {
+            Ok(mut sys) => {
+                sys.refresh_memory();
+                sys.total_memory() as f64 / GIB
+            }
+            Err(_) => 0.0,
         };
         probe.name = Some("Apple Silicon GPU".to_string());
         probe.vendor = Some("Apple".to_string());

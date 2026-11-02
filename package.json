@@ -1,7 +1,7 @@
 {
   "name": "pm",
   "private": true,
-  "version": "3.165.0-alpha",
+  "version": "3.166.0-alpha",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
@@ -17,6 +17,8 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
     "@fontsource/atkinson-hyperlegible": "^5.3.0",
     "@fontsource/hanken-grotesk": "^5.3.0",
     "@fontsource/jetbrains-mono": "^5.3.0",
@@ -27,6 +29,15 @@
     "@tauri-apps/plugin-updater": "^2",
     "d3-force": "^3.0.0",
     "d3-quadtree": "^3.0.1",
+    "prosemirror-commands": "^1.7.2",
+    "prosemirror-inputrules": "^1.5.1",
+    "prosemirror-keymap": "^1.2.3",
+    "prosemirror-model": "^1.25.12",
+    "prosemirror-schema-list": "^1.5.1",
+    "prosemirror-state": "^1.4.4",
+    "prosemirror-tables": "^1.8.5",
+    "prosemirror-transform": "^1.12.2",
+    "prosemirror-view": "^1.42.6",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-markdown": "^10.1.0",
@@ -46,7 +57,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
-    "eslint": "^10.13.0",
+    "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.7",
