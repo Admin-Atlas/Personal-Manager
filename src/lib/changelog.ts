@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.164.2-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Under-the-hood tidying: the encryption library under your database moves to a newer release, with fixes for how it reports a wrong key or a failed passphrase change. The third-party licence notices that come with PM now include each component's licence text, which had been missing. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.164.1-alpha",
     date: "2026-11-02",
     highlights: [

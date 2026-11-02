@@ -1,20 +1,24 @@
 {{!-- SPDX-FileCopyrightText: 2026 Bobby Yu --}}
 {{!-- SPDX-License-Identifier: AGPL-3.0-or-later --}}
+{{!-- Triple braces: this is a text file, so a licence's name and text go in verbatim rather than
+     HTML-escaped. The text field is `text`; an unknown field renders as nothing, and the NOTICE
+     shipped with no licence texts at all while this asked for `license_text`. --}}
 PM — third-party licence notices
 ================================
 
-PM bundles the Rust dependencies listed below. Each is reproduced under its own
-licence; PM itself is licensed under AGPL-3.0-or-later (see LICENCE.txt).
+PM bundles, or is built with, the Rust crates listed below. Each is reproduced
+under its own licence; PM itself is licensed under AGPL-3.0-or-later (see
+LICENCE.txt).
 
 {{#each licenses}}
 --------------------------------------------------------------------------------
-{{name}}{{#if id}} ({{id}}){{/if}}
+{{{name}}}{{#if id}} ({{id}}){{/if}}
 
 Used by:
 {{#each used_by}}
   - {{crate.name}} {{crate.version}}
 {{/each}}
 
-{{license_text}}
+{{{text}}}
 
 {{/each}}
