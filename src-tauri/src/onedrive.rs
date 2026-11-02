@@ -54,7 +54,7 @@ const MAX_PAGES: usize = 1000;
 const SELECT_ITEM: &str = "id,name,file,folder,deleted,webUrl,lastModifiedDateTime,size,createdBy,lastModifiedBy,createdDateTime,parentReference";
 
 const PROVIDER: &str = "microsoft";
-const SERVICE: &str = "onedrive";
+pub(crate) const SERVICE: &str = "onedrive";
 
 // --- identity / namespacing ---------------------------------------------------------------------
 

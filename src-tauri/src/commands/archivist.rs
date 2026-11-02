@@ -90,8 +90,8 @@ pub fn delete_document(app: AppHandle, state: State<'_, AppState>, document_id: 
 }
 
 /// What a deleted document leaves outside the database, to be removed only once its rows are gone.
-struct Leftover {
-    document_id: i64,
+pub(super) struct Leftover {
+    pub(super) document_id: i64,
     /// Vault-relative files PM held for it: the Markdown, and a photo's saved original.
     vault_files: Vec<String>,
     /// An index-only pointer's `source_id`, whose `.pmindex` manifest entry must go too.
@@ -100,9 +100,9 @@ struct Leftover {
 
 /// Delete one non-chat document's rows inside the caller's transaction, returning what is left to
 /// tidy after the commit — or `None` when the row is already gone. The rows half of
-/// [`delete_document`], shared with the bulk delete so the two can never disagree on what a
-/// deletion removes.
-fn delete_rows(tx: &rusqlite::Connection, document_id: i64) -> Result<Option<Leftover>> {
+/// [`delete_document`], shared with the bulk delete and the connector reset so none of them can
+/// disagree on what a deletion removes.
+pub(super) fn delete_rows(tx: &rusqlite::Connection, document_id: i64) -> Result<Option<Leftover>> {
     let Some((vault_path, source_type, source_id)) = tx
         .query_row(
             "SELECT vault_path, source_type, source_id FROM documents WHERE id = ?1",

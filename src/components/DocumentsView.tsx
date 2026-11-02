@@ -81,6 +81,10 @@ import {
   DeleteUnreachableDialog,
   deadSources,
 } from "./DeleteDocumentDialog";
+import {
+  ResetConnectorDocumentsDialog,
+  connectorDocumentCount,
+} from "./ResetConnectorDocumentsDialog";
 import { ProjectPicker, ProjectSummary, projectsOf } from "./ProjectPicker";
 import { IngestProgress } from "./IngestProgress";
 // ONE-TIME cleanup — remove with the component in the release after this one (card #651 follow-up).
@@ -204,6 +208,10 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [deletingDoc, setDeletingDoc] = useState<Document | null>(null);
   // The bulk "delete every file PM can't reach" confirmation is open (#1017).
   const [deletingDead, setDeletingDead] = useState(false);
+  // The connector reset's confirmation is open (#1019), and how many it removed once it has run — the
+  // re-fetch carries on in the background, so the list is briefly short and the banner says why.
+  const [resetting, setResetting] = useState(false);
+  const [resetCount, setResetCount] = useState<number | null>(null);
   // `projects[0]` is the primary; the rest are links (#275). Held as one ordered list so a single
   // Save writes the whole membership, for the same reason project and importance already share a
   // draft: two independent optimistic writes race and silently drop one.
@@ -808,6 +816,18 @@ export function DocumentsView({ onReviewClick }: Props) {
           >
             Rebuild
           </Button>
+          {/* Faint and last, like Rebuild: the most destructive tool on the tab (#1019). Only
+              when there is something it would reset. */}
+          {connectorDocumentCount(documents) > 0 && (
+            <Button
+              variant="tertiary"
+              onClick={() => setResetting(true)}
+              disabled={busy || installingOcr}
+              title="Remove every file from your connected accounts and folders, with its filing, and fetch them again"
+            >
+              Reset…
+            </Button>
+          )}
         </div>
       </header>
 
@@ -843,6 +863,19 @@ export function DocumentsView({ onReviewClick }: Props) {
                   disabled={busy}
                 >
                   Rebuild now
+                </button>
+              </div>
+            </Banner>
+          )}
+          {resetCount != null && (
+            <Banner tone="info">
+              <div className="flex items-center justify-between gap-3">
+                <span>
+                  Removed {resetCount} connector file{resetCount === 1 ? "" : "s"}. They come back
+                  as your accounts and folders sync; Settings › Connectors shows the progress.
+                </span>
+                <button onClick={() => setResetCount(null)} className="shrink-0 underline">
+                  Dismiss
                 </button>
               </div>
             </Banner>
@@ -1626,6 +1659,16 @@ export function DocumentsView({ onReviewClick }: Props) {
           docs={documents}
           onClose={() => setDeletingDead(false)}
           onDeleted={() => void refresh()}
+        />
+      )}
+      {resetting && (
+        <ResetConnectorDocumentsDialog
+          docs={documents}
+          onClose={() => setResetting(false)}
+          onReset={(count) => {
+            setResetCount(count);
+            void refresh();
+          }}
         />
       )}
     </div>

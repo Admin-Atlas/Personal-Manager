@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.164.0-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Start your connected files over. Reset… in the Documents tab removes every file PM indexed from Google Drive, OneDrive and your watched folders, along with its project, importance and tags, then fetches them all again, so they come back unsorted for Review to file afresh. The files themselves are never touched, and files you added to the vault and your chats are left alone.",
+    ],
+  },
+  {
     version: "3.163.0-alpha",
     date: "2026-11-02",
     highlights: [
