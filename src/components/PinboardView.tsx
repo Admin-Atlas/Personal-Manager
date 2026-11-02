@@ -29,7 +29,7 @@ import {
 } from "../lib/ipc";
 import { revealCaret } from "../lib/caretReveal";
 import { Markdown } from "../lib/markdown";
-import { CELL, folderAtPointer } from "../lib/pinboard/grid";
+import { boardExtent, CELL, folderAtPointer, spaceOf, type BoardSpace } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
   caretForRestore,
@@ -152,6 +152,13 @@ const PANEL_H = 17 * CELL;
 /** The share of the main board an opened folder's overlay takes up. */
 const OVERLAY_SHARE = 0.8;
 
+/** The padding across each axis of the main board's scroller (p-6) and a folder board's (p-3). */
+const BOARD_INSET = 48;
+const FOLDER_BOARD_INSET = 24;
+
+const sameSpace = (a: BoardSpace, b: BoardSpace) =>
+  a.cols === b.cols && a.rows === b.rows && a.barCols === b.barCols && a.barRows === b.barRows;
+
 /**
  * A board canvas: the ruled grid every widget is positioned against, sized in cells. Shared by the
  * main board and a folder's overlay board so the two can't drift apart — `ref` is what turns a
@@ -270,18 +277,24 @@ export function PinboardView() {
   // the viewport and showed scrollbars — the board read as "bigger than the screen". Measure the
   // scroller instead (its p-6 gives a 24px inset each side → −48), floored on the CELL grid, and seed
   // from the window so the first load reflow has a sane width before the layout effect measures.
-  const [measured, setMeasured] = useState(() => ({
-    cols: Math.max(1, Math.floor((window.innerWidth - 48) / CELL)),
-    rows: Math.max(1, Math.floor((window.innerHeight - 48) / CELL)),
-  }));
+  //
+  // The scroller's OWN box (`getBoundingClientRect`, to the subpixel), not `clientWidth`, which is the
+  // box less whatever scrollbar is showing: the board's size fed its scrollbars and its scrollbars fed
+  // its size, so the board shook, scrollbars came and went, and at some window sizes (often a
+  // maximised one) it never settled. `boardExtent` leaves room for a scrollbar only where the
+  // widgets will actually scroll.
+  const [measured, setMeasured] = useState(() =>
+    spaceOf(window.innerWidth, window.innerHeight, BOARD_INSET),
+  );
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const measure = () =>
-      setMeasured({
-        cols: Math.max(1, Math.floor((el.clientWidth - 48) / CELL)),
-        rows: Math.max(1, Math.floor((el.clientHeight - 48) / CELL)),
-      });
+    const measure = () => {
+      const box = el.getBoundingClientRect();
+      const next = spaceOf(box.width, box.height, BOARD_INSET);
+      // Same cells, same object: no render for a resize that moved nothing.
+      setMeasured((was) => (sameSpace(was, next) ? was : next));
+    };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(el);
@@ -1727,16 +1740,18 @@ function FolderBoard({
   // element to measure and no element to observe. Coming back to the cards then left the canvas at
   // its 1×1 seed, sized only to whatever the cards themselves reached — a board with no ruled grid
   // showing anywhere they weren't. Re-running when the face changes is what puts the ruling back.
-  const [measured, setMeasured] = useState({ cols: 1, rows: 1 });
+  //
+  // The scroller's own box, as the main board measures it, so this board's scrollbars can't feed
+  // back into its size either.
+  const [measured, setMeasured] = useState<BoardSpace>({ cols: 1, rows: 1 });
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const PAD = 12;
-    const measure = () =>
-      setMeasured({
-        cols: Math.max(1, Math.floor((el.clientWidth - PAD * 2) / CELL)),
-        rows: Math.max(1, Math.floor((el.clientHeight - PAD * 2) / CELL)),
-      });
+    const measure = () => {
+      const box = el.getBoundingClientRect();
+      const next = spaceOf(box.width, box.height, FOLDER_BOARD_INSET);
+      setMeasured((was) => (sameSpace(was, next) ? was : next));
+    };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(el);
@@ -1746,15 +1761,7 @@ function FolderBoard({
   // The canvas fills the body, then grows to contain any card sitting past it — cards are never
   // re-flowed to fit (that would resize them, which is exactly what this view exists to preserve),
   // so the board scrolls to reach them instead.
-  const bounds = useMemo(() => {
-    let cols = measured.cols;
-    let rows = measured.rows;
-    for (const c of children) {
-      cols = Math.max(cols, c.rect.x + c.rect.w);
-      rows = Math.max(rows, c.rect.y + c.rect.h);
-    }
-    return { cols, rows };
-  }, [measured, children]);
+  const bounds = useMemo(() => boardExtent(measured, children), [measured, children]);
   const boundsRef = useRef(bounds);
   boundsRef.current = bounds;
 

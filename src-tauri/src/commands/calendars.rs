@@ -223,14 +223,42 @@ pub async fn request_calendar_access(
 }
 
 /// Tick/untick one calendar (by its `calendars.id`) for syncing.
+///
+/// Unticking takes the calendar's events out of the mirror here and now instead of leaving them for
+/// the next sync to prune, so nothing has to sync for the box to take effect: the Connectors tab used
+/// to run a full sync of every account after each click, and wait for it. Ticking only records the
+/// choice; the Connectors tab starts the sync that fetches the calendar. Either way the open views
+/// are told to re-read (`calendar://synced`), so the Calendar tab's sidebar follows at once rather
+/// than at the next tab switch.
 #[tauri::command]
-pub fn set_calendar_selected(
-    state: State<'_, AppState>,
+pub async fn set_calendar_selected(
+    app: AppHandle,
     calendar_id: String,
     selected: bool,
 ) -> Result<()> {
-    let conn = state.conn()?;
-    calendar::set_calendar_selected(&conn, &calendar_id, selected)
+    let worker = app.clone();
+    let id = calendar_id.clone();
+    spawn_blocking_result("calendar selection", move || -> Result<()> {
+        let state = worker.state::<AppState>();
+        let conn = state.conn()?;
+        calendar::set_calendar_selected(&conn, &id, selected)?;
+        if !selected {
+            let active: Vec<String> = calendar::selected_calendars(&conn)?
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+            calendar::prune_unselected(&conn, &active)?;
+            // Forget when it was last fetched: ticked again, it must be fetched whole, not checked
+            // for changes since a fetch whose events are gone.
+            let keep: HashSet<&str> = active.iter().map(String::as_str).collect();
+            note_fresh(&worker, |f| f.keep_only(&keep));
+            briefing::nudge(&state);
+        }
+        Ok(())
+    })
+    .await?;
+    announce_synced(&app, vec![calendar_id]);
+    Ok(())
 }
 
 /// Type one calendar as work or personal, or clear it with `None` (v45).
@@ -1156,8 +1184,9 @@ fn never_reached_google(e: &Error) -> bool {
     matches!(e, Error::Http(h) if h.is_connect() || h.is_timeout())
 }
 
-/// `calendar://synced`: these calendars' events were just written by a sync or a change check, so
-/// an open Calendar or Focus view re-reads them without waiting for a focus change.
+/// `calendar://synced`: these calendars' events were just written by a sync or a change check, or
+/// the calendar was ticked or unticked, so an open Calendar or Focus view (and the sidebar's roster)
+/// re-reads them without waiting for a focus change.
 #[derive(Clone, Serialize)]
 struct CalendarSynced {
     calendar_ids: Vec<String>,

@@ -24,6 +24,22 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.165.0-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Settings saves as you go, and says so. The Save button is gone: every change is kept the moment you make it, and the bottom of Settings shows “Changes saved ✓”. The backup schedule works the same way now, with Keep last saved once you've finished typing it.",
+      "Unticking a calendar under Settings → Connectors takes effect at once: it leaves the Calendar tab's list and its events go, without waiting for a sync. Ticking one fetches it in the background, so you can keep ticking.",
+      "Settings remembers which connector groups (This device, Google, Microsoft, Apple, Calendar subscriptions) you folded, even after a restart.",
+      "In the Calendar, Today now sits at the far left. In Day and Week, + New event moves into the grid's top-left corner, above the time zones; in the other views it's beside Refresh.",
+      "Drag over empty time from one day to another to make an event that runs across them, as you already could in the all-day row and Month.",
+      "When an invitation reaches more than one of your Google accounts, “Going?” shows which account you're answering as.",
+      "The All day switch only switches when you click it or its name, not the empty space beside it.",
+      "The Pinboard no longer shakes or flickers its scrollbars, and fits the window properly when it's maximised.",
+      "Deleting every file PM can't reach no longer freezes PM while it works, and neither does deleting one large file.",
+      "On a Mac, the window buttons are red, yellow and green, and hovering one names it.",
+    ],
+  },
+  {
     version: "3.164.2-alpha",
     date: "2026-11-02",
     highlights: [

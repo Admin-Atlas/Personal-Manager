@@ -496,17 +496,34 @@ describe("plans", () => {
 
   it("planCreate", () => {
     const anchor = at(D, 9, 7);
-    expect(planCreate(anchor, 640, null)).toEqual(ok(timed(at(D, 9), at(D, 10, 45))));
-    expect(planCreate(anchor, 440, null)).toEqual(ok(timed(at(D, 7, 15), at(D, 9, 15)))); // up
-    expect(planCreate(anchor, 550, null)).toEqual(ok(timed(at(D, 9), at(D, 9, 15)))); // same slot
-    expect(planCreate(anchor, 540, null)).toEqual(ok(timed(at(D, 9), at(D, 9, 15))));
-    // Clamped to the anchor's day.
-    expect(planCreate(at(D, 23, 10), 1500, null)).toEqual(ok(timed(at(D, 23), at(WED, 0))));
-    expect(planCreate(at(D, 0, 30), -20, null)).toEqual(ok(timed(at(D, 0), at(D, 0, 45))));
+    const on = (day: string, min: number): WallPoint => ({ day, min });
+    expect(planCreate(anchor, on(D, 640), null)).toEqual(ok(timed(at(D, 9), at(D, 10, 45))));
+    // up
+    expect(planCreate(anchor, on(D, 440), null)).toEqual(ok(timed(at(D, 7, 15), at(D, 9, 15))));
+    // same slot
+    expect(planCreate(anchor, on(D, 550), null)).toEqual(ok(timed(at(D, 9), at(D, 9, 15))));
+    expect(planCreate(anchor, on(D, 540), null)).toEqual(ok(timed(at(D, 9), at(D, 9, 15))));
+    // Clamped to the pointer's day.
+    expect(planCreate(at(D, 23, 10), on(D, 1500), null)).toEqual(ok(timed(at(D, 23), at(WED, 0))));
+    expect(planCreate(at(D, 0, 30), on(D, -20), null)).toEqual(ok(timed(at(D, 0), at(D, 0, 45))));
     // A press at the very bottom anchors on the day's last slot.
-    expect(planCreate({ day: D, min: 1440 }, 1440, null)).toEqual(
+    expect(planCreate({ day: D, min: 1440 }, on(D, 1440), null)).toEqual(
       ok(timed(at(D, 23, 45), at(WED, 0))),
     );
+  });
+
+  it("planCreate across days runs from the anchor to the pointer's slot on its day", () => {
+    const anchor = at(D, 9, 7);
+    // Right, to a later day: from the anchor's slot to the pointer's, rounded up.
+    expect(planCreate(anchor, at(THU, 14, 20), null)).toEqual(ok(timed(at(D, 9), at(THU, 14, 30))));
+    // A later day but earlier in it is still later: the event spans the night.
+    expect(planCreate(anchor, at(WED, 7, 50), null)).toEqual(ok(timed(at(D, 9), at(WED, 8))));
+    // Left, to an earlier day: from the pointer's slot, rounded down, to the end of the anchor's.
+    expect(planCreate(anchor, at(MON, 14, 20), null)).toEqual(
+      ok(timed(at(MON, 14, 15), at(D, 9, 15))),
+    );
+    // The top of the next day is the end of this one.
+    expect(planCreate(at(D, 22), at(WED, 0), null)).toEqual(ok(timed(at(D, 22), at(WED, 0))));
   });
 
   it("planClickCreate", () => {
@@ -626,9 +643,12 @@ describe("planGesture dispatches by press and target", () => {
       { kind: "empty", surface: "grid", create: ok(timed(at(D, 9), at(D, 10))) },
       { zone: "timed", day: D, minute: 547 },
     );
-    // The anchor's column only, whichever the pointer is over.
-    expect(planGesture(grid, { zone: "timed", day: THU, minute: 640 }, OPTS)).toEqual(
+    expect(planGesture(grid, { zone: "timed", day: D, minute: 640 }, OPTS)).toEqual(
       ok(timed(at(D, 9), at(D, 10, 45))),
+    );
+    // Over another day's column, the event runs across to it.
+    expect(planGesture(grid, { zone: "timed", day: THU, minute: 640 }, OPTS)).toEqual(
+      ok(timed(at(D, 9), at(THU, 10, 45))),
     );
     expect(planGesture(grid, inStrip, OPTS)).toBeNull();
     const strip = pressOf(

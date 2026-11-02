@@ -378,6 +378,23 @@ describe("CalendarView: a new event", () => {
     expect(quick()).toBeTruthy();
   });
 
+  // One home per view: the time grid's corner in Week and Day, above the timezone control; the
+  // header's right end where there's no corner.
+  it("+ New event sits in Week's grid corner and in Month's header", async () => {
+    localStorage.setItem("pm.calendar.view", "week");
+    const first = await mount();
+    expect(screen.getAllByRole("button", { name: "+ New event" })).toHaveLength(1);
+    expect(newEvent().closest("[data-calendar-grid]")).not.toBeNull();
+    expect(newEvent().closest("header")).toBeNull();
+    first.unmount();
+    localStorage.setItem("pm.calendar.view", "month");
+    const { CalendarView } = await import("./CalendarView");
+    render(<CalendarView />);
+    await screen.findByRole("button", { name: "+ New event" });
+    expect(screen.getAllByRole("button", { name: "+ New event" })).toHaveLength(1);
+    expect(newEvent().closest("header")).not.toBeNull();
+  });
+
   it("Shift+C opens quick create, non-modal, under + New event; c the full editor", async () => {
     await mount();
     press("C", true);

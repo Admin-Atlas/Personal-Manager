@@ -36,7 +36,13 @@ import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types
 import { askOwnerFor, copyRank, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
-import { markDeclined, myReply, removingFrom, replyCopies } from "../../lib/calendarEdit/rsvp";
+import {
+  markDeclined,
+  myReply,
+  removingFrom,
+  replyCopies,
+  replyingAs,
+} from "../../lib/calendarEdit/rsvp";
 import { isRepeating } from "../../lib/calendarEdit/saveChoices";
 import {
   accountLength,
@@ -121,6 +127,7 @@ import {
 } from "./parts/CalendarEventPopover";
 import { whenText } from "./parts/whenText";
 import { CalendarHeader } from "./CalendarHeader";
+import { NewEventButton } from "./NewEventButton";
 import { DeleteEventDialog } from "./edit/DeleteEventDialog";
 import { EventEditor } from "./edit/EventEditor";
 import { NewEventEditor, type CopyOf, type CreateHandover } from "./edit/NewEventEditor";
@@ -1003,6 +1010,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       current: myReply(event, calendar.remote_id),
       repeating: isRepeating(event),
       forWhom,
+      replyAs: replyingAs(overview?.accounts ?? [], calendar),
       onReply: (reply, scope) => writes.respond(event.id, reply, null, scope),
     })),
     ask: askFor(ev),
@@ -1060,6 +1068,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
   const label = viewLabel(view, cursor, dayCount);
   const isTerminal = system === "terminal";
+  // "+ New event" has one home per view: the time grid's top-left corner in Week and Day, above the
+  // timezone control, and the header's right end where there's no corner (Month, Year, Agenda, and
+  // Terminal, which draws no grid). Either way it's the same button: quick create opens under it.
+  const createInCorner = !isTerminal && (view === "week" || view === "day");
+  const newEventInCorner =
+    hasGoogle && createInCorner ? (
+      <NewEventButton
+        compact
+        onCreate={openCreate}
+        createReason={createReason}
+        createRef={createButtonRef}
+      />
+    ) : undefined;
 
   // --- dragging an event to move it (#884, C16b) ---
 
@@ -1332,6 +1353,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
                   }
                 : undefined
             }
+            corner={newEventInCorner}
           />
         );
     }
@@ -1362,7 +1384,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onRefresh={onRefresh}
         syncing={syncing}
         lastSync={overview?.last_sync ?? null}
-        onCreate={hasGoogle ? openCreate : undefined}
+        onCreate={hasGoogle && !createInCorner ? openCreate : undefined}
         createReason={createReason}
         createRef={createButtonRef}
       />

@@ -30,6 +30,7 @@ const protonCliStatus = vi.fn();
 const protonDisconnect = vi.fn();
 const protonStatus = vi.fn();
 const scorePassphrase = vi.fn();
+const setBackupSchedule = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
   backupArchivePrefix: () => backupArchivePrefix(),
@@ -59,7 +60,7 @@ vi.mock("../lib/ipc", () => ({
   scorePassphrase: (...a: unknown[]) => scorePassphrase(...a),
   setBackupDestinations: vi.fn(),
   setBackupPassphrase: vi.fn(),
-  setBackupSchedule: vi.fn(),
+  setBackupSchedule: (...a: unknown[]) => setBackupSchedule(...a),
   setProtonCliPath: vi.fn(),
   stopBackup: vi.fn(),
   switchToVault: vi.fn(),
@@ -323,5 +324,36 @@ describe("Disconnect a backup destination", () => {
 
     await waitFor(() => expect(backupGdriveDisconnect).toHaveBeenCalledTimes(1));
     expect(protonDisconnect).not.toHaveBeenCalled();
+  });
+});
+
+// Settings has no Save button: the schedule saves as it changes, and "Keep last" once it's typed.
+describe("the automatic schedule saves as it changes", () => {
+  it("saves a frequency the moment it's chosen, with no Save schedule to press", async () => {
+    await mountPanel();
+    expect(screen.queryByRole("button", { name: /Save schedule/ })).toBeNull();
+    fireEvent.change(screen.getByDisplayValue("Weekly"), { target: { value: "daily" } });
+    await waitFor(() => expect(setBackupSchedule).toHaveBeenCalledWith("daily", 5));
+  });
+
+  it("saves Keep last when you leave it, not on the way to the number", async () => {
+    // Saving 1 on the way to 15 would make one backup the live schedule for a moment.
+    await mountPanel();
+    const keep = screen.getByDisplayValue("5");
+    fireEvent.change(keep, { target: { value: "1" } });
+    fireEvent.change(keep, { target: { value: "15" } });
+    expect(setBackupSchedule).not.toHaveBeenCalled();
+    fireEvent.blur(keep);
+    await waitFor(() => expect(setBackupSchedule).toHaveBeenCalledWith("weekly", 15));
+    expect(setBackupSchedule).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers only Off until a passphrase is remembered, and says why", async () => {
+    getBackupSchedule.mockResolvedValue(schedule({ frequency: "off", passphrase_stored: false }));
+    render(<BackupSettings />);
+    const daily = await screen.findByRole<HTMLOptionElement>("option", { name: "Daily" });
+    expect(daily.disabled).toBe(true);
+    expect(screen.getByRole<HTMLOptionElement>("option", { name: "Off" }).disabled).toBe(false);
+    expect(screen.getByText(/to turn on automatic backups/)).toBeTruthy();
   });
 });

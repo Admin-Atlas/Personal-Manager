@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { CalendarOverview, Conversation, LocalLlmStatus } from "../lib/types";
-import { calendarOverview, listArchivedProjects, listProjects } from "../lib/ipc";
+import { calendarOverview, listArchivedProjects, listProjects, onCalendarSynced } from "../lib/ipc";
 import { archivedSet, isArchived } from "../lib/archivedProjects";
 import { shortModel } from "../lib/format";
 import { readHidden, readRosterOpen, writeHidden, writeRosterOpen } from "../lib/calendarPrefs";
@@ -276,13 +276,26 @@ export function Sidebar({
   useEffect(() => {
     if (view !== "calendar") return;
     let alive = true;
-    calendarOverview()
-      .then((o) => alive && setCalOverview(o))
-      .catch(() => {
-        /* best-effort: no roster simply means no block */
-      });
+    let unlisten: (() => void) | null = null;
+    const load = () =>
+      calendarOverview()
+        .then((o) => alive && setCalOverview(o))
+        .catch(() => {
+          /* best-effort: no roster simply means no block */
+        });
+    void load();
+    // A calendar ticked or unticked in Settings → Connectors, or a sync that found a new one, says so
+    // here. Settings opens over this still-mounted sidebar, so reading only on the way into the tab
+    // left an unticked calendar listed until PM restarted.
+    void onCalendarSynced(() => void load())
+      .then((stop) => {
+        if (alive) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {});
     return () => {
       alive = false;
+      unlisten?.();
     };
   }, [view]);
   // The grid writes the same set, and this sidebar is mounted alongside it, so follow the app-wide

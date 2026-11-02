@@ -266,7 +266,9 @@ export function WhenFields({
     <fieldset className="flex min-w-0 flex-col gap-2" disabled={disabled}>
       <legend className="text-sm text-ink2">When</legend>
       {!single && (
-        <label className="flex items-center gap-2 text-xs text-ink3">
+        // As wide as the switch and its words, no wider: a label passes a click anywhere in it to
+        // the switch, and stretched across the editor it switched All day from empty space.
+        <label className="flex w-fit items-center gap-2 text-xs text-ink3">
           <Toggle
             ariaLabel="All day"
             checked={t.kind === "all_day"}

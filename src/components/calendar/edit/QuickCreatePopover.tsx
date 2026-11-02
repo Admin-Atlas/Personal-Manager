@@ -786,7 +786,9 @@ export function QuickCreatePopover({
             t.last_day !== t.first_day && <span>to {formatDateOnly(t.last_day)}</span>
           )}
         </div>
-        <label className="flex items-center gap-2 text-xs text-ink3">
+        {/* Only as wide as the switch and its words: stretched across the box, a click on empty
+            space beside it switched All day. */}
+        <label className="flex w-fit items-center gap-2 text-xs text-ink3">
           <Toggle
             ariaLabel="All day"
             checked={t.kind === "all_day"}

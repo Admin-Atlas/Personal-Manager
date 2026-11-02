@@ -15,7 +15,7 @@
 // the ends that may be dragged, the ghost in each column it touches, and the pending look; the drag
 // itself is the calendar's (`useCalendarGesture`), which listens on the window.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { CalendarEvent } from "../../../lib/types";
 import type { CalendarRange, RangeBounds } from "../../../lib/calendarPrefs";
 import {
@@ -84,6 +84,8 @@ interface Props {
    *  ghost and the pending look, and keeps the all-day row. Absent (Focus's read-only grid), the DOM
    *  is as it always was. */
   interaction?: GridInteraction;
+  /** Drawn in the top-left corner above the timezone control: the calendar's "+ New event". */
+  corner?: ReactNode;
 }
 
 /** What a dragging calendar tells the grid. */
@@ -158,6 +160,7 @@ export function TimeGridView({
   now,
   onEventClick,
   interaction,
+  corner,
 }: Props) {
   const { minimal, showPower } = useDepth();
   const nowDate = now ?? new Date();
@@ -374,6 +377,7 @@ export function TimeGridView({
           zoneCol={ZONE_COL}
           localCol={LOCAL_COL}
           allowAdd={allowZones}
+          corner={corner}
         />
         {columns.map((c) => (
           <div

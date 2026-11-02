@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The register of settings a user has EDITED BUT NOT COMMITTED, so Settings can refuse to walk away
-// from them silently.
+// The register of settings a user has EDITED BUT NOT COMMITTED, so Settings can commit them before it
+// walks away instead of letting the unmount discard them.
 //
 // Almost every control in Settings writes on change and has nothing to register. The exceptions are
 // the controls where writing per keystroke would be actively wrong — the backup schedule is the
 // standing example: committing a retention of "1" on the way to typing "15" would briefly make it
-// the live schedule and could delete backups. Those keep an explicit Save, and register here so that
-// leaving the tab (or closing Settings) asks first, and names what is at stake rather than showing a
-// bare "unsaved changes" scare.
+// the live schedule and could delete backups. Those commit when you're done (leaving the field, or
+// Enter), and register here meanwhile, so that leaving the tab or closing Settings commits them
+// first — Settings has no Save button — and the footer can name what is still being typed.
 //
 // Deliberately a registry rather than a prop chain: the tabs are independently-mounted components
 // several levels down, and threading a dirty flag up through each one would mean every future
@@ -90,7 +90,7 @@ export function useSettingsPending(): Registry | null {
  * `save` is kept in a ref so a caller can pass a fresh closure each render — the common case, since
  * it closes over the draft state — without the effect re-running and thrashing the registry.
  * Unregisters on unmount, so a tab that is switched away from cannot leave a phantom entry behind
- * (the guard runs BEFORE the switch, so by the time it unmounts the user has already decided).
+ * (the commit runs BEFORE the switch, so by the time it unmounts the edit has been saved).
  */
 export function useRegisterPending(
   id: string,

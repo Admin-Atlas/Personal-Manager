@@ -164,6 +164,7 @@ import { replyOf, type GuestSuggestion } from "../../../lib/calendarEdit/guests"
 import {
   guestsWithReply,
   replyHeld,
+  replyingAs,
   replyStanding,
   withReply,
   type ReplyStanding,
@@ -1304,6 +1305,7 @@ export function EventEditor({
                   current={replyOf(loaded.event.reply?.response ?? null)}
                   repeating={repeating}
                   forWhom={calendar && !calendar.is_primary ? calendar.name : null}
+                  replyAs={replyingAs(overview?.accounts ?? [], calendar)}
                   note={loaded.event.reply?.note ?? ""}
                   title={title}
                   disabled={saving || mustReopen}
