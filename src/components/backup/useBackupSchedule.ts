@@ -13,7 +13,7 @@
 // `scheduleError ? … : schedule === null ? …` branch) is also what stops the unsaved-draft guard
 // clearing itself whenever the schedule is null or failed to load.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   forgetBackupPassphrase,
@@ -71,15 +71,14 @@ export function useBackupSchedule({ setMessage }: BackupScheduleDeps) {
   ].filter(Boolean) as string[];
 
   const keepN = schedule?.retention_n ?? null;
-  // The one control in Settings that holds an unsaved buffer. Done — or merely switching Settings
-  // tabs, which unmounts this panel — throws the drafts away silently, which made the footer's
-  // "changes are saved as you make them" untrue here. Say so instead of pretending.
+  // Settings saves as you go, and so does this: the frequency the moment it's chosen, "Keep last"
+  // once you're done typing it (you leave the field or press Enter). Not per keystroke — typing 15
+  // passes through 1, and a scheduled run in between would prune to one backup. While it's being
+  // typed it's the one unsaved thing in Settings, so it registers: leaving the tab, or closing
+  // Settings, commits it first instead of the unmount discarding it.
   const scheduleDirty =
     schedule != null &&
     (freqDraft !== schedule.frequency || retentionDraft !== String(schedule.retention_n));
-  // Register those drafts so leaving the tab, or closing Settings, asks first and names them —
-  // rather than the unmount discarding them in silence. Only the fields that actually differ are
-  // listed, so the dialog reads as a specific warning rather than a generic one.
   useRegisterPending(
     "backup-schedule",
     "backup",
@@ -90,7 +89,12 @@ export function useBackupSchedule({ setMessage }: BackupScheduleDeps) {
         ? "How many backups to keep"
         : null,
     ].filter((x): x is string => x !== null),
-    doSaveSchedule,
+    async () => {
+      // Throws, unlike the field's own commit, so a failed save keeps Settings where its error shows.
+      if (!(await saveSchedule(freqDraft, retentionDraft))) {
+        throw new Error("The backup schedule wasn't saved.");
+      }
+    },
   );
 
   async function doForgetPass() {
@@ -132,23 +136,59 @@ export function useBackupSchedule({ setMessage }: BackupScheduleDeps) {
     }
   }
 
-  async function doSaveSchedule() {
-    setMessage(null);
-    setScheduleSaveError(null);
-    setSavingSchedule(true);
-    try {
-      // Round + clamp the free-typed retention so the backend's u32 never sees a non-integer.
-      const retentionN = Math.max(1, Math.min(100, Math.round(Number(retentionDraft) || 5)));
-      await setBackupSchedule(freqDraft, retentionN);
-      setMessage(
-        freqDraft === "off" ? "Automatic backups turned off." : "Automatic backup schedule saved.",
-      );
-      await refreshSchedule();
-    } catch (e) {
-      setScheduleSaveError(String(e));
-    } finally {
-      setSavingSchedule(false);
-    }
+  // The save in flight and what it writes, so the field's blur and the leave-the-tab commit that
+  // follows it in the same click share one write instead of racing two. A save of other values
+  // waits for it rather than being dropped.
+  const inFlight = useRef<{ key: string; run: Promise<boolean> } | null>(null);
+
+  /** Write the schedule, resolving whether it was saved. Takes the values rather than reading the
+   *  drafts, so a frequency just chosen is saved before its state update has rendered. */
+  function saveSchedule(
+    frequency: BackupSchedule["frequency"],
+    retention: string,
+  ): Promise<boolean> {
+    const key = `${frequency}|${retention}`;
+    if (inFlight.current?.key === key) return inFlight.current.run;
+    const before = inFlight.current?.run;
+    const entry: { key: string; run: Promise<boolean> } = { key, run: Promise.resolve(false) };
+    entry.run = (async () => {
+      if (before) await before;
+      setMessage(null);
+      setScheduleSaveError(null);
+      setSavingSchedule(true);
+      try {
+        // Round + clamp the free-typed retention so the backend's u32 never sees a non-integer.
+        const retentionN = Math.max(1, Math.min(100, Math.round(Number(retention) || 5)));
+        await setBackupSchedule(frequency, retentionN);
+        setMessage(
+          frequency === "off"
+            ? "Automatic backups turned off."
+            : "Automatic backup schedule saved.",
+        );
+        await refreshSchedule();
+        return true;
+      } catch (e) {
+        setScheduleSaveError(String(e));
+        return false;
+      } finally {
+        setSavingSchedule(false);
+        if (inFlight.current === entry) inFlight.current = null;
+      }
+    })();
+    inFlight.current = entry;
+    return entry.run;
+  }
+
+  /** A frequency chosen: saved at once. */
+  function changeFrequency(next: BackupSchedule["frequency"]) {
+    setFreqDraft(next);
+    void saveSchedule(next, retentionDraft);
+  }
+
+  /** "Keep last" left or confirmed with Enter: saved if it changed. */
+  function commitRetention() {
+    if (!schedule || retentionDraft === String(schedule.retention_n)) return;
+    void saveSchedule(freqDraft, retentionDraft);
   }
 
   return {
@@ -160,18 +200,17 @@ export function useBackupSchedule({ setMessage }: BackupScheduleDeps) {
     // stays visible instead of being re-invented behind a second sink.
     setScheduleSaveError,
     freqDraft,
-    setFreqDraft,
+    changeFrequency,
     retentionDraft,
     setRetentionDraft,
+    commitRetention,
     savingSchedule,
     refreshSchedule,
     passphraseStored,
     showStatus,
     enabledDestinations,
     keepN,
-    scheduleDirty,
     doForgetPass,
     doToggleDestination,
-    doSaveSchedule,
   };
 }

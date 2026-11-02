@@ -28,7 +28,7 @@ import {
   tidyNote,
 } from "../../../lib/calendarEdit/rsvp";
 import { replyText, type Tone } from "../../../lib/calendarEdit/editReasons";
-import { Button, SegmentedControl, Textarea } from "../../ui";
+import { Button, SegmentedControl, Textarea, VisuallyHidden } from "../../ui";
 import { noteReply } from "./useEventWrites";
 
 interface Props {
@@ -38,6 +38,9 @@ interface Props {
   repeating: boolean;
   /** Whose reply, when it isn't plainly the user's own: a calendar's name. */
   forWhom: string | null;
+  /** The account the reply goes out as, shown as a tag beside "Going?" when there's more than one
+   *  it could be (`replyingAs`). */
+  replyAs?: string | null;
   /** The note Google holds. `null` where PM doesn't know it (the popover): no note box then. */
   note: string | null;
   /** The event's title, for a notice that says what the reply came to after the control has gone. */
@@ -62,6 +65,7 @@ export function RsvpControl({
   current,
   repeating,
   forWhom,
+  replyAs = null,
   note,
   title,
   disabled = false,
@@ -218,8 +222,26 @@ export function RsvpControl({
     <div ref={rootRef} className="flex flex-col gap-1.5">
       {step === null ? (
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span id={labelId} className="text-xs text-ink2">
-            {label}
+          <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-ink2">
+            {replyAs ? (
+              // The buttons' name says whose answer they send, in one string: names are joined
+              // across elements without the spaces between them.
+              <span id={labelId}>
+                <span aria-hidden>{label}</span>
+                <VisuallyHidden>{`${label} Replying as ${replyAs}.`}</VisuallyHidden>
+              </span>
+            ) : (
+              <span id={labelId}>{label}</span>
+            )}
+            {replyAs && (
+              <span
+                aria-hidden
+                className="max-w-full truncate rounded-[var(--radius-sm)] border border-border px-1.5 py-px font-mono text-[0.625rem] text-ink3"
+                title={`Your reply goes out as ${replyAs}`}
+              >
+                {replyAs}
+              </span>
+            )}
           </span>
           <div ref={choicesRef}>
             <SegmentedControl<Rsvp | "awaiting">

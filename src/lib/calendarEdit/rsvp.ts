@@ -18,6 +18,7 @@ import { occurrenceKey } from "../calendar-layout";
 import type {
   Attendee,
   Calendar,
+  CalendarAccount,
   CalendarEvent,
   EventForEdit,
   GuestForEdit,
@@ -234,6 +235,20 @@ export function replyCopies(
     ...c,
     forWhom: copies.length > 1 || !c.calendar.is_primary ? c.calendar.name : null,
   }));
+}
+
+/** The account a reply from `calendar` goes out as, when "Going?" must say so: with more than one
+ *  Google account connected, an invitation one sends the other shows as a single event, and which
+ *  account the reply comes from isn't something to guess. Null with one account (nobody else it could
+ *  be), or a calendar on none of them. */
+export function replyingAs(
+  accounts: readonly CalendarAccount[],
+  calendar: Calendar | null | undefined,
+): string | null {
+  const google = accounts.filter((a) => a.provider === "google");
+  if (google.length < 2 || !calendar) return null;
+  const account = google.find((a) => a.id === calendar.source_id);
+  return account ? account.email || account.label : null;
 }
 
 /** The calendar Remove on `ev` must name (C14d), as the reply strip names whose reply it is: one

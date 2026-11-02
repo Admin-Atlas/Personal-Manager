@@ -18,6 +18,55 @@ export const CELL = 24;
 export const COLS = 44;
 export const ROWS = 28;
 
+/** The width `.pm-scrollbars` gives a scrollbar, in px. */
+export const SCROLLBAR_PX = 12;
+
+/** The cells a board has room for: `cols`×`rows` with no scrollbar showing, and `barCols`/`barRows`
+ *  once the OTHER axis's scrollbar takes its width (left out: the same). */
+export interface BoardSpace {
+  cols: number;
+  rows: number;
+  barCols?: number;
+  barRows?: number;
+}
+
+/** The cells in a scroller's box, `width`×`height` px with `inset` px of padding across each axis.
+ *  The box is the scroller's own size, which doesn't change when it shows a scrollbar: measuring the
+ *  space INSIDE the scrollbars made the board's size depend on the scrollbars the board itself
+ *  causes, and they fed each other — the shaking, scrollbars coming and going. */
+export function spaceOf(width: number, height: number, inset: number): BoardSpace {
+  const cells = (px: number) => Math.max(1, Math.floor((px - inset) / CELL));
+  return {
+    cols: cells(width),
+    rows: cells(height),
+    barCols: cells(width - SCROLLBAR_PX),
+    barRows: cells(height - SCROLLBAR_PX),
+  };
+}
+
+/** The board's live extent: the space, grown to hold every widget. Where the widgets run past one
+ *  axis, that axis scrolls and its scrollbar takes room from the other, so the other is sized without
+ *  it. Which axes scroll is decided from the widgets, never from what the page shows at the moment, so
+ *  it can't feed back on itself. */
+export function boardExtent(
+  space: BoardSpace,
+  widgets: readonly { rect: Rect }[],
+): { cols: number; rows: number } {
+  let right = 0;
+  let bottom = 0;
+  for (const w of widgets) {
+    right = Math.max(right, w.rect.x + w.rect.w);
+    bottom = Math.max(bottom, w.rect.y + w.rect.h);
+  }
+  const barCols = space.barCols ?? space.cols;
+  const barRows = space.barRows ?? space.rows;
+  let cols = bottom > space.rows ? barCols : space.cols;
+  const rows = right > cols ? barRows : space.rows;
+  // A horizontal scrollbar can push the content past the bottom after all.
+  if (bottom > rows) cols = barCols;
+  return { cols: Math.max(cols, right), rows: Math.max(rows, bottom) };
+}
+
 /** Smallest a note/timeline may be shrunk to (cells), so a resize can't make it unusable. */
 export const MIN_W = 4;
 export const MIN_H = 3;

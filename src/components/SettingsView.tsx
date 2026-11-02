@@ -42,7 +42,6 @@ import {
   Callout,
   cn,
   Collapsible,
-  ConfirmDialog,
   Input,
   Modal,
   NavItem,
@@ -117,52 +116,38 @@ export function SettingsView({
   // tab change so each tab opens from its first section.
   const [tab, setTab] = useState<SettingsTab>("general");
   const contentRef = useRef<HTMLDivElement>(null);
-  // Uncommitted edits on the current tab, registered by the controls that defer their write.
+  // Edits on the current tab that save when you're done with them rather than per keystroke
+  // (the backup schedule's "Keep last"), registered by their controls.
   const pending = useSettingsPending();
-  // A pending navigation held up by that guard: what is at stake, and where we were going.
-  const [leaveGuard, setLeaveGuard] = useState<{ labels: string[]; go: () => void } | null>(null);
-  // When the last settings write landed. Drives the transient "Saved" tick in the footer.
-  const [savedAt, setSavedAt] = useState<number | null>(null);
 
   function applyTab(next: SettingsTab) {
     setTab(next);
     contentRef.current?.scrollTo({ top: 0 });
   }
 
-  /** Switch tabs, but stop first if this tab holds an edit that hasn't been committed. Almost every
-   *  control here writes on change and registers nothing; the ones that defer (the backup schedule)
-   *  would otherwise have their draft silently discarded by the unmount. The dialog NAMES what is
-   *  pending rather than saying "unsaved changes" — the point is to let you recognise whether you
-   *  care, not to make you anxious. */
+  /** Leave this tab — for another, or out of Settings — committing anything still on it first.
+   *  Settings has no Save button: every control writes as it changes, and the few that wait for you
+   *  to finish typing are committed here, so leaving is the save and nothing is ever discarded. A
+   *  commit that fails keeps you on the tab, where its error shows. */
+  async function leaveTab(go: () => void) {
+    if ((pending?.labelsForTab(tab) ?? []).length > 0) {
+      try {
+        await pending?.saveTab(tab);
+      } catch (e) {
+        setError(String(e));
+        return;
+      }
+    }
+    go();
+  }
+
   function selectTab(next: SettingsTab) {
-    const labels = pending?.labelsForTab(tab) ?? [];
-    if (labels.length > 0) {
-      setLeaveGuard({ labels, go: () => applyTab(next) });
-      return;
-    }
-    applyTab(next);
+    void leaveTab(() => applyTab(next));
   }
 
-  /** Done / clicking outside. Same guard: closing is just a tab switch that lands nowhere. */
+  /** Done, Escape or clicking outside: a tab switch that lands nowhere. */
   function requestClose() {
-    const labels = pending?.labelsForTab(tab) ?? [];
-    if (labels.length > 0) {
-      setLeaveGuard({ labels, go: onClose });
-      return;
-    }
-    onClose();
-  }
-
-  /** The explicit Save. It commits anything pending on this tab, but it ALWAYS flashes the tick,
-   *  even when there was nothing to commit — the button exists so there is something to press, and
-   *  a press that appears to do nothing is worse than no button. */
-  async function saveNow() {
-    try {
-      await pending?.saveTab(tab);
-      setSavedAt(Date.now());
-    } catch (e) {
-      setError(String(e));
-    }
+    void leaveTab(onClose);
   }
 
   // The active tab's in-rail sub-nav: scroll-spy lights the section currently in view; clicking a
@@ -512,7 +497,7 @@ export function SettingsView({
     );
   }
 
-  // ── Settings: a left-rail, tabbed surface. State + Save are shared across all tabs. ──────────
+  // ── Settings: a left-rail, tabbed surface. Every tab saves as it changes. ────────────────────
   return (
     // Settings is a dialog, and now says so. It was a hand-rolled panel with NO `role="dialog"`, no
     // accessible name, no focus trap, no focus restore and — the one users could feel — no Escape at
@@ -678,56 +663,21 @@ export function SettingsView({
             {error}
           </Callout>
         )}
-        {/* Save sits beside Done deliberately. Almost nothing here needs it — the tabs write on
-              change — but a settings window with no Save reads as a settings window that hasn't
-              saved, and the button is also the one place a deferred draft (the backup schedule) can
-              be committed without hunting for its own control. Pressing it always acknowledges,
-              even with nothing to commit. */}
+        {/* No Save button: every setting saves as it changes, the footer's tick confirms each one,
+            and leaving a tab commits whatever was still being typed (see `leaveTab`). A Save
+            beside Done pressed nothing but the tick, and implied the rest hadn't saved.
+
+            Dialogs a tab opens (the per-tab reset confirmations, the re-index progress, the three
+            remove-my-data steps) render INSIDE this one, and that placement is load-bearing:
+            `useDialogLayer`'s topmost rule is DOM containment, so a sibling would not shadow
+            Settings and one Escape would close both. */}
         <div className="flex items-center justify-between gap-3">
-          <SavedTick pendingLabels={pending?.labelsForTab(tab) ?? []} savedAt={savedAt} />
-          <div className="flex shrink-0 items-center gap-2">
-            <Button variant="secondary" onClick={() => void saveNow()}>
-              Save
-            </Button>
-            <Button variant="primary" onClick={requestClose}>
-              Done
-            </Button>
-          </div>
+          <SavedTick pendingLabels={pending?.labelsForTab(tab) ?? []} />
+          <Button variant="primary" onClick={requestClose}>
+            Done
+          </Button>
         </div>
       </div>
-
-      {/* Two choices, not three, and Save is not one of them. The Save button is right there in the
-          footer the dialog is covering, so offering "save and continue" here would duplicate it and
-          make the destructive path the quiet one. Cancel puts you back on the tab with the draft
-          intact and the button in front of you.
-
-          It renders INSIDE the Settings dialog, not beside it, and that placement is load-bearing:
-          `useDialogLayer`'s topmost rule is DOM containment, so a guard mounted as a SIBLING would
-          not shadow Settings and one Escape would dismiss the guard AND close the window — driving
-          straight through the check `requestClose` exists to make. Same for every other dialog a tab
-          opens (the per-tab reset confirmations, the re-index progress, the three remove-my-data
-          steps): they are all descendants of this one now. */}
-      <ConfirmDialog
-        open={leaveGuard !== null}
-        title="This tab has changes you haven't saved"
-        confirmLabel="Discard and continue"
-        cancelLabel="Stay here"
-        danger
-        onConfirm={() => {
-          const go = leaveGuard?.go;
-          setLeaveGuard(null);
-          go?.();
-        }}
-        onClose={() => setLeaveGuard(null)}
-      >
-        <p>These would be discarded:</p>
-        <ul className="mt-1 list-disc pl-5">
-          {(leaveGuard?.labels ?? []).map((l) => (
-            <li key={l}>{l}</li>
-          ))}
-        </ul>
-        <p className="mt-2">Stay here and press Save to keep them.</p>
-      </ConfirmDialog>
     </Modal>
   );
 }

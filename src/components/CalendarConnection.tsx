@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   calendarOverview,
   connectGoogleCalendarAccount,
@@ -212,6 +212,35 @@ export function CalendarConnection({
       await refresh();
     });
 
+  // The sync a tick starts. It runs in the background, beside the busy latch rather than inside it,
+  // so the boxes stay usable while it does, and ticking several in a row costs one more sync, not
+  // one each. Every tick used to run a full sync of every account and hold the whole panel until it
+  // finished, which is why unticking a calendar could take so long.
+  const [syncing, setSyncing] = useState(false);
+  const syncRunning = useRef(false);
+  const syncAgain = useRef(false);
+  async function syncInBackground() {
+    if (syncRunning.current) {
+      syncAgain.current = true;
+      return;
+    }
+    syncRunning.current = true;
+    setSyncing(true);
+    try {
+      do {
+        syncAgain.current = false;
+        const n = await syncCalendar();
+        setNote(`Synced ${n} event${n === 1 ? "" : "s"}.`);
+      } while (syncAgain.current);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      syncRunning.current = false;
+      setSyncing(false);
+      await refresh();
+    }
+  }
+
   const toggle = (cal: Calendar, on: boolean) =>
     run("select", async () => {
       // Optimistic flip, rolled back by a refresh if the backend rejects it.
@@ -229,9 +258,9 @@ export function CalendarConnection({
         await refresh();
         throw e;
       }
-      const n = await syncCalendar().catch(() => 0);
-      setNote(`Synced ${n} event${n === 1 ? "" : "s"}.`);
-      await refresh();
+      // Unticking needs no sync: the backend has already taken the calendar's events out. A tick
+      // has none until a sync fetches them.
+      if (on) void syncInBackground();
     });
 
   // Mark a calendar quiet (or not). Unlike the sync tick this needs no re-sync — the events stay in
@@ -369,8 +398,8 @@ export function CalendarConnection({
                 : `Not synced yet · ${overview?.window_days ?? 21} days ahead`}
             </p>
             {accounts.length > 0 && (
-              <Button size="sm" onClick={sync} disabled={busy != null}>
-                {busy === "sync" || busy === "select" ? "Syncing…" : "Sync now"}
+              <Button size="sm" onClick={sync} disabled={busy != null || syncing}>
+                {busy === "sync" || syncing ? "Syncing…" : "Sync now"}
               </Button>
             )}
           </div>

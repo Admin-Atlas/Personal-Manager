@@ -4,7 +4,7 @@
 // Custom window chrome (PR3). Native decorations are off (tauri.conf.json `decorations: false`), so
 // this bar provides window dragging (data-tauri-drag-region), double-click-to-maximize, and the
 // minimize / maximize / close controls. Controls follow OS convention: macOS = traffic-light dots on
-// the left (the design's --border2 dots); Windows/Linux = caption buttons on the right. Per-System
+// the left, in macOS's red, yellow and green; Windows/Linux = caption buttons on the right. Per-System
 // styling rides the active theme. Mounted ABOVE <App/> in main.tsx so it is present on every screen
 // (incl. the loading + onboarding states) — a frameless window needs a way to drag/close throughout.
 //
@@ -20,6 +20,7 @@ import { useTheme } from "../../theme";
 import { subscribeUntilCleanup } from "../../lib/subscribe";
 import { isKeyForADialog } from "../../lib/useDialogLayer";
 import { cn } from "./cn";
+import { Tooltip } from "./Tooltip";
 import { useEdgeResizeCursor } from "./useEdgeResizeCursor";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -66,20 +67,56 @@ function SystemLabel() {
   );
 }
 
-function MacDot({ label, onClick }: { label: string; onClick: () => void }) {
+/** What each dot draws when the pointer is over the three, as macOS does: ×, − and +. */
+const MAC_GLYPH = {
+  close: "M1.5 1.5l5 5M6.5 1.5l-5 5",
+  minimize: "M1 4h6",
+  zoom: "M4 1v6M1 4h6",
+} as const;
+
+function MacDot({
+  kind,
+  label,
+  onClick,
+}: {
+  kind: "close" | "minimize" | "zoom";
+  label: string;
+  onClick: () => void;
+}) {
   // The visible dot stays 12px, but the button is a 24px hit target (WCAG 2.5.8) with the dot
   // centred inside. 24px targets can't sit at the old ~20px centres without overlapping, so the
   // three dots read a touch more spread than before — a macOS-only change flagged for OS testing.
+  //
+  // macOS's own red, yellow and green (they were all grey, so nothing said which was close), and a
+  // tooltip naming each. The tooltip is PM's own, below the dot: the bar is the top of the window, so
+  // one above would be off-screen.
   return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onClick={onClick}
-      className="group flex h-6 w-6 items-center justify-center"
-    >
-      <span className="h-3 w-3 rounded-full bg-[var(--border2)] transition-colors group-hover:bg-[var(--ink4)]" />
-    </button>
+    <Tooltip label={label} placement="below">
+      <button
+        type="button"
+        aria-label={label}
+        onClick={onClick}
+        className="flex h-6 w-6 items-center justify-center"
+      >
+        <span
+          className="flex h-3 w-3 items-center justify-center rounded-full"
+          style={{ background: `var(--mac-${kind})` }}
+        >
+          <svg
+            width="8"
+            height="8"
+            viewBox="0 0 8 8"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.2"
+            aria-hidden
+            className="text-black/55 opacity-0 transition-opacity group-hover/dots:opacity-100 motion-reduce:transition-none"
+          >
+            <path d={MAC_GLYPH[kind]} />
+          </svg>
+        </span>
+      </button>
+    </Tooltip>
   );
 }
 
@@ -215,11 +252,15 @@ export function TitleBar() {
     >
       <div data-tauri-drag-region className="flex items-center gap-2 px-3">
         {IS_MAC && (
-          <div className="flex items-center">
+          <div className="group/dots flex items-center">
             {/* macOS order: close, minimize, zoom (left→right) */}
-            <MacDot label="Close" onClick={close} />
-            <MacDot label="Minimize" onClick={minimize} />
-            <MacDot label={maximized ? "Restore" : "Maximize"} onClick={toggleMaximize} />
+            <MacDot kind="close" label="Close" onClick={close} />
+            <MacDot kind="minimize" label="Minimize" onClick={minimize} />
+            <MacDot
+              kind="zoom"
+              label={maximized ? "Restore" : "Maximize"}
+              onClick={toggleMaximize}
+            />
           </div>
         )}
         <SystemLabel />

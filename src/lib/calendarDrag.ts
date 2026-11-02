@@ -524,19 +524,33 @@ export function planMonthMove(
   return finish(origin, timing, zone);
 }
 
-/** A drag down (or up) an empty column from `anchor`: the anchor's slot always, out to the pointer's
- *  slot, inside the anchor's day. */
-export function planCreate(anchor: WallPoint, minute: number, zone: string | null): Plan {
-  const a = Math.min(snapMinutes(anchor.min, SNAP_MIN, "floor"), LAST_SLOT);
-  const m = clamp(minute, 0, DAY_MIN);
-  const [from, to] =
-    m >= a
-      ? [a, Math.min(DAY_MIN, Math.max(a + SNAP_MIN, snapMinutes(m, SNAP_MIN, "ceil")))]
-      : [Math.max(0, snapMinutes(m, SNAP_MIN, "floor")), a + SNAP_MIN];
-  const midnight: WallPoint = { day: anchor.day, min: 0 };
+/** A drag over empty time from `anchor`: the anchor's slot always, out to the pointer's slot. The
+ *  pointer may be over another day's column, and then the event runs across the days between, as a
+ *  drag across the all-day row or Month's days already made a several-day one. (It used to keep to the
+ *  anchor's column; the spec had that from inference, not from Google, and Bobby asked for this.) */
+export function planCreate(anchor: WallPoint, target: WallPoint, zone: string | null): Plan {
+  const a: WallPoint = {
+    day: anchor.day,
+    min: Math.min(snapMinutes(anchor.min, SNAP_MIN, "floor"), LAST_SLOT),
+  };
+  const anchorEnd = addWall(a, SNAP_MIN);
+  const midnight: WallPoint = { day: target.day, min: 0 };
+  const m = clamp(target.min, 0, DAY_MIN);
+  if (wallDiff(a, { day: target.day, min: m }) >= 0) {
+    const end = addWall(midnight, snapMinutes(m, SNAP_MIN, "ceil"));
+    return finish(
+      null,
+      { kind: "timed", start: a, end: wallDiff(anchorEnd, end) > 0 ? end : anchorEnd },
+      zone,
+    );
+  }
   return finish(
     null,
-    { kind: "timed", start: addWall(midnight, from), end: addWall(midnight, to) },
+    {
+      kind: "timed",
+      start: addWall(midnight, snapMinutes(m, SNAP_MIN, "floor")),
+      end: anchorEnd,
+    },
     zone,
   );
 }
@@ -577,7 +591,11 @@ export function planGesture(press: Press, target: Target | null, opts: PlanOpts)
     if (on.create === null) return null;
     if (at.zone === "timed") {
       return target.zone === "timed"
-        ? planCreate({ day: at.day, min: at.minute }, target.minute, opts.zone)
+        ? planCreate(
+            { day: at.day, min: at.minute },
+            { day: target.day, min: target.minute },
+            opts.zone,
+          )
         : null;
     }
     return target.zone === at.zone ? planDayRange(at.day, target.day) : null;

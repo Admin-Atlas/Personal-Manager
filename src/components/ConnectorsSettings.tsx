@@ -7,6 +7,7 @@ import { driveStatus, oneDriveStatus } from "../lib/ipc";
 import type { GoogleGrantOutcome } from "../lib/googleGrantNote";
 import { Button, Collapsible, SectionInfo, SectionLabel, SegmentedControl, SettingRow } from "./ui";
 import { clearJustJoinedVault, justJoinedVault } from "../lib/joinedVault";
+import { useRememberedFold } from "../lib/foldPrefs";
 import { CalendarConnection } from "./CalendarConnection";
 import { CloudDriveConnection } from "./CloudDriveConnection";
 import { LocalFolderConnection } from "./LocalFolderConnection";
@@ -309,7 +310,8 @@ function GoogleMultiAccountHelp() {
  * A connector group (Google / Microsoft / Apple / Calendar subscriptions) holding a provider's shared
  * sign-in and its services. These get large (multi-account Drive, calendar feeds), so each is
  * **collapsible**: open by default for Standard/Power density, **collapsed at Minimal** (so the tab
- * stays scannable), always toggleable. The disclosure state is per-group local UI.
+ * stays scannable), always toggleable. A group you fold or open stays that way on this device, across
+ * reopening Settings and restarts; one you haven't touched follows the density default.
  *
  * The `blurb` — what this provider connects and what's shared — folds into a {@link SectionInfo} at
  * the **foot** of the group, so opening a group lands you on its controls rather than on a paragraph
@@ -325,10 +327,12 @@ function ConnectorGroup({
   children: ReactNode;
 }) {
   const { minimal } = useDepth();
+  const [open, setOpen] = useRememberedFold(`settings.connectors.${title}`, !minimal);
   return (
     <Collapsible
       className="mt-4 rounded-[var(--radius)] border border-border p-3"
-      defaultOpen={!minimal}
+      open={open}
+      onOpenChange={setOpen}
       title={<SectionLabel as="span">{title}</SectionLabel>}
     >
       <div className="mt-3">{children}</div>

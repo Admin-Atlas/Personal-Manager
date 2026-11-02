@@ -16,6 +16,7 @@ const setCalendarEditingPaused = vi.fn();
 const connectGoogleCalendarAccount = vi.fn();
 const disconnectGoogleCalendarAccount = vi.fn();
 const syncCalendar = vi.fn();
+const setCalendarSelected = vi.fn();
 
 vi.mock("../lib/ipc", () => ({
   calendarOverview: () => calendarOverview(),
@@ -25,7 +26,7 @@ vi.mock("../lib/ipc", () => ({
   disconnectGoogleCalendarAccount: (...a: unknown[]) => disconnectGoogleCalendarAccount(...a),
   connectOutlookCalendar: vi.fn(),
   disconnectOutlookCalendar: vi.fn(),
-  setCalendarSelected: vi.fn(),
+  setCalendarSelected: (...a: unknown[]) => setCalendarSelected(...a),
   setCalendarQuiet: vi.fn(),
   setCalendarKind: vi.fn(),
   syncCalendar: () => syncCalendar(),
@@ -217,5 +218,61 @@ describe("CalendarConnection editing switch", () => {
     render(<CalendarConnection provider="microsoft" />);
     await screen.findByText(EMAIL);
     expect(screen.queryByRole("button", { name: /editing/ })).toBeNull();
+  });
+});
+
+// A tick used to run a full sync of every account and hold the whole panel until it finished, so
+// unticking a big calendar could take a long while. Unticking needs no sync now (the backend takes the
+// calendar's events out), and a tick's sync runs beside the panel rather than in front of it.
+describe("CalendarConnection calendar ticks", () => {
+  const withCalendar = (selected: boolean): CalendarOverview => ({
+    ...overview("on"),
+    calendars: [
+      {
+        id: `${ID}:team`,
+        source_id: ID,
+        provider: "google",
+        remote_id: "team",
+        name: "Team",
+        color: null,
+        selected,
+        is_primary: false,
+        quiet: false,
+        kind: null,
+        access_role: "owner",
+        time_zone: null,
+        default_reminders: [],
+        conference_types: [],
+        data_owner: null,
+      },
+    ],
+  });
+  it("unticks without a sync", async () => {
+    calendarOverview.mockResolvedValue(withCalendar(true));
+    setCalendarSelected.mockResolvedValue(undefined);
+    render(<CalendarConnection provider="google" />);
+    await screen.findByText("Team");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await waitFor(() => expect(setCalendarSelected).toHaveBeenCalledWith(`${ID}:team`, false));
+    await waitFor(() =>
+      expect(screen.getAllByRole("checkbox")[0]).toHaveProperty("disabled", false),
+    );
+    expect(syncCalendar).not.toHaveBeenCalled();
+  });
+
+  it("ticks, then syncs in the background with the boxes still usable", async () => {
+    calendarOverview.mockResolvedValue(withCalendar(false));
+    setCalendarSelected.mockResolvedValue(undefined);
+    let finish: (n: number) => void = () => {};
+    syncCalendar.mockReturnValue(new Promise<number>((r) => (finish = r)));
+    render(<CalendarConnection provider="google" />);
+    await screen.findByText("Team");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await waitFor(() => expect(syncCalendar).toHaveBeenCalledTimes(1));
+    // The sync is still running: the box isn't held, and Sync now says what's happening.
+    expect(screen.getAllByRole("checkbox")[0]).toHaveProperty("disabled", false);
+    expect(screen.getByRole("button", { name: "Syncing…" })).toBeTruthy();
+    finish(7);
+    expect(await screen.findByText("Synced 7 events.")).toBeTruthy();
   });
 });

@@ -52,8 +52,19 @@ const REBUILD_PENDING_KEY: &str = "rebuild_pending";
 /// Side effects land only AFTER the commit — the same rule `MutationFiles` encodes for project
 /// deletion: a file or manifest entry that outlives its row is harmless and self-healing, whereas
 /// removing either before a failed commit strands the database pointing at truth that is gone.
+///
+/// Async and off the runtime: a plain `fn` command runs on the main thread, so a document with a
+/// lot of chunks held the whole window still while its rows went.
 #[tauri::command]
-pub fn delete_document(app: AppHandle, state: State<'_, AppState>, document_id: i64) -> Result<()> {
+pub async fn delete_document(app: AppHandle, document_id: i64) -> Result<()> {
+    spawn_blocking_result("document delete", move || {
+        delete_document_blocking(&app, document_id)
+    })
+    .await
+}
+
+fn delete_document_blocking(app: &AppHandle, document_id: i64) -> Result<()> {
+    let state = app.state::<AppState>();
     let (vault_dir, _cipher) = state.markdown_io()?;
     let (vault_root, _rules_cipher) = state.rules_io()?;
     let (_, manifest_cipher) = state.manifest_io()?;
@@ -80,7 +91,7 @@ pub fn delete_document(app: AppHandle, state: State<'_, AppState>, document_id: 
     // deadlock. Nothing after this point needs the DB.
     drop(conn);
     tidy_after_delete(
-        &app,
+        app,
         &vault_dir,
         &vault_root,
         &manifest_cipher,
@@ -200,27 +211,30 @@ fn still_dead(conn: &rusqlite::Connection, ids: &[i64]) -> Result<Vec<i64>> {
 ///
 /// A connector or folder that comes back later re-indexes these as new, unsorted items — the honest
 /// consequence of removing PM's record of them, and the one the dialog states.
+///
+/// Off the main thread, as the connector reset is: a plain `fn` command runs there, and hundreds of
+/// row deletes froze the whole window until the last one went.
 #[tauri::command]
-pub fn delete_unreachable_documents(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    document_ids: Vec<i64>,
-) -> Result<usize> {
-    let (vault_dir, _cipher) = state.markdown_io()?;
-    let (vault_root, _rules_cipher) = state.rules_io()?;
-    let (_, manifest_cipher) = state.manifest_io()?;
-    let conn = state.conn()?;
-    let doomed = still_dead(&conn, &document_ids)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut leftovers = Vec::with_capacity(doomed.len());
-    for id in doomed {
-        leftovers.extend(delete_rows(&tx, id)?);
-    }
-    tx.commit()?;
-    drop(conn);
-    let deleted = leftovers.len();
-    tidy_after_delete(&app, &vault_dir, &vault_root, &manifest_cipher, leftovers);
-    Ok(deleted)
+pub async fn delete_unreachable_documents(app: AppHandle, document_ids: Vec<i64>) -> Result<usize> {
+    spawn_blocking_result("unreachable delete", move || -> Result<usize> {
+        let state = app.state::<AppState>();
+        let (vault_dir, _cipher) = state.markdown_io()?;
+        let (vault_root, _rules_cipher) = state.rules_io()?;
+        let (_, manifest_cipher) = state.manifest_io()?;
+        let conn = state.conn()?;
+        let doomed = still_dead(&conn, &document_ids)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut leftovers = Vec::with_capacity(doomed.len());
+        for id in doomed {
+            leftovers.extend(delete_rows(&tx, id)?);
+        }
+        tx.commit()?;
+        drop(conn);
+        let deleted = leftovers.len();
+        tidy_after_delete(&app, &vault_dir, &vault_root, &manifest_cipher, leftovers);
+        Ok(deleted)
+    })
+    .await
 }
 
 /// Drop the documents whose vault file was deleted outside PM (#1024), the way Rebuild's sweep does,

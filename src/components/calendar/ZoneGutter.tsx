@@ -5,7 +5,11 @@
 // hover) plus the add control that opens a filtered IANA-zone picker. It sits where the vertical time
 // axis meets the horizontal date header — the space-saving home for zone management, replacing the old
 // header "Zones" button. The local column stays nearest the grid and is never removable. Token-driven.
+//
+// The local column also holds the calendar's "+ New event" (`corner`), above the timezone control: the
+// corner had room the header didn't, and the header's left end now starts with Today.
 
+import type { ReactNode } from "react";
 import { deviceTimeZone } from "../../theme";
 import { MAX_EXTRA_ZONES } from "../../lib/calendarPrefs";
 import { cn } from "../ui";
@@ -26,10 +30,12 @@ interface Props {
   /** When false, the add-zone control is hidden — for a compact embed (the Focus Upcoming grid) that
    *  has no room for extra zone columns and always runs with `zones = []`. Defaults to true. */
   allowAdd?: boolean;
+  /** Drawn at the top of the local column, above the timezone control: the calendar's New event. */
+  corner?: ReactNode;
 }
 
 /** The corner add/remove strip. Width mirrors the body gutter (local + one column per extra zone). */
-export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true }: Props) {
+export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true, corner }: Props) {
   const atCap = zones.length >= MAX_EXTRA_ZONES;
   const width = localCol + zones.length * zoneCol;
 
@@ -55,20 +61,23 @@ export function ZoneGutter({ zones, onChange, zoneCol, localCol, allowAdd = true
         </div>
       ))}
       <div
-        className="flex items-end justify-end gap-1 px-1 pb-0.5"
+        className="flex flex-col items-end justify-end gap-0.5 px-1 pb-0.5"
         style={{ width: `${localCol}px` }}
       >
-        {allowAdd && !atCap && (
-          <AddZone zones={zones} onChange={onChange} compact={zones.length > 0} />
-        )}
-        {zones.length > 0 && (
-          <span
-            className="truncate font-mono text-[0.5625rem] uppercase tracking-tight text-ink4"
-            title={deviceTimeZone()}
-          >
-            {zoneShort(deviceTimeZone())}
-          </span>
-        )}
+        {corner}
+        <div className="flex min-w-0 max-w-full items-end justify-end gap-1">
+          {allowAdd && !atCap && (
+            <AddZone zones={zones} onChange={onChange} compact={zones.length > 0} />
+          )}
+          {zones.length > 0 && (
+            <span
+              className="truncate font-mono text-[0.5625rem] uppercase tracking-tight text-ink4"
+              title={deviceTimeZone()}
+            >
+              {zoneShort(deviceTimeZone())}
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );

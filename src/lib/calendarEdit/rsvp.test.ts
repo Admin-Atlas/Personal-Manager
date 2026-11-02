@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import type {
   Attendee,
   Calendar,
+  CalendarAccount,
   CalendarEvent,
   EventForEdit,
   GuestForEdit,
@@ -28,6 +29,7 @@ import {
   removingFrom,
   replyCopies,
   replyHeld,
+  replyingAs,
   replyStanding,
   RSVP_CHOICES,
   rsvpLabel,
@@ -245,6 +247,30 @@ describe("the copies a reply can come from (C14b)", () => {
     expect(ids(offered)).toEqual([["e1", null]]);
     // Nothing answerable, nothing offered.
     expect(replyCopies(rows, shown, calendars, () => false)).toEqual([]);
+  });
+
+  it("says which account a reply goes out as only when there's more than one Google account", () => {
+    const account = (id: string, email: string | null, provider = "google"): CalendarAccount => ({
+      id,
+      provider,
+      email,
+      label: `${id} label`,
+      state: "ok",
+      last_synced_at: null,
+    });
+    const home = account("gcal:me", "me@home.org");
+    const outlook = account("gcal:work", "me@work.org", "microsoft");
+    // One Google account (an Outlook one beside it doesn't count): nobody else it could be.
+    expect(replyingAs([home, outlook], me)).toBeNull();
+    const work = account("gcal:work", "me@work.org");
+    expect(replyingAs([home, work], me)).toBe("me@home.org");
+    expect(replyingAs([home, work], calendar("work"))).toBe("me@work.org");
+    // No address on record: the account's label. No calendar, or none of theirs: nothing.
+    expect(replyingAs([home, account("gcal:work", null)], calendar("work"))).toBe(
+      "gcal:work label",
+    );
+    expect(replyingAs([home, work], null)).toBeNull();
+    expect(replyingAs([home, work], calendar("team"))).toBeNull();
   });
 
   it("takes only the occurrence shown, and the row alone when it has no iCal UID", () => {

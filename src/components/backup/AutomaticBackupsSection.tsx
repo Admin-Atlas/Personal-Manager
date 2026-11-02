@@ -32,16 +32,15 @@ export function AutomaticBackupsSection({
     scheduleError,
     scheduleSaveError,
     freqDraft,
-    setFreqDraft,
+    changeFrequency,
     retentionDraft,
     setRetentionDraft,
+    commitRetention,
     savingSchedule,
     refreshSchedule,
     passphraseStored,
     enabledDestinations,
-    scheduleDirty,
     doToggleDestination,
-    doSaveSchedule,
   } = state;
 
   return (
@@ -83,16 +82,26 @@ export function AutomaticBackupsSection({
 
           <label className="flex items-center justify-between gap-2 text-xs text-ink3">
             <span>Frequency</span>
+            {/* Saved as it's chosen. Without a remembered passphrase only Off can be: the backend
+                refuses a schedule it couldn't run, and the line below says what's missing. */}
             <Select
               compact
               value={freqDraft}
-              onChange={(e) => setFreqDraft(e.currentTarget.value as BackupSchedule["frequency"])}
+              onChange={(e) =>
+                changeFrequency(e.currentTarget.value as BackupSchedule["frequency"])
+              }
               disabled={savingSchedule || busy}
             >
               <option value="off">Off</option>
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
-              <option value="monthly">Monthly</option>
+              <option value="daily" disabled={!passphraseStored}>
+                Daily
+              </option>
+              <option value="weekly" disabled={!passphraseStored}>
+                Weekly
+              </option>
+              <option value="monthly" disabled={!passphraseStored}>
+                Monthly
+              </option>
             </Select>
           </label>
 
@@ -106,12 +115,16 @@ export function AutomaticBackupsSection({
                 className="w-20 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-ink2"
                 value={retentionDraft}
                 onChange={(e) => setRetentionDraft(e.currentTarget.value)}
+                onBlur={commitRetention}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitRetention();
+                }}
                 disabled={savingSchedule || busy}
               />
             </label>
           )}
 
-          {freqDraft !== "off" && !passphraseStored && (
+          {!passphraseStored && (
             <p className="text-xs text-st-due">
               Remember your backup passphrase above (under &ldquo;Backup passphrase&rdquo;) to turn
               on automatic backups.
@@ -124,18 +137,7 @@ export function AutomaticBackupsSection({
             </p>
           )}
 
-          <div className="flex items-center gap-2">
-            <Button
-              variant="secondary"
-              onClick={doSaveSchedule}
-              disabled={savingSchedule || busy || (freqDraft !== "off" && !passphraseStored)}
-            >
-              {savingSchedule ? "Saving…" : "Save schedule"}
-            </Button>
-            {scheduleDirty && !savingSchedule && (
-              <span className="text-xs text-st-look">Not saved yet</span>
-            )}
-          </div>
+          {savingSchedule && <p className="text-xs text-ink4">Saving&hellip;</p>}
 
           {scheduleSaveError && (
             <p className="break-words text-xs text-st-due">{scheduleSaveError}</p>

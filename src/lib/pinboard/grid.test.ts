@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  boardExtent,
   clampRect,
   FOLDER_MIN,
   folderAtPointer,
@@ -11,6 +12,7 @@ import {
   rectsOverlap,
   reflowToWidth,
   resolveDrop,
+  spaceOf,
 } from "./grid";
 import type { Rect, Widget } from "./types";
 
@@ -288,5 +290,55 @@ describe("resolveDrop — file / fold / move", () => {
   it("returns the list unchanged when the moving id is absent", () => {
     const widgets = [note("a", size)];
     expect(resolveDrop(widgets, "ghost", size, 44, 28, stubId, null)).toBe(widgets);
+  });
+});
+
+describe("the space a board has, and its extent", () => {
+  // 1000×600 px less a 48 px inset: 39 columns (952 / 24) and 23 rows (552 / 24); with a 12 px
+  // scrollbar across the other axis, 39 columns still (940 / 24) and 22 rows (540 / 24).
+  const space = spaceOf(1000, 600, 48);
+
+  it("counts whole cells inside the inset, with and without a scrollbar's width", () => {
+    expect(space).toEqual({ cols: 39, rows: 23, barCols: 39, barRows: 22 });
+    // 12 px of slack: the scrollbar takes the last column.
+    expect(spaceOf(1008, 600, 48)).toEqual({ cols: 40, rows: 23, barCols: 39, barRows: 22 });
+    // Never below one cell.
+    expect(spaceOf(0, 0, 48)).toEqual({ cols: 1, rows: 1, barCols: 1, barRows: 1 });
+  });
+
+  it("is the space when the widgets fit, whatever the page shows", () => {
+    expect(boardExtent(space, [])).toEqual({ cols: 39, rows: 23 });
+    expect(boardExtent(space, [note("a", { x: 35, y: 20, w: 4, h: 3 })])).toEqual({
+      cols: 39,
+      rows: 23,
+    });
+  });
+
+  it("grows to the widgets, leaving the scrollbar's room on the other axis", () => {
+    const wide = spaceOf(1008, 600, 48);
+    // Below the bottom: it scrolls down, so the columns lose the scrollbar's width.
+    expect(boardExtent(wide, [note("a", { x: 0, y: 22, w: 4, h: 4 })])).toEqual({
+      cols: 39,
+      rows: 26,
+    });
+    // Past the right: it scrolls across, so the rows do.
+    expect(boardExtent(space, [note("a", { x: 37, y: 0, w: 4, h: 3 })])).toEqual({
+      cols: 41,
+      rows: 22,
+    });
+    // Across that pushes a widget on the last row past the bottom: both scroll.
+    expect(
+      boardExtent(wide, [
+        note("a", { x: 37, y: 0, w: 4, h: 3 }),
+        note("b", { x: 0, y: 20, w: 4, h: 3 }),
+      ]),
+    ).toEqual({ cols: 41, rows: 23 });
+  });
+
+  it("takes a plain cols×rows as the space with no scrollbar to allow for", () => {
+    expect(boardExtent({ cols: 10, rows: 5 }, [note("a", { x: 0, y: 4, w: 2, h: 3 })])).toEqual({
+      cols: 10,
+      rows: 7,
+    });
   });
 });

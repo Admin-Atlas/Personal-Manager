@@ -132,6 +132,8 @@ export interface PopoverRsvp {
   current: Reply | null;
   repeating: boolean;
   forWhom: string | null;
+  /** The account the reply goes out as, when there's more than one it could be. */
+  replyAs: string | null;
   onReply: (reply: Rsvp, scope: RsvpScope | null) => Promise<WriteOutcome>;
 }
 
@@ -607,6 +609,7 @@ export function CalendarEventPopover({
               current={copy.current}
               repeating={copy.repeating}
               forWhom={copy.forWhom}
+              replyAs={copy.replyAs}
               note={null}
               title={title}
               onReply={(reply, _note, scope) => copy.onReply(reply, scope)}

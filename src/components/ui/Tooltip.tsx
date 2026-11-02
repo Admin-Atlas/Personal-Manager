@@ -14,10 +14,13 @@ import { createPortal } from "react-dom";
 export interface TooltipProps {
   /** The text to show (e.g. `Bullet list · Ctrl+Shift+8`). */
   label: string;
+  /** Above the control (the default), or below it for one at the top of the window, where above is
+   *  off-screen (the title bar's window controls). */
+  placement?: "above" | "below";
   children: ReactNode;
 }
 
-export function Tooltip({ label, children }: TooltipProps) {
+export function Tooltip({ label, placement = "above", children }: TooltipProps) {
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const ref = useRef<HTMLSpanElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -25,7 +28,8 @@ export function Tooltip({ label, children }: TooltipProps) {
   const show = () => {
     timer.current = setTimeout(() => {
       const r = ref.current?.getBoundingClientRect();
-      if (r) setPos({ x: r.left + r.width / 2, y: r.top - 6 });
+      if (r)
+        setPos({ x: r.left + r.width / 2, y: placement === "below" ? r.bottom + 6 : r.top - 6 });
     }, 120);
   };
   const hide = () => {
@@ -49,7 +53,9 @@ export function Tooltip({ label, children }: TooltipProps) {
           <span
             role="tooltip"
             style={{ left: pos.x, top: pos.y }}
-            className="pointer-events-none fixed z-[60] -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-[var(--radius-sm)] border border-border2 bg-panel px-1.5 py-0.5 text-[0.625rem] text-ink2 shadow-md"
+            className={`pointer-events-none fixed z-[60] -translate-x-1/2 ${
+              placement === "below" ? "" : "-translate-y-full"
+            } whitespace-nowrap rounded-[var(--radius-sm)] border border-border2 bg-panel px-1.5 py-0.5 text-[0.625rem] text-ink2 shadow-md`}
           >
             {label}
           </span>,

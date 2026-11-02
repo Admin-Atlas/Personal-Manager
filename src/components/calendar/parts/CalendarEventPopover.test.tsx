@@ -1048,6 +1048,7 @@ describe("CalendarEventPopover", () => {
       current: "awaiting",
       repeating: false,
       forWhom: null,
+      replyAs: null,
       onReply: vi.fn(() => Promise.resolve(SAVED)),
       ...over,
     });
@@ -1106,6 +1107,17 @@ describe("CalendarEventPopover", () => {
       expect(view.getByRole("group", { name: "Going? Replying for Personal." })).toBeTruthy();
       // Still a NON-modal dialog with the strip in it.
       expect(view.getByRole("dialog").getAttribute("aria-modal")).toBeNull();
+    });
+
+    it("tags the account a reply goes out as, as part of the label", () => {
+      const view = render(popover(editing([copy({ replyAs: "me@work.org" })])));
+      expect(view.getByRole("group", { name: "Going? Replying as me@work.org." })).toBeTruthy();
+      // And on screen, as a tag beside "Going?".
+      expect(view.getByText("me@work.org")).toBeTruthy();
+      view.rerender(popover(editing([copy({ forWhom: "Work", replyAs: "me@work.org" })])));
+      expect(
+        view.getByRole("group", { name: "Going? Replying for Work. Replying as me@work.org." }),
+      ).toBeTruthy();
     });
 
     it("a reply calls that copy's onReply with the scope", async () => {

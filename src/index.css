@@ -44,6 +44,12 @@
      copies in Modal / App / CommandPalette collapse to var(--scrim). */
   --scrim: rgba(8, 6, 4, 0.5);
 
+  /* macOS's window controls, fixed like the scrim: they're the OS's colours, not the theme's, and a
+     Mac user finds close, minimise and zoom by colour before anything else. */
+  --mac-close: #ff5f57;
+  --mac-minimize: #febc2e;
+  --mac-zoom: #28c840;
+
   --head: "Newsreader", Georgia, serif;
   --ui: "Hanken Grotesk", system-ui, sans-serif;
   --mono: "JetBrains Mono", monospace;
