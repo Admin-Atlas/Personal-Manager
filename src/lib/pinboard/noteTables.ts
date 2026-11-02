@@ -25,7 +25,7 @@ import type { TextEdit } from "./notesMarkdown";
 export const TABLE_PICKER_COLS = 8;
 export const TABLE_PICKER_ROWS = 8;
 
-type Align = "none" | "left" | "center" | "right";
+export type Align = "none" | "left" | "center" | "right";
 
 /** One table in a note: its line span (`end` exclusive) and its cells, header first. The delimiter
  *  row is not in `rows`; its alignments are kept apart so a re-format writes them back. */
@@ -103,7 +103,7 @@ const width = (s: string) => [...s].length;
 /** Lay a table out as aligned source lines, and say where each cell's text starts: `at(r, c)` is
  *  the offset into the returned text (r = 0 is the header row). Columns are as wide as their widest
  *  cell, three at least, so an empty grid still reads as one. */
-function layout(
+export function layout(
   rows: string[][],
   aligns: Align[],
 ): { text: string; at: (r: number, c: number) => number } {
@@ -300,4 +300,18 @@ export function tableCellOffset(
     pipes++;
   }
   return null;
+}
+
+/** The note with every table laid out afresh — so two notes that differ only in how their tables'
+ *  columns are padded compare equal. The rich editor's round-trip check reads through this: column
+ *  padding is spacing, not content, and re-padding is all the rich editor ever does to a table. */
+export function normalizeTables(value: string): string {
+  const lines = value.split("\n");
+  const tables = findTables(lines);
+  for (let k = tables.length - 1; k >= 0; k--) {
+    const t = tables[k];
+    const { text } = layout(t.rows, t.aligns);
+    lines.splice(t.start, t.end - t.start, ...text.split("\n"));
+  }
+  return lines.join("\n");
 }

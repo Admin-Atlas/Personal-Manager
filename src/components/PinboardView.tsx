@@ -40,13 +40,17 @@ import {
 import { insertTable, moveCell, tableEnter } from "../lib/pinboard/noteTables";
 import { NoteTablePicker } from "./NoteTablePicker";
 import { NoteEditor, type NoteEditorHandle } from "./NoteEditor";
+import { RichNoteEditor, type RichFormat, type RichNoteEditorHandle } from "./RichNoteEditor";
+import { roundTrips } from "../lib/pinboard/richNote";
 import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
 import {
   isPastTimelineDate,
   readConfirmDelete,
   readShowCompletedTimelineItems,
   readShowPastTimelineItems,
+  useNoteMode,
   writeConfirmDelete,
+  writeNoteMode,
   writeShowCompletedTimelineItems,
   writeShowPastTimelineItems,
 } from "../lib/pinboard/prefs";
@@ -1070,15 +1074,32 @@ const NoteBody = memo(function NoteBody({
 }) {
   const text = widget.text ?? "";
   const editorRef = useRef<NoteEditorHandle>(null);
+  const richRef = useRef<RichNoteEditorHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  // The note is always its live-preview editor (NoteEditor), formatted as you type. `editing` is
-  // whether you're working in it, which brings up the format toolbar and the colours; an empty note
-  // shows them too, as it always has.
+  // The note is always an editor: the rich one (Docs-style, no Markdown on screen) by default, or the
+  // Markdown one (the text, formatted as you type) when chosen on this device. `editing` is whether
+  // you're working in it, which brings up the format toolbar and the colours; an empty note shows
+  // them too, as it always has.
   const [editing, setEditing] = useState(false);
   const showEditor = editing || !text.trim();
+  const mode = useNoteMode();
+
+  // A note opens rich only when the rich editor can hold its text exactly (richNote's `roundTrips`);
+  // anything else stays Markdown, so nothing it can't express is ever rewritten. Text the rich editor
+  // wrote itself is taken as read, so a note never flips editor under someone mid-sentence.
+  const richWrote = useRef<string | null>(null);
+  const canRich = useMemo(() => text === richWrote.current || roundTrips(text), [text]);
+  const rich = mode === "rich" && canRich;
 
   const editText = useCallback(
     (next: string) => onChange(widget.id, { text: next }),
+    [onChange, widget.id],
+  );
+  const editRich = useCallback(
+    (next: string) => {
+      richWrote.current = next;
+      onChange(widget.id, { text: next });
+    },
     [onChange, widget.id],
   );
 
@@ -1094,7 +1115,7 @@ const NoteBody = memo(function NoteBody({
       if ((e.target as Element).closest?.("[data-popover-panel]")) return;
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setEditing(false);
     };
-    const onWinFocus = () => editorRef.current?.focus();
+    const onWinFocus = () => (richRef.current ?? editorRef.current)?.focus();
     document.addEventListener("pointerdown", onDown, true);
     window.addEventListener("focus", onWinFocus);
     return () => {
@@ -1128,14 +1149,18 @@ const NoteBody = memo(function NoteBody({
     }
   }
 
-  // Apply a pure text edit (a toolbar button) at the editor's selection, as one change.
-  const applyEdit = useCallback(
-    (make: (value: string, selStart: number, selEnd: number) => TextEdit) => {
-      editorRef.current?.apply(make);
-      setEditing(true);
-    },
-    [],
-  );
+  // A toolbar button: the rich editor's own command, or in the Markdown editor the pure text edit at
+  // its selection, as one change.
+  const format = (a: FormatAction) => {
+    if (rich) richRef.current?.format(a.key as RichFormat);
+    else editorRef.current?.apply(a.apply);
+    setEditing(true);
+  };
+  const addTable = (cols: number, rows: number) => {
+    if (rich) richRef.current?.insertTable(cols, rows);
+    else editorRef.current?.apply((v, s, end) => insertTable(v, s, end, cols, rows));
+    setEditing(true);
+  };
 
   // The Ingest / filing-status control sits in the top bar (right of the title, left of ✕).
   const ingestControl = !ingested ? (
@@ -1197,14 +1222,26 @@ const NoteBody = memo(function NoteBody({
         }
       />
       {ingestErr && <p className="shrink-0 px-2 pt-1 text-[0.625rem] text-st-due">{ingestErr}</p>}
-      <NoteEditor
-        ref={editorRef}
-        value={text}
-        onChange={editText}
-        onFocus={() => setEditing(true)}
-        keyEdit={noteKeyEdit}
-        placeholder="Jot something down…"
-      />
+      {rich ? (
+        <RichNoteEditor
+          key="rich"
+          ref={richRef}
+          value={text}
+          onChange={editRich}
+          onFocus={() => setEditing(true)}
+          placeholder="Jot something down…"
+        />
+      ) : (
+        <NoteEditor
+          key="markdown"
+          ref={editorRef}
+          value={text}
+          onChange={editText}
+          onFocus={() => setEditing(true)}
+          keyEdit={noteKeyEdit}
+          placeholder="Jot something down…"
+        />
+      )}
       {/* Footer: only render when it has something to show — the format toolbar + colour swatches
           appear while editing, and the size (w×h) at power depth. An idle filled note has neither,
           so the footer vanishes and the note gains that space. */}
@@ -1220,19 +1257,39 @@ const NoteBody = memo(function NoteBody({
                     // Keep the editor focused/selected so the edit (and its shortcut) lands where
                     // the caret is.
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => applyEdit(a.apply)}
+                    onClick={() => format(a)}
                     className={FORMAT_BUTTON_CLASS}
                   >
                     {a.icon}
                   </button>
                 </Tooltip>
               ))}
-              <NoteTablePicker
-                buttonClassName={FORMAT_BUTTON_CLASS}
-                onPick={(cols, rows) =>
-                  applyEdit((v, s, end) => insertTable(v, s, end, cols, rows))
+              <NoteTablePicker buttonClassName={FORMAT_BUTTON_CLASS} onPick={addTable} />
+              <Tooltip
+                label={
+                  !canRich
+                    ? "Shown as Markdown: this note has formatting the rich editor can't keep exactly"
+                    : mode === "markdown"
+                      ? "Edit notes as formatted text"
+                      : "Edit notes as Markdown"
                 }
-              />
+              >
+                <button
+                  type="button"
+                  aria-pressed={!rich}
+                  aria-label="Markdown"
+                  disabled={!canRich}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => writeNoteMode(mode === "rich" ? "markdown" : "rich")}
+                  // Its own classes, not FORMAT_BUTTON_CLASS plus overrides: `cn` is a plain joiner, so
+                  // a `w-auto` beside that `w-5` would leave which width wins to stylesheet order.
+                  className={`flex h-5 min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] px-1 font-mono text-[0.625rem] hover:bg-surface disabled:opacity-60 ${
+                    rich ? "text-ink4 hover:text-ink2" : "bg-surface text-ink2"
+                  }`}
+                >
+                  MD
+                </button>
+              </Tooltip>
             </div>
           )}
           {/* Right-aligned: colour swatches (edit only) then the size (power). */}

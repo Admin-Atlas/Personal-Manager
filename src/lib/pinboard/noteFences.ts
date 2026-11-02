@@ -41,3 +41,27 @@ export function fenceMask(lines: readonly string[]): boolean[] {
     return true;
   });
 }
+
+/** Each fenced block as a line span (`end` exclusive), and whether a closing fence ends it — the
+ *  same rules as {@link fenceMask}, grouped, for the rich note editor's code blocks. */
+export function fenceBlocks(
+  lines: readonly string[],
+): { start: number; end: number; closed: boolean }[] {
+  const out: { start: number; end: number; closed: boolean }[] = [];
+  let open: { char: string; len: number; start: number } | null = null;
+  lines.forEach((line, i) => {
+    const m = FENCE_RE.exec(line);
+    if (!open) {
+      if (!m || (m[1][0] === "`" && m[2].includes("`"))) return;
+      open = { char: m[1][0], len: m[1].length, start: i };
+      return;
+    }
+    if (m && m[1][0] === open.char && m[1].length >= open.len && m[2].trim() === "") {
+      out.push({ start: open.start, end: i + 1, closed: true });
+      open = null;
+    }
+  });
+  if (open)
+    out.push({ start: (open as { start: number }).start, end: lines.length, closed: false });
+  return out;
+}

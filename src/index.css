@@ -358,7 +358,10 @@ body {
 /* The checkbox is drawn, not a native input: CodeMirror owns every event in the text, and a real
    <input> would take focus and keyboard input of its own. */
 .pm-cm-box,
-.pm-cm-ticked {
+.pm-cm-ticked,
+.pm-rich-task,
+.pm-rich-ticked {
+  display: inline-block;
   width: 0.8rem;
   min-width: 0;
   height: 0.8rem;
@@ -368,12 +371,14 @@ body {
   border-radius: 3px;
   cursor: pointer;
 }
-.pm-cm-ticked {
+.pm-cm-ticked,
+.pm-rich-ticked {
   background: var(--accent);
   border-color: var(--accent);
   position: relative;
 }
-.pm-cm-ticked::after {
+.pm-cm-ticked::after,
+.pm-rich-ticked::after {
   content: "";
   position: absolute;
   left: 0.22rem;
@@ -392,7 +397,9 @@ body {
   border-collapse: collapse;
 }
 .pm-cm-table th,
-.pm-cm-table td {
+.pm-cm-table td,
+.pm-rich-editor th,
+.pm-rich-editor td {
   border: 1px solid var(--border2);
   padding: 0.25rem 0.5rem;
   min-width: 3rem;
@@ -401,9 +408,155 @@ body {
   vertical-align: top;
   cursor: text;
 }
-.pm-cm-table th {
+.pm-cm-table th,
+.pm-rich-editor th {
   color: var(--ink2);
   font-weight: 600;
+}
+
+/* A pinboard note's rich editor (RichNoteEditor, ProseMirror): Docs-style, no Markdown on screen.
+   Sizes follow the live preview's above, so switching editors doesn't move anything. ProseMirror's
+   own required rules are here too (its stylesheet carries colours of its own). */
+.pm-rich-editor {
+  overflow: auto;
+}
+.pm-rich-editor .ProseMirror {
+  position: relative;
+  min-height: 100%;
+  padding: 0.25rem 0.5rem;
+  outline: none;
+  font-size: 0.875rem;
+  line-height: 1.375;
+  color: var(--ink2);
+  white-space: pre-wrap;
+  white-space: break-spaces;
+  word-wrap: break-word;
+  font-variant-ligatures: none;
+  caret-color: var(--ink);
+}
+.pm-rich-editor .ProseMirror p {
+  margin: 0;
+}
+.pm-rich-editor .ProseMirror :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-rich-editor .ProseMirror h1 {
+  font-size: 1.25rem;
+}
+.pm-rich-editor .ProseMirror h2 {
+  font-size: 1.125rem;
+}
+.pm-rich-editor .ProseMirror h3 {
+  font-size: 1rem;
+}
+.pm-rich-editor .ProseMirror :is(h4, h5, h6) {
+  font-size: 0.875rem;
+}
+.pm-rich-editor .ProseMirror strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pm-rich-editor .ProseMirror blockquote {
+  margin: 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border2);
+  color: var(--ink3);
+  font-style: italic;
+}
+.pm-rich-editor .ProseMirror pre {
+  margin: 0.25rem 0;
+  padding: 0.5rem;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 0.8em;
+  white-space: pre-wrap;
+}
+.pm-rich-editor .ProseMirror code {
+  font-family: var(--mono);
+  font-size: 0.8em;
+  background: var(--surface);
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+}
+.pm-rich-editor .ProseMirror pre code {
+  background: transparent;
+  padding: 0;
+}
+.pm-rich-editor .ProseMirror hr {
+  margin: 0.5rem 0;
+  border: 0;
+  border-top: 1px solid var(--rule);
+}
+.pm-rich-editor .ProseMirror hr.ProseMirror-selectednode {
+  border-top-color: var(--accent);
+}
+.pm-rich-link {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.pm-rich-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pm-rich-list .pm-rich-list {
+  padding-left: 1.25rem;
+}
+.pm-rich-list > li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+.pm-rich-item {
+  flex: 1;
+  min-width: 0;
+}
+.pm-rich-marker {
+  flex: none;
+  min-width: 0.75rem;
+  color: var(--ink3);
+  user-select: none;
+}
+.pm-rich-list > li[data-marker="ticked"] > .pm-rich-item > p {
+  color: var(--ink3);
+}
+.pm-rich-empty::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  color: var(--ink4);
+  pointer-events: none;
+}
+/* Tables: a grid you type in, like a Docs table. prosemirror-tables marks the cells of a selection. */
+.pm-rich-editor .tableWrapper {
+  overflow-x: auto;
+  margin: 0.25rem 0;
+}
+.pm-rich-editor table {
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.pm-rich-editor td,
+.pm-rich-editor th {
+  position: relative;
+}
+.pm-rich-editor .selectedCell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--accent-soft);
+  opacity: 0.6;
+  pointer-events: none;
+}
+.pm-rich-editor .ProseMirror-hideselection *::selection {
+  background: transparent;
+}
+.pm-rich-editor .ProseMirror-hideselection {
+  caret-color: transparent;
 }
 .pm-markdown strong {
   color: var(--ink);

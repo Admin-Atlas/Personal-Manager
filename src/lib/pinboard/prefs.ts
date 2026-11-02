@@ -10,6 +10,8 @@
 // PinboardView (App's `showSettings` is independent of `view`), so a cached copy would go stale the
 // moment the toggle was flipped with the board still behind it.
 
+import { useSyncExternalStore } from "react";
+
 const CONFIRM_DELETE_KEY = "pm.pinboard.confirmDelete";
 
 /** Ask before deleting a note or timeline? On by default — the first time you delete something must
@@ -98,4 +100,46 @@ export function isPastTimelineDate(date: string | null | undefined, todayIso: st
   if (!date) return false;
   const day = date.slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(day) && day < todayIso;
+}
+
+const NOTE_MODE_KEY = "pm.pinboard.noteEditor";
+
+/** How notes are edited on this device: "rich" (Docs-style, no Markdown on screen — the default) or
+ *  "markdown" (the text itself, formatted as you type). Every note follows the one choice, so the
+ *  switch tells all mounted notes at once. Unlike the prefs above this one IS held in memory: its
+ *  only control is the note's own toolbar, which writes through `writeNoteMode`, so nothing can
+ *  change it behind the cache. */
+export type NoteMode = "rich" | "markdown";
+
+const noteModeListeners = new Set<() => void>();
+
+export function readNoteMode(): NoteMode {
+  try {
+    return localStorage.getItem(NOTE_MODE_KEY) === "markdown" ? "markdown" : "rich";
+  } catch {
+    return "rich";
+  }
+}
+
+export function writeNoteMode(mode: NoteMode): void {
+  try {
+    localStorage.setItem(NOTE_MODE_KEY, mode);
+  } catch {
+    // Best-effort; the switch still applies until the board is closed.
+  }
+  noteModeCache = mode;
+  noteModeListeners.forEach((l) => l());
+}
+
+let noteModeCache: NoteMode | null = null;
+
+/** The note editing mode, kept in step across every note on the board. */
+export function useNoteMode(): NoteMode {
+  return useSyncExternalStore(
+    (l) => {
+      noteModeListeners.add(l);
+      return () => noteModeListeners.delete(l);
+    },
+    () => (noteModeCache ??= readNoteMode()),
+  );
 }

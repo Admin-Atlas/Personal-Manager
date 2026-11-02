@@ -118,7 +118,7 @@ export function isRomanToken(token: string): boolean {
 }
 
 /** The marker that should begin the NEXT item after one whose token is `token`. */
-function nextMarker(token: string): string | null {
+export function nextMarker(token: string): string | null {
   if (token.length === 1 && "-+.*>".includes(token)) return `${token} `;
   if (/^\[[ xX]?\]$/.test(token)) return "[] "; // a continued checkbox is always fresh/unchecked
   if (/^\d+\.$/.test(token)) return `${parseInt(token, 10) + 1}. `;

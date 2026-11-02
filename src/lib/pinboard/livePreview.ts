@@ -152,16 +152,28 @@ const INLINE: {
   },
 ];
 
-function inline(out: PreviewMark[], text: string, base: number, on: boolean) {
+/** One inline span in a line: its content (`from`–`to`) and the delimiter text either side of it
+ *  (`delim` opens, `end` closes), offsets into the line. The rich note editor parses with the same
+ *  spans, so a line formats identically in both editors. */
+export interface InlineSpan {
+  cls: "strong" | "em" | "strike" | "code" | "link";
+  from: number;
+  to: number;
+  delim: string;
+  end: string;
+  href?: string;
+}
+
+export function inlineSpans(text: string): InlineSpan[] {
   const blank = (s: string, from: number, to: number) =>
     s.slice(0, from) + "\u0000".repeat(to - from) + s.slice(to);
+  const out: InlineSpan[] = [];
   let scan = text;
   for (const m of text.matchAll(/(`+)([^`]|[^`].*?[^`])\1(?!`)/g)) {
     const from = m.index;
     const to = from + m[0].length;
     const tick = m[1].length;
-    delims(out, base + from, base + from + tick, base + to - tick, base + to, on);
-    out.push({ kind: "style", from: base + from + tick, to: base + to - tick, cls: "code" });
+    out.push({ cls: "code", from: from + tick, to: to - tick, delim: m[1], end: m[1] });
     scan = blank(scan, from, to);
   }
   for (const { re, cls, open, close } of INLINE) {
@@ -169,19 +181,34 @@ function inline(out: PreviewMark[], text: string, base: number, on: boolean) {
       const from = m.index;
       const to = from + m[0].length;
       const inner = [from + open, to - close(m)] as const;
-      delims(out, base + from, base + inner[0], base + inner[1], base + to, on);
       out.push({
-        kind: "style",
-        from: base + inner[0],
-        to: base + inner[1],
-        cls,
+        cls: cls as InlineSpan["cls"],
+        from: inner[0],
+        to: inner[1],
+        delim: text.slice(from, inner[0]),
+        end: text.slice(inner[1], to),
         ...(cls === "link" ? { href: m[2] } : {}),
       });
+      // A link's text is not re-read as formatting of the line around it, but stays readable for
+      // emphasis inside it — only its brackets and address are claimed.
       scan = blank(scan, from, inner[0]);
       scan = blank(scan, inner[1], to);
-      // A link's text is not re-read as formatting of the line around it, but stays readable for
-      // emphasis inside it — only its brackets and address are claimed above.
     }
+  }
+  return out;
+}
+
+function inline(out: PreviewMark[], text: string, base: number, on: boolean) {
+  for (const sp of inlineSpans(text)) {
+    const a = base + sp.from - sp.delim.length;
+    delims(out, a, base + sp.from, base + sp.to, base + sp.to + sp.end.length, on);
+    out.push({
+      kind: "style",
+      from: base + sp.from,
+      to: base + sp.to,
+      cls: sp.cls,
+      ...(sp.href != null ? { href: sp.href } : {}),
+    });
   }
 }
 
