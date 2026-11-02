@@ -10,7 +10,15 @@ import { ProviderChip } from "./ProviderChip";
 import { ThinkingToggle } from "./ThinkingToggle";
 import { FallbackStrip } from "./FallbackStrip";
 import { RetrievalExplainPanel } from "./RetrievalExplainPanel";
-import { listDocuments, listMilestones, listProjects, setDocumentMetadata } from "../lib/ipc";
+import {
+  listArchivedProjects,
+  listDocuments,
+  listMilestones,
+  listProjects,
+  setDocumentMetadata,
+  setProjectArchived,
+} from "../lib/ipc";
+import { archivedSet, isArchived } from "../lib/archivedProjects";
 import { useResizable } from "../lib/useResizable";
 import { useSidebarSplit } from "../lib/useSidebarSplit";
 import { idleSince } from "../lib/chatSession";
@@ -243,8 +251,30 @@ export function ProjectView({
     // the same project change.
     refreshDocuments();
     refreshMilestones();
+    refreshArchived();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
+
+  // Whether this project is archived (#1018) — the header says so and offers the way back, since an
+  // archived project is opened from Focus's Archive folder and the Chats list no longer shows it.
+  const [archived, setArchived] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  function refreshArchived() {
+    listArchivedProjects()
+      .then((names) => setArchived(isArchived(archivedSet(names), project)))
+      .catch(() => {});
+  }
+  async function toggleArchived() {
+    setArchiving(true);
+    try {
+      await setProjectArchived(project, !archived);
+      setArchived(!archived);
+    } catch (e) {
+      chat.setError(String(e));
+    } finally {
+      setArchiving(false);
+    }
+  }
 
   // When the palette opens this project to land on a file, scroll it into view
   // and flash it. Keyed on the docs too, so it fires once the list has rendered.
@@ -485,9 +515,22 @@ export function ProjectView({
           <h1 className="truncate font-head text-sm font-semibold text-ink">{project}</h1>
           <p className="font-mono text-xs text-ink4">
             {documents.length} document{documents.length === 1 ? "" : "s"} · chat scoped to this
-            project
+            project{archived && " · archived"}
           </p>
         </div>
+        <Button
+          variant="tertiary"
+          className="ml-auto shrink-0"
+          onClick={() => void toggleArchived()}
+          disabled={archiving}
+          title={
+            archived
+              ? "Put this project back in Focus, the briefing and the Chats list"
+              : "Move it to Focus's Archive folder: no status or reminders, and it leaves the Chats list"
+          }
+        >
+          {archived ? "Unarchive" : "Archive"}
+        </Button>
       </header>
 
       <div className={`flex flex-1 overflow-hidden ${resizing ? "select-none" : ""}`}>

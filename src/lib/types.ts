@@ -814,6 +814,8 @@ export interface ProjectOverview {
   milestones: Milestone[];
   /** The governing milestone (nearest unmet) driving the status + card line, if any. */
   governing_milestone: GoverningMilestone | null;
+  /** Archived by the user (#1018): Focus shows it in the Archive folder, not the list. */
+  archived: boolean;
 }
 
 /** What a *Merge into* would move, counted live from the rows the merge will touch (#279).

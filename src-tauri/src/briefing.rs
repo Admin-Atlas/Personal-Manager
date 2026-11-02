@@ -586,6 +586,7 @@ mod tests {
             calendar_event: None,
             milestones,
             governing_milestone: None,
+            archived: false,
         }
     }
 

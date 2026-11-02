@@ -1038,6 +1038,7 @@ mod tests {
              DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
              ALTER TABLE projects DROP COLUMN importance; \
+             ALTER TABLE projects DROP COLUMN archived_at; \
              DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
              ALTER TABLE calendar_events DROP COLUMN kind_override; \
@@ -1234,6 +1235,7 @@ mod tests {
              DROP TABLE project_milestones; \
              ALTER TABLE projects DROP COLUMN last_touched; \
              ALTER TABLE projects DROP COLUMN importance; \
+             ALTER TABLE projects DROP COLUMN archived_at; \
              DROP INDEX idx_calendar_events_uid; \
              DROP INDEX idx_calendar_events_entity; \
              ALTER TABLE calendar_events DROP COLUMN kind_override; \

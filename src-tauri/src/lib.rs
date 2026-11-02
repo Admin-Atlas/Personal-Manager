@@ -1764,6 +1764,8 @@ pub fn run() {
             commands::delete_document,
             commands::delete_unreachable_documents,
             commands::list_project_overviews,
+            commands::set_project_archived,
+            commands::list_archived_projects,
             commands::set_project_metadata,
             commands::propose_project_metadata,
             commands::list_milestones,

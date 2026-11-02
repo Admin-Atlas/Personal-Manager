@@ -347,7 +347,8 @@ async fn run_briefing_refresh(app: &AppHandle, force: bool) -> Result<briefing::
         let zone = resolve_zone(&conn);
         let now = clock::now_local_iso(zone);
         let today = clock::today_sql_in(zone);
-        let projects = projects::list_overviews(&conn, &today)?;
+        // Archived projects (#1018) brief nothing: no status line, no "gone quiet", no flags.
+        let projects = projects::list_active_overviews(&conn, &today)?;
         let events = calendar::list_upcoming(&conn, briefing::BRIEFING_AGENDA_DAYS, &today)?;
         // Evaluate the structured flag layer BEFORE rendering (card 9): reconcile the stored flag
         // set to the current projects + calendar, then render the ACTIVE (unresolved) flags as the

@@ -658,13 +658,37 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
 
 // --- personal assistant: projects & focus view (Step 5) ---
 
-/// Every active project with its triage metadata and one derived status — the
-/// focus view's data (spec §4.1).
+/// Every project with its triage metadata and one derived status — the focus view's data
+/// (spec §4.1). Archived projects are included, flagged, for Focus's Archive folder.
 #[tauri::command]
 pub fn list_project_overviews(state: State<'_, AppState>) -> Result<Vec<ProjectOverview>> {
     let conn = state.conn()?;
     let today = clock::today_sql_in(resolve_zone(&conn));
     projects::list_overviews(&conn, &today)
+}
+
+/// Archive or unarchive a project (#1018). Reversible and non-destructive: only `archived_at`
+/// changes. The caller refreshes the briefing, whose flag reconcile then clears (or restores) the
+/// project's deadline flags.
+#[tauri::command]
+pub fn set_project_archived(
+    state: State<'_, AppState>,
+    name: String,
+    archived: bool,
+) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Other("project name is empty".into()));
+    }
+    let conn = state.conn()?;
+    projects::set_archived(&conn, name, archived)
+}
+
+/// The names of the archived projects — the Chats sidebar and the Documents filter read this.
+#[tauri::command]
+pub fn list_archived_projects(state: State<'_, AppState>) -> Result<Vec<String>> {
+    let conn = state.conn()?;
+    projects::archived_names(&conn)
 }
 
 /// Set (or update) a project's triage metadata — the user confirming/correcting an

@@ -188,10 +188,54 @@ pub struct ProjectOverview {
     /// The milestone driving the status + card line (nearest unmet), or `None` when the
     /// project has no unmet dated milestone.
     pub governing_milestone: Option<GoverningMilestone>,
+    /// The user archived this project (#1018). Focus shows it in its Archive folder instead of the
+    /// list, and [`list_active_overviews`] leaves it out of the briefing and the flag layer. Its
+    /// status is still derived, so unarchiving shows exactly what it would have shown.
+    pub archived: bool,
 }
 
-/// Every active project (distinct `documents.project`) with its triage metadata
-/// (LEFT JOINed from `projects`) and derived status. Day deltas for the deadline
+/// [`list_overviews`] without the archived projects — what the briefing and the flag layer reason
+/// over (#1018). An archived project raises no deadline flag, no "gone quiet" line and no status in
+/// the briefing; dropping it from the input is what does all three, and the flag reconcile then
+/// clears any flag it had already raised, the same as for a project that no longer exists.
+pub fn list_active_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverview>> {
+    let mut all = list_overviews(conn, today)?;
+    all.retain(|p| !p.archived);
+    Ok(all)
+}
+
+/// Archive (`true`) or unarchive (`false`) a project (#1018), creating its triage row if it has
+/// none yet. Nothing else about the project changes, so unarchiving restores every surface exactly
+/// as it was. A blank name is a no-op.
+pub fn set_archived(conn: &Connection, name: &str, archived: bool) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO projects(name, archived_at) \
+         VALUES (?1, CASE WHEN ?2 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END) \
+         ON CONFLICT(name) DO UPDATE SET \
+            archived_at = CASE WHEN ?2 THEN COALESCE(archived_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')) END",
+        params![name, archived],
+    )?;
+    Ok(())
+}
+
+/// The names of every archived project, for the surfaces that list projects by name rather than
+/// through [`list_overviews`] — the Chats sidebar and the Documents list's filter.
+pub fn archived_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM projects WHERE archived_at IS NOT NULL ORDER BY name")?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
+/// Every project (distinct `documents.project`) with its triage metadata
+/// (LEFT JOINed from `projects`) and derived status — archived ones included, flagged, because
+/// Focus shows them in its Archive folder ([`list_active_overviews`] drops them). Day deltas for the deadline
 /// and last activity are computed in SQL so `derive_status` stays pure. `today` is
 /// the user's zone-local civil date (`YYYY-MM-DD`, from `clock::today_sql_in`): both
 /// deltas reason against this one `:today` midnight, so the deadline and activity
@@ -224,7 +268,8 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
                 max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')) AS last_activity, \
                 p.deadline, p.size, p.blocked_by, p.importance, \
                 julianday(:today) - julianday(date(replace( \
-                    max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')),'Z',''))) AS days_since \
+                    max(MAX(COALESCE(d.last_activity, d.ingested_at)), COALESCE(p.last_touched,'')),'Z',''))) AS days_since, \
+                p.archived_at IS NOT NULL AS archived \
          FROM ({memberships}) m \
          JOIN documents d ON d.id = m.document_id \
          LEFT JOIN projects p ON p.name = m.name \
@@ -234,11 +279,13 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
                 0 AS doc_count, \
                 p.last_touched AS last_activity, \
                 p.deadline, p.size, p.blocked_by, p.importance, \
-                julianday(:today) - julianday(date(replace(COALESCE(p.last_touched,''),'Z',''))) AS days_since \
+                julianday(:today) - julianday(date(replace(COALESCE(p.last_touched,''),'Z',''))) AS days_since, \
+                p.archived_at IS NOT NULL AS archived \
          FROM projects p \
          WHERE NOT EXISTS (SELECT 1 FROM ({memberships}) m2 \
                            WHERE m2.norm = lower(trim(p.name))) \
            AND (p.last_touched IS NOT NULL \
+                OR p.archived_at IS NOT NULL \
                 OR EXISTS (SELECT 1 FROM project_milestones pm WHERE pm.project_name = p.name)) \
          ORDER BY name",
         memberships = crate::tags::MEMBERSHIPS_SQL
@@ -253,6 +300,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
         let blocked_by: Option<String> = row.get(5)?;
         let importance: Option<String> = row.get(6)?;
         let days_since: Option<f64> = row.get(7)?;
+        let archived: bool = row.get(8)?;
         Ok((
             name,
             doc_count,
@@ -262,6 +310,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             blocked_by,
             importance,
             days_since,
+            archived,
         ))
     })?;
 
@@ -272,7 +321,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     // `raw` by value — the structural graph the dependent counts reduce.
     let edges: Vec<(String, Option<String>)> = raw
         .iter()
-        .map(|(name, _, _, _, _, blocked_by, _, _)| (name.clone(), blocked_by.clone()))
+        .map(|(name, _, _, _, _, blocked_by, _, _, _)| (name.clone(), blocked_by.clone()))
         .collect();
     // Reduced ONCE, like `milestones::all_by_project` on the next statement. Asking per project
     // rescanned the whole graph N times, each comparison heap-allocating two Unicode case-folds.
@@ -292,7 +341,18 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
     let zone = crate::commands::resolve_zone(conn);
 
     let mut out = Vec::new();
-    for (name, doc_count, last_activity, deadline, size, blocked_by, importance, dsince) in raw {
+    for (
+        name,
+        doc_count,
+        last_activity,
+        deadline,
+        size,
+        blocked_by,
+        importance,
+        dsince,
+        archived,
+    ) in raw
+    {
         let project_milestones = milestones_by_project.remove(&name).unwrap_or_default();
         let governing_milestone = milestones::governing_info(&project_milestones, today);
 
@@ -340,6 +400,7 @@ pub fn list_overviews(conn: &Connection, today: &str) -> Result<Vec<ProjectOverv
             calendar_event,
             milestones: project_milestones,
             governing_milestone,
+            archived,
         });
     }
     Ok(out)
@@ -431,9 +492,10 @@ pub fn rename_project_satellites(conn: &Connection, old: &str, new: &str) -> Res
     //    present (merge survivor) -> keep the survivor's row untouched.
     conn.execute(
         "INSERT OR IGNORE INTO projects \
-             (name, deadline, size, blocked_by, importance, last_touched, entity_id, created_at, updated_at) \
+             (name, deadline, size, blocked_by, importance, last_touched, entity_id, created_at, \
+              updated_at, archived_at) \
          SELECT ?2, deadline, size, blocked_by, importance, last_touched, entity_id, created_at, \
-                strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'), archived_at \
            FROM projects WHERE name = ?1",
         params![old, new],
     )?;
@@ -1237,6 +1299,69 @@ mod tests {
         let fresh = overview_for(&rows, "Fresh");
         assert_eq!(fresh.status, ProjectStatus::DueSoon);
         assert_eq!(fresh.milestones.len(), 1);
+    }
+
+    /// #1018: an archived project stays in the overview, flagged, for Focus's Archive folder, but the
+    /// briefing and flag layer's list drops it — so its due milestone raises nothing. Unarchiving
+    /// restores it with its status intact, and a rename carries the archive across.
+    #[test]
+    fn archiving_takes_a_project_out_of_the_briefing_and_flags_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let today = "2026-06-28";
+        conn.execute(
+            "INSERT INTO documents(vault_path, content_hash, project, last_activity) \
+             VALUES ('v1','h1','Atlas','2026-06-27T10:00:00Z'), \
+                    ('v2','h2','Other','2026-06-27T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        crate::milestones::add(&conn, "Atlas", "pitch", Some("2026-07-01".into()), None).unwrap();
+
+        set_archived(&conn, "Atlas", true).unwrap();
+        let all = list_overviews(&conn, today).unwrap();
+        assert!(overview_for(&all, "Atlas").archived);
+        assert!(!overview_for(&all, "Other").archived);
+        let active = list_active_overviews(&conn, today).unwrap();
+        assert!(active.iter().all(|p| p.name != "Atlas"));
+        let det = crate::flags::detect(&active, &[], today, chrono_tz::Tz::UTC);
+        assert!(
+            det.drafts.is_empty(),
+            "an archived project's due milestone flags nothing"
+        );
+        assert_eq!(archived_names(&conn).unwrap(), vec!["Atlas".to_string()]);
+
+        // Archiving twice keeps the first stamp rather than moving it.
+        let stamp = |c: &Connection| -> Option<String> {
+            c.query_row(
+                "SELECT archived_at FROM projects WHERE name = 'Atlas'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let first = stamp(&conn);
+        set_archived(&conn, "Atlas", true).unwrap();
+        assert_eq!(stamp(&conn), first);
+
+        rename_project_satellites(&conn, "Atlas", "Atlas 2").unwrap();
+        assert_eq!(archived_names(&conn).unwrap(), vec!["Atlas 2".to_string()]);
+
+        set_archived(&conn, "Atlas 2", false).unwrap();
+        assert!(archived_names(&conn).unwrap().is_empty());
+    }
+
+    /// An archived project with no documents, milestones or engagement still surfaces, so it can be
+    /// found in the Archive folder and unarchived rather than becoming unreachable.
+    #[test]
+    fn an_archived_project_with_nothing_else_still_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        set_archived(&conn, "Empty", true).unwrap();
+        let rows = list_overviews(&conn, "2026-06-28").unwrap();
+        let empty = overview_for(&rows, "Empty");
+        assert!(empty.archived);
+        assert_eq!(empty.doc_count, 0);
     }
 
     /// F-19: a project with milestones but ZERO documents still appears in the overview — so it shows in

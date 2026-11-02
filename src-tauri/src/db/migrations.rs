@@ -1660,6 +1660,15 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE calendars ADD COLUMN data_owner TEXT;
     ALTER TABLE calendars ADD COLUMN event_labels TEXT;
     "#,
+    // v58: archiving a project (#1018). `archived_at` is when the user archived it; NULL = active.
+    // An archived project leaves Focus (into its Archive folder), the briefing, the flag layer and
+    // the Chats sidebar, and its files hide from the Documents list unless asked for — all of that
+    // read from this one column, so unarchiving (back to NULL) restores every surface exactly as it
+    // was. Nothing about the project is deleted or rewritten. A timestamp rather than a flag so a
+    // later "archived on …" needs no second migration. Additive, NULL for every existing row.
+    r#"
+    ALTER TABLE projects ADD COLUMN archived_at TEXT;
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1728,6 +1737,7 @@ mod tests {
              ALTER TABLE calendars DROP COLUMN conference_types;
              ALTER TABLE calendars DROP COLUMN data_owner;
              ALTER TABLE calendars DROP COLUMN event_labels;
+             ALTER TABLE projects DROP COLUMN archived_at;
              PRAGMA user_version = 53;
              INSERT INTO documents(vault_path, title, content_hash, project, source_type,
                  source_id, source_state, external_ref, source_content_hash)
@@ -1808,7 +1818,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 57,
+            version, 58,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1837,7 +1847,8 @@ mod tests {
              Rebuild-stable retrieval-feedback identities + answer-time config stamp is v49; \
              documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54; \n             which file a location points at is v55; \
              the folder trail above a file is v56; \
-             what editing a Google event needs to know is v57)"
+             what editing a Google event needs to know is v57; \
+             archiving a project is v58)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

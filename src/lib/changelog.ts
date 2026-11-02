@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.163.0-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Archive a project you're done with. Choose Archive in a project's Triage, or at the top of the project, and it moves to an Archive folder at the bottom of Focus. It stops showing a status, nudging you to take a look or raising deadline reminders, and it leaves the Chats list. Nothing is deleted: open it from the Archive folder any time, and Unarchive puts it back exactly as it was.",
+      "Files in archived projects are hidden from the Documents list, with a line above the list saying how many and a Show button to bring them back. Search and chat still find them.",
+    ],
+  },
+  {
     version: "3.162.0-alpha",
     date: "2026-11-02",
     highlights: [

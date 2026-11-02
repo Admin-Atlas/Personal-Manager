@@ -1197,9 +1197,9 @@ fn detect_and_store_at(
 /// Fetch the focus-view inputs, then [`detect_and_store`] — the entry the background scheduler uses
 /// (it has nothing pre-fetched). The briefing path calls `detect_and_store` directly with the
 /// inputs it already holds. Both fetch the same event window and share the same reducer, so they
-/// agree on the flag set.
+/// agree on the flag set. Both leave archived projects out (#1018), so their milestones raise nothing.
 pub fn run_detection(conn: &Connection, today: &str, zone: Tz) -> Result<DetectionSummary> {
-    let projects = projects::list_overviews(conn, today)?;
+    let projects = projects::list_active_overviews(conn, today)?;
     let events = calendar::list_upcoming(conn, DETECT_EVENT_WINDOW_DAYS, today)?;
     detect_and_store(conn, &projects, &events, today, zone)
 }
@@ -1500,6 +1500,7 @@ mod tests {
             calendar_event: None,
             milestones,
             governing_milestone: None,
+            archived: false,
         }
     }
 

@@ -13,6 +13,7 @@ import {
   proposeProjectMetadata,
   resolveFlag,
   routeFocusInput,
+  setProjectArchived,
   setProjectMetadata,
 } from "../lib/ipc";
 import { MilestoneList } from "./MilestoneList";
@@ -45,6 +46,7 @@ import {
   Button,
   Callout,
   Card,
+  Collapsible,
   Input,
   Popover,
   Skeleton,
@@ -234,7 +236,35 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
   useEffect(() => {
     writeSort(sort);
   }, [sort]);
-  const sorted = useMemo(() => sortProjects(projects, sort), [projects, sort]);
+  // Archived projects (#1018) sit in the Archive folder under the list, alphabetical, never sorted
+  // in among the live ones — their status is real but not a call to action.
+  const sorted = useMemo(
+    () =>
+      sortProjects(
+        projects.filter((p) => !p.archived),
+        sort,
+      ),
+    [projects, sort],
+  );
+  const archived = useMemo(
+    () =>
+      projects
+        .filter((p) => p.archived)
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })),
+    [projects],
+  );
+  // Archiving changes what the briefing and the flag layer reason over, so it re-runs both, the
+  // same pair a resolved flag re-runs.
+  async function setArchived(name: string, on: boolean) {
+    setError(null);
+    try {
+      await setProjectArchived(name, on);
+      setEditing(null);
+      await Promise.all([regenerateBriefing(), refresh()]);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
 
   // Split (side-by-side) vs stacked layout — per-device, set from this header.
   const [layout, setLayout] = useState<FocusLayout>(readFocusLayout);
@@ -414,27 +444,71 @@ export function FocusView({ onOpenProject, onAsk }: Props) {
           No projects yet. Ingest some documents and sort them in Review.
         </p>
       ) : (
-        <ul className="flex flex-col gap-2" data-help="focus-cards">
-          {sorted.map((p) => (
-            <ProjectCard
-              key={p.name}
-              project={p}
-              otherProjects={names.filter((n) => n !== p.name)}
-              proposal={proposals[p.name]}
-              suggesting={proposing === p.name}
-              suggestDisabled={proposing !== null}
-              onSuggest={() => void suggestOne(p.name)}
-              editing={editing === p.name}
-              onEdit={() => setEditing(editing === p.name ? null : p.name)}
-              onOpen={() => onOpenProject(p.name)}
-              onChanged={refresh}
-              onSaved={async () => {
-                setEditing(null);
-                await refresh();
-              }}
-            />
-          ))}
-        </ul>
+        <>
+          {sorted.length === 0 && <p className="text-sm text-ink4">Every project is archived.</p>}
+          <ul className="flex flex-col gap-2" data-help="focus-cards">
+            {sorted.map((p) => (
+              <ProjectCard
+                key={p.name}
+                project={p}
+                otherProjects={names.filter((n) => n !== p.name)}
+                proposal={proposals[p.name]}
+                suggesting={proposing === p.name}
+                suggestDisabled={proposing !== null}
+                onSuggest={() => void suggestOne(p.name)}
+                editing={editing === p.name}
+                onEdit={() => setEditing(editing === p.name ? null : p.name)}
+                onOpen={() => onOpenProject(p.name)}
+                onArchive={() => void setArchived(p.name, true)}
+                onChanged={refresh}
+                onSaved={async () => {
+                  setEditing(null);
+                  await refresh();
+                }}
+              />
+            ))}
+          </ul>
+          {/* The Archive folder (#1018): closed by default, below everything live. A project here
+              shows no status, raises no flags and is gone from the Chats sidebar; opening it still
+              works, and Unarchive puts it back exactly as it was. */}
+          {archived.length > 0 && (
+            <Collapsible
+              className="mt-4"
+              defaultOpen={false}
+              title="Archive"
+              meta={<span className="font-mono text-xs text-ink4">{archived.length}</span>}
+            >
+              <ul className="mt-2 flex flex-col gap-1">
+                {archived.map((p) => (
+                  <li
+                    key={p.name}
+                    className="flex items-center justify-between gap-3 rounded-[var(--radius-sm)] px-2 py-1.5 hover:bg-surface"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onOpenProject(p.name)}
+                      className="min-w-0 flex-1 truncate text-left text-sm text-ink2"
+                      title={`Open ${p.name}`}
+                    >
+                      {p.name}
+                      <span className="ml-2 font-mono text-xs text-ink4">
+                        {p.doc_count} doc{p.doc_count === 1 ? "" : "s"}
+                      </span>
+                    </button>
+                    <Button
+                      variant="tertiary"
+                      size="sm"
+                      onClick={() => void setArchived(p.name, false)}
+                      title="Put this project back in the list"
+                    >
+                      Unarchive
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </Collapsible>
+          )}
+        </>
       )}
     </>
   );
@@ -614,6 +688,7 @@ function ProjectCard({
   editing,
   onEdit,
   onOpen,
+  onArchive,
   onChanged,
   onSaved,
 }: {
@@ -627,6 +702,7 @@ function ProjectCard({
   editing: boolean;
   onEdit: () => void;
   onOpen: () => void;
+  onArchive: () => void;
   onChanged: () => void;
   onSaved: () => void;
 }) {
@@ -698,6 +774,7 @@ function ProjectCard({
             suggesting={suggesting}
             suggestDisabled={suggestDisabled}
             onSuggest={onSuggest}
+            onArchive={onArchive}
             onChanged={onChanged}
             onSaved={onSaved}
           />
@@ -716,6 +793,7 @@ function MetaEditor({
   suggesting,
   suggestDisabled,
   onSuggest,
+  onArchive,
   onChanged,
   onSaved,
 }: {
@@ -725,6 +803,7 @@ function MetaEditor({
   suggesting: boolean;
   suggestDisabled: boolean;
   onSuggest: () => void;
+  onArchive: () => void;
   onChanged: () => void;
   onSaved: () => void;
 }) {
@@ -857,11 +936,18 @@ function MetaEditor({
           "this was never its own project" — is now this explicit, irreversible action (#279). */}
       <div className="mt-3 flex items-center justify-between gap-3">
         <span className="text-xs text-ink4">
-          {otherProjects.length > 0
-            ? "Turns out this was always part of another project?"
-            : "Done with this project?"}
+          Done with this project, or was it part of another?
         </span>
         <div className="flex shrink-0 gap-2">
+          {/* The gentle one first (#1018): Archive keeps everything and is undone from the Archive
+              folder; Merge and Delete are the irreversible two. */}
+          <Button
+            variant="tertiary"
+            onClick={onArchive}
+            title="Move it to the Archive folder: no status or reminders, and it leaves the Chats list. Undo any time."
+          >
+            Archive
+          </Button>
           {otherProjects.length > 0 && (
             <Button variant="tertiary" onClick={() => setMerging(true)}>
               Merge into…
