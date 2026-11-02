@@ -30,7 +30,7 @@ import {
   type DecorationSet,
 } from "@codemirror/view";
 import { minimalChange as diff, previewMarks, type PreviewMark } from "../lib/pinboard/livePreview";
-import { tableCellOffset } from "../lib/pinboard/noteTables";
+import { tableCellOffset, unescapeCell } from "../lib/pinboard/noteTables";
 import { toggleTaskAt, type TextEdit } from "../lib/pinboard/notesMarkdown";
 import { openUrl } from "../lib/ipc";
 
@@ -101,7 +101,7 @@ class TableWidget extends WidgetType {
       for (let c = 0; c < cols; c++) {
         const cell = r === 0 ? document.createElement("th") : document.createElement("td");
         // Cell text as text — never markup — so what a note holds can't become HTML here.
-        cell.textContent = (cells[c] ?? "").replace(/\\\|/g, "|");
+        cell.textContent = unescapeCell(cells[c] ?? "");
         tr.appendChild(cell);
       }
     });

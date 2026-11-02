@@ -6,7 +6,7 @@ import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { Markdown } from "../markdown";
 import { toRenderMarkdown } from "./notesMarkdown";
-import { insertTable } from "./noteTables";
+import { escapeCell, insertTable } from "./noteTables";
 
 // `notesMarkdown.test.ts` proves what `toRenderMarkdown` EMITS. These prove what the renderer then
 // DOES with it — the two halves had drifted: the transform was appending the two-space hard break
@@ -179,6 +179,15 @@ describe("round bullets and dash points render as two kinds of list", () => {
 });
 
 describe("a note's table renders as a table", () => {
+  it("agrees with the editor on where a cell ends when backslashes precede a pipe", () => {
+    const cells = (note: string) => {
+      const { container } = render(<Markdown dashLists>{toRenderMarkdown(note)}</Markdown>);
+      return [...container.querySelector("table")!.rows[0].cells].map((c) => c.textContent);
+    };
+    expect(cells(`| ${escapeCell("x \\| y")} |\n| --- |`)).toEqual(["x \\| y"]);
+    expect(cells("| x \\\\| y |\n| --- | --- |")).toEqual(["x \\", "y"]);
+  });
+
   it("renders the picker's empty grid as a table of empty cells", () => {
     const { container } = render(
       <Markdown dashLists>{toRenderMarkdown(insertTable("", 0, 0, 3, 2).text)}</Markdown>,

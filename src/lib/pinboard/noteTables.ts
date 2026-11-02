@@ -40,16 +40,16 @@ const ROW_RE = /^ {0,3}\|/;
 const DELIM_CELL_RE = /^:?-+:?$/;
 
 /** A row's cells: the leading pipe (and a trailing one, when typed) dropped, split on every pipe
- *  that isn't escaped, each trimmed. An escaped `\|` is cell text, not a boundary. */
+ *  that isn't escaped, each trimmed. Reads backslashes the way GFM does, so this and the renderer
+ *  agree on where a cell ends: `\\` and `\|` are pairs, which makes the pipe in `\\|` a boundary. */
 function splitRow(line: string): string[] {
   let s = line.trim();
   if (s.startsWith("|")) s = s.slice(1);
-  if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
   const cells: string[] = [];
   let cur = "";
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === "\\" && s[i + 1] === "|") {
-      cur += "\\|";
+    if (s[i] === "\\" && (s[i + 1] === "\\" || s[i + 1] === "|")) {
+      cur += s[i] + s[i + 1];
       i++;
     } else if (s[i] === "|") {
       cells.push(cur.trim());
@@ -58,8 +58,36 @@ function splitRow(line: string): string[] {
       cur += s[i];
     }
   }
-  cells.push(cur.trim());
+  // Nothing after the last boundary means it was the row's closing pipe, not a new empty cell.
+  if (cur !== "" || cells.length === 0) cells.push(cur.trim());
   return cells;
+}
+
+/** Rewrite every pipe in a cell, given how many backslashes sit right before it. Any other
+ *  backslash is left alone, so `C:\\new` in a cell survives a round trip exactly. */
+function mapPipes(cell: string, pipe: (backslashes: number) => string): string {
+  let out = "";
+  let run = 0;
+  for (const ch of cell) {
+    if (ch === "\\") {
+      run++;
+      continue;
+    }
+    out += ch === "|" ? pipe(run) : "\\".repeat(run) + ch;
+    run = 0;
+  }
+  return out + "\\".repeat(run);
+}
+
+/** A cell's text as table source: its pipes escaped, along with the backslashes right before them
+ *  (else the text `\|` would be written `\\|`, which ends the cell). */
+export function escapeCell(text: string): string {
+  return mapPipes(text, (n) => `${"\\".repeat(2 * n + 1)}|`);
+}
+
+/** The reverse of `escapeCell`, for a cell `findTables` returned. */
+export function unescapeCell(source: string): string {
+  return mapPipes(source, (n) => `${"\\".repeat(n >> 1)}|`);
 }
 
 function delimAligns(line: string): Align[] | null {
@@ -163,7 +191,7 @@ function locate(value: string, caret: number) {
   if (!table) return null;
   const row = line <= table.start + 1 ? 0 : line - table.start - 1;
   const before = lines[line].slice(0, caret - start);
-  const pipes = before.replace(/\\\|/g, "").split("|").length - 1;
+  const pipes = before.replace(/\\[\\|]/g, "").split("|").length - 1;
   const cols = Math.max(table.aligns.length, ...table.rows.map((r) => r.length));
   const col = Math.min(Math.max(pipes - 1, 0), cols - 1);
   return { lines, table, row, col, cols };

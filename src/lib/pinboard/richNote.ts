@@ -22,7 +22,14 @@ import { tableNodes } from "prosemirror-tables";
 import { fenceBlocks } from "./noteFences";
 import { inlineSpans, type InlineSpan } from "./livePreview";
 import { isRomanToken, matchMarker, nextMarker } from "./notesMarkdown";
-import { findTables, layout, normalizeTables, type Align } from "./noteTables";
+import {
+  escapeCell,
+  findTables,
+  layout,
+  normalizeTables,
+  unescapeCell,
+  type Align,
+} from "./noteTables";
 
 const tables = tableNodes({
   tableGroup: "block",
@@ -281,7 +288,7 @@ export function parseNote(text: string): PMNode {
               Array.from({ length: cols }, (_, c) =>
                 (r === 0 ? S.nodes.table_header : S.nodes.table_cell).create(
                   null,
-                  inlineNodes((row[c] ?? "").replace(/\\\|/g, "|")),
+                  inlineNodes(unescapeCell(row[c] ?? "")),
                 ),
               ),
             ),
@@ -456,7 +463,7 @@ export function serializeNote(doc: PMNode): string {
         const rows: string[][] = [];
         block.forEach((row) => {
           const cells: string[] = [];
-          row.forEach((cell) => cells.push(inlineText(cell).replace(/\|/g, "\\|")));
+          row.forEach((cell) => cells.push(escapeCell(inlineText(cell))));
           rows.push(cells);
         });
         out.push(layout(rows, block.attrs.aligns as Align[]).text);

@@ -39,6 +39,8 @@ const EXACT = [
   "| a   | b   |\n| --- | --- |\n| 1   | 2   |",
   "| left | mid | right |\n| :--- | :-: | ----: |\n| x    | y   | z     |",
   "| a \\| b | c   |\n| ------ | --- |",
+  "| a \\\\\\| b | c   |\n| -------- | --- |",
+  "| C:\\new | c   |\n| ------ | --- |",
   "intro\n\n| a   |\n| --- |\n\nafter",
   "# Plan\n\n. one\n[] two\n\n> note\n\n```\ncode\n```\n\n| a   |\n| --- |\n| 1   |",
   "café ☕ — “quotes” 日本語",
@@ -138,6 +140,17 @@ describe("serializeNote after edits", () => {
       table.copy(table.content.replaceChild(0, S.nodes.table_row.create(null, [cell]))),
     ]);
     expect(serializeNote(doc)).toBe("| x \\| y |\n| ------ |");
+  });
+
+  it("keeps a backslash typed before a pipe from ending the cell", () => {
+    const table = parseNote("| a   |\n| --- |").firstChild!;
+    const cell = S.nodes.table_header.create(null, S.text("x \\| y"));
+    const doc = S.nodes.doc.create(null, [
+      table.copy(table.content.replaceChild(0, S.nodes.table_row.create(null, [cell]))),
+    ]);
+    const note = serializeNote(doc);
+    expect(note).toBe("| x \\\\\\| y |\n| -------- |");
+    expect(parseNote(note).textContent).toBe("x \\| y");
   });
 });
 

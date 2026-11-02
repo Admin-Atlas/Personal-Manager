@@ -2,7 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, it, expect } from "vitest";
-import { insertTable, moveCell, tableCellOffset, tableEnter, tableLineMask } from "./noteTables";
+import {
+  escapeCell,
+  insertTable,
+  moveCell,
+  tableCellOffset,
+  tableEnter,
+  tableLineMask,
+  unescapeCell,
+} from "./noteTables";
 import { toRenderMarkdown } from "./notesMarkdown";
 
 const GRID_2x3 = ["|     |     |", "| --- | --- |", "|     |     |", "|     |     |"].join("\n");
@@ -84,6 +92,35 @@ describe("moveCell", () => {
     expect(r.text.split("\n")[0]).toBe("| a \\| b | c   |");
     expect(r.text.slice(r.selStart, r.selEnd)).toBe("c");
   });
+
+  it("treats a pipe after an escaped backslash as a boundary, as GFM does", () => {
+    const r = moveCell("| a \\\\| b |\n|---|---|", 2, 1)!;
+    expect(r.text.split("\n")[0]).toBe("| a \\\\ | b   |");
+    expect(r.text.slice(r.selStart, r.selEnd)).toBe("b");
+  });
+
+  it("keeps a closing pipe from opening an empty cell, unless the pipe is escaped", () => {
+    expect(moveCell("| a | b |\n|---|---|", 2, 1)!.text.split("\n")[1]).toBe("| --- | --- |");
+    expect(moveCell("| a | b \\|\n|---|---|", 2, 1)!.text.split("\n")[0]).toBe("| a   | b \\| |");
+  });
+});
+
+describe("escapeCell / unescapeCell", () => {
+  it("escapes a pipe and doubles the backslashes right before it", () => {
+    expect(escapeCell("x | y")).toBe("x \\| y");
+    expect(escapeCell("x \\| y")).toBe("x \\\\\\| y");
+  });
+
+  it("leaves every other backslash alone", () => {
+    expect(escapeCell("C:\\new\\")).toBe("C:\\new\\");
+    expect(unescapeCell("C:\\new\\")).toBe("C:\\new\\");
+  });
+
+  for (const text of ["|", "\\|", "\\\\|", "a|b|c", "\\", "\\a\\|b\\", "☕ | 日本語"]) {
+    it(`round-trips ${JSON.stringify(text)}`, () => {
+      expect(unescapeCell(escapeCell(text))).toBe(text);
+    });
+  }
 });
 
 describe("tableEnter", () => {
