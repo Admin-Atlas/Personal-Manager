@@ -413,11 +413,24 @@ pub fn write_synced(
 /// document now. Call this AFTER the promote's DB transaction commits, so the mirror already excludes
 /// the id and no racing sync can re-add it.
 pub fn forget_source(vault_root: &Path, cipher: &ManifestCipher, source_id: &str) -> Result<()> {
+    forget_sources(vault_root, cipher, &[source_id.to_string()])
+}
+
+/// [`forget_source`] for many sources in ONE decrypt-filter-encrypt pass — the bulk delete's path
+/// (#1017), where one rewrite per item would re-encrypt the whole manifest hundreds of times.
+pub fn forget_sources(
+    vault_root: &Path,
+    cipher: &ManifestCipher,
+    source_ids: &[String],
+) -> Result<()> {
     let Some(mut manifest) = read_manifest(vault_root, cipher)? else {
         return Ok(());
     };
+    let doomed: std::collections::HashSet<&str> = source_ids.iter().map(String::as_str).collect();
     let before = manifest.items.len();
-    manifest.items.retain(|it| it.source_id != source_id);
+    manifest
+        .items
+        .retain(|it| !doomed.contains(it.source_id.as_str()));
     if manifest.items.len() != before {
         write_manifest(vault_root, cipher, &manifest)?;
     }
@@ -2754,6 +2767,40 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         forget_source(empty.path(), &cipher, "anything").unwrap();
         assert!(read_manifest(empty.path(), &cipher).unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_sources_drops_every_named_item_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let cipher = ManifestCipher::from_master(VAULT_ID, &MASTER);
+        write_manifest(
+            dir.path(),
+            &cipher,
+            &Manifest {
+                schema: MANIFEST_SCHEMA,
+                items: vec![item("a:1", "A"), item("b:2", "B"), item("c:3", "C")],
+            },
+        )
+        .unwrap();
+
+        forget_sources(
+            dir.path(),
+            &cipher,
+            &["a:1".to_string(), "c:3".to_string(), "absent:9".to_string()],
+        )
+        .unwrap();
+        let ids: Vec<String> = read_manifest(dir.path(), &cipher)
+            .unwrap()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.source_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["b:2".to_string()],
+            "an absent id is ignored, the rest go"
+        );
     }
 
     #[test]

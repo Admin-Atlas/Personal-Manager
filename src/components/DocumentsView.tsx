@@ -71,7 +71,12 @@ import { sourceFactKnown, sourceFactValue } from "../lib/sourceFacts";
 import { Button, Card, Collapsible, ConfirmDialog, IconButton, Popover } from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
-import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
+import {
+  DeleteDocumentButton,
+  DeleteDocumentDialog,
+  DeleteUnreachableDialog,
+  deadSources,
+} from "./DeleteDocumentDialog";
 import { ProjectPicker, ProjectSummary, projectsOf } from "./ProjectPicker";
 import { IngestProgress } from "./IngestProgress";
 // ONE-TIME cleanup — remove with the component in the release after this one (card #651 follow-up).
@@ -185,6 +190,8 @@ export function DocumentsView({ onReviewClick }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null);
   // The document whose delete is being confirmed, or null (#575).
   const [deletingDoc, setDeletingDoc] = useState<Document | null>(null);
+  // The bulk "delete every file PM can't reach" confirmation is open (#1017).
+  const [deletingDead, setDeletingDead] = useState(false);
   // `projects[0]` is the primary; the rest are links (#275). Held as one ordered list so a single
   // Save writes the whole membership, for the same reason project and importance already share a
   // draft: two independent optimistic writes race and silently drop one.
@@ -715,6 +722,7 @@ export function DocumentsView({ onReviewClick }: Props) {
   }
 
   const unreviewed = documents.filter((d) => !d.reviewed).length;
+  const deadCount = useMemo(() => deadSources(documents).ids.length, [documents]);
 
   // Click a column header to sort; same header again flips the direction. A new column starts in its
   // natural direction (descending for importance/chunks/ingested, ascending for title/project).
@@ -812,6 +820,26 @@ export function DocumentsView({ onReviewClick }: Props) {
                   disabled={busy}
                 >
                   Rebuild now
+                </button>
+              </div>
+            </Banner>
+          )}
+          {/* Dead weight from an unmounted folder, a disconnected account or files deleted at the
+              source, cleared in one go (#1017) rather than one hover-Delete at a time. Calm, not a
+              warning: nothing is wrong with PM, and the rows keep their own badges. */}
+          {deadCount > 0 && (
+            <Banner tone="info">
+              <div className="flex items-center justify-between gap-3">
+                <span>
+                  {deadCount} file{deadCount === 1 ? "" : "s"} can&rsquo;t be reached at the source
+                  any more.
+                </span>
+                <button
+                  onClick={() => setDeletingDead(true)}
+                  className="shrink-0 underline"
+                  title="Delete every file whose source is unreachable or deleted"
+                >
+                  Delete them…
                 </button>
               </div>
             </Banner>
@@ -1545,6 +1573,13 @@ export function DocumentsView({ onReviewClick }: Props) {
         <DeleteDocumentDialog
           doc={deletingDoc}
           onClose={() => setDeletingDoc(null)}
+          onDeleted={() => void refresh()}
+        />
+      )}
+      {deletingDead && (
+        <DeleteUnreachableDialog
+          docs={documents}
+          onClose={() => setDeletingDead(false)}
           onDeleted={() => void refresh()}
         />
       )}

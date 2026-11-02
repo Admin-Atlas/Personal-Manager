@@ -1762,6 +1762,7 @@ pub fn run() {
             commands::delete_project_preview,
             commands::delete_project,
             commands::delete_document,
+            commands::delete_unreachable_documents,
             commands::list_project_overviews,
             commands::set_project_metadata,
             commands::propose_project_metadata,

@@ -876,6 +876,12 @@ export const mergeProjects = (from: string, into: string) =>
 export const deleteDocument = (documentId: number) =>
   invoke<void>("delete_document", { documentId });
 
+/** Delete, in one go, those of `documentIds` whose source is STILL unreachable or deleted — the
+ *  backend re-checks, so an item a sync brought back in the meantime is kept. Same per-kind rules as
+ *  `deleteDocument`. Resolves to how many were deleted. Irreversible. */
+export const deleteUnreachableDocuments = (documentIds: number[]) =>
+  invoke<number>("delete_unreachable_documents", { documentIds });
+
 /** What deleting `project` would affect — the live counts behind its confirmation ceremony. */
 export const deleteProjectPreview = (project: string) =>
   invoke<DeletePreview>("delete_project_preview", { project });
