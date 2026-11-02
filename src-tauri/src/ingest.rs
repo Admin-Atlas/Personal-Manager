@@ -1764,6 +1764,43 @@ pub(crate) fn plan_reap(file: FileState) -> ReapPlan {
     }
 }
 
+/// Delete the documents whose vault file is provably gone ([`plan_reap`]), in one transaction, and
+/// return their ids. Shared by Rebuild's sweep and the reap that runs when the Documents list loads
+/// (#1024), so a file deleted from the vault outside PM leaves the list without waiting for a Rebuild.
+///
+/// The caller owns the other gate, [`may_reap`]: run this only after a COMPLETE walk of the vault,
+/// because a vault root that isn't there makes every file look gone. Holding `conn` for the whole
+/// sweep means a metadata write can't move a file between the check and the delete. Index-only
+/// documents are excluded: their `vault_path` is a synthetic `idx://` sentinel no file backs. A
+/// deleted document's projects keep a row ([`crate::projects::keep_projects_of`]).
+pub(crate) fn sweep_deleted_vault_files(conn: &Connection, vault: &Path) -> Result<Vec<i64>> {
+    let candidates: Vec<(i64, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, vault_path FROM documents WHERE source_type != ?1")?;
+        let rows = stmt
+            .query_map(params![SOURCE_TYPE_INDEX_ONLY], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let doomed: Vec<i64> = candidates
+        .into_iter()
+        .filter(|(_, rel)| plan_reap(FileState::of(&vault.join(rel))) == ReapPlan::Delete)
+        .map(|(id, _)| id)
+        .collect();
+    if doomed.is_empty() {
+        return Ok(doomed);
+    }
+    let tx = conn.unchecked_transaction()?;
+    for id in &doomed {
+        crate::projects::keep_projects_of(&tx, *id)?;
+        delete_document(&tx, *id)?;
+    }
+    tx.commit()?;
+    Ok(doomed)
+}
+
 /// Which pass last rebuilt the document at `vault_path`, if PM holds one at all.
 fn stored_pass(conn: &Connection, vault_path: &str) -> Result<Option<Option<String>>> {
     Ok(conn
@@ -1963,25 +2000,8 @@ pub fn rebuild(
     // Index-only documents are excluded: their `vault_path` is the synthetic `idx://<source_id>` sentinel
     // that no file will ever back, and the manifest — not the vault walk — is their source of truth.
     if may_reap(complete) {
-        let candidates: Vec<(i64, String)> = {
-            let conn = state.conn()?;
-            let mut stmt =
-                conn.prepare("SELECT id, vault_path FROM documents WHERE source_type != ?1")?;
-            let rows = stmt
-                .query_map(params![SOURCE_TYPE_INDEX_ONLY], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows
-        };
-        for (doc_id, doc_vault_path) in candidates {
-            if plan_reap(FileState::of(&vault.join(&doc_vault_path))) == ReapPlan::Delete {
-                let mut conn = state.conn()?;
-                let tx = conn.transaction()?;
-                delete_document(&tx, doc_id)?;
-                tx.commit()?;
-            }
-        }
+        let conn = state.conn()?;
+        sweep_deleted_vault_files(&conn, &vault)?;
     }
 
     // The retrieval stamp is deliberately NOT written here. It may only be written once BOTH phases have
@@ -5472,6 +5492,38 @@ mod tests {
         // A dir entry we couldn't read: a file may exist that we never enumerated, and in the worst case
         // the vault root itself is half-readable — sweeping that picture could delete the library.
         assert!(!may_reap(false), "a partial walk must never sweep");
+    }
+
+    #[test]
+    fn the_sweep_drops_only_documents_whose_vault_file_is_gone() {
+        // #1024: a vault file deleted outside PM leaves the list; one still there stays; a pointer's
+        // synthetic `idx://` path is never mistaken for a deleted file; the project stays.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("kept.md"), "x").unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), TEST_KEY).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, vault_path, title, content_hash, project, source_type) VALUES \
+                 (1, 'kept.md', 'K', 'h1', 'Atlas', 'vault'), \
+                 (2, 'gone.md', 'G', 'h2', 'Atlas', 'vault'), \
+                 (3, 'idx://local:k:f', 'P', 'h3', 'Atlas', 'index_only')",
+            [],
+        )
+        .unwrap();
+
+        let reaped = sweep_deleted_vault_files(&conn, vault.path()).unwrap();
+        assert_eq!(reaped, vec![2]);
+        let left: Vec<i64> = conn
+            .prepare("SELECT id FROM documents ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, vec![1, 3]);
+        assert!(crate::tags::project_names(&conn)
+            .unwrap()
+            .contains(&"Atlas".to_string()));
     }
 
     #[test]

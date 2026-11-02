@@ -15,6 +15,7 @@ import {
   listDocuments,
   listMilestones,
   listProjects,
+  reapDeletedVaultDocuments,
   setDocumentMetadata,
   setProjectArchived,
 } from "../lib/ipc";
@@ -241,7 +242,10 @@ export function ProjectView({
   const belongsHere = (d: Document) => d.project === project || d.linked_projects.includes(project);
 
   const refreshDocuments = () => {
-    listDocuments()
+    // A vault file deleted outside PM leaves the list first (#1024); best-effort, never blocking.
+    reapDeletedVaultDocuments()
+      .catch(() => 0)
+      .then(() => listDocuments())
       .then((all) => setDocuments(all.filter(belongsHere)))
       .catch((e) => chat.setError(String(e)));
   };

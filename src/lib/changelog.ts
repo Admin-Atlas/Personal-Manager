@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.164.1-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Projects no longer disappear when their files do. Deleting a project's last files, clearing out files PM can't reach, or resetting your connector files used to take the project with them if it had no deadline. Now a project stays in Focus, empty and without nagging, until you delete or merge it.",
+      "Files you delete from the vault folder outside PM now leave the Documents list the next time you open it, instead of waiting for a Rebuild.",
+    ],
+  },
+  {
     version: "3.164.0-alpha",
     date: "2026-11-02",
     highlights: [

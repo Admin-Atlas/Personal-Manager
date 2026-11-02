@@ -14,6 +14,7 @@ import {
   listArchivedProjects,
   listProjects,
   onOcrInstall,
+  reapDeletedVaultDocuments,
   optionalOcrStatus,
   promoteIndexOnly,
   onIngestProgress,
@@ -490,6 +491,9 @@ export function DocumentsView({ onReviewClick }: Props) {
 
   async function refresh() {
     try {
+      // A vault file deleted outside PM leaves the list first (#1024), as a Rebuild's sweep would
+      // take it. Best-effort: a refusal or failure just means the list reads as it did before.
+      await reapDeletedVaultDocuments().catch(() => 0);
       // Capture the arrival sequence BEFORE the await: a document committing between the query
       // running and `setDocuments` replacing the list would otherwise vanish until the next full
       // refresh. Anything that landed in that gap is unioned back in below.

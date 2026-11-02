@@ -882,6 +882,11 @@ export const deleteDocument = (documentId: number) =>
 export const deleteUnreachableDocuments = (documentIds: number[]) =>
   invoke<number>("delete_unreachable_documents", { documentIds });
 
+/** Drop the documents whose vault file was deleted outside PM (#1024), as a Rebuild would. Call it
+ *  as a document list loads. Resolves to how many went; 0 when it couldn't be sure (a Rebuild or
+ *  import running, part of the vault unreadable, or no Markdown found at all). */
+export const reapDeletedVaultDocuments = () => invoke<number>("reap_deleted_vault_documents");
+
 /** What deleting `project` would affect — the live counts behind its confirmation ceremony. */
 export const deleteProjectPreview = (project: string) =>
   invoke<DeletePreview>("delete_project_preview", { project });
