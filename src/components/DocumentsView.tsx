@@ -72,8 +72,26 @@ import {
 } from "../lib/documentSort";
 import { sourceSummary } from "../lib/sourceLabel";
 import { DocumentBreadcrumb } from "./DocumentBreadcrumb";
+import { FolderCrumbs, FolderGrid } from "./DocumentFolders";
+import {
+  buildFolderTree,
+  openFolder,
+  readDocView,
+  readFolderPath,
+  writeDocView,
+  writeFolderPath,
+  type DocView,
+} from "../lib/documentFolders";
 import { sourceFactKnown, sourceFactValue } from "../lib/sourceFacts";
-import { Button, Card, Collapsible, ConfirmDialog, IconButton, Popover } from "./ui";
+import {
+  Button,
+  Card,
+  Collapsible,
+  ConfirmDialog,
+  IconButton,
+  Popover,
+  SegmentedControl,
+} from "./ui";
 import { DevTableGrid } from "./dev/DevTableGrid";
 import { ImportancePicker } from "./ImportancePicker";
 import {
@@ -770,6 +788,35 @@ export function DocumentsView({ onReviewClick }: Props) {
     [documents, archivedSplit, showArchived, activeSort],
   );
 
+  // All files, or sorted into folders by where they came from or by project (#1030). The view and
+  // the folder open in each are remembered, because leaving the tab unmounts this view.
+  const [docView, setDocViewState] = useState<DocView>(readDocView);
+  const [folderPath, setFolderPathState] = useState<string[]>(() => readFolderPath(readDocView()));
+  const setDocView = (view: DocView) => {
+    setDocViewState(view);
+    writeDocView(view);
+    setFolderPathState(readFolderPath(view));
+  };
+  const setFolderPath = (path: string[]) => {
+    setFolderPathState(path);
+    writeFolderPath(docView, path);
+  };
+  const folderTree = useMemo(
+    () =>
+      docView === "all"
+        ? null
+        : buildFolderTree(
+            sortedDocuments,
+            docView,
+            // A file shown from an active home can still link to an archived project; that project's
+            // folder stays hidden with the rest of it.
+            showArchived ? undefined : archivedSet(archivedNames),
+          ),
+    [docView, sortedDocuments, showArchived, archivedNames],
+  );
+  const opened = folderTree ? openFolder(folderTree, folderPath) : null;
+  const tableDocuments = opened ? opened.folder.files : sortedDocuments;
+
   return (
     <div className="flex h-full flex-col">
       {/* ONE-TIME cleanup for vault files older versions left behind — REMOVE this line with the
@@ -1178,62 +1225,91 @@ export function DocumentsView({ onReviewClick }: Props) {
                 ) : (
                   <span />
                 )}
-                {/* The shared Popover primitive rather than a hand-rolled panel: this was the only
+                <div className="flex items-center gap-2" data-help="documents-view">
+                  <SegmentedControl
+                    ariaLabel="Show documents as"
+                    value={docView}
+                    onChange={setDocView}
+                    options={[
+                      { value: "all", label: "All files", title: "Every document in one list" },
+                      {
+                        value: "folders",
+                        label: "Folders",
+                        title: "In folders by where each file came from",
+                      },
+                      { value: "projects", label: "Projects", title: "In a folder per project" },
+                    ]}
+                  />
+                  {/* The shared Popover primitive rather than a hand-rolled panel: this was the only
                     dismissless one left in the tree, so clicking anywhere else on the page left it
                     hanging open. It brings click-outside, Escape and focus-restore with it. Passed as
                     a plain node, NOT the function form — the function form hands you `close`, which
                     is right for a menu of actions and wrong for a list of checkboxes you tick several
                     of. */}
-                <Popover
-                  align="right"
-                  ariaLabel="Columns"
-                  rootClassName="flex justify-end"
-                  panelClassName="w-56 p-2"
-                  trigger={({ open, toggle }) => (
-                    <Button
-                      variant="tertiary"
-                      size="sm"
-                      onClick={toggle}
-                      aria-expanded={open}
-                      title="Choose which columns this table shows"
-                    >
-                      Columns
-                    </Button>
-                  )}
-                >
-                  <>
-                    <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
-                    {DOC_COLUMN_KEYS.map((key) => (
-                      <label
-                        key={key}
-                        className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={shows(key)}
-                          onChange={() => setColumns(toggleColumn(columns, key))}
-                        />
-                        {DOC_COLUMN_LABELS[key]}
-                      </label>
-                    ))}
-                    <div className="mt-1 border-t border-rule pt-1">
+                  <Popover
+                    align="right"
+                    ariaLabel="Columns"
+                    rootClassName="flex justify-end"
+                    panelClassName="w-56 p-2"
+                    trigger={({ open, toggle }) => (
                       <Button
                         variant="tertiary"
                         size="sm"
-                        onClick={() => setColumns(null)}
-                        disabled={columnChoice == null}
-                        title="Go back to following your display depth"
+                        onClick={toggle}
+                        aria-expanded={open}
+                        title="Choose which columns this table shows"
                       >
-                        Reset to depth
+                        Columns
                       </Button>
-                    </div>
-                  </>
-                </Popover>
+                    )}
+                  >
+                    <>
+                      <p className="px-1 pb-1 text-xs text-ink4">Title always shows.</p>
+                      {DOC_COLUMN_KEYS.map((key) => (
+                        <label
+                          key={key}
+                          className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-sm text-ink2 hover:bg-surface"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={shows(key)}
+                            onChange={() => setColumns(toggleColumn(columns, key))}
+                          />
+                          {DOC_COLUMN_LABELS[key]}
+                        </label>
+                      ))}
+                      <div className="mt-1 border-t border-rule pt-1">
+                        <Button
+                          variant="tertiary"
+                          size="sm"
+                          onClick={() => setColumns(null)}
+                          disabled={columnChoice == null}
+                          title="Go back to following your display depth"
+                        >
+                          Reset to depth
+                        </Button>
+                      </div>
+                    </>
+                  </Popover>
+                </div>
               </div>
+            )}
+            {opened && documents.length > 0 && (
+              <>
+                <FolderCrumbs
+                  trail={opened.trail}
+                  rootLabel={docView === "projects" ? "All projects" : "All sources"}
+                  onOpen={(depth) => setFolderPath(opened.path.slice(0, depth))}
+                />
+                <FolderGrid
+                  folders={opened.folder.folders}
+                  onOpen={(key) => setFolderPath([...opened.path, key])}
+                />
+              </>
             )}
             {documents.length === 0 ? (
               <p className="text-sm text-ink4">No documents yet.</p>
-            ) : (
+            ) : tableDocuments.length === 0 ? null : (
               // Auto layout, so every column is as wide as what is actually in it — an Importance
               // column holding "high" no longer reserves the width of the word "Importance" twice
               // over. Title carries `w-full`, which is what hands it the leftover space; the free-text
@@ -1315,7 +1391,7 @@ export function DocumentsView({ onReviewClick }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedDocuments.map((doc) => {
+                  {tableDocuments.map((doc) => {
                     return (
                       <Fragment key={doc.id}>
                         <tr

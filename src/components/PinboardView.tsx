@@ -42,6 +42,8 @@ import {
   toggleWrap,
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
+import { insertTable, moveCell, tableCellOffset, tableEnter } from "../lib/pinboard/noteTables";
+import { NoteTablePicker } from "./NoteTablePicker";
 import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
 import {
   isPastTimelineDate,
@@ -867,6 +869,9 @@ const FORMAT_ACTIONS: FormatAction[] = [
   },
 ];
 
+const FORMAT_BUTTON_CLASS =
+  "flex h-5 w-5 min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2";
+
 /** Map a keydown to its formatting action, or null. Kept beside FORMAT_ACTIONS so the shortcuts
  *  and the tooltip hints can't drift apart. */
 function formatForKey(e: ReactKeyboardEvent<HTMLTextAreaElement>): FormatAction | null {
@@ -1024,6 +1029,18 @@ function taskIndexAt(container: HTMLElement, clientX: number, clientY: number): 
   return null;
 }
 
+/** Where in the note's source the rendered table cell under `target` starts, or null when the click
+ *  wasn't on a cell. The nth rendered table is the nth source table, and an HTML table's `rowIndex`
+ *  counts the header row as 0, the same way `tableCellOffset` does. */
+function tableCellAt(container: HTMLElement, target: Element, text: string): number | null {
+  const cell = target.closest<HTMLTableCellElement>("td, th");
+  const row = cell?.parentElement as HTMLTableRowElement | null;
+  const table = cell?.closest("table");
+  if (!cell || !row || !table || !container.contains(table)) return null;
+  const index = [...container.querySelectorAll("table")].indexOf(table);
+  return tableCellOffset(text, index, row.rowIndex, cell.cellIndex);
+}
+
 // Memoised: a drag/resize sets state on every pointermove, re-rendering the whole board — without
 // memo each note would re-run the react-markdown pipeline per tick. All props are stable across a
 // board drag: widget objects are only replaced when edited; `onChange`/`onDelete`/`onIngested` and
@@ -1062,9 +1079,18 @@ const NoteBody = memo(function NoteBody({
   const showEditor = editing || !text.trim();
 
   // Focus the textarea only when the user actively opens a rendered note for editing — not on load,
-  // so existing empty notes don't fight over focus.
+  // so existing empty notes don't fight over focus. A click on a rendered table cell opens the editor
+  // with the caret in that cell's source: the offset waits here until the textarea exists.
+  const caretOnOpen = useRef<number | null>(null);
   useLayoutEffect(() => {
-    if (editing) taRef.current?.focus();
+    if (!editing) return;
+    const ta = taRef.current;
+    ta?.focus();
+    if (ta && caretOnOpen.current != null) {
+      ta.selectionStart = ta.selectionEnd = caretOnOpen.current;
+      revealCaret(ta);
+    }
+    caretOnOpen.current = null;
   }, [editing]);
 
   // An undo/redo swaps `text` out from under the caret, and React parks a controlled textarea's caret
@@ -1106,6 +1132,9 @@ const NoteBody = memo(function NoteBody({
   useEffect(() => {
     if (!editing) return;
     const onDown = (e: PointerEvent) => {
+      // A popover the note opened (the table size grid) is portalled out of the note, but a press in
+      // it is still a press in the note.
+      if ((e.target as Element).closest?.("[data-popover-panel]")) return;
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setEditing(false);
     };
     const onWinFocus = () => taRef.current?.focus();
@@ -1174,9 +1203,15 @@ const NoteBody = memo(function NoteBody({
       return;
     }
     // Tab / Shift+Tab indent / outdent the current line(s). Indenting a checkbox nests it under the
-    // item above; continueList carries that indent to the items typed after it.
+    // item above; continueList carries that indent to the items typed after it. In a table they move
+    // between cells instead.
     if (e.key === "Tab") {
       e.preventDefault();
+      const caret = e.currentTarget.selectionStart;
+      if (moveCell(text, caret, e.shiftKey ? -1 : 1)) {
+        applyEdit((v, s) => moveCell(v, s, e.shiftKey ? -1 : 1)!);
+        return;
+      }
       applyEdit(e.shiftKey ? outdentLines : indentLines);
       return;
     }
@@ -1198,6 +1233,12 @@ const NoteBody = memo(function NoteBody({
     if (e.key !== "Enter" || e.shiftKey) return;
     const ta = e.currentTarget;
     if (ta.selectionStart !== ta.selectionEnd) return;
+    // Enter in a table adds a row (or, on an empty last row, leaves the table).
+    if (tableEnter(ta.value, ta.selectionStart)) {
+      e.preventDefault();
+      applyEdit((v, s) => tableEnter(v, s)!);
+      return;
+    }
     const res = continueList(ta.value, ta.selectionStart);
     if (!res) return;
     e.preventDefault();
@@ -1301,6 +1342,7 @@ const NoteBody = memo(function NoteBody({
                 return;
               }
             }
+            caretOnOpen.current = tableCellAt(e.currentTarget, e.target as Element, text);
             setEditing(true);
           }}
           // Keyboard path into edit mode. No role/aria-label — it's the note's content region, so its
@@ -1336,12 +1378,18 @@ const NoteBody = memo(function NoteBody({
                     // the caret is.
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => applyEdit(a.apply)}
-                    className="flex h-5 w-5 min-h-[var(--tap-min,24px)] min-w-[var(--tap-min,24px)] items-center justify-center rounded-[var(--radius-sm)] text-ink4 hover:bg-surface hover:text-ink2"
+                    className={FORMAT_BUTTON_CLASS}
                   >
                     {a.icon}
                   </button>
                 </Tooltip>
               ))}
+              <NoteTablePicker
+                buttonClassName={FORMAT_BUTTON_CLASS}
+                onPick={(cols, rows) =>
+                  applyEdit((v, s, end) => insertTable(v, s, end, cols, rows))
+                }
+              />
             </div>
           )}
           {/* Right-aligned: colour swatches (edit only) then the size (power). */}

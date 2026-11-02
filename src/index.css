@@ -333,6 +333,18 @@ body {
 .pm-note-md .pm-markdown li ol {
   text-indent: 0;
 }
+/* A note's table is a grid you fill in, like a Docs or Word table (#1030), so every cell is ruled —
+   the shared rule further down lines only the rows, which suits a table that is read, not written.
+   An empty cell keeps a row's height, or the picker's empty grid would collapse to hairlines. */
+.pm-note-md .pm-markdown th,
+.pm-note-md .pm-markdown td {
+  border: 1px solid var(--border2);
+  min-width: 3rem;
+  height: 1.75rem;
+}
+.pm-note-md .pm-markdown th {
+  color: var(--ink2);
+}
 .pm-markdown strong {
   color: var(--ink);
   font-weight: 600;

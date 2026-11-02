@@ -181,6 +181,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Rebuild",
     body: "Rebuilds how PM searches your library. It re-reads every document, note and chat from your vault and re-splits them with the current settings, then re-reads your connected files (Google Drive, OneDrive, watched folders) from their source so each is indexed on its full contents — not just its saved summary. Each one is rebuilt in place, so search keeps working the whole time, and if PM is closed part-way through it picks up where it left off instead of starting over. Your documents, projects, tags and importance are never changed. Safe to run anytime; large connected sources make it take longer, and anything offline is left as it is and caught up on the next sync.",
   },
+  "documents-view": {
+    title: "All files, Folders or Projects",
+    body: "How the list is laid out. All files is every document in one list. Folders sorts them by where each one came from: a folder for each Google account's Drive, Shared with you, shared drives, each OneDrive, each folder PM watches on this computer, and the files you added to PM yourself, your photos, pinboard notes and chats. Inside a connected account you find the same folders as in the account itself. Projects gives each project a folder; a document in several projects is in each of their folders. Click a folder to open it, and the path at the top to go back up. The files in a folder are listed with the same columns and sorting as All files. PM remembers the layout and the folder you had open on this computer.",
+  },
   "documents-review-banner": {
     title: "Documents to review",
     body: "How many ingested documents are still waiting for you to confirm their project, tags, and importance. Click to jump to the Review queue.",
@@ -685,7 +689,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-note-format": {
     title: "Format the note",
-    body: "Quick formatting for the note: bold, italic, heading, and bullet / numbered / checklist lists. Each button applies to the selected line(s) — press it again to turn it off. Every button also has a keyboard shortcut (shown when you hover) so you can format without leaving the keyboard.",
+    body: "Quick formatting for the note: bold, italic, heading, and bullet / numbered / checklist lists. Each button applies to the selected line(s) — press it again to turn it off. Every button also has a keyboard shortcut (shown when you hover) so you can format without leaving the keyboard. Table opens a grid: sweep across it (or drag, or use the arrow keys) to choose how many columns and rows, then click to add the table where your cursor is. While you're in a table, Tab and Shift+Tab move between cells and line the columns up, Tab in the last cell adds a row, Enter adds a row, and Enter on an empty last row takes you out of the table. Click a cell of a finished note to edit right there. The table is saved as an ordinary Markdown table, so it stays a table when you ingest the note.",
   },
   "pinboard-note-ingest": {
     title: "Ingest as a document",

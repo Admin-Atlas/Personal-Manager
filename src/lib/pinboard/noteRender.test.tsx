@@ -6,6 +6,7 @@ import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { Markdown } from "../markdown";
 import { toRenderMarkdown } from "./notesMarkdown";
+import { insertTable } from "./noteTables";
 
 // `notesMarkdown.test.ts` proves what `toRenderMarkdown` EMITS. These prove what the renderer then
 // DOES with it — the two halves had drifted: the transform was appending the two-space hard break
@@ -176,5 +177,30 @@ describe("round bullets and dash points render as two kinds of list", () => {
       const once = toRenderMarkdown(note);
       expect(toRenderMarkdown(once)).toBe(once);
     }
+  });
+});
+
+describe("a note's table renders as a table", () => {
+  it("renders the picker's empty grid as a table of empty cells", () => {
+    const { container } = render(
+      <Markdown dashLists>{toRenderMarkdown(insertTable("", 0, 0, 3, 2).text)}</Markdown>,
+    );
+    const table = container.querySelector("table");
+    expect(table).not.toBeNull();
+    expect(table!.rows).toHaveLength(2);
+    expect(table!.rows[0].cells).toHaveLength(3);
+  });
+
+  it("keeps the prose either side of a table out of it", () => {
+    const { container } = render(
+      <Markdown dashLists>
+        {toRenderMarkdown("above\n| a | b |\n| --- | --- |\n| 1 | 2 |\nbelow")}
+      </Markdown>,
+    );
+    const table = container.querySelector("table")!;
+    expect(table.rows).toHaveLength(2);
+    expect(table.textContent).not.toContain("above");
+    expect(table.textContent).not.toContain("below");
+    expect(container.textContent).toContain("below");
   });
 });

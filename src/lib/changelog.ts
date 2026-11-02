@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.166.0-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Pinboard notes can hold tables. Press Table in a note's toolbar and sweep across the grid to choose how many columns and rows, like in Docs or Word. Tab moves from cell to cell and keeps the columns lined up, Tab in the last cell or Enter adds a row, and clicking a cell of a finished note takes you straight to it.",
+      "Documents can be shown as folders. Beside Columns, choose All files for the full list, Folders to sort them by where they came from (each Google Drive, OneDrive, folder on this computer, the files you added, photos, notes and chats, with each account's own folders inside), or Projects for a folder per project. PM remembers your choice and the folder you had open.",
+    ],
+  },
+  {
     version: "3.165.0-alpha",
     date: "2026-11-02",
     highlights: [
