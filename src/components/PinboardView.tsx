@@ -11,7 +11,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
@@ -27,23 +26,20 @@ import {
   setMilestoneStatus,
   updateMilestone,
 } from "../lib/ipc";
-import { revealCaret } from "../lib/caretReveal";
-import { Markdown } from "../lib/markdown";
 import { boardExtent, CELL, folderAtPointer, spaceOf, type BoardSpace } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
-  caretForRestore,
   continueList,
   indentLines,
   listIndentBeforeCaret,
   outdentLines,
   toRenderMarkdown,
-  toggleTaskAt,
   toggleWrap,
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
-import { insertTable, moveCell, tableCellOffset, tableEnter } from "../lib/pinboard/noteTables";
+import { insertTable, moveCell, tableEnter } from "../lib/pinboard/noteTables";
 import { NoteTablePicker } from "./NoteTablePicker";
+import { NoteEditor, type NoteEditorHandle } from "./NoteEditor";
 import { rectToPx, useBoardDrag, type DragMode, type PxRect } from "../lib/pinboard/useBoardDrag";
 import {
   isPastTimelineDate,
@@ -83,7 +79,6 @@ import {
   NumberIcon,
   SegmentedControl,
   Select,
-  Textarea,
   Tooltip,
 } from "./ui";
 
@@ -267,9 +262,9 @@ function WidgetTile({
  * downward to hold content that doesn't fit — so it scrolls vertically when full but never overflows
  * the window horizontally. Notes, timelines and
  * folders are available at every
- * depth; per-widget metadata shows at `power`. Notes are Markdown: they render in place and turn
- * back into an editor on click, with a formatting toolbar, keyboard shortcuts, and smart list
- * continuation (`lib/pinboard/notesMarkdown.ts`).
+ * depth; per-widget metadata shows at `power`. Notes are Markdown, formatted as you type (NoteEditor's
+ * live preview), with a formatting toolbar, keyboard shortcuts, tables, and smart list continuation
+ * (`lib/pinboard/notesMarkdown.ts`).
  */
 export function PinboardView() {
   const { showMeta, showPower } = useDepth();
@@ -389,9 +384,9 @@ export function PinboardView() {
   // being inside the board — deleting a card leaves focus on <body>, i.e. "outside", which would kill
   // Ctrl+Z exactly when it's most wanted.)
   //
-  // We must OWN the shortcut rather than let the textarea's native undo run: the note's textarea is
-  // controlled, so native undo already launders itself into board state through onChange, and the
-  // formatting/list helpers write values through React, which corrupts the native stack anyway. Two
+  // We must OWN the shortcut rather than let a note's editor undo on its own: every note edit already
+  // lands in board state through onChange, so one board history covers notes, cards and moves alike
+  // (NoteEditor deliberately has no history of its own, and applies an undo as a new value). Two
   // listeners because keydown alone misses the WebView's own Edit ▸ Undo (context menu): `beforeinput`
   // catches the resulting `historyUndo`. `beforeinput` is scoped to the board element so we never
   // interfere with native undo in the rest of the app.
@@ -874,7 +869,9 @@ const FORMAT_BUTTON_CLASS =
 
 /** Map a keydown to its formatting action, or null. Kept beside FORMAT_ACTIONS so the shortcuts
  *  and the tooltip hints can't drift apart. */
-function formatForKey(e: ReactKeyboardEvent<HTMLTextAreaElement>): FormatAction | null {
+function formatForKey(
+  e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "shiftKey" | "code">,
+): FormatAction | null {
   if (!(e.metaKey || e.ctrlKey)) return null;
   if (e.shiftKey) {
     if (e.code === "Digit8") return FORMAT_ACTIONS.find((a) => a.key === "bullet") ?? null;
@@ -886,6 +883,43 @@ function formatForKey(e: ReactKeyboardEvent<HTMLTextAreaElement>): FormatAction 
   if (e.code === "KeyB") return FORMAT_ACTIONS.find((a) => a.key === "bold") ?? null;
   if (e.code === "KeyI") return FORMAT_ACTIONS.find((a) => a.key === "italic") ?? null;
   return null;
+}
+
+/** A keypress the note handles itself, as the edit it makes, or null to let the editor have it.
+ *  Cmd/Ctrl formatting shortcuts win first. Tab / Shift+Tab move between a table's cells, or else
+ *  indent / outdent the line(s) — indenting a checkbox nests it under the item above, and
+ *  continueList carries that indent on. Backspace inside a list item's leading indent outdents rather
+ *  than nibbling one space. Enter adds a table row, or continues the current list (next bullet /
+ *  number / roman / checkbox) or exits it on an empty item; Shift+Enter stays a plain newline. */
+function noteKeyEdit(
+  e: KeyboardEvent,
+  value: string,
+  selStart: number,
+  selEnd: number,
+): TextEdit | null {
+  if (e.isComposing) return null;
+  const fmt = formatForKey(e);
+  if (fmt) return fmt.apply(value, selStart, selEnd);
+  if (e.key === "Tab") {
+    return (
+      moveCell(value, selStart, e.shiftKey ? -1 : 1) ??
+      (e.shiftKey ? outdentLines : indentLines)(value, selStart, selEnd)
+    );
+  }
+  const plain = !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey;
+  if (
+    e.key === "Backspace" &&
+    plain &&
+    selStart === selEnd &&
+    listIndentBeforeCaret(value, selStart) != null
+  ) {
+    return outdentLines(value, selStart, selEnd);
+  }
+  if (e.key !== "Enter" || e.shiftKey || selStart !== selEnd) return null;
+  const row = tableEnter(value, selStart);
+  if (row) return row;
+  const res = continueList(value, selStart);
+  return res ? { text: res.text, selStart: res.caret, selEnd: res.caret } : null;
 }
 
 /** The shared top bar for every widget: an editable title, an optional right-side `actions` slot,
@@ -1005,44 +1039,8 @@ function DragGrip() {
   );
 }
 
-/** Which rendered task checkbox (if any) a click at these viewport coordinates landed on.
- *
- *  Hit-tested against each box's own rect rather than by walking up to the `<li>`, because the whole
- *  list item is also the click target for "open the editor" — only the box itself should tick. The
- *  boxes are in document order, which is the order `toggleTaskAt` counts markers in, so the array
- *  index IS the marker index. `PAD` gives the ~13px native box a forgiving target without letting it
- *  reach the text. */
-function taskIndexAt(container: HTMLElement, clientX: number, clientY: number): number | null {
-  const PAD = 4;
-  const boxes = container.querySelectorAll<HTMLInputElement>('li input[type="checkbox"]');
-  for (let i = 0; i < boxes.length; i++) {
-    const r = boxes[i].getBoundingClientRect();
-    if (
-      clientX >= r.left - PAD &&
-      clientX <= r.right + PAD &&
-      clientY >= r.top - PAD &&
-      clientY <= r.bottom + PAD
-    ) {
-      return i;
-    }
-  }
-  return null;
-}
-
-/** Where in the note's source the rendered table cell under `target` starts, or null when the click
- *  wasn't on a cell. The nth rendered table is the nth source table, and an HTML table's `rowIndex`
- *  counts the header row as 0, the same way `tableCellOffset` does. */
-function tableCellAt(container: HTMLElement, target: Element, text: string): number | null {
-  const cell = target.closest<HTMLTableCellElement>("td, th");
-  const row = cell?.parentElement as HTMLTableRowElement | null;
-  const table = cell?.closest("table");
-  if (!cell || !row || !table || !container.contains(table)) return null;
-  const index = [...container.querySelectorAll("table")].indexOf(table);
-  return tableCellOffset(text, index, row.rowIndex, cell.cellIndex);
-}
-
 // Memoised: a drag/resize sets state on every pointermove, re-rendering the whole board — without
-// memo each note would re-run the react-markdown pipeline per tick. All props are stable across a
+// memo each note would re-render its editor per tick. All props are stable across a
 // board drag: widget objects are only replaced when edited; `onChange`/`onDelete`/`onIngested` and
 // the memoised `onStartDrag` are stable useCallbacks; `onPopOut` is absent for board tiles; `status`
 // comes out of a map rebuilt only on refetch.
@@ -1065,69 +1063,28 @@ const NoteBody = memo(function NoteBody({
   onStartDrag?: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
   /** When set (a folder's child), a "move out to the board" control shows in the header. Takes the
    *  child's id so the parent can pass ONE stable callback rather than a fresh arrow per render,
-   *  which would defeat this component's memo and re-run react-markdown on every drag tick. */
+   *  which would defeat this component's memo and re-render on every drag tick. */
   onPopOut?: (id: string) => void;
   status?: DocStatus;
   onIngested: () => void;
 }) {
   const text = widget.text ?? "";
-  const taRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<NoteEditorHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  // Render-on-idle: a filled note shows rendered Markdown (so lists read as lists); click it — or an
-  // empty note — to drop into the textarea, and it re-renders on blur. No manual preview/edit toggle.
+  // The note is always its live-preview editor (NoteEditor), formatted as you type. `editing` is
+  // whether you're working in it, which brings up the format toolbar and the colours; an empty note
+  // shows them too, as it always has.
   const [editing, setEditing] = useState(false);
   const showEditor = editing || !text.trim();
 
-  // Focus the textarea only when the user actively opens a rendered note for editing — not on load,
-  // so existing empty notes don't fight over focus. A click on a rendered table cell opens the editor
-  // with the caret in that cell's source: the offset waits here until the textarea exists.
-  const caretOnOpen = useRef<number | null>(null);
-  useLayoutEffect(() => {
-    if (!editing) return;
-    const ta = taRef.current;
-    ta?.focus();
-    if (ta && caretOnOpen.current != null) {
-      ta.selectionStart = ta.selectionEnd = caretOnOpen.current;
-      revealCaret(ta);
-    }
-    caretOnOpen.current = null;
-  }, [editing]);
-
-  // An undo/redo swaps `text` out from under the caret, and React parks a controlled textarea's caret
-  // at the end when the value shrinks — so undoing a few seconds of typing mid-note would dump you at
-  // the bottom of it. Put the caret back where the change actually was.
-  //
-  // ONLY for a change this note didn't make itself. `selfEdit` is the discriminator, and it has to
-  // be: the browser has already placed the caret correctly for a keystroke, and where a string is
-  // ambiguous (type "a" at the start of "aaaaa") the text alone cannot tell us where the edit was —
-  // guessing would move the caret out from under someone who is simply typing.
-  const lastText = useRef(text);
-  const selfEdit = useRef(false);
-  useLayoutEffect(() => {
-    const ta = taRef.current;
-    const from = lastText.current;
-    lastText.current = text;
-    if (selfEdit.current) {
-      selfEdit.current = false;
-      return;
-    }
-    if (!ta || from === text || document.activeElement !== ta) return;
-    ta.selectionStart = ta.selectionEnd = caretForRestore(from, text);
-    // Undo landing three lines above the fold is the same problem in the other direction.
-    revealCaret(ta);
-  }, [text]);
-  /** Change this note's text, flagging it as ours so the caret restore above stands aside. */
   const editText = useCallback(
-    (next: string) => {
-      selfEdit.current = true;
-      onChange(widget.id, { text: next });
-    },
+    (next: string) => onChange(widget.id, { text: next }),
     [onChange, widget.id],
   );
 
   // Stay in edit mode until the user clicks elsewhere on the board — NOT when the window merely
   // loses OS focus (tabbing out of the app used to collapse the note, because the textarea blurred).
-  // Exit only on a pointer-down outside this note; re-focus the textarea when the window returns
+  // Exit only on a pointer-down outside this note; re-focus the editor when the window returns
   // while we're still editing, so the caret picks back up.
   useEffect(() => {
     if (!editing) return;
@@ -1137,7 +1094,7 @@ const NoteBody = memo(function NoteBody({
       if ((e.target as Element).closest?.("[data-popover-panel]")) return;
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setEditing(false);
     };
-    const onWinFocus = () => taRef.current?.focus();
+    const onWinFocus = () => editorRef.current?.focus();
     document.addEventListener("pointerdown", onDown, true);
     window.addEventListener("focus", onWinFocus);
     return () => {
@@ -1171,87 +1128,14 @@ const NoteBody = memo(function NoteBody({
     }
   }
 
-  // Apply a pure text edit (toolbar button or shortcut) through the controlled value, then restore
-  // the selection after React re-renders — mirrors the caret-restore already used for list continuation.
+  // Apply a pure text edit (a toolbar button) at the editor's selection, as one change.
   const applyEdit = useCallback(
     (make: (value: string, selStart: number, selEnd: number) => TextEdit) => {
-      const ta = taRef.current;
-      if (!ta) return;
-      const res = make(text, ta.selectionStart, ta.selectionEnd);
-      editText(res.text);
+      editorRef.current?.apply(make);
       setEditing(true);
-      requestAnimationFrame(() => {
-        const t = taRef.current;
-        if (!t) return;
-        t.focus();
-        t.selectionStart = res.selStart;
-        t.selectionEnd = res.selEnd;
-        // The engine only reveals a caret it moved itself, and this one was moved by us.
-        revealCaret(t);
-      });
     },
-    [text, editText],
+    [],
   );
-
-  // Cmd/Ctrl formatting shortcuts win first; then Enter continues the current list (next bullet /
-  // number / roman / checkbox) or exits it on an empty item; Shift+Enter stays a plain newline.
-  function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
-    const fmt = formatForKey(e);
-    if (fmt) {
-      e.preventDefault();
-      applyEdit(fmt.apply);
-      return;
-    }
-    // Tab / Shift+Tab indent / outdent the current line(s). Indenting a checkbox nests it under the
-    // item above; continueList carries that indent to the items typed after it. In a table they move
-    // between cells instead.
-    if (e.key === "Tab") {
-      e.preventDefault();
-      const caret = e.currentTarget.selectionStart;
-      if (moveCell(text, caret, e.shiftKey ? -1 : 1)) {
-        applyEdit((v, s) => moveCell(v, s, e.shiftKey ? -1 : 1)!);
-        return;
-      }
-      applyEdit(e.shiftKey ? outdentLines : indentLines);
-      return;
-    }
-    // Backspace while the caret sits inside a list item's leading indent → outdent, rather than
-    // nibbling one space at a time.
-    if (
-      e.key === "Backspace" &&
-      !e.shiftKey &&
-      !e.metaKey &&
-      !e.ctrlKey &&
-      !e.altKey &&
-      e.currentTarget.selectionStart === e.currentTarget.selectionEnd &&
-      listIndentBeforeCaret(e.currentTarget.value, e.currentTarget.selectionStart) != null
-    ) {
-      e.preventDefault();
-      applyEdit(outdentLines);
-      return;
-    }
-    if (e.key !== "Enter" || e.shiftKey) return;
-    const ta = e.currentTarget;
-    if (ta.selectionStart !== ta.selectionEnd) return;
-    // Enter in a table adds a row (or, on an empty last row, leaves the table).
-    if (tableEnter(ta.value, ta.selectionStart)) {
-      e.preventDefault();
-      applyEdit((v, s) => tableEnter(v, s)!);
-      return;
-    }
-    const res = continueList(ta.value, ta.selectionStart);
-    if (!res) return;
-    e.preventDefault();
-    editText(res.text);
-    requestAnimationFrame(() => {
-      const t = taRef.current;
-      if (!t) return;
-      t.selectionStart = t.selectionEnd = res.caret;
-      // The new bullet is the thing you are about to type into, so it has to be on screen before
-      // you start — on a note card a few lines tall it lands below the fold otherwise.
-      revealCaret(t);
-    });
-  }
 
   // The Ingest / filing-status control sits in the top bar (right of the title, left of ✕).
   const ingestControl = !ingested ? (
@@ -1313,55 +1197,14 @@ const NoteBody = memo(function NoteBody({
         }
       />
       {ingestErr && <p className="shrink-0 px-2 pt-1 text-[0.625rem] text-st-due">{ingestErr}</p>}
-      {showEditor ? (
-        <Textarea
-          ref={taRef}
-          value={text}
-          onChange={(e) => editText(e.target.value)}
-          onKeyDown={onKeyDown}
-          onFocus={() => setEditing(true)}
-          // No onBlur exit — edit mode ends only on a click outside the note (see the effect above),
-          // so tabbing out of the app or clicking the note's own controls keeps it editable.
-          placeholder="Jot something down…"
-          className="min-h-0 flex-1 resize-none border-0 bg-transparent text-sm leading-snug focus:ring-0"
-        />
-      ) : (
-        <div
-          // pm-note-md scopes the flush-checkbox rule to notes (index.css) without touching chat/reader.
-          className="pm-note-md min-h-0 flex-1 cursor-text overflow-auto px-2 text-sm"
-          // A click on a rendered checkbox ticks it; a click anywhere else opens the editor. The
-          // boxes carry `pointer-events: none` (index.css) so the click lands here rather than being
-          // swallowed by the disabled input, and the hit test is by COORDINATES against each box's
-          // rect — not "did you hit the <li>" — so clicking a task's TEXT still opens the editor.
-          onClick={(e) => {
-            const idx = taskIndexAt(e.currentTarget, e.clientX, e.clientY);
-            if (idx !== null) {
-              const next = toggleTaskAt(text, idx);
-              if (next !== null) {
-                editText(next);
-                return;
-              }
-            }
-            caretOnOpen.current = tableCellAt(e.currentTarget, e.target as Element, text);
-            setEditing(true);
-          }}
-          // Keyboard path into edit mode. No role/aria-label — it's the note's content region, so its
-          // text stays the accessible name; Enter only edits when the region itself (not a link inside) is focused.
-          tabIndex={0}
-          onKeyDown={(e) => {
-            if (e.target === e.currentTarget && e.key === "Enter") {
-              e.preventDefault();
-              setEditing(true);
-            }
-          }}
-          title="Click to edit"
-        >
-          {/* `dashLists`: the note dialect emits its "-" dash points as "+" bullets, and this is
-              the one surface that means that by them. Every other <Markdown> host renders other
-              people's Markdown and must keep rendering a "+" bullet as an ordinary bullet. */}
-          <Markdown dashLists>{toRenderMarkdown(text)}</Markdown>
-        </div>
-      )}
+      <NoteEditor
+        ref={editorRef}
+        value={text}
+        onChange={editText}
+        onFocus={() => setEditing(true)}
+        keyEdit={noteKeyEdit}
+        placeholder="Jot something down…"
+      />
       {/* Footer: only render when it has something to show — the format toolbar + colour swatches
           appear while editing, and the size (w×h) at power depth. An idle filled note has neither,
           so the footer vanishes and the note gains that space. */}
@@ -1374,7 +1217,7 @@ const NoteBody = memo(function NoteBody({
                   <button
                     type="button"
                     aria-label={`${a.label} (${a.hint})`}
-                    // Keep the textarea focused/selected so the edit (and its shortcut) lands where
+                    // Keep the editor focused/selected so the edit (and its shortcut) lands where
                     // the caret is.
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => applyEdit(a.apply)}
@@ -1401,7 +1244,7 @@ const NoteBody = memo(function NoteBody({
                   return (
                     <Tooltip key={c} label={name}>
                       <button
-                        // Don't blur the textarea's caret when picking a colour (mirrors the format
+                        // Don't blur the editor's caret when picking a colour (mirrors the format
                         // buttons) so edit mode and the selection survive.
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => onChange(widget.id, { color: c })}

@@ -29,7 +29,7 @@ type Align = "none" | "left" | "center" | "right";
 
 /** One table in a note: its line span (`end` exclusive) and its cells, header first. The delimiter
  *  row is not in `rows`; its alignments are kept apart so a re-format writes them back. */
-interface TableBlock {
+export interface TableBlock {
   start: number;
   end: number;
   rows: string[][];
@@ -74,7 +74,7 @@ function delimAligns(line: string): Align[] | null {
 }
 
 /** Every table in the note, in order. */
-function findTables(lines: readonly string[]): TableBlock[] {
+export function findTables(lines: readonly string[]): TableBlock[] {
   const code = fenceMask(lines);
   const out: TableBlock[] = [];
   for (let i = 0; i + 1 < lines.length; i++) {

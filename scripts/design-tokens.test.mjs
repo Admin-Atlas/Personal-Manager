@@ -309,10 +309,11 @@ describe("every selector in index.css is one a browser will accept", () => {
   });
 
   it("finds the rules it is meant to be looking at", () => {
-    // Without this the scan could quietly match nothing and pass forever. The checklist rule is the
-    // one the guard was written for, so it is the one named here.
+    // Without this the scan could quietly match nothing and pass forever. The guard was written for
+    // the note-only flush-checklist rule, which went with the note's rendered view (#1030); the
+    // task-list rule beside it is the same kind of `:has()` selector and is still here.
     const lists = selectorLists();
     expect(lists.length).toBeGreaterThan(20);
-    expect(lists.some((s) => s.includes("ul.contains-task-list"))).toBe(true);
+    expect(lists.some((s) => s.includes('li:has(input[type="checkbox"])'))).toBe(true);
   });
 });

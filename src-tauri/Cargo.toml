@@ -127,11 +127,13 @@ file-id = "0.2"
 notify = "8"
 notify-debouncer-full = "0.7"
 
-# Hardware scan for the local-AI Workbench (#296): RAM / CPU / disk only. sysinfo 0.39 has no
-# GPU/VRAM/battery, so GPU/VRAM is hand-rolled in hardware.rs and AC/battery in power_source.rs.
+# Hardware scan for the local-AI Workbench (#296): RAM / CPU / disk only. sysinfo had no
+# GPU/VRAM/battery when this was written, so GPU/VRAM is hand-rolled in hardware.rs and AC/battery in
+# power_source.rs. 0.40 added an optional `gpu` feature; it is not enabled, and the hand-rolled probe
+# stays until someone checks it reports VRAM as well on all three OSes.
 # default-features off drops the network/component/user probes we don't use — leaner binary and
 # licence surface.
-sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 
 # OpenRouter streaming chat client. rustls keeps TLS independent of SQLCipher's crypto.
 # `blocking` is used by python_fetch (macOS interpreter download) from inside spawn_blocking.

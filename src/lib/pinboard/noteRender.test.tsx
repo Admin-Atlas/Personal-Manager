@@ -99,7 +99,7 @@ describe("toRenderMarkdown stays idempotent", () => {
     expect(out).toContain("checked");
   });
 
-  it("keeps the task-list classes the flush-indent CSS relies on", () => {
+  it("keeps the task-list classes the checklist CSS relies on", () => {
     // The `:has()` selectors in index.css are a fallback for renderers that drop these; on an
     // engine without `:has()` support these classes are the ONLY thing carrying the rule.
     const out = html("[] todo");
@@ -155,11 +155,9 @@ describe("round bullets and dash points render as two kinds of list", () => {
   });
 
   it("puts a bullet and a checkbox in ONE list, and marks the non-task item", () => {
-    // The shape the flush-checklist CSS has to cope with. `ul.contains-task-list` gets its left
-    // padding zeroed so a checklist sits at the note's edge, and a plain bullet's disc is drawn in
-    // exactly that padding — so a non-task sibling silently lost its marker and read as a stray line
-    // of prose. The rule that gives it back keys on `li:not(.task-list-item)`, which only works if
-    // remark-gfm marks the task item and leaves the bullet unmarked, in the same list.
+    // The shape a note's vault copy reaches the reader in: a checkbox under a bullet stays in the
+    // bullet's list (both are emitted on the same marker), and remark-gfm marks only the task item,
+    // so the task-list CSS styles the box without taking the bullet's disc away.
     const { container } = render(<Markdown dashLists>{toRenderMarkdown(". a\n[] b")}</Markdown>);
     const lists = container.querySelectorAll("ul");
     expect(lists).toHaveLength(1);

@@ -35,7 +35,7 @@ import { tableLineMask } from "./noteTables";
 
 /** One marker match on a single line: the leading indent, the marker token (no trailing space),
  *  and the content after it. */
-interface MarkerMatch {
+export interface MarkerMatch {
   indent: string;
   token: string;
   content: string;
@@ -60,7 +60,7 @@ const MARKER_RE = /^(\s*)(-|\+|\.|\*|>|\[[ xX]?\]|\d+\.|[ivxlcdmIVXLCDM]+\.)\s+(
  *  PM note, which is what keeps the vault copy portable. */
 const BULLET_MARKER = "*";
 
-function matchMarker(line: string): MarkerMatch | null {
+export function matchMarker(line: string): MarkerMatch | null {
   const m = MARKER_RE.exec(line);
   if (!m) return null;
   return { indent: m[1], token: m[2], content: m[3] };
@@ -113,7 +113,7 @@ function fromRoman(s: string): number | null {
   return i === lower.length && toRoman(n) === lower ? n : null;
 }
 
-function isRomanToken(token: string): boolean {
+export function isRomanToken(token: string): boolean {
   return /^[ivxlcdmIVXLCDM]+\.$/.test(token) && fromRoman(token.slice(0, -1)) != null;
 }
 
@@ -560,27 +560,4 @@ export function toggleWrap(
     selStart: pos,
     selEnd: pos,
   };
-}
-
-/**
- * Where to put the caret after an undo/redo swaps a textarea's text out from under it.
- *
- * Restoring the string but leaving the caret at the end feels broken — you undo three seconds of
- * typing mid-paragraph and land at the bottom of the note. The edit is bracketed by whatever the two
- * versions still share, so the caret belongs at the end of the common PREFIX: that's the point the
- * two texts start to differ, i.e. where the change was.
- *
- * The common SUFFIX is what makes it right for a deletion as well as an insertion, and it must be
- * bounded so the two runs can't overlap and count the same characters twice (they would on repeated
- * characters — "aa" → "aaa" shares a 2-char prefix AND a 2-char suffix of a 3-char string).
- */
-export function caretForRestore(from: string, to: string): number {
-  let prefix = 0;
-  const max = Math.min(from.length, to.length);
-  while (prefix < max && from[prefix] === to[prefix]) prefix++;
-  let suffix = 0;
-  while (suffix < max - prefix && from[from.length - 1 - suffix] === to[to.length - 1 - suffix]) {
-    suffix++;
-  }
-  return to.length - suffix;
 }
