@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PM",
-  "version": "3.166.0-alpha",
+  "version": "3.166.1-alpha",
   "identifier": "org.itsatlas.pm",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -61,7 +61,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIyMDhGQjU1MzM3NUYzNUQKUldSZDgzVXpWZnNJc3QwcWN1dFQyY3NLWWd3d2F4bkE3UFRHdlAwcnc2bWdGZlEvLy9sZTAzSkwK",
       "endpoints": [
-        "https://github.com/Admin-Atlas/Personal-Manager/releases/latest/download/latest.json"
+        "https://github.com/itsAtlas-org/Personal-Manager/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

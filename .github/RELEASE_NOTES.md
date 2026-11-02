@@ -1,4 +1,4 @@
-PM desktop release — **v3.161.2-alpha**.
+PM desktop release — **v3.166.1-alpha**.
 
 ## Install
 
@@ -47,49 +47,50 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.161.2-alpha
+## What's new in 3.166.1-alpha
 
-The big one: **you can now change your Google calendars from PM**, not just read them. Plus a much
-simpler way to run AI on your own machine, sturdier sign-ins, and the fixes since v3.130.10.
+The big one: **Pinboard notes now work like a document**, tables included. Plus folders in
+Documents, an Archive for finished projects, and the fixes since v3.161.2.
 
-- **Create, change, move and delete events.** Turn on editing for an account in **Settings ›
-  Connectors**. Then press **+ New event**, **Shift+C** for a quick one, or click or drag on the
-  calendar; move and resize events by dragging; delete with a few seconds to **Undo**. Nothing
-  changes on any account until you turn editing on, and PM reads Google's latest copy first, so a
-  change made somewhere else isn't overwritten.
+- **Notes read like a document while you write them.** No Markdown on screen: typing `.` `-` `1.`
+  `[]` `#` or `>` at the start of a line makes a bullet, dash, number, checkbox, heading or quote,
+  and a checkbox ticks with one click. Press **Table** and sweep across the grid to add a table;
+  **Tab** moves from cell to cell. A note with formatting the document view can't keep exactly opens
+  as Markdown instead, formatted as you type, so nothing in it changes.
 
-- **Repeating events and guests work as they do in Google Calendar.** PM asks whether you mean this
-  event, this and the following events, or all events. New events can repeat, and you can change
-  how one repeats. Add guests, mark them optional and choose what they may do; PM asks each time
-  whether Google should email them, and says how many emails that is.
+- **Documents can be shown as folders.** Beside **Columns**, choose **All files**, **Folders** to
+  sort them by where they came from, or **Projects** for a folder per project. PM remembers your
+  choice and the folder you had open.
 
-- **Answer invitations from PM.** Choose Yes, No or Maybe, add a note, and set your own
-  notifications, colour and Busy or Free. **Remove** takes one off your calendar, and Google tells
-  the organiser you declined. Events you've declined are struck through.
+- **Archive a project you're done with.** It moves to an Archive folder at the bottom of Focus and
+  stops nudging you or raising deadline reminders. Nothing is deleted, search and chat still find
+  its files, and **Unarchive** puts it back exactly as it was.
 
-- **Events can do much more.** Google Meet calls, Duplicate, moving to another calendar you own,
-  notifications, Google's eleven colours, and formatted descriptions with bold, lists and links.
-  Birthdays and events Gmail added can be changed where Google allows it, and a calendar shared
-  with you to view only can offer to email its owner for edit access.
+- **Clearing out is easier.** The Documents tab offers to delete every file PM can't reach in one
+  go. **Reset…** removes every file PM indexed from Google Drive, OneDrive and your watched folders,
+  along with its project, importance and tags, then fetches them again so they come back unsorted
+  for Review. The files at the source are never touched.
 
-- **A better calendar all round.** Changes made in Google show within about half a minute while PM
-  is open, events past midnight fill their hours, events show the colours you gave them in Google,
-  and a sideways swipe moves one day, or as many as you choose in Settings.
+- **Projects stay until you say otherwise.** A project no longer disappears when its files do: it
+  stays in Focus until you delete or merge it. You may see some old, empty projects come back after
+  this update; delete any you don't want. Files you delete from the vault folder outside PM now
+  leave the Documents list the next time you open it.
 
-- **Running AI on your own machine is simpler.** Settings › Local AI starts with the model PM would
-  run on your computer and four steps to get it going, with honest speed estimates. Models that
-  think before they answer now work properly on Ollama, with a **Thinking** button in chat. On
-  battery, PM can hand your work to your cloud model and give your graphics card's memory back, and
-  the sidebar says what each model is doing right now.
+- **Settings saves as you go.** The Save button is gone and every change is kept the moment you make
+  it. Unticking a calendar takes effect at once, and Settings remembers which connector groups you
+  folded.
 
-- **Sturdier sign-ins.** Disconnecting Google Calendar no longer cuts off Drive or your backups on
-  the same account, Advanced Protection accounts need their Cloud project pasted only once, and
-  while you sign in, Settings shows the link so you can use another browser. **Open data folder**
-  no longer freezes PM on some Linux desktops.
+- **A tidier Calendar.** **Today** sits at the far left, **+ New event** moves into the grid's
+  top-left corner in Day and Week, and you can drag from one day to another to make an event that
+  runs across them. When an invitation reaches more than one of your Google accounts, **Going?**
+  shows which one you're answering as.
 
-- **Under the hood.** Security fixes for how PM reads photos and makes secure connections, a safer
-  update on Windows and Mac, and fresher versions of the parts that read your documents. The first
-  time PM starts after this update, it reinstalls its document engine once.
+- **Smoother all round.** The Pinboard no longer shakes or flickers its scrollbars, deleting large
+  files no longer freezes PM, and on a Mac the window buttons are red, yellow and green.
+
+- **Under the hood.** A newer encryption library under your database, third-party licence notices
+  that now include each licence's text, and PM's home on GitHub has moved, so its links and update
+  check point to the new address.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
