@@ -19,8 +19,36 @@ accepted = [
   "Unicode-3.0",
   "Unlicense",
   "Zlib",
+  "blessing",
+  "WTFPL",
 ]
 
-# Attribute what actually ships: drop build- and dev-only dependencies.
-ignore-build-dependencies = true
+# Build dependencies stay IN. Two of them are C sources compiled into the binary: sqlcipher-src
+# (SQLCipher and SQLite, under the encrypted store) and openssl-src (the vendored OpenSSL under
+# it), and dropping build dependencies left both out of the NOTICE. Including the rest lists about
+# thirty build tools (cc, tauri-build, …) that don't ship, which over-attributes but omits nothing.
+ignore-build-dependencies = false
 ignore-dev-dependencies = true
+
+# sqlcipher-src's own LICENSE is only the packager's MIT. SQLCipher's BSD-3-Clause text, with the
+# Zetetic copyright line the licence requires in binary distributions, sits in sqlcipher/, which
+# cargo-about doesn't read by itself. A checksum that stops matching (the files changed in a new
+# sqlcipher-src) makes cargo-about drop the clarification with only a warning; `just notice-rust`
+# fails on that warning, so take the new checksums (sha256sum) after reading the new files.
+[sqlcipher-src.clarify]
+license = "MIT AND BSD-3-Clause AND blessing AND WTFPL"
+
+[[sqlcipher-src.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "413f82e0f4f8191a8624a7b7b2c9809466f7f3d930ad52a74ad29f2dd907881d"
+
+[[sqlcipher-src.clarify.files]]
+path = "sqlcipher/LICENSE-sqlcipher"
+license = "BSD-3-Clause"
+checksum = "2a2826f6acf46fa650730cf42cbb22a642be33a7ef119c9c4f4bf6daf3bef48e"
+
+[[sqlcipher-src.clarify.files]]
+path = "sqlcipher/LICENSE-libtomcrypt"
+license = "WTFPL"
+checksum = "8f196cb13afd271f5e267fd29543fc454596382ad580e7592709492843996ac8"

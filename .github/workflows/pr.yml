@@ -312,8 +312,9 @@ jobs:
           echo "$CARGO_ABOUT_SHA256  $RUNNER_TEMP/$asset.tar.gz" | sha256sum --check --strict
           tar -xz -C /usr/local/bin --strip-components=1 -f "$RUNNER_TEMP/$asset.tar.gz" "$asset/cargo-about"
       - name: Third-party NOTICE (Rust half) generates
+        # Rendered to a real file, not /dev/null: the recipe also checks the licence texts made it in.
         if: ${{ !cancelled() }}
-        run: cd src-tauri && cargo about generate about.hbs -o /dev/null
+        run: just notice-rust "$RUNNER_TEMP/THIRD-PARTY-NOTICES-rust.txt"
 
   # --- workflow security: zizmor over .github/workflows -------------------
   workflows:

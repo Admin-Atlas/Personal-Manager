@@ -48,6 +48,16 @@ allow = [
 name = "r-efi"
 allow = ["LGPL-2.1-or-later"]
 
+# sqlcipher-src carries the SQLCipher amalgamation libsqlite3-sys compiles into the encrypted
+# store (since rusqlite 0.41). Its expression is `MIT AND BSD-3-Clause AND blessing AND WTFPL`:
+# `blessing` is SQLite's public-domain dedication and `WTFPL` is one arm of libtomcrypt's dual
+# public-domain licence, both permissive and AGPL-compatible. PM builds with the OpenSSL provider,
+# so libtomcrypt is never compiled in. Scoped to this crate like r-efi above, so a new dependency
+# under either licence still trips here. about.toml clarifies its licence files for the NOTICE.
+[[licenses.exceptions]]
+name = "sqlcipher-src"
+allow = ["blessing", "WTFPL"]
+
 [bans]
 # A Tauri tree legitimately carries many duplicate versions; warn (don't fail).
 multiple-versions = "warn"

@@ -293,5 +293,27 @@ lock-regen:
 # Needs `cargo about` AND node_modules (`npm ci`); the npm generator fails rather than emitting a
 # short NOTICE, because a partial attribution file reads as compliance.
 notice out="THIRD-PARTY-NOTICES.txt":
-    cd src-tauri && cargo about generate about.hbs -o "../{{out}}"
+    just notice-rust "{{out}}"
     node scripts/generate-npm-notice.mjs >> "{{out}}"
+
+# The Rust half on its own. pr.yml's `dependencies` job renders it on every PR, so a fault surfaces
+# there rather than in the release's publish job. It fails on two faults cargo-about lets through
+# with exit 0: a clarification in src-tauri/about.toml whose checksum stopped matching, which only
+# warns and then drops that crate's licence text, and a template field cargo-about doesn't provide,
+# which renders as nothing. The second shipped every release from #36 to 3.164.1 with crate names
+# and no licence texts, because about.hbs asked for `license_text`.
+notice-rust out:
+    @log="$(mktemp)"; \
+    cargo about generate -m {{manifest}} src-tauri/about.hbs -o "{{out}}" 2>"$log"; status=$?; \
+    cat "$log" >&2; \
+    if [ "$status" -ne 0 ]; then rm -f "$log"; exit "$status"; fi; \
+    if grep -q "failed to validate" "$log"; then \
+        rm -f "$log"; \
+        echo "✗ NOTICE: a clarification in src-tauri/about.toml no longer matches its crate (warning above). Read the crate's new licence files, then update the checksums." >&2; \
+        exit 1; \
+    fi; \
+    rm -f "$log"; \
+    if ! grep -q "Permission is hereby granted" "{{out}}"; then \
+        echo "✗ NOTICE: no licence text rendered into {{out}}. Check the field names in src-tauri/about.hbs." >&2; \
+        exit 1; \
+    fi
