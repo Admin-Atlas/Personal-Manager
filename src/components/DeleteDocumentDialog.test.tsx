@@ -10,10 +10,10 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DeleteDocumentDialog } from "./DeleteDocumentDialog";
+import { DeleteDocumentDialog, DeleteUnreachableDialog, deadSources } from "./DeleteDocumentDialog";
 import type { Document } from "../lib/types";
 
-vi.mock("../lib/ipc", () => ({ deleteDocument: vi.fn() }));
+vi.mock("../lib/ipc", () => ({ deleteDocument: vi.fn(), deleteUnreachableDocuments: vi.fn() }));
 
 // Same stub the other component tests use: the dialog's <Button>s reach for `useTheme`, and the real
 // ThemeProvider pulls in IPC.
@@ -124,5 +124,38 @@ describe("DeleteDocumentDialog", () => {
     expect(
       screen.getAllByText(/Answers that already cited it will keep listing it/).length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("deadSources (#1017)", () => {
+  it("takes unreachable and source-deleted files, never a healthy one or a chat", () => {
+    const got = deadSources([
+      doc({ id: 1, source_type: "index_only", source_state: "unreachable" }),
+      doc({ id: 2, source_type: "index_only", source_state: "source_missing" }),
+      doc({ id: 3, source_type: "index_only", source_state: "ok" }),
+      doc({ id: 4, source_type: "chat", source_state: "unreachable" }),
+    ]);
+    expect(got).toEqual({ ids: [1, 2], unreachable: 1, missing: 1, vaultCopies: 0 });
+  });
+});
+
+describe("DeleteUnreachableDialog", () => {
+  it("counts each state and promises the source files are untouched", () => {
+    render(
+      <DeleteUnreachableDialog
+        docs={[
+          doc({ id: 1, source_type: "index_only", source_state: "unreachable" }),
+          doc({ id: 2, source_type: "index_only", source_state: "unreachable" }),
+          doc({ id: 3, source_type: "index_only", source_state: "source_missing" }),
+        ]}
+        onClose={() => {}}
+        onDeleted={() => {}}
+      />,
+    );
+    expect(screen.getByText(/Delete 3 files PM can’t reach\?/)).toBeTruthy();
+    expect(screen.getByText(/2 files whose folder or account can’t be reached/)).toBeTruthy();
+    expect(screen.getByText(/1 file deleted at the source/)).toBeTruthy();
+    expect(screen.getAllByText(/files at the source aren’t touched/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/vault copy/)).toBeNull();
   });
 });

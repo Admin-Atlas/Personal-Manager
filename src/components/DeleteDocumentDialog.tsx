@@ -3,7 +3,8 @@
 
 // Confirm deleting one document (board card #575). Shared by the Documents tab and a project's file
 // list so the wording — and the promise it makes — can't drift between the two places a user reaches
-// this from.
+// this from. The bulk "delete every file PM can't reach" confirmation (#1017) lives here too, so its
+// promise about the source files is written beside the one-file version it must agree with.
 //
 // Built on `ConfirmDialog`, the design's Approval pattern for irreversible actions, rather than a
 // bespoke modal: it already carries the danger tint, the busy latch that blocks Esc/scrim dismissal
@@ -15,7 +16,7 @@
 // doesn't would stop people using this, and implying it doesn't when it does would destroy work.
 
 import { useState } from "react";
-import { deleteDocument } from "../lib/ipc";
+import { deleteDocument, deleteUnreachableDocuments } from "../lib/ipc";
 import type { Document } from "../lib/types";
 import { Callout, ConfirmDialog } from "./ui";
 
@@ -96,6 +97,98 @@ export function DeleteDocumentDialog({
       <p className="mt-2 text-xs text-ink4">
         Answers that already cited it will keep listing it, and say it has been deleted when you
         click through.
+      </p>
+      {error && (
+        <Callout as="p" size="md" className="mt-3">
+          {error}
+        </Callout>
+      )}
+    </ConfirmDialog>
+  );
+}
+
+/** The documents the bulk delete offers (#1017): every one whose source PM can no longer reach, or
+ *  whose file is gone at the source, split by which so the dialog can say how many of each. */
+export function deadSources(docs: Document[]): {
+  ids: number[];
+  unreachable: number;
+  missing: number;
+  /** How many of them PM keeps a vault copy of — anything that isn't a pointer. */
+  vaultCopies: number;
+} {
+  const dead = docs.filter(
+    (d) =>
+      d.source_type !== "chat" &&
+      (d.source_state === "unreachable" || d.source_state === "source_missing"),
+  );
+  return {
+    ids: dead.map((d) => d.id),
+    unreachable: dead.filter((d) => d.source_state === "unreachable").length,
+    missing: dead.filter((d) => d.source_state === "source_missing").length,
+    vaultCopies: dead.filter((d) => kindOf(d) !== "pointer").length,
+  };
+}
+
+const files = (n: number) => `${n} file${n === 1 ? "" : "s"}`;
+
+/** Confirm deleting every unreachable / source-deleted document at once. The backend re-checks each
+ *  id, so one a sync brought back while this was open is kept — which is why the done count can come
+ *  in under the number shown here. */
+export function DeleteUnreachableDialog({
+  docs,
+  onClose,
+  onDeleted,
+}: {
+  docs: Document[];
+  onClose: () => void;
+  /** Called with how many went, after a successful delete and before close. */
+  onDeleted: (count: number) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Frozen at open: the list refreshing underneath (a sync landing) must not change what the user is
+  // confirming while they read it.
+  const [dead] = useState(() => deadSources(docs));
+
+  async function run() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      onDeleted(await deleteUnreachableDocuments(dead.ids));
+      onClose();
+    } catch (e: unknown) {
+      setError(String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <ConfirmDialog
+      open
+      danger
+      busy={busy}
+      title={`Delete ${files(dead.ids.length)} PM can’t reach?`}
+      confirmLabel="Delete all"
+      onConfirm={() => void run()}
+      onClose={onClose}
+    >
+      <ul className="list-disc pl-5 text-ink2">
+        {dead.unreachable > 0 && (
+          <li>
+            {files(dead.unreachable)} whose folder or account can&rsquo;t be reached right now
+          </li>
+        )}
+        {dead.missing > 0 && <li>{files(dead.missing)} deleted at the source</li>}
+      </ul>
+      <p className="mt-2">
+        Only PM&rsquo;s index of them is removed — the files at the source aren&rsquo;t touched.
+        {dead.vaultCopies > 0 &&
+          ` PM’s own vault copy goes too for ${dead.vaultCopies === 1 ? "the one" : `the ${dead.vaultCopies}`} it keeps.`}{" "}
+        Their project, importance and tags are lost, and this can&rsquo;t be undone from inside PM.
+      </p>
+      <p className="mt-2 text-xs text-ink4">
+        If a folder or account comes back later, its files are indexed again as new, unsorted files.
       </p>
       {error && (
         <Callout as="p" size="md" className="mt-3">

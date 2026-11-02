@@ -71,41 +71,154 @@ pub fn delete_document(app: AppHandle, state: State<'_, AppState>, document_id: 
         return chat::delete_conversation_inner(&conn, &vault_dir, cid);
     }
 
-    let (vault_path, source_type, source_id): (Option<String>, Option<String>, Option<String>) =
-        conn.query_row(
-            "SELECT vault_path, source_type, source_id FROM documents WHERE id = ?1",
-            params![document_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?
-        .ok_or_else(|| Error::Other("that document no longer exists".into()))?;
-
-    // Read BEFORE the delete — the `photos` row cascades away with the document.
-    let photo_original = ingest::saved_photo_original(&conn, document_id)?;
-    let owns_file = ingest::owns_a_vault_file(source_type.as_deref());
-
     let tx = conn.unchecked_transaction()?;
-    ingest::delete_document(&tx, document_id)?;
+    let leftover = delete_rows(&tx, document_id)?
+        .ok_or_else(|| Error::Other("that document no longer exists".into()))?;
     tx.commit()?;
     // Release the connection BEFORE the duplicate watch is touched below: `sweep_arrivals` takes the
     // watch and then a connection, so taking them the other way round here is how the two would
     // deadlock. Nothing after this point needs the DB.
     drop(conn);
-    // The cached duplicate report is a derived snapshot the panel re-reads on mount, and a pair
-    // naming a row that no longer exists is not a question — left in place it rendered a card, with
-    // live Open and Remove buttons, for a deleted document.
-    crate::duplicates::forget_document(&app, document_id);
-
-    if owns_file {
-        for rel in [vault_path, photo_original].into_iter().flatten() {
-            if !rel.trim().is_empty() {
-                let _ = std::fs::remove_file(vault_dir.join(rel));
-            }
-        }
-    } else if let Some(sid) = source_id.as_deref().filter(|s| !s.trim().is_empty()) {
-        let _ = index_only::forget_source(&vault_root, &manifest_cipher, sid);
-    }
+    tidy_after_delete(
+        &app,
+        &vault_dir,
+        &vault_root,
+        &manifest_cipher,
+        vec![leftover],
+    );
     Ok(())
+}
+
+/// What a deleted document leaves outside the database, to be removed only once its rows are gone.
+struct Leftover {
+    document_id: i64,
+    /// Vault-relative files PM held for it: the Markdown, and a photo's saved original.
+    vault_files: Vec<String>,
+    /// An index-only pointer's `source_id`, whose `.pmindex` manifest entry must go too.
+    source_id: Option<String>,
+}
+
+/// Delete one non-chat document's rows inside the caller's transaction, returning what is left to
+/// tidy after the commit — or `None` when the row is already gone. The rows half of
+/// [`delete_document`], shared with the bulk delete so the two can never disagree on what a
+/// deletion removes.
+fn delete_rows(tx: &rusqlite::Connection, document_id: i64) -> Result<Option<Leftover>> {
+    let Some((vault_path, source_type, source_id)) = tx
+        .query_row(
+            "SELECT vault_path, source_type, source_id FROM documents WHERE id = ?1",
+            params![document_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    // Read BEFORE the delete — the `photos` row cascades away with the document.
+    let photo_original = ingest::saved_photo_original(tx, document_id)?;
+    let owns_file = ingest::owns_a_vault_file(source_type.as_deref());
+    ingest::delete_document(tx, document_id)?;
+    let nonblank = |s: &String| !s.trim().is_empty();
+    Ok(Some(if owns_file {
+        Leftover {
+            document_id,
+            vault_files: [vault_path, photo_original]
+                .into_iter()
+                .flatten()
+                .filter(nonblank)
+                .collect(),
+            source_id: None,
+        }
+    } else {
+        Leftover {
+            document_id,
+            vault_files: Vec::new(),
+            source_id: source_id.filter(nonblank),
+        }
+    }))
+}
+
+/// The after-commit half of a delete: drop the documents from the cached duplicate report, remove the
+/// vault files PM held, and forget the index-only pointers in ONE manifest rewrite. Call it with the
+/// connection already released (see [`delete_document`] on the lock order). Best-effort by design: a
+/// file or manifest entry that outlives its row is harmless and self-healing, which is why the row
+/// goes first.
+fn tidy_after_delete(
+    app: &AppHandle,
+    vault_dir: &std::path::Path,
+    vault_root: &std::path::Path,
+    manifest_cipher: &index_only::ManifestCipher,
+    leftovers: Vec<Leftover>,
+) {
+    let mut sources = Vec::new();
+    for left in leftovers {
+        // The cached duplicate report is a derived snapshot the panel re-reads on mount, and a pair
+        // naming a row that no longer exists is not a question — left in place it rendered a card,
+        // with live Open and Remove buttons, for a deleted document.
+        crate::duplicates::forget_document(app, left.document_id);
+        for rel in left.vault_files {
+            let _ = std::fs::remove_file(vault_dir.join(rel));
+        }
+        sources.extend(left.source_id);
+    }
+    if !sources.is_empty() {
+        let _ = index_only::forget_sources(vault_root, manifest_cipher, &sources);
+    }
+}
+
+/// The source states the bulk delete clears: the source can't be reached (an unmounted folder, a
+/// disconnected account) or the file is gone at the source.
+const DEAD_SOURCE_STATES: &str = "('unreachable', 'source_missing')";
+
+/// Of `ids`, the documents whose source is STILL dead, in id order. The bulk delete acts on the list
+/// the user confirmed, re-checked here because a sync can bring an item back between the dialog
+/// opening and the click — and a file that came back is no longer what they agreed to delete. Saved
+/// chats are never in it: they are vault documents whose source is PM itself.
+fn still_dead(conn: &rusqlite::Connection, ids: &[i64]) -> Result<Vec<i64>> {
+    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM documents WHERE source_state IN {DEAD_SOURCE_STATES} \
+         AND id NOT IN (SELECT document_id FROM chat_sessions WHERE document_id IS NOT NULL) \
+         ORDER BY id"
+    ))?;
+    let dead = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(dead.into_iter().filter(|id| wanted.contains(id)).collect())
+}
+
+/// Delete every document in `document_ids` whose source is still unreachable or deleted (#1017), in
+/// one transaction, with exactly the per-kind semantics of [`delete_document`]: an index-only pointer
+/// loses PM's row and manifest entry and never the file at the source. Returns how many went.
+///
+/// A connector or folder that comes back later re-indexes these as new, unsorted items — the honest
+/// consequence of removing PM's record of them, and the one the dialog states.
+#[tauri::command]
+pub fn delete_unreachable_documents(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    document_ids: Vec<i64>,
+) -> Result<usize> {
+    let (vault_dir, _cipher) = state.markdown_io()?;
+    let (vault_root, _rules_cipher) = state.rules_io()?;
+    let (_, manifest_cipher) = state.manifest_io()?;
+    let conn = state.conn()?;
+    let doomed = still_dead(&conn, &document_ids)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut leftovers = Vec::with_capacity(doomed.len());
+    for id in doomed {
+        leftovers.extend(delete_rows(&tx, id)?);
+    }
+    tx.commit()?;
+    drop(conn);
+    let deleted = leftovers.len();
+    tidy_after_delete(&app, &vault_dir, &vault_root, &manifest_cipher, leftovers);
+    Ok(deleted)
 }
 
 /// In-chat "Retrieval explain" (card 7H): the same instrumented read the Developer-mode panel runs,
@@ -1163,5 +1276,40 @@ mod tests {
             derive_title(&emoji).chars().filter(|c| *c == '🌍').count(),
             80
         );
+    }
+
+    #[test]
+    fn the_bulk_delete_takes_only_what_is_still_dead_and_was_confirmed() {
+        // A sync can bring an item back between the dialog opening and the click; what came back is
+        // no longer what the user agreed to delete. A dead item they were never shown is not theirs
+        // to lose either, and a saved chat is never a candidate whatever its state says.
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let seed = |vp: &str, state: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO documents(vault_path, title, content_hash, source_state) \
+                 VALUES (?1, 'T', ?1, ?2)",
+                params![vp, state],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let unreachable = seed("idx://a", "unreachable");
+        let missing = seed("idx://b", "source_missing");
+        let back = seed("idx://c", "ok");
+        let unseen = seed("idx://d", "unreachable");
+        let chat = seed("chats/chat-1.md", "unreachable");
+        conn.execute("INSERT INTO conversations(id, title) VALUES (1, 'c')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chat_sessions(conversation_id, document_id, scope) VALUES (1, ?1, 'general')",
+            params![chat],
+        )
+        .unwrap();
+
+        let got = still_dead(&conn, &[unreachable, missing, back, chat]).unwrap();
+        assert_eq!(got, vec![unreachable, missing]);
+        assert!(!got.contains(&unseen));
     }
 }

@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.162.0-alpha",
+    date: "2026-11-02",
+    highlights: [
+      "Clear out files PM can't reach in one go. When files sit in a folder that's no longer there, an account you've disconnected, or were deleted at the source, the Documents tab says how many and offers to delete them all at once. Only PM's index of them goes; the files at the source are never touched, and if a folder or account comes back, its files are indexed again.",
+    ],
+  },
+  {
     version: "3.161.2-alpha",
     date: "2026-11-01",
     release: true,
