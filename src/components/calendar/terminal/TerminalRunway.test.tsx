@@ -11,6 +11,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { RunwayWindow } from "../../../lib/calendarPrefs";
+import { formatClockIso } from "../../../lib/format";
 import type { CalendarEvent, Task, TaskStack } from "../../../lib/types";
 
 vi.mock("../../../lib/ipc", () => ({
@@ -34,6 +35,12 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
 
 import * as ipc from "../../../lib/ipc";
 import { TerminalRunway } from "./TerminalRunway";
+
+// The strip prints the locale clock (12-hour on CI's en-US runners, 24-hour on an en-GB box), so the
+// expected name is built from the same formatter rather than hard-coding 09:00.
+const standupName = (name: string) =>
+  name.replace(/\s+/g, "") ===
+  `${formatClockIso("2026-11-04T09:00:00")}Standup`.replace(/\s+/g, "");
 
 const mocked = vi.mocked(ipc);
 
@@ -231,7 +238,7 @@ describe("TerminalRunway", () => {
     const strip = within(screen.getByRole("region", { name: "Today" })).getByRole("group", {
       name: "Events, Today",
     });
-    fireEvent.click(within(strip).getByRole("button", { name: /09:00\s*Standup/ }));
+    fireEvent.click(within(strip).getByRole("button", { name: standupName }));
     expect(onEventClick).toHaveBeenCalledWith(standup, expect.anything());
     // A milestone shows its date in its tone, not only once it's late.
     const tomorrow = within(screen.getByRole("region", { name: "Tomorrow" })).getByText("tomorrow");

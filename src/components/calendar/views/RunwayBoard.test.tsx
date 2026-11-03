@@ -13,7 +13,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RunwayWindow } from "../../../lib/calendarPrefs";
-import { formatDateLocal } from "../../../lib/format";
+import { formatClockIso, formatDateLocal } from "../../../lib/format";
 import type { CalendarEvent, Milestone, Task, TaskStack } from "../../../lib/types";
 
 vi.mock("../../../lib/ipc", () => ({
@@ -40,6 +40,12 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
 import * as ipc from "../../../lib/ipc";
 import { RunwayBoard } from "./RunwayBoard";
 import { EDGE_SCROLL_MAX, edgeScrollStep } from "./useRunwayDrag";
+
+// The strip prints the locale clock (12-hour on CI's en-US runners, 24-hour on an en-GB box), so the
+// expected name is built from the same formatter rather than hard-coding 09:00.
+const standupName = (name: string) =>
+  name.replace(/\s+/g, "") ===
+  `${formatClockIso("2026-11-04T09:00:00")}Standup`.replace(/\s+/g, "");
 
 const mocked = vi.mocked(ipc);
 
@@ -390,7 +396,7 @@ describe("RunwayBoard", () => {
       />,
     );
     const today = within(column("Today")).getByRole("group", { name: "Events, Today" });
-    fireEvent.click(within(today).getByRole("button", { name: /09:00\s*Standup/ }));
+    fireEvent.click(within(today).getByRole("button", { name: standupName }));
     expect(spies.onEventClick).toHaveBeenCalledWith(standup, expect.anything());
     // A pinboard entry rides along, on its day.
     expect(
