@@ -28,6 +28,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   confirmWipeIdentity,
   destroyBriefingWindow,
+  destroyCalendarWindow,
   launchUninstaller,
   revealAppInFinder,
   wipePmData,
@@ -254,6 +255,14 @@ export function RemovePmData({ biometricAvailable }: Props) {
           await destroyBriefingWindow();
         } catch {
           /* the erase matters more than the window; a stray theme key is not worth aborting for */
+        }
+        // The pop-out Calendar, for the same reason: a second JS context writing calendar
+        // preferences into the same store. It can be signalled, but it has no reason to outlive
+        // the data it shows.
+        try {
+          await destroyCalendarWindow();
+        } catch {
+          /* as above */
         }
         // Then stop THIS window writing: the theme provider re-persists eleven keys on any axis or
         // resolved-mode change, and its driver listens to matchMedia and visibilitychange, so

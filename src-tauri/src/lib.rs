@@ -84,6 +84,8 @@ mod outlook_calendar;
 mod pathguard;
 mod paths;
 mod photos;
+/// The Calendar in a window of its own (#1039).
+mod popout;
 // The On battery policy (#432): the pure latch and settings parsers in `power`, the per-OS reading of
 // the machine's power source in `power_source`. The watcher that joins them lives in `local_ai`.
 mod power;
@@ -1225,8 +1227,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        // Close policy for both windows: the briefing panel always just hides, and the main
-        // window hides instead of quitting ONLY when the tray is on (see tray.rs).
+        // Close policy: the briefing panel always just hides, and the main window hides instead of
+        // quitting ONLY when the tray is on (see tray.rs). The pop-out Calendar (popout.rs) closes
+        // like any window: it's destroyed.
         .on_window_event(tray::on_window_event)
         .setup(|app| {
             let handle = app.handle();
@@ -1903,6 +1906,9 @@ pub fn run() {
             commands::close_briefing_window,
             commands::destroy_briefing_window,
             commands::show_main_window,
+            commands::open_calendar_window,
+            commands::show_in_main_window,
+            commands::destroy_calendar_window,
             commands::get_daily_briefing,
             commands::refresh_daily_briefing,
             commands::sync_daily_briefing,

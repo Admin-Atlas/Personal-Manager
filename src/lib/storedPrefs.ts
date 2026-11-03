@@ -31,7 +31,8 @@
 // NO MIGRATION IS INVOLVED. `settings` is a key/value table that has existed since v1; adding a key
 // is not DDL. The keys are allowlisted backend-side in `settings.rs::WEBVIEW_PREFS`.
 
-import { getPref, setPref } from "./ipc";
+import { announceStoredPref, getPref, onStoredPref, setPref } from "./ipc";
+import { subscribeUntilCleanup } from "./subscribe";
 
 /** The three store keys. Each is its own row: `project_ui` is rewritten whole by useSidebarSplit on
  *  every divider drag, so anything folded in there is silently deleted on the next drag. */
@@ -65,15 +66,49 @@ export function readStored(key: StoredPrefKey): PrefBlob {
   return cache[key];
 }
 
+/** This JS context's name in `prefs://stored`, so a window skips its own announcements. */
+const SELF = crypto.randomUUID();
+
 /** Patch a blob and persist it. Fire-and-forget: a rejected write is best-effort exactly like the
  *  localStorage `try/catch` it replaces, and must never throw into a click handler. */
 export function writeStored(key: StoredPrefKey, patch: PrefBlob): void {
   if (!hydrated) return; // never persist a pre-hydration default over a stored value
   const next = { ...cache[key], ...patch };
   cache[key] = next;
-  setPref(key, JSON.stringify(next)).catch(() => {
-    /* best-effort — the cache keeps this session consistent */
-  });
+  setPref(key, JSON.stringify(next))
+    .then(() => announceStoredPref(key, SELF))
+    .catch(() => {
+      /* best-effort — the cache keeps this session consistent */
+    });
+}
+
+/**
+ * Keep this window's cache in step with writes from PM's other windows, and tell its surfaces
+ * (`pm:settings-changed`, the event hydration already sends). Returns the unsubscribe.
+ *
+ * With the Calendar popped out (#1039) two windows each hold a cache, and `writeStored` writes the
+ * WHOLE blob from its own: hiding a calendar in one window and then adding a Runway window in the
+ * other would write the first window's change away. Each write announces itself once it lands, and
+ * every other window re-reads that blob before it can write over it.
+ *
+ * A window's own announcement is skipped: re-reading after its own first write could land after its
+ * second, and put the older blob back in its cache.
+ */
+export function followStoredPrefs(): () => void {
+  return subscribeUntilCleanup(() =>
+    onStoredPref((key, from) => {
+      if (from === SELF || !hydrated || !(KEYS as readonly string[]).includes(key)) return;
+      getPref(key)
+        .then((raw) => {
+          if (raw == null) return;
+          cache[key as StoredPrefKey] = parseBlob(raw);
+          window.dispatchEvent(new Event("pm:settings-changed"));
+        })
+        .catch(() => {
+          /* the store closed under us: this window's curtain is about to say so */
+        });
+    }),
+  );
 }
 
 /**

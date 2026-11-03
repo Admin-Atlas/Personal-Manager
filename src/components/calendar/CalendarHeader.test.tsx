@@ -30,6 +30,7 @@ interface Over {
   view?: CalendarViewMode;
   agendaMode?: AgendaMode;
   onAgendaModeChange?: (mode: AgendaMode) => void;
+  onPopOut?: () => void;
 }
 
 function header(over: Over = {}) {
@@ -185,5 +186,15 @@ describe("CalendarHeader: the Agenda layout", () => {
     expect(screen.getByRole("button", { name: "Previous" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Today" })).toBeTruthy();
     expect(screen.queryByText("From today")).toBeNull();
+  });
+
+  it("offers Pop out where it's given, and not in the pop-out itself", () => {
+    const onPopOut = vi.fn();
+    const { unmount } = header({ onPopOut });
+    fireEvent.click(screen.getByRole("button", { name: "Pop out" }));
+    expect(onPopOut).toHaveBeenCalledOnce();
+    unmount();
+    header();
+    expect(screen.queryByRole("button", { name: "Pop out" })).toBeNull();
   });
 });

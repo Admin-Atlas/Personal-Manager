@@ -31,6 +31,7 @@ mod tasks;
 // modules above, never a command, and `super::vault_writes::…` is how they name it.
 mod vault_writes;
 mod vaults;
+mod windows;
 
 pub use archivist::*;
 pub use assistant::*;
@@ -49,6 +50,7 @@ pub use reader::*;
 pub use spend::*;
 pub use tasks::*;
 pub use vaults::*;
+pub use windows::*;
 
 // `resolve_zone` is called from `flags`, `milestones` and `projects` as
 // `crate::commands::resolve_zone`, so `shared` is re-exported too — at `pub(crate)`, which is

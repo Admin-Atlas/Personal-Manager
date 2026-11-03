@@ -66,6 +66,9 @@ interface Props {
   /** The Agenda's layout: the Runway board or the dated list. Its switch shows in Agenda only. */
   agendaMode?: AgendaMode;
   onAgendaModeChange?: (mode: AgendaMode) => void;
+  /** Open the Calendar in a window of its own (#1039), or bring that window forward. Absent in the
+   *  pop-out itself. */
+  onPopOut?: () => void;
 }
 
 const AGENDA_OPTIONS: SegOption<AgendaMode>[] = [
@@ -106,6 +109,7 @@ export function CalendarHeader({
   createRef,
   agendaMode = "list",
   onAgendaModeChange,
+  onPopOut,
 }: Props) {
   const { showMeta } = useDepth();
   const { system } = useTheme();
@@ -217,6 +221,16 @@ export function CalendarHeader({
         >
           {syncing ? "Refreshing…" : showMeta && synced ? `Refresh · ${synced}` : "Refresh"}
         </Button>
+        {onPopOut && (
+          <Button
+            variant="tertiary"
+            onClick={onPopOut}
+            title="Open the calendar in a window of its own, to keep beside PM"
+            data-help="calendar-popout"
+          >
+            Pop out
+          </Button>
+        )}
       </div>
     </header>
   );
