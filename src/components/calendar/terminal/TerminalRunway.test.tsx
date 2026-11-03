@@ -128,6 +128,14 @@ describe("TerminalRunway", () => {
     expect(document.querySelector('[data-help="calendar-runway"]')).not.toBeNull();
   });
 
+  it("hides and shows the events from the header, as the board does", () => {
+    localStorage.clear();
+    runway({ tasks: [] });
+    fireEvent.click(screen.getByRole("button", { name: /Hide events/ }));
+    expect(screen.getByRole("button", { name: /Show events/ })).toBeTruthy();
+    localStorage.clear();
+  });
+
   it("has no pointer drag: nothing is marked to drag or drop on", () => {
     runway();
     expect(document.querySelector("[data-runway-zone]")).toBeNull();
@@ -179,7 +187,7 @@ describe("TerminalRunway", () => {
   });
 
   it("folds any column from its rule, not only Before today", () => {
-    runway({ tasks: [task({ do_start: null, title: "Someday" })] });
+    runway({ tasks: [task({ do_start: "2026-12-20", title: "Someday" })] });
     const later = screen.getByRole("button", { name: "── Later (1) ▾ ──" });
     expect(later.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByText("Someday")).toBeTruthy();

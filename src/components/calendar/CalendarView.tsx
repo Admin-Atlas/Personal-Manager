@@ -876,13 +876,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [pinboardItems],
   );
 
-  // Open tasks as synthetic all-day events — the third first-party overlay (PA-1): on their plan
-  // window, else on their effective deadline ("Due: …"). Parked ones, done ones and archived
-  // projects' aren't drawn. Inert to the grid's drag (`dragCapability` refuses every overlay):
-  // a task is re-planned on the Runway, never by dragging it here.
+  // Open tasks as synthetic all-day events — the third first-party overlay (PA-1): one chip on the
+  // plan's first day (today once that has passed, so unfinished work moves on daily), else on the
+  // effective deadline ("Due: …"). Parked ones, done ones and archived projects' aren't drawn.
+  // Inert to the grid's drag (`dragCapability` refuses every overlay): a task is re-planned on the
+  // Runway, never by dragging it here. Keyed on the day, not the minute tick.
+  const todayKey = dayKey(startOfDay(now));
   const taskEvents = useMemo<CalendarEvent[]>(
-    () => taskOverlayEvents(tasks, archived),
-    [tasks, archived],
+    () => taskOverlayEvents(tasks, archived, parseLocal(todayKey, true) ?? new Date()),
+    [tasks, archived, todayKey],
   );
 
   const writes = useEventWrites();

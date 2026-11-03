@@ -104,6 +104,7 @@ export type AgendaMode = "runway" | "list";
 
 const AGENDA_MODE_KEY = "pm.calendar.agendaMode";
 const RUNWAY_PAST_OPEN_KEY = "pm.calendar.runwayPastOpen";
+const RUNWAY_EVENTS_KEY = "pm.calendar.runwayEvents";
 
 /** The Agenda layout last chosen on this device. Defaults to the Runway. View state, so
  *  localStorage, like the view itself. */
@@ -135,6 +136,25 @@ export function readRunwayPastOpen(): boolean {
 export function writeRunwayPastOpen(open: boolean): void {
   try {
     localStorage.setItem(RUNWAY_PAST_OPEN_KEY, open ? "true" : "false");
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** Does the Runway show each column's events strip (calendar events and pinboard entries)? Shown
+ *  until the user hides it: a busy calendar can fill a column with events and push its tasks
+ *  out of sight. */
+export function readRunwayShowEvents(): boolean {
+  try {
+    return localStorage.getItem(RUNWAY_EVENTS_KEY) !== "hidden";
+  } catch {
+    return true;
+  }
+}
+
+export function writeRunwayShowEvents(show: boolean): void {
+  try {
+    localStorage.setItem(RUNWAY_EVENTS_KEY, show ? "shown" : "hidden");
   } catch {
     // Best-effort.
   }

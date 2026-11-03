@@ -6,7 +6,7 @@
 // projects' tasks unless scoped to one, folds parked and done tasks away, writes through the one
 // status command, reorders within the open list, and turns to a plain summary below Standard depth.
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Task } from "../../lib/types";
 import { TaskList } from "./TaskList";
@@ -183,6 +183,82 @@ describe("TaskList", () => {
       expect.objectContaining({ title: "Call the venue", project: "Atlas", deadline: null }),
     );
     await waitFor(() => expect((box as HTMLInputElement).value).toBe(""));
+  });
+
+  it("clears the quick-add row once More… has made the task, and keeps it if cancelled", async () => {
+    mocked.listTasks.mockResolvedValue([]);
+    render(<TaskList project="Atlas" />);
+    await screen.findByText("No tasks for this project yet. Add one below.");
+    const typed = () => screen.getByRole("textbox", { name: "New task" }) as HTMLInputElement;
+    fireEvent.change(typed(), { target: { value: "Call the venue" } });
+
+    // Cancelled: what was typed is still there.
+    fireEvent.click(screen.getByRole("button", { name: "More…" }));
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "New task" })).getByRole("button", {
+        name: "Cancel",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull());
+    expect(typed().value).toBe("Call the venue");
+
+    // Added: the row starts empty again.
+    fireEvent.click(screen.getByRole("button", { name: "More…" }));
+    const dialog = screen.getByRole("dialog", { name: "New task" });
+    expect((within(dialog).getByLabelText("Title") as HTMLInputElement).value).toBe(
+      "Call the venue",
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add task" }));
+    await waitFor(() => expect(mocked.addTask).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull());
+    expect(typed().value).toBe("");
+  });
+
+  it("offers a sort only where the host keeps one, and applies it to open and parked tasks", async () => {
+    mocked.listTasks.mockResolvedValue([
+      task({ id: 1, title: "Banana", ordinal: 0 }),
+      task({ id: 2, title: "apple", ordinal: 1 }),
+      task({ id: 3, title: "Zebra", ordinal: 2, parked: true }),
+      task({ id: 4, title: "Mango", ordinal: 3, parked: true }),
+    ]);
+    const onSortChange = vi.fn();
+    const { rerender } = render(<TaskList project="Atlas" />);
+    await screen.findByText("Banana");
+    expect(screen.queryByRole("combobox", { name: "Sort tasks by" })).toBeNull();
+
+    rerender(
+      <TaskList project="Atlas" sort={{ by: "manual", desc: false }} onSortChange={onSortChange} />,
+    );
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort tasks by" }), {
+      target: { value: "alpha" },
+    });
+    expect(onSortChange).toHaveBeenCalledWith({ by: "alpha", desc: false });
+
+    rerender(
+      <TaskList project="Atlas" sort={{ by: "alpha", desc: true }} onSortChange={onSortChange} />,
+    );
+    const order = () =>
+      screen.getAllByRole("button", { name: /^Edit / }).map((b) => b.getAttribute("aria-label"));
+    expect(order()).toEqual(["Edit Banana", "Edit apple", "Edit Zebra", "Edit Mango"]);
+    // Sorted by anything but My order, there are no arrows to move a task with.
+    expect(screen.queryByRole("button", { name: "Move apple up" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Reverse the order/ }));
+    expect(onSortChange).toHaveBeenLastCalledWith({ by: "alpha", desc: false });
+  });
+
+  it("reorders a reversed My order the right way up", async () => {
+    mocked.listTasks.mockResolvedValue([
+      task({ id: 1, title: "A", ordinal: 0 }),
+      task({ id: 2, title: "B", ordinal: 1 }),
+      task({ id: 3, title: "C", ordinal: 2 }),
+    ]);
+    render(
+      <TaskList project="Atlas" sort={{ by: "manual", desc: true }} onSortChange={() => {}} />,
+    );
+    await screen.findByText("C");
+    // Shown C, B, A. Moving C down shows B, C, A: the global order A, C, B.
+    fireEvent.click(screen.getByRole("button", { name: "Move C down" }));
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenCalledWith([1, 3, 2]));
   });
 
   it("shows a refused write", async () => {

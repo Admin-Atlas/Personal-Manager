@@ -119,12 +119,96 @@ export function compareTasks(
   return a.ordinal - b.ordinal || a.id - b.id;
 }
 
+/** How a task list can be sorted. `manual` is the one global order (the ↑/↓ arrows and the Runway
+ *  move it); `nearest` is the sooner of the plan start and the effective deadline; `deadline` the
+ *  effective deadline alone; `alpha` the title; `added` when it was made. A closed set, stored on a
+ *  pinboard Task list card, so only ever add to it. */
+export type TaskSortKey = "manual" | "nearest" | "deadline" | "alpha" | "added";
+
+export interface TaskSort {
+  by: TaskSortKey;
+  /** Reversed: Z to A, the latest date first, the newest first, the manual order upside down. */
+  desc: boolean;
+}
+
+export const DEFAULT_TASK_SORT: TaskSort = { by: "manual", desc: false };
+
+/** Every sort, in the order the picker lists them, with how each reads. */
+export const TASK_SORTS: readonly { key: TaskSortKey; label: string }[] = [
+  { key: "manual", label: "My order" },
+  { key: "nearest", label: "Nearest date" },
+  { key: "deadline", label: "Deadline" },
+  { key: "alpha", label: "A–Z" },
+  { key: "added", label: "Date added" },
+];
+
+/** A stored sort, read defensively: anything this build doesn't know is the default. */
+export function readTaskSort(raw: unknown): TaskSort {
+  if (!raw || typeof raw !== "object") return DEFAULT_TASK_SORT;
+  const r = raw as Record<string, unknown>;
+  const by = TASK_SORTS.find((s) => s.key === r.by)?.key;
+  return by ? { by, desc: r.desc === true } : DEFAULT_TASK_SORT;
+}
+
+/** The date a task sorts by under `nearest` or `deadline`, `YYYY-MM-DD`, or null for none. */
+function sortDay(t: Task, by: "nearest" | "deadline"): string | null {
+  const due = t.effective_deadline?.slice(0, 10) || null;
+  if (by === "deadline") return due;
+  const start = t.do_start?.slice(0, 10) || null;
+  if (start && due) return start < due ? start : due;
+  return start ?? due;
+}
+
+const titleCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+
+/** `list` sorted by `sort`, as a new array. Ties fall back to the global order. A task with no date
+ *  goes last under a date sort whichever way it runs, since "no date" is neither near nor far. */
+export function sortTasks(list: readonly Task[], sort: TaskSort): Task[] {
+  const dir = sort.desc ? -1 : 1;
+  const cmp = (a: Task, b: Task): number => {
+    switch (sort.by) {
+      case "manual":
+        return dir * compareTasks(a, b);
+      case "alpha":
+        return dir * titleCollator.compare(a.title, b.title) || compareTasks(a, b);
+      case "added":
+        return dir * a.created_at.localeCompare(b.created_at) || dir * (a.id - b.id);
+      case "nearest":
+      case "deadline": {
+        const da = sortDay(a, sort.by);
+        const db = sortDay(b, sort.by);
+        if (da === null || db === null)
+          return (da === null ? 1 : 0) - (db === null ? 1 : 0) || compareTasks(a, b);
+        return dir * da.localeCompare(db) || compareTasks(a, b);
+      }
+    }
+  };
+  return [...list].sort(cmp);
+}
+
 /** How each stack kind reads. */
 export const STACK_KIND_LABEL: Record<TaskStackKind, string> = {
-  sequential: "In sequence: each one gates the next",
+  sequential: "In sequence",
   in_order: "In order",
   waiting_on: "Waiting on someone",
 };
+
+/** What each stack kind means, for the pickers. A label for you (and, later, the assistant): PM
+ *  doesn't hold a step back because the one before it is open. */
+export const STACK_KIND_MEANING: Record<TaskStackKind, string> = {
+  sequential: "each step waits for the one before",
+  in_order: "a suggested order, nothing waits",
+  waiting_on: "stuck until someone else does their part",
+};
+
+/** A stack kind as a picker lists it: its name and what it means. */
+export function stackKindOption(kind: TaskStackKind): string {
+  return `${STACK_KIND_LABEL[kind]}: ${STACK_KIND_MEANING[kind]}`;
+}
+
+/** What a stack is, for the editor's Stack field when none is chosen. */
+export const STACK_HINT =
+  "Group tasks that belong to one job, such as the steps of an application. On the Runway they fold into one card that shows how many are left and what's next.";
 
 /** Every stack kind, in the order the pickers list them. */
 export const STACK_KINDS: readonly TaskStackKind[] = ["sequential", "in_order", "waiting_on"];

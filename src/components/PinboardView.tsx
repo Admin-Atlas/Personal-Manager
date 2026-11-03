@@ -41,6 +41,7 @@ import {
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
 import { TaskList } from "./tasks/TaskList";
+import { readTaskSort } from "../lib/tasks";
 import { insertTable, moveCell, tableEnter } from "../lib/pinboard/noteTables";
 import { NoteTablePicker } from "./NoteTablePicker";
 import { NoteEditor, type NoteEditorHandle } from "./NoteEditor";
@@ -1776,7 +1777,13 @@ const TaskListBody = memo(function TaskListBody({
             </div>
           </div>
         ) : (
-          <TaskList project={project} compact showProject={project === undefined} />
+          <TaskList
+            project={project}
+            compact
+            showProject={project === undefined}
+            sort={readTaskSort(widget.taskSort)}
+            onSortChange={(taskSort) => onChange(widget.id, { taskSort })}
+          />
         )}
       </div>
     </div>

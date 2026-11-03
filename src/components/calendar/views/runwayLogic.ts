@@ -11,7 +11,11 @@
 // nothing here keeps a copy of a task.
 
 import { useCallback, useMemo, useState } from "react";
-import type { RunwayWindow } from "../../../lib/calendarPrefs";
+import {
+  readRunwayShowEvents,
+  writeRunwayShowEvents,
+  type RunwayWindow,
+} from "../../../lib/calendarPrefs";
 import { dayKey, parseLocal, startOfDay } from "../../../lib/calendar-layout";
 import { changeTaskStatus, planTask, reorderTasks } from "../../../lib/ipc";
 import { formatClockIso, formatDateLocal, formatDateOnly } from "../../../lib/format";
@@ -62,7 +66,9 @@ export interface RunwayProps {
   announce: (text: string) => void;
 }
 
-/** The columns, where everything sits and each column's events, for `now`'s day. */
+/** The columns, where everything sits and each column's events, for `now`'s day. The events
+ *  strips can be hidden (remembered on this device): hidden, every column's strip is empty, while
+ *  a task's link to an event still resolves, since that reads `events` itself. */
 export function useRunwayModel({
   tasks,
   stacks,
@@ -79,6 +85,8 @@ export function useRunwayModel({
   columns: RunwayColumn[];
   model: RunwayModel;
   strips: Record<string, RunwayEventStrip>;
+  showEvents: boolean;
+  toggleEvents: () => void;
 } {
   // Keyed on the day, not the minute tick, so the model is rebuilt only when the date turns.
   const todayKey = dayKey(startOfDay(now));
@@ -88,8 +96,18 @@ export function useRunwayModel({
     () => placeCards({ tasks, stacks, milestones, columns, today, archived }),
     [tasks, stacks, milestones, columns, today, archived],
   );
-  const strips = useMemo(() => placeEvents(events, columns, today), [events, columns, today]);
-  return { today, columns, model, strips };
+  const [showEvents, setShowEvents] = useState(readRunwayShowEvents);
+  const toggleEvents = useCallback(() => {
+    setShowEvents((v) => {
+      writeRunwayShowEvents(!v);
+      return !v;
+    });
+  }, []);
+  const strips = useMemo(
+    () => (showEvents ? placeEvents(events, columns, today) : {}),
+    [showEvents, events, columns, today],
+  );
+  return { today, columns, model, strips, showEvents, toggleEvents };
 }
 
 /** Where a column's events strip says an event is: its clock time in a one-day column (or

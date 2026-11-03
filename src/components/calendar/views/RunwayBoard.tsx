@@ -109,7 +109,7 @@ export function RunwayBoard(props: RunwayProps) {
     onShowList,
     announce,
   } = props;
-  const { today, columns, model, strips } = useRunwayModel(props);
+  const { today, columns, model, strips, showEvents, toggleEvents } = useRunwayModel(props);
   const { error, cycle, replan, reorder } = useRunwayActions(announce);
   const [editing, setEditing] = useState<Editing>(null);
   const [windowEdit, setWindowEdit] = useState<{ window: RunwayWindow | null } | null>(null);
@@ -222,6 +222,8 @@ export function RunwayBoard(props: RunwayProps) {
         model={model}
         onAddTask={() => setEditing({ defaults: newTaskDefaults(today) })}
         onAddWindow={() => setWindowEdit({ window: null })}
+        showEvents={showEvents}
+        onToggleEvents={toggleEvents}
       />
       {error && (
         <div className="px-4 pt-2">

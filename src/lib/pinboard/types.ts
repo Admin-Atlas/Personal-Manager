@@ -69,6 +69,10 @@ export interface Widget {
    *  rather than silently widening to every task. A timeline reads `null` as unbound (it tests
    *  truthiness). Rename and merge rewrite the string through `rekey_pinboard_project`. */
   project?: string | null;
+  /** A task list's sort: which order (`TaskSortKey`) and whether reversed. Read through
+   *  `readTaskSort`, so a value this build doesn't know is the default. Unset → the global order.
+   *  Optional and additive, so `BOARD_VERSION` stays 1. */
+  taskSort?: { by: string; desc: boolean };
   /** Freeform timelines only: whether this widget's dated entries also appear on the Calendar tab
    *  (the pinboard overlay). Unset → shown, so entries land on the calendar by default. A
    *  project-bound timeline ignores it — those entries are real milestones, already drawn by the

@@ -6,9 +6,11 @@
 // every `tasks://changed` (fired after any task write, from any surface), so ticking a task here
 // ticks it on the Runway and the calendar too.
 //
-// Open tasks lead, in the one global order (↑/↓ reorder them within it); parked ones and done ones
-// sit under folds that start closed. Below Standard depth the list is a plain summary with no
-// controls, as the milestones panel is.
+// Open tasks lead, in the one global order (↑/↓ reorder them within it) unless the host offers a
+// sort (the pinboard card does, and stores the choice on the card), which orders the open and
+// parked tasks alike; done ones stay most recently finished first. Parked and done sit under folds
+// that start closed. Below Standard depth the list is a plain summary with no controls, as the
+// milestones panel is.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -26,14 +28,19 @@ import {
   compareTasks,
   deadlineInfo,
   deadlineKindOf,
+  DEFAULT_TASK_SORT,
   emptyTaskInput,
   isOpen,
+  sortTasks,
+  TASK_SORTS,
+  type TaskSort,
+  type TaskSortKey,
 } from "../../lib/tasks";
 import type { Task, TaskInput, TaskStack } from "../../lib/types";
 import { useNowTick } from "../../lib/useNowTick";
 import { useDepth } from "../../theme";
 import { DateField } from "../DateField";
-import { Button, Callout, Collapsible, Input, cn } from "../ui";
+import { Button, Callout, Collapsible, Input, Select, cn } from "../ui";
 import { DeadlineChip, ProjectChip, StackChip, TaskStatusButton } from "./TaskBits";
 import { TaskEditor } from "./TaskEditor";
 
@@ -48,6 +55,10 @@ export interface TaskListProps {
   readOnly?: boolean;
   /** Each row names its project (for an all-tasks list). */
   showProject?: boolean;
+  /** How the open and parked tasks are ordered. Default: the global order. */
+  sort?: TaskSort;
+  /** Offer the sort picker; the host keeps the choice. Absent: no picker. */
+  onSortChange?: (sort: TaskSort) => void;
 }
 
 type Editing = { task: Task } | { defaults: Partial<TaskInput> } | null;
@@ -63,11 +74,16 @@ export function TaskList({
   compact = false,
   readOnly = false,
   showProject = false,
+  sort = DEFAULT_TASK_SORT,
+  onSortChange,
 }: TaskListProps) {
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [stacks, setStacks] = useState<TaskStack[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Editing>(null);
+  // Bumped when a task made from the quick-add row's "More…" is saved, which remounts the row so
+  // what was typed there doesn't linger once it has become a task.
+  const [addRowKey, setAddRowKey] = useState(0);
   const { showMeta } = useDepth();
   const today = startOfDay(useNowTick());
 
@@ -103,8 +119,14 @@ export function TaskList({
   const visible = (tasks ?? []).filter(
     (t) => includeArchived || project !== undefined || !t.project_archived,
   );
-  const open = visible.filter((t) => isOpen(t) && !t.parked).sort(compareTasks);
-  const parked = visible.filter((t) => isOpen(t) && t.parked).sort(compareTasks);
+  const open = sortTasks(
+    visible.filter((t) => isOpen(t) && !t.parked),
+    sort,
+  );
+  const parked = sortTasks(
+    visible.filter((t) => isOpen(t) && t.parked),
+    sort,
+  );
   const done = visible.filter((t) => !isOpen(t)).sort(byCompleted);
   const stackById = new Map(stacks.map((s) => [s.id, s]));
 
@@ -139,6 +161,9 @@ export function TaskList({
               if (j < 0 || j >= list.length) return;
               const ids = list.map((x) => x.id);
               [ids[i], ids[j]] = [ids[j], ids[i]];
+              // Shown upside down, the list is the global order reversed: send it back the right
+              // way up.
+              if (sort.desc) ids.reverse();
               mutate(() => reorderTasks(ids));
             }
           : undefined
@@ -157,8 +182,12 @@ export function TaskList({
               : "No tasks yet. Add one below, or from a project."}
         </p>
       )}
-      {open.map((t, i) => row(t, i, open, true))}
+      {onSortChange && tasks !== null && open.length + parked.length > 1 && (
+        <SortPicker sort={sort} onChange={onSortChange} />
+      )}
+      {open.map((t, i) => row(t, i, open, sort.by === "manual"))}
       <AddTaskRow
+        key={addRowKey}
         project={project}
         compact={compact}
         onAdd={(input) =>
@@ -189,9 +218,62 @@ export function TaskList({
         task={editing && "task" in editing ? editing.task : null}
         defaults={editing && "defaults" in editing ? editing.defaults : undefined}
         onClose={() => setEditing(null)}
-        onSaved={reload}
+        onSaved={() => {
+          if (editing && "defaults" in editing) setAddRowKey((k) => k + 1);
+          reload();
+        }}
         onDeleted={reload}
       />
+    </div>
+  );
+}
+
+/** The sort picker above a list: which order, and which way round. Arrows only in "My order", since
+ *  moving a task up a list sorted by date would change nothing you could see. */
+function SortPicker({ sort, onChange }: { sort: TaskSort; onChange: (sort: TaskSort) => void }) {
+  const reverseLabel =
+    sort.by === "alpha"
+      ? sort.desc
+        ? "Z to A"
+        : "A to Z"
+      : sort.by === "manual"
+        ? sort.desc
+          ? "Bottom first"
+          : "Top first"
+        : sort.by === "added"
+          ? sort.desc
+            ? "Newest first"
+            : "Oldest first"
+          : sort.desc
+            ? "Latest first"
+            : "Soonest first";
+  return (
+    <div className="flex items-center justify-end gap-1">
+      <Select
+        compact
+        value={sort.by}
+        aria-label="Sort tasks by"
+        title="Sort tasks by"
+        onPointerDown={(e) => e.stopPropagation()}
+        onChange={(e) => onChange({ by: e.target.value as TaskSortKey, desc: sort.desc })}
+        className="min-w-0 max-w-[9rem] shrink text-[0.625rem]"
+      >
+        {TASK_SORTS.map((o) => (
+          <option key={o.key} value={o.key}>
+            {o.label}
+          </option>
+        ))}
+      </Select>
+      <Button
+        variant="tertiary"
+        size="xs"
+        aria-pressed={sort.desc}
+        aria-label={`Reverse the order (now ${reverseLabel.toLowerCase()})`}
+        title={`${reverseLabel}. Click to reverse.`}
+        onClick={() => onChange({ by: sort.by, desc: !sort.desc })}
+      >
+        {sort.desc ? "↑" : "↓"}
+      </Button>
     </div>
   );
 }

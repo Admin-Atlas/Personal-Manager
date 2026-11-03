@@ -169,6 +169,7 @@ describe("RunwayBoard", () => {
         task({ id: 2, title: "Call the bank", do_start: "2026-11-05", lane: "background" }),
         task({ id: 3, title: "Someday", do_start: null }),
         task({ id: 4, title: "On the shelf", parked: true }),
+        task({ id: 5, title: "Far off", do_start: "2026-12-01" }),
       ],
       milestones: [milestone],
     });
@@ -184,16 +185,45 @@ describe("RunwayBoard", () => {
     const tomorrow = column("Tomorrow");
     expect(within(tomorrow).getByText("Call the bank")).toBeTruthy();
     expect(within(tomorrow).getByRole("button", { name: "◆ Pitch · Atlas" })).toBeTruthy();
-    expect(within(column("Later")).getByText("Someday")).toBeTruthy();
-    expect(
-      within(screen.getByRole("region", { name: "Parked" })).getByText("On the shelf"),
-    ).toBeTruthy();
+    expect(within(column("Later")).getByText("Far off")).toBeTruthy();
+    // With no plan and no deadline, a task waits on the shelf with the parked ones, not in Later.
+    const shelf = within(screen.getByRole("region", { name: "Parked" }));
+    expect(shelf.getByText("On the shelf")).toBeTruthy();
+    expect(shelf.getByText("Someday")).toBeTruthy();
     // Before today starts folded, as a rail.
     expect(screen.getByRole("button", { name: "Show Before today" })).toBeTruthy();
     expect(within(column("Next week")).getAllByText("empty")).toHaveLength(2);
     // The strip: progress and what's next.
     expect(screen.getByText("0/4 done")).toBeTruthy();
     expect(document.querySelector('[data-help="calendar-runway"]')).not.toBeNull();
+  });
+
+  it("hides every column's events on request, and remembers it on this device", () => {
+    const standup: CalendarEvent = {
+      id: "e1",
+      calendar_id: "c",
+      summary: "Standup",
+      description: null,
+      location: null,
+      start: "2026-11-04",
+      end: null,
+      all_day: true,
+      html_link: null,
+      uid: "u1",
+    };
+    board({ events: [standup] });
+    const strip = () => within(column("Today")).queryByRole("group", { name: "Events, Today" });
+    expect(strip()).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Hide events" }));
+    expect(strip()).toBeNull();
+    // The tasks stay where they were.
+    expect(within(column("Today")).getByText("Draft the deck")).toBeTruthy();
+    cleanup();
+
+    board({ events: [standup] });
+    expect(strip()).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show events" }));
+    expect(strip()).not.toBeNull();
   });
 
   it("ticks a task through the task IPC", async () => {

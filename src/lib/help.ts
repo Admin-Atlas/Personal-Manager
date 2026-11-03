@@ -303,11 +303,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "calendar-filter": {
     title: "Which calendars show",
-    body: "Tick the connected calendars you want laid over each other; untick one to hide it here without disconnecting it. Each keeps its own colour so you can tell sources apart. This only changes what's shown — it doesn't stop PM syncing that calendar. Under Personal Manager, Milestones, Tasks and Pinboard put your project deadlines, your planned tasks (on the days you planned them, or on their deadline) and pinboard timeline entries on the calendar too; click a task to edit it.",
+    body: "Tick the connected calendars you want laid over each other; untick one to hide it here without disconnecting it. Each keeps its own colour so you can tell sources apart. This only changes what's shown — it doesn't stop PM syncing that calendar. Under Personal Manager, Milestones, Tasks and Pinboard put your project deadlines, your planned tasks (on the day you start one, moving on to today until it's done, or on its deadline) and pinboard timeline entries on the calendar too; click a task to edit it.",
   },
   "calendar-runway": {
     title: "The Runway",
-    body: "Your tasks and milestones laid out in columns of days: Before today (folded), Today, Tomorrow, the rest of this week, next week and later, each with a Foreground and a Background lane, and that day's calendar events and pinboard entries at the head of each column. Add a named window, such as a trip or a conference week, with + Window, and its days get a column of their own. A card sits on the day you plan to do it; its deadline shows separately, red when it's due or late and amber when it's close, and a deadline that follows a milestone or an event says which. Something you didn't finish rolls into Today. Use Move… on a card to plan it for another column, lane or Parked, or to move it up or down; outside the Terminal look you can also drag it. Tick the box to go from to do, to doing, to done. A stack folds into one card with how many are left; click it to open them. Milestones open their project and events open their details, but neither moves here. + Task adds a task for today.",
+    body: "Your tasks and milestones in columns of days: Before today (folded), Today, Tomorrow, the rest of this week, next week and later, each with a Foreground and a Background lane, and that day's events and pinboard entries at the head of each column; Hide events clears those away when your calendar is busy. + Window gives a trip or a conference week a column of its own. A card sits on the day you plan to do it, its deadline shown apart, red when due or late and amber when close. Something you didn't finish rolls into Today. A task with no date yet waits in Parked, with the ones you set aside, until you move it to a day. Use Move… on a card to plan it for another column, lane or Parked, or to move it up or down; outside the Terminal look you can also drag it. Tick the box to go from to do, to doing, to done. A stack folds into one card with how many are left; click it to open them. Milestones open their project and events open their details. + Task adds a task for today.",
   },
   "calendar-description-format": {
     title: "Format the description",
@@ -647,7 +647,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-tasks": {
     title: "This project's tasks",
-    body: "The to-dos linked to this project, the same tasks you see on the pinboard and the Calendar's Runway. Type one and press Enter to add it, with a deadline if you like; More… opens everything. Tick the box to go from to do, to doing, to done. Click a title to read why it matters, and ✎ to change anything: when you plan to do it, a deadline that's firm or one to aim for (or one that follows a milestone or a calendar event), the lane, a stack it belongs to, or park it for later. Done and parked tasks fold away at the bottom. Deleting the project keeps its tasks, without a project.",
+    body: "The to-dos linked to this project, the same tasks you see on the pinboard and the Calendar's Runway. Type one and press Enter to add it, with a deadline if you like; More… opens everything. Tick the box to go from to do, to doing, to done. Click a title to read why it matters, and ✎ to change anything: when you plan to do it, a deadline that's firm or one to aim for (or one that follows a milestone or a calendar event), the lane, a stack that groups it with the other steps of one job, or park it for later. Done and parked tasks fold away at the bottom. Deleting the project keeps its tasks, without a project.",
   },
   "project-chat": {
     title: "Project chat",
@@ -681,7 +681,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-tasklist": {
     title: "A task list",
-    body: "Your tasks, live: change the project in the header, or pick All tasks. Type one and press Enter to add it; tick the box to go from to do, to doing, to done; click a title to see why it matters, and ✎ to plan it, give it a deadline or link it to a milestone or an event. Every change shows everywhere the task does. If the project this list followed is deleted, the list asks whether to show all tasks or go.",
+    body: "Your tasks, live: change the project in the header, or pick All tasks. Type one and press Enter to add it; tick the box to go from to do, to doing, to done; click a title to see why it matters, and ✎ to plan it, give it a deadline or link it to a milestone or an event. Sort the list by your own order, nearest date, deadline, A–Z or date added, and the arrow beside it turns the order round; each card keeps its own. Every change shows everywhere the task does. If the project this list followed is deleted, the list asks whether to show all tasks or go.",
   },
   "pinboard-note-tasks": {
     title: "Turn checkboxes into tasks",

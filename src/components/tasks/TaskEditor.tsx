@@ -32,14 +32,17 @@ import {
   listTaskStacks,
   updateTask,
 } from "../../lib/ipc";
+import { useRememberedFold } from "../../lib/foldPrefs";
 import { formatDateOnly } from "../../lib/format";
 import { runMutation } from "../../lib/runMutation";
 import {
   DEADLINE_FROM_LABEL,
   emptyTaskInput,
   eventChoices,
+  STACK_HINT,
   STACK_KIND_LABEL,
   STACK_KINDS,
+  stackKindOption,
   TASK_STATUS_LABEL,
   taskToInput,
   type EventChoice,
@@ -59,6 +62,7 @@ import { DateField } from "../DateField";
 import {
   Button,
   Callout,
+  Collapsible,
   ConfirmDialog,
   Dialog,
   Input,
@@ -157,6 +161,9 @@ function TaskEditorBody({
   const [newStackNote, setNewStackNote] = useState("");
   const [status, setStatus] = useState<TaskStatus>(task?.status ?? "todo");
   const [editingStack, setEditingStack] = useState<TaskStack | null>(null);
+  // Folding Links away is remembered on this device, so the next task you add or edit opens with
+  // them folded too.
+  const [linksOpen, setLinksOpen] = useRememberedFold("tasks.editorLinks", true);
 
   const [projects, setProjects] = useState<string[]>([]);
   const [milestones, setMilestones] = useState<Milestone[] | null>(null);
@@ -246,6 +253,14 @@ function TaskEditorBody({
       : savedEventLink && task && !task.deadline_missing && task.effective_deadline
         ? task.effective_deadline
         : eventPin;
+  // What's linked, for the Links fold's header while it's folded away.
+  const linksMeta = [
+    !fixedProject && clean(project) ? "project" : null,
+    milestoneId !== null ? "milestone" : null,
+    eventUid !== null ? "event" : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
   const selectedStack =
     stackSel && stackSel !== NEW_STACK ? stacks.find((s) => String(s.id) === stackSel) : undefined;
 
@@ -465,101 +480,108 @@ function TaskEditorBody({
             />
           </div>
 
-          <fieldset className="flex flex-col gap-3 rounded-[var(--radius-sm)] border border-border p-3">
-            <legend className="px-1 text-xs text-ink3">Links (all optional)</legend>
-            {!fixedProject && (
+          <Collapsible
+            title={<span className="text-xs text-ink3">Links (all optional)</span>}
+            open={linksOpen}
+            onOpenChange={setLinksOpen}
+            meta={linksMeta || undefined}
+          >
+            <fieldset className="mt-2 flex flex-col gap-3 rounded-[var(--radius-sm)] border border-border p-3">
+              <legend className="sr-only">Links</legend>
+              {!fixedProject && (
+                <div>
+                  <label htmlFor={ids.project} className={fieldLabel}>
+                    Project
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id={ids.project}
+                      list={ids.projectList}
+                      value={project}
+                      placeholder="No project"
+                      onChange={(e) => setProject(e.target.value)}
+                      onBlur={settleProject}
+                      className="h-8 min-w-0 flex-1 text-xs"
+                    />
+                    <datalist id={ids.projectList}>
+                      {projects.map((p) => (
+                        <option key={p} value={p} />
+                      ))}
+                    </datalist>
+                    {project && (
+                      <Button
+                        variant="tertiary"
+                        size="xs"
+                        onClick={clearProject}
+                        aria-label="Clear the project"
+                        className="shrink-0"
+                      >
+                        Clear
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <div>
-                <label htmlFor={ids.project} className={fieldLabel}>
-                  Project
+                <label htmlFor={ids.milestone} className={fieldLabel}>
+                  Milestone
                 </label>
                 <div className="flex items-center gap-2">
-                  <Input
-                    id={ids.project}
-                    list={ids.projectList}
-                    value={project}
-                    placeholder="No project"
-                    onChange={(e) => setProject(e.target.value)}
-                    onBlur={settleProject}
-                    className="h-8 min-w-0 flex-1 text-xs"
-                  />
-                  <datalist id={ids.projectList}>
-                    {projects.map((p) => (
-                      <option key={p} value={p} />
+                  <Select
+                    id={ids.milestone}
+                    compact
+                    value={milestoneId === null ? "" : String(milestoneId)}
+                    onChange={(e) => chooseMilestone(e.target.value)}
+                    className="min-w-0 flex-1"
+                  >
+                    <option value="">None</option>
+                    {milestoneId !== null && !linkedMilestone && (
+                      <option value={String(milestoneId)}>
+                        {task?.milestone_label ?? "Linked milestone"}
+                      </option>
+                    )}
+                    {milestoneOptions.map((m) => (
+                      <option key={m.id} value={String(m.id)}>
+                        {milestoneText(m)}
+                      </option>
                     ))}
-                  </datalist>
-                  {project && (
+                  </Select>
+                  {milestoneId !== null && (
                     <Button
                       variant="tertiary"
                       size="xs"
-                      onClick={clearProject}
-                      aria-label="Clear the project"
+                      onClick={clearMilestone}
+                      aria-label="Clear the milestone"
                       className="shrink-0"
                     >
                       Clear
                     </Button>
                   )}
                 </div>
-              </div>
-            )}
-
-            <div>
-              <label htmlFor={ids.milestone} className={fieldLabel}>
-                Milestone
-              </label>
-              <div className="flex items-center gap-2">
-                <Select
-                  id={ids.milestone}
-                  compact
-                  value={milestoneId === null ? "" : String(milestoneId)}
-                  onChange={(e) => chooseMilestone(e.target.value)}
-                  className="min-w-0 flex-1"
-                >
-                  <option value="">None</option>
-                  {milestoneId !== null && !linkedMilestone && (
-                    <option value={String(milestoneId)}>
-                      {task?.milestone_label ?? "Linked milestone"}
-                    </option>
-                  )}
-                  {milestoneOptions.map((m) => (
-                    <option key={m.id} value={String(m.id)}>
-                      {milestoneText(m)}
-                    </option>
-                  ))}
-                </Select>
-                {milestoneId !== null && (
-                  <Button
-                    variant="tertiary"
-                    size="xs"
-                    onClick={clearMilestone}
-                    aria-label="Clear the milestone"
-                    className="shrink-0"
-                  >
-                    Clear
-                  </Button>
+                {milestones !== null && milestoneOptions.length === 0 && (
+                  <p className="mt-1 text-xs text-ink4">
+                    {scope ? `${scope} has no milestones yet.` : "No project has milestones yet."}
+                  </p>
                 )}
               </div>
-              {milestones !== null && milestoneOptions.length === 0 && (
-                <p className="mt-1 text-xs text-ink4">
-                  {scope ? `${scope} has no milestones yet.` : "No project has milestones yet."}
-                </p>
-              )}
-            </div>
 
-            <div>
-              <span id={ids.event} className={fieldLabel}>
-                Calendar event
-              </span>
-              <EventPicker
-                labelledBy={ids.event}
-                value={eventUid}
-                choices={choices ?? []}
-                loading={choices === null}
-                linkedTitle={task?.event_uid === eventUid ? task?.event_title : null}
-                pinnedDate={pickerDate}
-                onChange={changeEvent}
-              />
-            </div>
-          </fieldset>
+              <div>
+                <span id={ids.event} className={fieldLabel}>
+                  Calendar event
+                </span>
+                <EventPicker
+                  labelledBy={ids.event}
+                  value={eventUid}
+                  choices={choices ?? []}
+                  loading={choices === null}
+                  linkedTitle={task?.event_uid === eventUid ? task?.event_title : null}
+                  pinnedDate={pickerDate}
+                  onChange={changeEvent}
+                />
+              </div>
+            </fieldset>
+          </Collapsible>
 
           <div>
             <span id={ids.deadlineFrom} className={fieldLabel}>
@@ -710,6 +732,7 @@ function TaskEditorBody({
                 </Button>
               )}
             </div>
+            {stackSel === "" && <p className="mt-1 text-xs text-ink4">{STACK_HINT}</p>}
             {selectedStack && (
               <p className="mt-1 whitespace-pre-wrap break-words text-xs text-ink4">
                 {STACK_KIND_LABEL[selectedStack.kind]}
@@ -744,7 +767,7 @@ function TaskEditorBody({
                   >
                     {STACK_KINDS.map((k) => (
                       <option key={k} value={k}>
-                        {STACK_KIND_LABEL[k]}
+                        {stackKindOption(k)}
                       </option>
                     ))}
                   </Select>

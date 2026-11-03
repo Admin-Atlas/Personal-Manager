@@ -115,16 +115,21 @@ export function EventsStrip({
   );
 }
 
-/** The header strip: how far along, what's next, and the two add buttons. */
+/** The header strip: how far along, what's next, the events switch and the two add buttons. */
 export function RunwayStrip({
   model,
   onAddTask,
   onAddWindow,
+  showEvents,
+  onToggleEvents,
   terminal = false,
 }: {
   model: RunwayModel;
   onAddTask: () => void;
   onAddWindow: () => void;
+  /** Whether the columns show their events strips, and the switch for it. */
+  showEvents: boolean;
+  onToggleEvents: () => void;
   terminal?: boolean;
 }) {
   const { showMeta } = useDepth();
@@ -155,6 +160,18 @@ export function RunwayStrip({
         </span>
       )}
       <div className="ml-auto flex items-center gap-2">
+        <Button
+          variant="tertiary"
+          size="sm"
+          onClick={onToggleEvents}
+          title={
+            showEvents
+              ? "Hide the events and pinboard entries at the top of each column"
+              : "Show each day's events and pinboard entries at the top of its column"
+          }
+        >
+          {showEvents ? "Hide events" : "Show events"}
+        </Button>
         <Button variant="secondary" size="sm" onClick={onAddTask}>
           + Task
         </Button>

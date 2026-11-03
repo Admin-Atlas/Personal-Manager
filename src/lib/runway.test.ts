@@ -270,7 +270,7 @@ describe("buildColumns", () => {
 });
 
 describe("placeCards", () => {
-  it("puts a task on its plan start, else its effective deadline, else Later", () => {
+  it("puts a task on its plan start, else its effective deadline, else on the Parked shelf", () => {
     const { model } = place([
       task({ id: 1, do_start: "2026-11-05" }),
       task({ id: 2, effective_deadline: "2026-11-10", deadline: null, deadline_from: "event" }),
@@ -283,7 +283,8 @@ describe("placeCards", () => {
       "today/background": "5",
       "tomorrow/foreground": "1",
       "next/foreground": "2 4",
-      "later/foreground": "3",
+      // No plan and no deadline: no day to sit on, so it waits with the parked ones, not in Later.
+      parked: "3",
     });
   });
 
@@ -335,10 +336,11 @@ describe("placeCards", () => {
     });
   });
 
-  it("an undated task finished today stays in Later", () => {
+  it("an undated task finished today shows in Today, counted as done there", () => {
     const today = new Date(2026, 10, 4, 15);
     const { model } = place([task({ id: 1, status: "done", completed_at: today.toISOString() })]);
-    expect(where(model)).toEqual({ "later/foreground": "1" });
+    expect(where(model)).toEqual({ "today/foreground": "1" });
+    expect(model.progress).toEqual({ done: 1, total: 1, doing: 0 });
   });
 
   it("folds two or more of a stack in one column and lane into one card, where the first is", () => {
@@ -801,7 +803,7 @@ describe("a task's linked event", () => {
 });
 
 describe("the tasks overlay", () => {
-  it("draws open tasks on their plan window, else on their deadline as due", () => {
+  it("draws each open task on one day: its plan's first, else its deadline as due", () => {
     const evs = taskOverlayEvents(
       [
         task({ id: 1, title: "Draft", do_start: "2026-11-09", do_end: "2026-11-11" }),
@@ -814,13 +816,37 @@ describe("the tasks overlay", () => {
         task({ id: 8, title: "One day", do_start: "2026-11-10", effective_deadline: "2026-11-12" }),
       ],
       new Set(["Gone"]),
+      WED,
     );
     expect(evs.map((e) => [e.id, e.calendar_id, e.summary, e.start, e.end, e.all_day])).toEqual([
-      // The window's all-day end is exclusive: to Wednesday ends on Thursday.
-      ["task:1", TASK_CALENDAR_ID, "Draft", "2026-11-09", "2026-11-12", true],
+      // A plan over three days is one chip on its first day, not a bar across all three.
+      ["task:1", TASK_CALENDAR_ID, "Draft", "2026-11-09", null, true],
       ["task:2", TASK_CALENDAR_ID, "Due: Send", "2026-11-13", null, true],
       ["task:8", TASK_CALENDAR_ID, "One day", "2026-11-10", null, true],
     ]);
     expect(evs.every((e) => e.uid === null)).toBe(true);
+  });
+
+  it("moves unfinished work on to today once its first day has passed, and leaves a deadline put", () => {
+    const evs = taskOverlayEvents(
+      [
+        // Planned Monday to Friday, not done by Wednesday: on Wednesday.
+        task({ id: 1, title: "Week job", do_start: "2026-11-02", do_end: "2026-11-06" }),
+        // Planned last week, never finished: on Wednesday too, though its plan is over.
+        task({ id: 2, title: "Overdue", do_start: "2026-10-28" }),
+        // Due yesterday with no plan: the deadline is a date, so it stays where it was due.
+        task({ id: 3, title: "Missed", effective_deadline: "2026-11-03" }),
+        // Planned for today: today.
+        task({ id: 4, title: "Today", do_start: "2026-11-04" }),
+      ],
+      new Set(),
+      new Date(2026, 10, 4, 18, 30),
+    );
+    expect(evs.map((e) => [e.id, e.summary, e.start, e.end])).toEqual([
+      ["task:1", "Week job", "2026-11-04", null],
+      ["task:2", "Overdue", "2026-11-04", null],
+      ["task:3", "Due: Missed", "2026-11-03", null],
+      ["task:4", "Today", "2026-11-04", null],
+    ]);
   });
 });

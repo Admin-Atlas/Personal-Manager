@@ -572,6 +572,43 @@ describe("TaskEditor", () => {
     expect(mocked.listProjects).not.toHaveBeenCalled();
   });
 
+  it("remembers folding Links away, so the next task opens folded, and says what's linked", async () => {
+    localStorage.clear();
+    const links = () => screen.getByRole("button", { name: /^Links \(all optional\)/ });
+    const { unmount } = render(
+      <TaskEditor
+        open
+        task={task({ project_name: "Home", event_uid: "uid-demo" })}
+        onClose={() => {}}
+      />,
+    );
+    expect(links().getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(links());
+    expect(links().getAttribute("aria-expanded")).toBe("false");
+    expect(links().textContent).toContain("project, event");
+    unmount();
+
+    render(<TaskEditor open onClose={() => {}} />);
+    expect(links().getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(links());
+    expect(links().getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByLabelText("Milestone")).toBeTruthy();
+    localStorage.clear();
+  });
+
+  it("says what a stack is until one is picked", async () => {
+    render(<TaskEditor open onClose={() => {}} />);
+    expect(screen.getByText(/Group tasks that belong to one job/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Stack"), { target: { value: "new" } });
+    expect(screen.queryByText(/Group tasks that belong to one job/)).toBeNull();
+    const kind = screen.getByLabelText("How its tasks relate") as HTMLSelectElement;
+    expect([...kind.options].map((o) => o.textContent)).toEqual([
+      "In sequence: each step waits for the one before",
+      "In order: a suggested order, nothing waits",
+      "Waiting on someone: stuck until someone else does their part",
+    ]);
+  });
+
   it("renders nothing while closed", () => {
     render(<TaskEditor open={false} onClose={() => {}} />);
     expect(screen.queryByRole("dialog")).toBeNull();

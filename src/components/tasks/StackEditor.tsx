@@ -13,7 +13,7 @@
 import { useId, useState } from "react";
 import { deleteTaskStack, updateTaskStack } from "../../lib/ipc";
 import { runMutation } from "../../lib/runMutation";
-import { STACK_KIND_LABEL, STACK_KINDS } from "../../lib/tasks";
+import { STACK_KIND_LABEL, STACK_KINDS, stackKindOption } from "../../lib/tasks";
 import type { TaskStack, TaskStackKind } from "../../lib/types";
 import { Button, Callout, ConfirmDialog, Dialog, Input, Select, Textarea } from "../ui";
 
@@ -142,7 +142,7 @@ function StackEditorBody({
             >
               {STACK_KINDS.map((k) => (
                 <option key={k} value={k}>
-                  {STACK_KIND_LABEL[k]}
+                  {stackKindOption(k)}
                 </option>
               ))}
             </Select>

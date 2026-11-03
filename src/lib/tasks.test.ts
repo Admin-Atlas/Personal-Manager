@@ -19,7 +19,10 @@ import {
   filterEventChoices,
   isOpen,
   nextStatus,
+  readTaskSort,
+  sortTasks,
   STACK_KIND_LABEL,
+  stackKindOption,
   stackTooltip,
   taskToInput,
   TONE_CLASS,
@@ -168,10 +171,18 @@ describe("isOpen and compareTasks", () => {
 describe("STACK_KIND_LABEL", () => {
   it("names every stack kind", () => {
     expect(STACK_KIND_LABEL).toEqual({
-      sequential: "In sequence: each one gates the next",
+      sequential: "In sequence",
       in_order: "In order",
       waiting_on: "Waiting on someone",
     });
+  });
+
+  it("says what each kind means where you pick one", () => {
+    expect(stackKindOption("sequential")).toBe("In sequence: each step waits for the one before");
+    expect(stackKindOption("in_order")).toBe("In order: a suggested order, nothing waits");
+    expect(stackKindOption("waiting_on")).toBe(
+      "Waiting on someone: stuck until someone else does their part",
+    );
   });
 
   it("puts the stack's note in its chip tooltip", () => {
@@ -357,5 +368,77 @@ describe("deadlineKindOf", () => {
     expect(deadlineKindOf({ ...t, deadline_from: "event" })).toBe("hard");
     // A link that can't resolve hands the deadline back to the own date, and its kind with it.
     expect(deadlineKindOf({ ...t, deadline_from: "event", deadline_missing: true })).toBe("soft");
+  });
+});
+
+describe("sortTasks", () => {
+  const list = [
+    task({ id: 1, title: "banana", ordinal: 2, created_at: "2026-11-02T00:00:00Z" }),
+    task({
+      id: 2,
+      title: "Apple",
+      ordinal: 0,
+      do_start: "2026-11-09",
+      effective_deadline: "2026-11-06",
+      created_at: "2026-11-03T00:00:00Z",
+    }),
+    task({
+      id: 3,
+      title: "cherry 10",
+      ordinal: 1,
+      do_start: "2026-11-05",
+      created_at: "2026-11-01T00:00:00Z",
+    }),
+    task({
+      id: 4,
+      title: "Cherry 9",
+      ordinal: 3,
+      effective_deadline: "2026-11-20",
+      created_at: "2026-11-04T00:00:00Z",
+    }),
+  ];
+  const ids = (by: Parameters<typeof sortTasks>[1]["by"], desc = false) =>
+    sortTasks(list, { by, desc }).map((t) => t.id);
+
+  it("keeps the global order under My order, or turns it upside down", () => {
+    expect(ids("manual")).toEqual([2, 3, 1, 4]);
+    expect(ids("manual", true)).toEqual([4, 1, 3, 2]);
+  });
+
+  it("sorts titles A to Z ignoring case, with numbers in number order, and back", () => {
+    expect(ids("alpha")).toEqual([2, 1, 4, 3]);
+    expect(ids("alpha", true)).toEqual([3, 4, 1, 2]);
+  });
+
+  it("sorts by the sooner of plan and deadline, keeping undated last either way", () => {
+    // Apple: plan 09, due 06 → 06. Cherry 10: plan 05. Cherry 9: due 20. Banana: no date.
+    expect(ids("nearest")).toEqual([3, 2, 4, 1]);
+    expect(ids("nearest", true)).toEqual([4, 2, 3, 1]);
+  });
+
+  it("sorts by the deadline alone, with no deadline last", () => {
+    expect(ids("deadline")).toEqual([2, 4, 3, 1]);
+    expect(ids("deadline", true)).toEqual([4, 2, 3, 1]);
+  });
+
+  it("sorts by when each was added, oldest or newest first", () => {
+    expect(ids("added")).toEqual([3, 1, 2, 4]);
+    expect(ids("added", true)).toEqual([4, 2, 1, 3]);
+  });
+
+  it("leaves its input alone", () => {
+    const before = list.map((t) => t.id);
+    sortTasks(list, { by: "alpha", desc: true });
+    expect(list.map((t) => t.id)).toEqual(before);
+  });
+});
+
+describe("readTaskSort", () => {
+  it("reads a stored sort, and anything it doesn't know as My order", () => {
+    expect(readTaskSort({ by: "nearest", desc: true })).toEqual({ by: "nearest", desc: true });
+    expect(readTaskSort({ by: "alpha" })).toEqual({ by: "alpha", desc: false });
+    expect(readTaskSort({ by: "priority", desc: true })).toEqual({ by: "manual", desc: false });
+    expect(readTaskSort(undefined)).toEqual({ by: "manual", desc: false });
+    expect(readTaskSort("alpha")).toEqual({ by: "manual", desc: false });
   });
 });

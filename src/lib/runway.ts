@@ -366,9 +366,11 @@ export function planDay(t: Task): string | null {
 
 /** Where every task and milestone sits on the Runway.
  *
- *  - Archived projects' tasks and milestones are left off; parked open tasks go to `parked`.
- *  - A task sits on its plan start, else its effective deadline; with neither, in Later. A plan
- *    window that matches a window column exactly sits in that window.
+ *  - Archived projects' tasks and milestones are left off. Parked open tasks go to `parked`, and so
+ *    does an open task with no date at all (no plan, no deadline): it has no day to sit on, and
+ *    Later is for work planned past next week, not for work never planned.
+ *  - A task sits on its plan start, else its effective deadline. A plan window that matches a
+ *    window column exactly sits in that window.
  *  - An open task whose day has passed rolls into today's column (`rolled`, saying whether the day
  *    was its plan or its deadline), unless its plan window still runs through today, when it simply
  *    sits in today's column. A plan window matching a window's real dates sits in that window even
@@ -387,9 +389,7 @@ export function placeCards(input: PlaceInput): RunwayModel {
   const t0 = startOfDay(input.today);
   const tk = dayKey(t0);
   const floor = dayKey(addDays(t0, -PAST_DAYS));
-  const byId = new Map(columns.map((c) => [c.id, c]));
   const todayCol = columns.find((c) => c.today) ?? columnForDay(columns, tk);
-  const later = byId.get(LATER_COLUMN_ID) ?? todayCol;
   const past = columns.find((c) => c.kind === "past") ?? null;
   const stackById = new Map(stacks.map((s) => [s.id, s]));
 
@@ -434,7 +434,8 @@ export function placeCards(input: PlaceInput): RunwayModel {
   sortedTasks.forEach((t, rank) => {
     if (archivedTask(t, archived)) return;
     const open = isOpen(t);
-    if (open && t.parked) {
+    const day = planDay(t);
+    if (open && (t.parked || day === null)) {
       const c: RunwayTaskCard = {
         kind: "task",
         task: t,
@@ -446,7 +447,6 @@ export function placeCards(input: PlaceInput): RunwayModel {
       joinStack({ card: c, columnId: null });
       return;
     }
-    const day = planDay(t);
     const lane = t.lane;
     const card = (rolledBy: "plan" | "deadline" | null = null, daysAgo = 0): Placed => ({
       card: { kind: "task", task: t, rolled: rolledBy !== null, daysAgo, rolledBy },
@@ -455,12 +455,14 @@ export function placeCards(input: PlaceInput): RunwayModel {
     let col: RunwayColumn | null | undefined;
     let placed: Placed;
     if (day === null) {
-      const finished = open ? null : dayOf(completedDay(t.completed_at));
+      // Done, and undated (open undated tasks are parked above): on the day it was finished, so
+      // ticking one off the shelf counts as done today, then "Before today".
+      const finished = dayOf(completedDay(t.completed_at));
       if (finished !== null && finished < tk) {
         if (finished < floor) return;
         col = past;
       } else {
-        col = later;
+        col = todayCol;
       }
       placed = card();
     } else if (day < tk) {
@@ -814,41 +816,41 @@ export function linkedEvent(
   return next?.ev ?? last?.ev ?? null;
 }
 
-/** The task overlay on the calendar's grids and list (PA-1): one all-day event per open, unparked
- *  task of a live project, on its plan window, or with none on its effective deadline ("Due: …");
- *  a task with neither isn't drawn. Ids are `task:<id>`, on the `pm:tasks` pseudo-calendar. */
+/** The task overlay on the calendar's grids and list (PA-1): one all-day chip per open, unparked
+ *  task of a live project, on ONE day, never a bar across its plan window. The day is the plan's
+ *  first day; once that has passed and the task isn't done, it's today, so unfinished work moves on
+ *  a day at a time rather than leaving a stripe over days already gone. A task with no plan shows
+ *  on its effective deadline as "Due: …", which stays put; one with neither isn't drawn. Ids are
+ *  `task:<id>`, on the `pm:tasks` pseudo-calendar. */
 export function taskOverlayEvents(
   tasks: readonly Task[],
   archived: ReadonlySet<string>,
+  today: Date,
 ): CalendarEvent[] {
+  const tk = dayKey(startOfDay(today));
   const out: CalendarEvent[] = [];
   for (const t of [...tasks].sort(compareTasks)) {
     if (!isOpen(t) || t.parked || archivedTask(t, archived)) continue;
     const start = dayOf(t.do_start);
-    const end = dayOf(t.do_end);
     const due = dayOf(t.effective_deadline);
-    let first: string;
-    let last: string | null = null;
+    let on: string;
     let summary = t.title;
     if (start) {
-      first = start;
-      if (end && end > start) last = end;
+      on = start < tk ? tk : start;
     } else if (due) {
-      first = due;
+      on = due;
       summary = `Due: ${t.title}`;
     } else {
       continue;
     }
-    const lastDay = last ? parseLocal(last, true) : null;
     out.push({
       id: `task:${t.id}`,
       calendar_id: TASK_CALENDAR_ID,
       summary,
       description: null,
       location: null,
-      start: first,
-      // An all-day end is exclusive: a window to Friday ends on Saturday.
-      end: lastDay ? dayKey(addDays(lastDay, 1)) : null,
+      start: on,
+      end: null,
       all_day: true,
       html_link: null,
       uid: null,
