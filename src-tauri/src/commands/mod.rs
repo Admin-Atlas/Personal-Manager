@@ -26,6 +26,7 @@ mod prefs;
 mod reader;
 mod shared;
 mod spend;
+mod tasks;
 // Not re-exported: the DB-transaction ⊕ vault-file tail is machinery for the
 // modules above, never a command, and `super::vault_writes::…` is how they name it.
 mod vault_writes;
@@ -46,6 +47,7 @@ pub use organise::*;
 pub use prefs::*;
 pub use reader::*;
 pub use spend::*;
+pub use tasks::*;
 pub use vaults::*;
 
 // `resolve_zone` is called from `flags`, `milestones` and `projects` as

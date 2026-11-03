@@ -128,6 +128,7 @@ mod spreadsheets;
 /// ONE-TIME cleanup, removed in the release after this one — see the module docs and card #651.
 mod sweep;
 mod tags;
+mod tasks;
 mod tray;
 mod update_delivery;
 mod vault;
@@ -1782,6 +1783,18 @@ pub fn run() {
             commands::answer_feedback,
             commands::delete_milestone,
             commands::reorder_milestones,
+            commands::list_tasks,
+            commands::add_task,
+            commands::update_task,
+            commands::plan_task,
+            commands::change_task_status,
+            commands::reorder_tasks,
+            commands::delete_task,
+            commands::import_checklist_tasks,
+            commands::list_task_stacks,
+            commands::add_task_stack,
+            commands::update_task_stack,
+            commands::delete_task_stack,
             commands::calendar_overview,
             commands::request_calendar_access,
             commands::set_calendar_selected,

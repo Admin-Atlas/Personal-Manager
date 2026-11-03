@@ -32,10 +32,29 @@ export function isPinboardEvent(ev: CalendarEvent): boolean {
   return ev.calendar_id === PINBOARD_CALENDAR_ID;
 }
 
-/** True for any first-party PM overlay event (a milestone or a pinboard entry). A click on one jumps
- *  to where it lives (its project, or the Pinboard); a click on a synced event opens its details. */
+/** The pseudo-calendar carrying the tasks overlay (PA-1): open tasks, on their plan window or, with
+ *  none, on their deadline. Injected by CalendarView from the one global task list, toggled like a
+ *  calendar via the same `hidden` set, and never written to any calendar. Their `id` is
+ *  `task:<task id>`; a click opens the task editor. */
+export const TASK_CALENDAR_ID = "pm:tasks";
+
+/** True for a synthetic task event (vs a real synced event). */
+export function isTaskEvent(ev: CalendarEvent): boolean {
+  return ev.calendar_id === TASK_CALENDAR_ID;
+}
+
+/** The task id a task overlay event stands for, or null for any other event. */
+export function taskIdOfEvent(ev: CalendarEvent): number | null {
+  if (!isTaskEvent(ev) || !ev.id.startsWith("task:")) return null;
+  const id = Number(ev.id.slice("task:".length));
+  return Number.isInteger(id) ? id : null;
+}
+
+/** True for any first-party PM overlay event (a milestone, a pinboard entry or a task). A click on
+ *  one jumps to where it lives (its project, the Pinboard, the task editor); a click on a synced
+ *  event opens its details. None of them can be dragged on the grid (`dragCapability`). */
 export function isOverlayEvent(ev: CalendarEvent): boolean {
-  return isMilestoneEvent(ev) || isPinboardEvent(ev);
+  return isMilestoneEvent(ev) || isPinboardEvent(ev) || isTaskEvent(ev);
 }
 
 // --- the new event's ghost (#884, C10c) ---------------------------------------------------------------

@@ -6,7 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::error::{Error, Result};
 use crate::ingest;
@@ -131,6 +131,7 @@ fn rewrite_after_project_rekey(
 /// documents to the new canonical name (the payoff of identity-not-name).
 #[tauri::command]
 pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> Result<()> {
+    let notify = app.clone();
     spawn_entity_mutation(
         app,
         move |tx, vault, cipher, vault_root, manifest_cipher, files| {
@@ -156,7 +157,15 @@ pub async fn rename_entity(app: AppHandle, entity_id: i64, new_name: String) -> 
             )
         },
     )
-    .await
+    .await?;
+    tasks_changed(&notify);
+    Ok(())
+}
+
+/// A rename, merge or delete re-keys or unlinks the project's tasks, so the open task views
+/// re-read. Called once the mutation has committed and released the guard.
+fn tasks_changed(app: &AppHandle) {
+    let _ = app.emit(crate::tasks::TASKS_CHANGED, ());
 }
 
 /// What a project merge will move — the honest, computed preview behind the type-to-confirm
@@ -171,6 +180,8 @@ pub struct MergePreview {
     pub files: i64,
     pub milestones: i64,
     pub chats: i64,
+    /// Tasks linked to the project; they move with it.
+    pub tasks: i64,
     /// The target's canonical name, resolved through the alias table. This is what the source's
     /// documents end up filed under, so it is also the string the user must type to confirm —
     /// typing the alias they happened to click would confirm a name that never appears again.
@@ -206,8 +217,9 @@ fn resolve_merge_pair(conn: &Connection, from: &str, into: &str) -> Result<(i64,
 }
 
 /// What a project holds, counted from the rows an operation will actually touch: documents by
-/// `entity_id`, milestones and chats by project *name*. Shared by the merge and delete previews so
-/// the two can never quote different numbers for the same project.
+/// `entity_id`, milestones, chats and tasks by project *name*. Shared by the merge and delete
+/// previews so the two can never quote different numbers for the same project. Returns
+/// `(files, chats, milestones, tasks)`.
 ///
 /// `files` EXCLUDES chat documents — a chat is a `documents` row too, so a raw count would report
 /// every chat twice in the one sentence a user reads before an irreversible action.
@@ -215,7 +227,7 @@ fn project_content_counts(
     conn: &Connection,
     entity_id: i64,
     canonical: &str,
-) -> Result<(i64, i64, i64)> {
+) -> Result<(i64, i64, i64, i64)> {
     let files: i64 = conn.query_row(
         "SELECT COUNT(*) FROM documents \
          WHERE entity_id = ?1 AND COALESCE(source_type,'') <> 'chat'",
@@ -232,7 +244,8 @@ fn project_content_counts(
         params![canonical],
         |r| r.get(0),
     )?;
-    Ok((files, chats, milestones))
+    let tasks = crate::tasks::count_for_project(conn, canonical)?;
+    Ok((files, chats, milestones, tasks))
 }
 
 /// Count what merging `from` into `into` would move. Read-only; safe to call on every keystroke
@@ -246,11 +259,13 @@ pub fn merge_project_preview(
     let conn = state.conn()?;
     let (from_id, _, into_canonical) = resolve_merge_pair(&conn, &from, &into)?;
     let from_canonical = entities::canonical_name(&conn, from_id)?;
-    let (files, chats, milestones) = project_content_counts(&conn, from_id, &from_canonical)?;
+    let (files, chats, milestones, tasks) =
+        project_content_counts(&conn, from_id, &from_canonical)?;
     Ok(MergePreview {
         files,
         milestones,
         chats,
+        tasks,
         into_canonical,
     })
 }
@@ -272,6 +287,7 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
         let conn = state.conn()?;
         resolve_merge_pair(&conn, &from, &into)?;
     }
+    let notify = app.clone();
     spawn_entity_mutation(
         app,
         move |tx, vault, cipher, vault_root, manifest_cipher, files| {
@@ -297,7 +313,9 @@ pub async fn merge_projects(app: AppHandle, from: String, into: String) -> Resul
             )
         },
     )
-    .await
+    .await?;
+    tasks_changed(&notify);
+    Ok(())
 }
 
 // --- deleting a project (#573) --------------------------------------------------------------
@@ -352,6 +370,8 @@ pub struct DeletePreview {
     pub files: i64,
     pub chats: i64,
     pub milestones: i64,
+    /// Tasks linked to the project. They are kept, without a project (the FK's ON DELETE SET NULL).
+    pub tasks: i64,
     pub canonical: String,
 }
 
@@ -382,11 +402,12 @@ pub fn delete_project_preview(
 ) -> Result<DeletePreview> {
     let conn = state.conn()?;
     let (id, canonical) = resolve_deletable_project(&conn, &project)?;
-    let (files, chats, milestones) = project_content_counts(&conn, id, &canonical)?;
+    let (files, chats, milestones, tasks) = project_content_counts(&conn, id, &canonical)?;
     Ok(DeletePreview {
         files,
         chats,
         milestones,
+        tasks,
         canonical,
     })
 }
@@ -394,7 +415,10 @@ pub fn delete_project_preview(
 /// Delete a project, disposing of its contents as the user chose (#573).
 ///
 /// **Milestones are always destroyed** — there is nowhere sensible to move a dated milestone whose
-/// project no longer exists, so the UI warns instead of offering a choice.
+/// project no longer exists, so the UI warns instead of offering a choice. **Tasks are always
+/// kept**, without a project: they are the user's to-dos, and `tasks.project_name`'s ON DELETE SET
+/// NULL unlinks them when the triage row goes (a task linked to one of the milestones loses that
+/// link the same way).
 ///
 /// Ordering is load-bearing throughout, and each step exists because of a specific way this goes
 /// wrong; see the inline notes. The whole thing runs inside `spawn_entity_mutation`, which is not
@@ -414,6 +438,7 @@ pub async fn delete_project(
         let conn = state.conn()?;
         resolve_deletable_project(&conn, &project)?;
     }
+    let notify = app.clone();
     spawn_entity_mutation(
         app,
         move |tx, vault, cipher, vault_root, manifest_cipher, out| {
@@ -620,7 +645,9 @@ pub async fn delete_project(
             Ok(())
         },
     )
-    .await
+    .await?;
+    tasks_changed(&notify);
+    Ok(())
 }
 
 /// Merge `from_id` into `into_id`: fold aliases, repoint every document, rewrite their frontmatter
@@ -628,6 +655,7 @@ pub async fn delete_project(
 /// the variant pain in one move and stops it recurring.
 #[tauri::command]
 pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Result<()> {
+    let notify = app.clone();
     spawn_entity_mutation(
         app,
         move |tx, vault, cipher, vault_root, manifest_cipher, files| {
@@ -653,7 +681,9 @@ pub async fn merge_entities(app: AppHandle, from_id: i64, into_id: i64) -> Resul
             )
         },
     )
-    .await
+    .await?;
+    tasks_changed(&notify);
+    Ok(())
 }
 
 // --- personal assistant: projects & focus view (Step 5) ---

@@ -25,6 +25,7 @@ import type {
   GuestNotice,
   Milestone,
   NewEventDraft,
+  Task,
   WriteOutcome,
 } from "../../lib/types";
 import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-layout";
@@ -58,6 +59,20 @@ const ipc = vi.hoisted(() => ({
   requestCalendarAccess: vi.fn(),
   recurrencePresets: vi.fn(),
   describeRecurrence: vi.fn(),
+  // The tasks the Runway and the tasks overlay read (PA-1/PA-2), and what the task editor and the
+  // Runway write through.
+  listTasks: vi.fn(),
+  listTaskStacks: vi.fn(),
+  listArchivedProjects: vi.fn(),
+  onTasksChanged: vi.fn(),
+  planTask: vi.fn(),
+  reorderTasks: vi.fn(),
+  changeTaskStatus: vi.fn(),
+  addTask: vi.fn(),
+  updateTask: vi.fn(),
+  deleteTask: vi.fn(),
+  addTaskStack: vi.fn(),
+  listProjects: vi.fn(),
 }));
 // What the views and the header are shown: the System, the hidden calendars, and what the Year view
 // was handed (it lays nothing out without a measured pane, so it's a stand-in that keeps its events).
@@ -192,6 +207,9 @@ let held = false;
 let rows: CalendarEvent[] = [standup];
 // What the backend's "a write landed" event calls.
 let writeLanded: () => void = () => {};
+// The global task list as the backend holds it, and what its "tasks changed" event calls.
+let tasks: Task[] = [];
+let tasksChanged: () => void = () => {};
 
 // jsdom ships no ResizeObserver; the box and the pickers' popovers build one.
 beforeAll(() => {
@@ -208,6 +226,8 @@ beforeEach(() => {
   vi.resetModules();
   localStorage.clear();
   localStorage.setItem("pm.calendar.view", "agenda");
+  // The Agenda opens on the Runway; these suites read its dated list. The Runway's own are below.
+  localStorage.setItem("pm.calendar.agendaMode", "list");
   env.system = "slate";
   env.hidden = new Set();
   env.yearEvents = null;
@@ -230,6 +250,18 @@ beforeEach(() => {
   ipc.eventFlags.mockResolvedValue([]);
   // The Repeat row in quick create and the full editor: no ready-made rules, so just its own rows.
   ipc.recurrencePresets.mockResolvedValue([]);
+  tasks = [];
+  ipc.listTasks.mockImplementation(() => Promise.resolve(tasks));
+  ipc.listTaskStacks.mockResolvedValue([]);
+  ipc.listArchivedProjects.mockResolvedValue([]);
+  ipc.onTasksChanged.mockImplementation((cb: () => void) => {
+    tasksChanged = cb;
+    return Promise.resolve(() => {});
+  });
+  ipc.planTask.mockResolvedValue(undefined);
+  ipc.reorderTasks.mockResolvedValue(undefined);
+  ipc.changeTaskStatus.mockResolvedValue(undefined);
+  ipc.listProjects.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -1367,5 +1399,108 @@ describe("CalendarView: asking a calendar's owner for edit access", () => {
     fireEvent.click(chip());
     const dialog = await screen.findByRole("dialog", { name: "Standup" });
     expect(within(dialog).queryByRole("button", { name: /^Ask / })).toBeNull();
+  });
+});
+
+// Tasks on the Calendar tab (PA-1/PA-2): the Agenda opens on the Runway, the header switches it to
+// the dated list and back, open tasks ride the grids and the list as their own overlay (hidden like
+// a calendar), a click on one opens the task editor, and any task write anywhere redraws them.
+describe("CalendarView: tasks", () => {
+  const task = (over: Partial<Task>): Task => ({
+    id: 1,
+    title: "Draft the deck",
+    why: null,
+    project_name: null,
+    project_archived: false,
+    milestone_id: null,
+    event_uid: null,
+    do_start: today,
+    do_end: null,
+    deadline: null,
+    deadline_kind: "hard",
+    deadline_from: "date",
+    effective_deadline: null,
+    deadline_missing: false,
+    milestone_label: null,
+    event_title: null,
+    status: "todo",
+    completed_at: null,
+    lane: "foreground",
+    stack_id: null,
+    parked: false,
+    ordinal: 0,
+    source: "user",
+    created_at: "2026-11-01T00:00:00Z",
+    updated_at: "2026-11-01T00:00:00Z",
+    ...over,
+  });
+
+  it("opens the Agenda on the Runway, and the header switches it to the list and back", async () => {
+    localStorage.removeItem("pm.calendar.agendaMode");
+    tasks = [task({})];
+    const View = (await import("./CalendarView")).CalendarView;
+    render(<View />);
+    const board = await screen.findByRole("region", { name: "Today" });
+    expect(within(board).getByText("Draft the deck")).toBeTruthy();
+    expect(document.querySelector('[data-help="calendar-runway"]')).not.toBeNull();
+    // The Runway runs from today: no paging.
+    expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
+    expect(screen.getByText("From today")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "List" }));
+    await screen.findByRole("button", { name: /Standup/ });
+    expect(document.querySelector('[data-help="calendar-runway"]')).toBeNull();
+    expect(localStorage.getItem("pm.calendar.agendaMode")).toBe("list");
+    fireEvent.click(screen.getByRole("button", { name: "Runway" }));
+    await screen.findByRole("region", { name: "Today" });
+    expect(localStorage.getItem("pm.calendar.agendaMode")).toBe("runway");
+  });
+
+  it("draws an open task in the list, and a click on it opens the task editor", async () => {
+    tasks = [task({})];
+    await mount();
+    fireEvent.click(await screen.findByRole("button", { name: /Draft the deck/ }));
+    const editor = await screen.findByRole("dialog", { name: "Edit task" });
+    expect(within(editor).getByLabelText<HTMLInputElement>("Title").value).toBe("Draft the deck");
+    // Not an event: no event details opened, no calendar write wired.
+    expect(screen.queryByRole("dialog", { name: "Draft the deck" })).toBeNull();
+  });
+
+  it("draws a task with only a deadline as due, and leaves done and parked ones off", async () => {
+    tasks = [
+      task({ id: 1, title: "Send it", do_start: null, effective_deadline: today }),
+      task({ id: 2, title: "Finished", status: "done" }),
+      task({ id: 3, title: "Someday", parked: true }),
+    ];
+    await mount();
+    expect(await screen.findByRole("button", { name: /Due: Send it/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Finished/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Someday/ })).toBeNull();
+  });
+
+  it("hides the overlay with the Tasks calendar hidden", async () => {
+    tasks = [task({})];
+    env.hidden = new Set(["pm:tasks"]);
+    await mount();
+    expect(screen.queryByRole("button", { name: /Draft the deck/ })).toBeNull();
+  });
+
+  it("reads the tasks again when any task changes", async () => {
+    await mount();
+    expect(screen.queryByRole("button", { name: /Draft the deck/ })).toBeNull();
+    tasks = [task({})];
+    await act(async () => tasksChanged());
+    expect(await screen.findByRole("button", { name: /Draft the deck/ })).toBeTruthy();
+  });
+
+  it("the Terminal look runs the Runway as text, and its strip says so", async () => {
+    localStorage.removeItem("pm.calendar.agendaMode");
+    env.system = "terminal";
+    tasks = [task({})];
+    const View = (await import("./CalendarView")).CalendarView;
+    render(<View />);
+    await screen.findByText("Draft the deck");
+    expect(screen.getByText("cal --runway")).toBeTruthy();
+    expect(screen.getByText("── Today ──")).toBeTruthy();
   });
 });

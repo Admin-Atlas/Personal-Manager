@@ -26,6 +26,7 @@ import {
   FOLDER_H,
   FOLDER_W,
   minSize,
+  rectsOverlap,
   reflowToWidth,
   resolveDrop,
   ROWS,
@@ -65,15 +66,19 @@ function makeId(): string {
   }
 }
 
+/** Every kind this build can draw. A widget of any other kind is one a NEWER build made. */
+const KNOWN_KINDS: readonly string[] = ["note", "timeline", "folder", "tasklist"];
+
 /** A widget is only usable if it has an id, a known kind, and a fully-numeric rect — the
  *  view dereferences `w.rect.x` unconditionally while rendering, and there's no error
  *  boundary, so one malformed entry would white-screen the app. Validate per-widget, not
- *  just the top-level shape. */
-function isValidWidget(w: unknown): w is Widget {
-  if (!w || typeof w !== "object") return false;
+ *  just the top-level shape. Returns the widget to keep (a folder may come back with fewer
+ *  children), or null to drop it. */
+function validWidget(w: unknown): Widget | null {
+  if (!w || typeof w !== "object") return null;
   const x = w as Record<string, unknown>;
-  if (typeof x.id !== "string") return false;
-  if (x.kind !== "note" && x.kind !== "timeline" && x.kind !== "folder") return false;
+  if (typeof x.id !== "string") return null;
+  if (typeof x.kind !== "string" || !KNOWN_KINDS.includes(x.kind)) return null;
   const r = x.rect as Record<string, unknown> | undefined;
   const rectOk =
     !!r &&
@@ -81,17 +86,23 @@ function isValidWidget(w: unknown): w is Widget {
     typeof r.y === "number" &&
     typeof r.w === "number" &&
     typeof r.h === "number";
-  if (!rectOk) return false;
+  if (!rectOk) return null;
   if (x.kind === "folder") {
-    // Children must be an array of valid, NON-folder widgets (folders never nest). A single
-    // malformed child fails the whole folder rather than white-screening the app on render —
-    // there's no error boundary, and the view dereferences child fields unconditionally.
-    return (
-      Array.isArray(x.children) &&
-      x.children.every((c) => isValidWidget(c) && (c as Widget).kind !== "folder")
-    );
+    if (!Array.isArray(x.children)) return null;
+    // A folder keeps its valid, NON-folder children (folders never nest) and drops the rest, rather
+    // than failing as a whole. It used to fail as a whole, which is safe against a white screen but
+    // loses every note in the folder to one child this build can't read — a kind a newer build added,
+    // say. Since the next write sends the whole board, that loss would be permanent. So: the folder
+    // survives if anything valid is left in it, or if it was empty to begin with (an empty folder is
+    // a real thing the user made). A folder whose every child is unreadable still goes, because there
+    // is nothing of it left to show.
+    const kids = x.children
+      .map(validWidget)
+      .filter((c): c is Widget => c !== null && c.kind !== "folder");
+    if (kids.length === 0 && x.children.length > 0) return null;
+    return { ...(x as unknown as Widget), children: kids };
   }
-  return true;
+  return x as unknown as Widget;
 }
 
 /** Apply `fn` to the widget with `id` wherever it lives — top-level or a folder child. Folders
@@ -107,6 +118,16 @@ function mapWidget(widgets: Widget[], id: string, fn: (w: Widget) => Widget): Wi
   });
 }
 
+/** The kind of the widget with `id`, top-level or a folder child (depth-1, as {@link mapWidget}). */
+function kindOf(widgets: Widget[], id: string): Widget["kind"] | undefined {
+  for (const w of widgets) {
+    if (w.id === id) return w.kind;
+    const child = w.children?.find((c) => c.id === id);
+    if (child) return child.kind;
+  }
+  return undefined;
+}
+
 /** A generous absolute cap (cells) so a corrupt/hand-edited pref can't blow the board up to a
  *  pathological size, while still dwarfing any real (even multi-monitor) layout. */
 const MAX_BOARD_CELLS = 512;
@@ -120,7 +141,7 @@ function parseBoard(raw: string | null, cols: number, rows: number): Board {
     if (!parsed || parsed.version !== BOARD_VERSION || !Array.isArray(parsed.widgets)) {
       return EMPTY_BOARD;
     }
-    const valid = parsed.widgets.filter(isValidWidget);
+    const valid = parsed.widgets.map(validWidget).filter((w): w is Widget => w !== null);
     // The board is a FIXED-WIDTH canvas = `cols` (the window) and grows only downward; give it a
     // generous vertical cap so widgets that overhang the width wrap onto new rows (the board scrolls)
     // rather than piling up. `rows` is the caller's generous vertical extent (≈ the screen height).
@@ -186,7 +207,7 @@ function weighBoard(b: Board): number {
 
 /** How a widget patch should be recorded. The default is one undo step per change; the exceptions are
  *  the changes that reach past the board. */
-function commitForPatch(id: string, patch: Partial<Widget>): CommitKind {
+function commitForPatch(id: string, patch: Partial<Widget>, kind?: Widget["kind"]): CommitKind {
   // Ingest metadata mirrors a REAL vault document, which undo cannot delete. Rolling these fields
   // back would only make the note lie about whether it had been filed.
   if ("ingestedAt" in patch || "ingestedHash" in patch) return { mode: "silent" };
@@ -202,7 +223,12 @@ function commitForPatch(id: string, patch: Partial<Widget>): CommitKind {
   // No board snapshot can retract them, and restoring the freeform entries they were made from would
   // draw both on the calendar — so a link is where the board's history honestly ends. (Unlinking
   // writes nothing, so it stays an ordinary, undoable step.)
-  if ("project" in patch && patch.project !== undefined) return { mode: "barrier" };
+  //
+  // A task list's `project` is only its filter — choosing one writes nothing anywhere — so for that
+  // kind it is an ordinary step, and Ctrl+Z puts the old filter back.
+  if (kind !== "tasklist" && "project" in patch && patch.project !== undefined) {
+    return { mode: "barrier" };
+  }
   // Typing is grouped so one Ctrl+Z doesn't take a single character — keyed per widget and per field
   // so two notes, or a title and a body, never merge into each other.
   if ("text" in patch) return { mode: "push", key: `text:${id}` };
@@ -371,6 +397,48 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
     return id;
   }, [change]);
 
+  /** A Task list card (PA-1): a live view of the global task list, filtered to `project` (unset →
+   *  every task). The card stores only that filter; the tasks themselves live in the backend.
+   *
+   *  `near` places it beside that rect — right of it, else below it — when the spot is clear, so a
+   *  note turned into a task list gets its list next to it; otherwise it takes the first free slot.
+   *
+   *  `fromConversion` records it as a history BARRIER, the same reason a timeline's project link is
+   *  one: "Make this a task list" has already written real task rows before this card lands, and no
+   *  board snapshot can take them back. An undo that removed the card would leave the tasks, and
+   *  invite a second conversion that only finds them all "already there". */
+  const addTaskList = useCallback(
+    (project?: string, near?: Rect, fromConversion = false) => {
+      const id = makeId();
+      change(
+        (b) => {
+          const { cols, rows } = boundsRef.current;
+          const W = 9;
+          const H = 8;
+          const clear = (r: Rect) =>
+            r.x >= 0 &&
+            r.y >= 0 &&
+            r.x + r.w <= cols &&
+            !b.widgets.some((w) => rectsOverlap(r, w.rect));
+          const beside = near
+            ? [
+                { x: near.x + near.w, y: near.y, w: W, h: H },
+                // Below may run past the window's rows: the board grows downward to hold it.
+                { x: near.x, y: near.y + near.h, w: W, h: H },
+              ].find(clear)
+            : undefined;
+          const rect = beside ?? findFreeRect(b.widgets, W, H, cols, rows);
+          const widget: Widget = { id, kind: "tasklist", rect, title: "" };
+          if (project !== undefined) widget.project = project;
+          return { ...b, widgets: [...b.widgets, widget] };
+        },
+        fromConversion ? { mode: "barrier" } : { mode: "push" },
+      );
+      return id;
+    },
+    [change],
+  );
+
   /** An EMPTY folder, made on purpose. Nothing auto-dissolves it: it lives until the user ungroups
    *  it, so it can sit there waiting to be filled. `children: []` is not optional — `isValidWidget`
    *  silently drops a folder whose `children` isn't an array, which would lose it on the next load. */
@@ -401,7 +469,7 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
     (id: string, patch: Partial<Widget>) => {
       change(
         (b) => ({ ...b, widgets: mapWidget(b.widgets, id, (w) => ({ ...w, ...patch })) }),
-        commitForPatch(id, patch),
+        commitForPatch(id, patch, kindOf(boardRef.current.widgets, id)),
       );
     },
     [change],
@@ -661,6 +729,7 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
     addNote,
     addTimeline,
     addFolder,
+    addTaskList,
     updateWidget,
     moveWidget,
     dropWidget,

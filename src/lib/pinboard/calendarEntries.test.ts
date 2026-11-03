@@ -68,6 +68,26 @@ describe("pinboardEntries — freeform timeline entries for the calendar overlay
     ]);
   });
 
+  it("draws nothing for a task list — tasks reach the calendar through their own overlay", () => {
+    // The card holds only a filter; its tasks are backend rows, drawn by the Tasks overlay. Lifting
+    // anything from the card here would double-draw them, so a task list contributes nothing, at
+    // the top level or (should one ever be met there) inside a folder.
+    const list: Widget = {
+      id: "t1",
+      kind: "tasklist",
+      rect: { x: 0, y: 0, w: 9, h: 8 },
+      project: "Atlas",
+    };
+    const folder: Widget = {
+      id: "f1",
+      kind: "folder",
+      rect: { x: 0, y: 0, w: 3, h: 3 },
+      children: [{ ...list, id: "t2" }],
+    };
+    expect(pinboardEntries(board([list, folder]))).toEqual([]);
+    expect(pinboardEntries(board([list, timeline()]))).toHaveLength(2);
+  });
+
   it("yields nothing for absent, malformed, or wrong-version boards rather than throwing", () => {
     expect(pinboardEntries(null)).toEqual([]);
     expect(pinboardEntries("")).toEqual([]);

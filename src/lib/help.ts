@@ -26,7 +26,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "nav-calendar": {
     title: "Calendar",
-    body: "One place to see everything from the calendars you've connected (Google, Outlook and iCal subscriptions), laid over each other. Switch between Day, Week, Month, Year and Agenda, jump to today, and choose which calendars show. On a Google account with editing turned on you can do most of what Google Calendar does from here: create events, change, move and delete the ones you can edit, and answer invitations, and every change goes straight to Google. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
+    body: "One place to see everything from the calendars you've connected (Google, Outlook and iCal subscriptions), laid over each other. Switch between Day, Week, Month, Year and Agenda (your tasks on the Runway board, or a dated list of events), jump to today, and choose which calendars show. On a Google account with editing turned on you can do most of what Google Calendar does from here: create events, change, move and delete the ones you can edit, and answer invitations, and every change goes straight to Google. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
   },
   "nav-documents": {
     title: "Documents",
@@ -273,7 +273,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "calendar-header": {
     title: "Move around & choose a view",
-    body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Day, Week, Month, Year and Agenda, and the label shows the range you're looking at. + New event (or c) creates an event in Google, on an account with editing turned on: in Day and Week it's in the grid's top-left corner with the time zones, and elsewhere beside Refresh, which reads your calendars again now. Everything else here only changes what you see.",
+    body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Day, Week, Month, Year and Agenda, and the label shows the range you're looking at. + New event (or c) creates an event in Google, on an account with editing turned on: in Day and Week it's in the grid's top-left corner with the time zones, and elsewhere beside Refresh, which reads your calendars again now. In Agenda, Runway | List switches between the Runway board of your tasks and milestones and a dated list of events; the Runway always starts from today, so the stepping buttons give way to \"From today\". Everything else here only changes what you see.",
   },
   // In the calendar view only: Focus › Upcoming's details pop-up keeps `focus-agenda`'s help.
   "calendar-event": {
@@ -303,7 +303,11 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "calendar-filter": {
     title: "Which calendars show",
-    body: "Tick the connected calendars you want laid over each other; untick one to hide it here without disconnecting it. Each keeps its own colour so you can tell sources apart. This only changes what's shown — it doesn't stop PM syncing that calendar.",
+    body: "Tick the connected calendars you want laid over each other; untick one to hide it here without disconnecting it. Each keeps its own colour so you can tell sources apart. This only changes what's shown — it doesn't stop PM syncing that calendar. Under Personal Manager, Milestones, Tasks and Pinboard put your project deadlines, your planned tasks (on the days you planned them, or on their deadline) and pinboard timeline entries on the calendar too; click a task to edit it.",
+  },
+  "calendar-runway": {
+    title: "The Runway",
+    body: "Your tasks and milestones laid out in columns of days: Before today (folded), Today, Tomorrow, the rest of this week, next week and later, each with a Foreground and a Background lane. Add a named window, such as a trip or a conference week, with + Window, and its days get a column of their own. A card sits on the day you plan to do it; its deadline shows separately, red when it's due or late and amber when it's close, and a deadline that follows a milestone or an event says which. Something you didn't finish rolls into Today. Drag a task to another column, lane or Parked to plan it again, or use Move… on the card from the keyboard. Tick the box to go from to do, to doing, to done. Tasks grouped into a stack fold into one card with how many are left; click it to open them. Milestones open their project and calendar events open their details, but neither moves here. + Task adds a task for today.",
   },
   "calendar-description-format": {
     title: "Format the description",
@@ -623,7 +627,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-milestones": {
     title: "Milestones",
-    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a name and a date. Tick the checkbox on the left to mark one done: it gets a 'Done' tag and a line through it. The nearest one you haven't ticked off drives the 'Due soon' status; tick it and the next takes over. Reorder with the arrows, remove with ×. A milestone linked to a calendar event (📅) takes its date from that event; Unlink makes the date yours to edit.",
+    body: "A project's deadlines — a pitch, a presentation, an internal due date — each with a name and a date. Set how far along each one is with its progress menu; at Done it gets a line through it. The nearest one that isn't done drives the 'Due soon' status; finish it and the next takes over. Reorder with the arrows, remove with ×. A milestone linked to a calendar event (📅) takes its date from that event; Unlink makes the date yours to edit.",
   },
   "project-resize": {
     title: "Resize the panel",
@@ -631,15 +635,19 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "project-sidebar": {
     title: "Project panel",
-    body: "Everything about the open project, on the right: its milestones on top and its filed documents below, over a chat that draws on just this project. Drag the left edge to widen it, and the divider between milestones and files to change their split.",
+    body: "Everything about the open project, on the right: its milestones and tasks on top and its filed documents below, over a chat that draws on just this project. Drag the left edge to widen it, and the divider between the top and the files to change their split.",
   },
   "project-milestones-panel": {
     title: "This project's milestones",
-    body: "The project's deadlines, editable in place — add one, date it, tick it off, reorder, or unlink one that takes its date from a calendar event. The nearest one you haven't ticked drives the project's 'Due soon' status. Drag the divider below to give this panel more or less room against the files list.",
+    body: "The project's deadlines and tasks, editable in place. Add a milestone, date it, set its progress, reorder, or unlink one that takes its date from a calendar event; the nearest one that isn't done drives the project's 'Due soon' status. Under it, this project's tasks. Drag the divider below to give this panel more or less room against the files list.",
   },
   "project-split": {
-    title: "Resize milestones vs files",
-    body: "Drag to change how the panel is split between the milestones (top) and the files (bottom). The ratio is remembered on this device, so the panel opens the way you left it.",
+    title: "Resize milestones and tasks vs files",
+    body: "Drag to change how the panel is split between the milestones and tasks (top) and the files (bottom). The ratio is remembered on this device, so the panel opens the way you left it.",
+  },
+  "project-tasks": {
+    title: "This project's tasks",
+    body: "The to-dos linked to this project, the same tasks you see on the pinboard and the Calendar's Runway. Type one and press Enter to add it, with a deadline if you like; More… opens everything. Tick the box to go from to do, to doing, to done. Click a title to read why it matters, and ✎ to change anything: when you plan to do it, a deadline that's firm or one to aim for (or one that follows a milestone or a calendar event), the lane, a stack it belongs to, or park it for later. Done and parked tasks fold away at the bottom. Deleting the project keeps its tasks, without a project.",
   },
   "project-chat": {
     title: "Project chat",
@@ -653,7 +661,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Pinboard (spec §4) — a free-form planning board
   "pinboard-board": {
     title: "Your planning board",
-    body: "A free space to think. Add notes, timelines and folders, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. Cards are free to overlap; to file one into a folder, drop it with your mouse pointer over the folder. Ctrl+Z (⌘Z on a Mac) undoes what you last did here — a deletion, a colour, a move, or the last few seconds of typing — and Ctrl+Y (or Ctrl/⌘+Shift+Z) puts it back; the trail is kept for this visit, not saved between them. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
+    body: "A free space to think. Add notes, timelines, task lists and folders, then drag them anywhere and resize from the bottom-right corner — they snap to a grid and stay where you put them between visits. Cards are free to overlap; to file one into a folder, drop it with your mouse pointer over the folder. Ctrl+Z (⌘Z on a Mac) undoes what you last did here — a deletion, a colour, a move, or the last few seconds of typing — and Ctrl+Y (or Ctrl/⌘+Shift+Z) puts it back; the trail is kept for this visit, not saved between them. The board is saved on this device, encrypted with the rest of your data, and is separate from your indexed documents.",
   },
   "pinboard-add-note": {
     title: "Add a note",
@@ -667,9 +675,21 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Add a folder",
     body: "Drops an empty folder on the board to tidy things into. Drag a note or timeline so your mouse pointer is over the folder and let go to file it inside — the folder lights up when it's going to catch what you're holding. (Dropping a card so it merely overlaps a folder just leaves it lying on top, the same as notes overlap each other.) You can also make a folder without this button, by dropping one card exactly on top of another the same size. A folder stays until you ungroup it with its ✕, however few cards are left in it — so an empty one will happily sit and wait.",
   },
+  "pinboard-add-tasklist": {
+    title: "Add a task list",
+    body: "Drops a live list of your tasks on the board: all of them, or one project's, chosen in the card's header. The tasks themselves live in PM, not on the card, so ticking one here ticks it on the project page and the Calendar's Runway too, and deleting the card leaves the tasks where they are.",
+  },
+  "pinboard-tasklist": {
+    title: "A task list",
+    body: "Your tasks, live: change the project in the header, or pick All tasks. Type one and press Enter to add it; tick the box to go from to do, to doing, to done; click a title to see why it matters, and ✎ to plan it, give it a deadline or link it to a milestone or an event. Every change shows everywhere the task does. If the project this list followed is deleted, the list asks whether to show all tasks or go.",
+  },
+  "pinboard-note-tasks": {
+    title: "Turn checkboxes into tasks",
+    body: "Copies this note's checkbox lines into real tasks, ticked ones as done, and puts a task list beside the note so you can work from it. Choose a project for them or leave them on their own. The note stays exactly as it is, and a line that's already a task isn't added twice.",
+  },
   "pinboard-folder": {
     title: "A folder",
-    body: "A group of notes and timelines, kept in one tile so the board stays tidy. It shows how many cards are inside; click it to open them, and give it a title like any other card. Drag a card onto it — pointer over the folder — to file that card away. Folders don't go inside folders: drag one onto another and they simply stack, each keeping its own cards. The ✕ ungroups the folder, spilling its cards back onto the board rather than deleting them. Once open, 'In place' shows the cards as a compact grid beside the folder, and 'Overlay' opens the folder's own pinboard over the middle of the screen, where the cards keep their real shape and size. Give a folder a game with the dice in its top bar and the tile changes: it shows that game's face and how many cards are still in, and clicking it plays instead of opening. 'Cards' in the top bar is always the way back to the notes.",
+    body: "A group of notes and timelines, kept in one tile so the board stays tidy. It shows how many cards are inside; click it to open them, and give it a title like any other card. Drag a card onto it — pointer over the folder — to file that card away. Folders don't go inside folders: drag one onto another and they simply stack, each keeping its own cards. Task lists stay on the board too and never file into a folder. The ✕ ungroups the folder, spilling its cards back onto the board rather than deleting them. Once open, 'In place' shows the cards as a compact grid beside the folder, and 'Overlay' opens the folder's own pinboard over the middle of the screen, where the cards keep their real shape and size. Give a folder a game with the dice in its top bar and the tile changes: it shows that game's face and how many cards are still in, and clicking it plays instead of opening. 'Cards' in the top bar is always the way back to the notes.",
   },
   "pinboard-folder-game": {
     title: "Gamble your next task",

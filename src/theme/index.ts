@@ -77,4 +77,5 @@ export {
   sourceShapeIndex,
   milestoneColor,
   pinboardColor,
+  taskColor,
 } from "./sourcePalette";

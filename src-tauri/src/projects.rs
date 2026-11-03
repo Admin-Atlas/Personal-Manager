@@ -534,6 +534,12 @@ pub fn rename_project_satellites(conn: &Connection, old: &str, new: &str) -> Res
         "UPDATE project_milestones SET project_name = ?2 WHERE project_name = ?1",
         params![old, new],
     )?;
+    //    Tasks too (v59). Their FK is ON DELETE SET NULL, so missing this would not fail: step 6
+    //    would quietly unlink every task from the renamed or merged project instead.
+    conn.execute(
+        "UPDATE tasks SET project_name = ?2 WHERE project_name = ?1",
+        params![old, new],
+    )?;
     conn.execute(
         "UPDATE project_activity SET project = ?2 WHERE project = ?1",
         params![old, new],
@@ -992,6 +998,53 @@ mod tests {
 
         assert!(unbind_pinboard_project(blob, "Nonexistent").is_none());
         assert!(unbind_pinboard_project("not json", "Doomed").is_none());
+    }
+
+    /// Deleting a project keeps its tasks (they are the user's to-dos), unlinked from it and from its
+    /// milestones by the FKs' ON DELETE SET NULL: no SQL in `delete_project_satellites` needed.
+    #[test]
+    fn delete_project_satellites_keeps_the_tasks_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite"), DB_KEY).unwrap();
+        let mid = crate::milestones::add(&conn, "Doomed", "ship", None, None).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title, project_name, milestone_id) VALUES ('write it', 'Doomed', ?1)",
+            params![mid],
+        )
+        .unwrap();
+        touch(&conn, "Keeper").unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title, project_name) VALUES ('other', 'Keeper')",
+            [],
+        )
+        .unwrap();
+
+        delete_project_satellites(&conn, "Doomed").unwrap();
+
+        let (project, milestone): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT project_name, milestone_id FROM tasks WHERE title = 'write it'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (project, milestone),
+            (None, None),
+            "the task stays, unlinked"
+        );
+        let keeper: Option<String> = conn
+            .query_row(
+                "SELECT project_name FROM tasks WHERE title = 'other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            keeper.as_deref(),
+            Some("Keeper"),
+            "another project's task is untouched"
+        );
     }
 
     /// The delete counterpart to the rename's satellite move. The load-bearing part is the flag GC:
@@ -1607,6 +1660,11 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO conversations(project) VALUES ('Atlas')", [])
             .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title, project_name, milestone_id) VALUES ('deck', 'Atlas', ?1)",
+            params![mid],
+        )
+        .unwrap();
         crate::project_activity::record(&conn, "Atlas", crate::project_activity::Kind::Chat, None);
         conn.execute(
             "INSERT INTO project_activity_daily(project, day, kind, count) VALUES ('Atlas', 20000, 'chat', 2)",
@@ -1632,6 +1690,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(m_project, "Atlas Initiative");
+        // The task followed, still linked to its milestone (tasks' FK is SET NULL, so a missed
+        // re-key would have quietly unlinked it rather than failing).
+        let task: (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT project_name, milestone_id FROM tasks WHERE title = 'deck'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task, (Some("Atlas Initiative".into()), Some(mid)));
         // Triage carried across; the source row is gone.
         let size: Option<String> = conn
             .query_row(
@@ -1709,8 +1777,23 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title, project_name) VALUES ('from old', 'Old'), ('from new', 'New')",
+            [],
+        )
+        .unwrap();
 
         rename_project_satellites(&conn, "Old", "New").unwrap();
+
+        // Both projects' tasks end up on the survivor.
+        let on_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE project_name = 'New'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(on_new, 2, "the folded project's task moved to the survivor");
 
         let summed: i64 = conn
             .query_row(

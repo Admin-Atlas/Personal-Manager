@@ -80,6 +80,7 @@ pub fn add_milestone(
 /// milestone keeps its calendar-owned date regardless.
 #[tauri::command]
 pub fn update_milestone(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: i64,
     label: String,
@@ -89,7 +90,16 @@ pub fn update_milestone(
     milestones::update(&conn, id, &label, due_date)?;
     touch_milestone_project(&conn, id)?;
     briefing::nudge(&state);
+    drop(conn);
+    milestone_moved_tasks(&app);
     Ok(())
+}
+
+/// A task whose deadline follows a milestone reads that milestone's date, label and existence, so a
+/// change to any of them is a change to what the task views show (PA-1). Emitted after the guard
+/// is dropped, like every task write.
+fn milestone_moved_tasks(app: &AppHandle) {
+    let _ = app.emit(crate::tasks::TASKS_CHANGED, ());
 }
 
 /// Link a milestone to a calendar event (`event_uid` Some, `cached_date` seeds the offline cache)
@@ -99,6 +109,7 @@ pub fn update_milestone(
 /// moved that didn't. A relink moves the date that governs the project, so the briefing looks again.
 #[tauri::command]
 pub fn set_milestone_event(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: i64,
     event_uid: Option<String>,
@@ -114,6 +125,8 @@ pub fn set_milestone_event(
         only_if_linked_to.as_deref(),
     )?;
     briefing::nudge(&state);
+    drop(conn);
+    milestone_moved_tasks(&app);
     Ok(())
 }
 
@@ -138,7 +151,12 @@ fn relink(
 
 /// Mark a milestone met or unmet.
 #[tauri::command]
-pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Result<()> {
+pub fn set_milestone_state(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    met: bool,
+) -> Result<()> {
     let conn = state.conn()?;
     milestones::set_state(&conn, id, met)?;
     // Un-marking a milestone done is the "I made a mistake" undo: clear any flag the user asserted done
@@ -150,6 +168,8 @@ pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Re
     }
     touch_milestone_project(&conn, id)?;
     briefing::nudge(&state);
+    drop(conn);
+    milestone_moved_tasks(&app);
     Ok(())
 }
 
@@ -160,7 +180,12 @@ pub fn set_milestone_state(state: State<'_, AppState>, id: i64, met: bool) -> Re
 /// the deadline again. Skipping that here would make the two controls behave differently on the
 /// same transition.
 #[tauri::command]
-pub fn set_milestone_status(state: State<'_, AppState>, id: i64, status: String) -> Result<()> {
+pub fn set_milestone_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    status: String,
+) -> Result<()> {
     let conn = state.conn()?;
     milestones::set_status(&conn, id, &status)?;
     if status != milestones::STATUS_DONE {
@@ -168,12 +193,15 @@ pub fn set_milestone_status(state: State<'_, AppState>, id: i64, status: String)
     }
     touch_milestone_project(&conn, id)?;
     briefing::nudge(&state);
+    drop(conn);
+    milestone_moved_tasks(&app);
     Ok(())
 }
 
-/// Delete a milestone by id.
+/// Delete a milestone by id. A task linked to it loses the link (the FK nulls it), so the task views
+/// re-read.
 #[tauri::command]
-pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
+pub fn delete_milestone(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<()> {
     let conn = state.conn()?;
     // Resolve the owning project before the row is gone, then bump its activity.
     let project = milestones::project_of(&conn, id)?;
@@ -185,6 +213,8 @@ pub fn delete_milestone(state: State<'_, AppState>, id: i64) -> Result<()> {
         // milestone's id is still a valid historical reference for the observation.
         project_activity::record(&conn, &project, project_activity::Kind::Milestone, Some(id));
     }
+    drop(conn);
+    milestone_moved_tasks(&app);
     Ok(())
 }
 

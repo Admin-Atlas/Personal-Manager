@@ -1015,7 +1015,11 @@ mod tests {
             // v46: the join drops before the tags it points at — `document_tags.tag_id REFERENCES
             // tags(id)` under `PRAGMA foreign_keys = ON`, so the parent cannot go first (the same
             // rule the `preferences`/`entities` pair below follows).
-            "DROP TABLE document_tags; \
+            // v59: `tasks` references `project_milestones`, `projects` and `task_stacks`, so it drops
+            // first, then its stacks.
+            "DROP TABLE tasks; \
+             DROP TABLE task_stacks; \
+             DROP TABLE document_tags; \
              DROP TABLE tags; \
              DROP TABLE retrieval_feedback; \
              ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \
@@ -1212,7 +1216,11 @@ mod tests {
             // v46: the join drops before the tags it points at — `document_tags.tag_id REFERENCES
             // tags(id)` under `PRAGMA foreign_keys = ON`, so the parent cannot go first (the same
             // rule the `preferences`/`entities` pair below follows).
-            "DROP TABLE document_tags; \
+            // v59: `tasks` references `project_milestones`, `projects` and `task_stacks`, so it drops
+            // first, then its stacks.
+            "DROP TABLE tasks; \
+             DROP TABLE task_stacks; \
+             DROP TABLE document_tags; \
              DROP TABLE tags; \
              DROP TABLE retrieval_feedback; \
              ALTER TABLE messages DROP COLUMN retrieved_chunk_ids; \

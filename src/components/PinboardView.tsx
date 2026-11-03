@@ -19,6 +19,7 @@ import { runMutation } from "../lib/runMutation";
 import {
   addMilestone,
   deleteMilestone,
+  importChecklistTasks,
   ingestNote,
   listDocuments,
   listMilestones,
@@ -29,14 +30,17 @@ import {
 import { boardExtent, CELL, folderAtPointer, spaceOf, type BoardSpace } from "../lib/pinboard/grid";
 import {
   applyLineMarker,
+  checklistItems,
   continueList,
   indentLines,
   listIndentBeforeCaret,
   outdentLines,
   toRenderMarkdown,
   toggleWrap,
+  type ChecklistLine,
   type TextEdit,
 } from "../lib/pinboard/notesMarkdown";
+import { TaskList } from "./tasks/TaskList";
 import { insertTable, moveCell, tableEnter } from "../lib/pinboard/noteTables";
 import { NoteTablePicker } from "./NoteTablePicker";
 import { NoteEditor, type NoteEditorHandle } from "./NoteEditor";
@@ -81,7 +85,9 @@ import { MOD, SHIFT } from "../lib/setupGuide";
 import {
   BulletIcon,
   Button,
+  Callout,
   ConfirmDialog,
+  Dialog,
   Modal,
   NumberIcon,
   SegmentedControl,
@@ -129,6 +135,9 @@ function deleteCost(w: Widget, status?: DocStatus): string | null {
   if (w.kind === "timeline" && w.project) {
     return `This timeline is linked to ${w.project}. Only the card goes — the project's milestones stay exactly as they are.`;
   }
+  if (w.kind === "tasklist") {
+    return "Only the card goes — your tasks stay, on the project page and the calendar's Runway.";
+  }
   return null;
 }
 
@@ -159,6 +168,10 @@ const OVERLAY_SHARE = 0.8;
 /** The padding across each axis of the main board's scroller (p-6) and a folder board's (p-3). */
 const BOARD_INSET = 48;
 const FOLDER_BOARD_INSET = 24;
+
+/** A no-break space, written as its code so it stays visible in the source (and prettier can't turn
+ *  it into a literal one). */
+const NBSP = String.fromCharCode(0xa0);
 
 const sameSpace = (a: BoardSpace, b: BoardSpace) =>
   a.cols === b.cols && a.rows === b.rows && a.barCols === b.barCols && a.barRows === b.barRows;
@@ -227,7 +240,9 @@ function WidgetTile({
           ? "pinboard-note"
           : widget.kind === "timeline"
             ? "pinboard-timeline"
-            : "pinboard-folder"
+            : widget.kind === "tasklist"
+              ? "pinboard-tasklist"
+              : "pinboard-folder"
       }
       aria-label={dimmed ? "Already drawn this round" : undefined}
       className={`absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none ${
@@ -237,8 +252,8 @@ function WidgetTile({
     >
       {children}
 
-      {/* A note shows its size inline in its own footer (see NoteBody); timeline/folder keep the
-          compact coords strip. */}
+      {/* A note shows its size inline in its own footer (see NoteBody); timeline, task list and
+          folder keep the compact coords strip. */}
       {showPower && widget.kind !== "note" && (
         <div className="shrink-0 border-t border-rule px-2 py-0.5 font-mono text-[0.5625rem] text-ink4">
           {widget.rect.x},{widget.rect.y} · {widget.rect.w}×{widget.rect.h}
@@ -318,6 +333,7 @@ export function PinboardView() {
     addNote,
     addTimeline,
     addFolder,
+    addTaskList,
     updateWidget,
     moveWidget,
     dropWidget,
@@ -404,9 +420,14 @@ export function PinboardView() {
   // the Delete then cleared the redo. The folder overlay is a dialog inside the board surface, so the
   // board's Undo still works in it.
   useEffect(() => {
+    // A field whose text is NOT board state keeps its own native undo — a task list's add row, whose
+    // typing reaches the board's history nowhere (tasks are backend rows).
+    const nativeUndo = (t: EventTarget | null) =>
+      t instanceof Element && !!t.closest("[data-native-undo]");
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
       if (isDialogOpenOutside(boardRef.current)) return;
+      if (nativeUndo(e.target)) return;
       // The letter the layout types (a German Z sits where QWERTY has Y), falling back to the
       // physical key on a layout with no Latin letters.
       const isZ = isLetterKey(e, "z");
@@ -423,6 +444,7 @@ export function PinboardView() {
     const onBeforeInput = (e: Event) => {
       const t = (e as InputEvent).inputType;
       if (t !== "historyUndo" && t !== "historyRedo") return;
+      if (nativeUndo(e.target)) return;
       e.preventDefault();
       if (t === "historyRedo") redo();
       else undo();
@@ -458,6 +480,51 @@ export function PinboardView() {
   const handleAddNote = useCallback(() => setPendingScrollId(addNote()), [addNote]);
   const handleAddTimeline = useCallback(() => setPendingScrollId(addTimeline()), [addTimeline]);
   const handleAddFolder = useCallback(() => setPendingScrollId(addFolder()), [addFolder]);
+  const handleAddTaskList = useCallback(() => setPendingScrollId(addTaskList()), [addTaskList]);
+
+  // What the board just did that has no card of its own to show it — today, the result of turning a
+  // note into a task list. Shown in the header (a live region, so it is read out too) and cleared after
+  // a while. `sayAgain`'s trick: the same words twice differ by a no-break space, so they're re-read.
+  const [notice, setNotice] = useState("");
+  const announce = useCallback(
+    (text: string) => setNotice((was) => (was === text ? `${text}${NBSP}` : text)),
+    [],
+  );
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(""), 8000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  // "Make this a task list": the note whose checklist is being converted, read when the note's "To
+  // tasks" is pressed. The items are taken THEN, not at Convert, so the dialog's count is the count
+  // that gets imported even if the note is edited behind it.
+  const [converting, setConverting] = useState<{ noteId: string; items: ChecklistLine[] } | null>(
+    null,
+  );
+  // Stable (reads the board through its ref), so every NoteBody's memo survives a drag.
+  const requestTaskList = useCallback((id: string) => {
+    const w = findWidget(widgetsRef.current, id);
+    const items = w?.kind === "note" ? checklistItems(w.text ?? "") : [];
+    if (items.length > 0) setConverting({ noteId: id, items });
+  }, []);
+  /** The task list lands on the board's top level, beside the note — or beside the note's folder
+   *  when it is inside one, since a task list never goes into a folder (`isFileable`). */
+  const finishTaskList = useCallback(
+    (noteId: string, project: string | null, created: number, skipped: number) => {
+      const ws = widgetsRef.current;
+      const near =
+        ws.find((w) => w.id === noteId)?.rect ??
+        ws.find((w) => w.children?.some((c) => c.id === noteId))?.rect;
+      setPendingScrollId(addTaskList(project ?? undefined, near, true));
+      setConverting(null);
+      const added =
+        created === 0 ? "No new tasks" : `${created} task${created === 1 ? "" : "s"} added`;
+      announce(skipped > 0 ? `${added}, ${skipped} already there` : added);
+    },
+    [addTaskList, announce],
+  );
+
   useLayoutEffect(() => {
     if (!pendingScrollId) return;
     const el = scrollRef.current;
@@ -573,6 +640,9 @@ export function PinboardView() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <span role="status" aria-live="polite" className="text-xs text-ink3">
+            {notice}
+          </span>
           {showPower && board.widgets.length > 0 && (
             <span className="mr-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
               {board.widgets.length} item{board.widgets.length === 1 ? "" : "s"}
@@ -606,6 +676,16 @@ export function PinboardView() {
             data-help="pinboard-add-folder"
           >
             + Folder
+          </Button>
+          {/* A live view of your tasks — the same list as the project page and the Runway. */}
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={handleAddTaskList}
+            disabled={load !== "ready"}
+            data-help="pinboard-add-tasklist"
+          >
+            + Task list
           </Button>
         </div>
       </header>
@@ -662,6 +742,7 @@ export function PinboardView() {
                   onStartDrag={startDrag}
                   status={docStatus.get(`note:${w.id}`)}
                   onIngested={refreshDocs}
+                  onMakeTaskList={requestTaskList}
                 />
               ) : w.kind === "timeline" ? (
                 <TimelineBody
@@ -673,6 +754,13 @@ export function PinboardView() {
                   onAddItem={addTimelineItem}
                   onUpdateItem={updateTimelineItem}
                   onRemoveItem={removeTimelineItem}
+                />
+              ) : w.kind === "tasklist" ? (
+                <TaskListBody
+                  widget={w}
+                  onChange={updateWidget}
+                  onDelete={requestDelete}
+                  onStartDrag={startDrag}
                 />
               ) : (
                 <FolderTile
@@ -735,6 +823,7 @@ export function PinboardView() {
                   onRemoveItem={removeTimelineItem}
                   docStatus={docStatus}
                   onIngested={refreshDocs}
+                  onMakeTaskList={requestTaskList}
                   onClose={closeFolder}
                 />
               </Modal>
@@ -767,6 +856,7 @@ export function PinboardView() {
                   onRemoveItem={removeTimelineItem}
                   docStatus={docStatus}
                   onIngested={refreshDocs}
+                  onMakeTaskList={requestTaskList}
                   onClose={closeFolder}
                 />
               </div>
@@ -778,7 +868,13 @@ export function PinboardView() {
           it now, but that only helps someone who knows about Ctrl+Z and notices in time. */}
       <ConfirmDialog
         open={!!pendingDelete}
-        title={pendingDelete?.kind === "timeline" ? "Delete this timeline?" : "Delete this note?"}
+        title={
+          pendingDelete?.kind === "timeline"
+            ? "Delete this timeline?"
+            : pendingDelete?.kind === "tasklist"
+              ? "Delete this task list?"
+              : "Delete this note?"
+        }
         danger
         confirmLabel="Delete"
         onConfirm={confirmDelete}
@@ -809,7 +905,120 @@ export function PinboardView() {
           </>
         )}
       </ConfirmDialog>
+
+      {converting && (
+        <MakeTaskListDialog
+          key={converting.noteId}
+          noteId={converting.noteId}
+          items={converting.items}
+          onDone={finishTaskList}
+          onClose={() => setConverting(null)}
+        />
+      )}
     </div>
+  );
+}
+
+/**
+ * "Make this a task list": a note's checklist becomes real tasks, and a Task list card showing them
+ * lands beside the note. The note itself is left exactly as it was.
+ *
+ * The tasks are written FIRST, and only once they're in does the card go on the board (as a history
+ * barrier — see `addTaskList`). A failed import puts nothing on the board and keeps the dialog open
+ * with the reason. Importing skips any item already a task with the same title in the same project,
+ * so converting the same note twice never doubles up.
+ */
+function MakeTaskListDialog({
+  noteId,
+  items,
+  onDone,
+  onClose,
+}: {
+  noteId: string;
+  items: ChecklistLine[];
+  onDone: (noteId: string, project: string | null, created: number, skipped: number) => void;
+  onClose: () => void;
+}) {
+  const [projects, setProjects] = useState<string[]>([]);
+  const [project, setProject] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selectId = `pm-tasklist-project-${noteId}`;
+  useEffect(() => {
+    listProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
+  }, []);
+  const n = items.length;
+  const done = items.filter((i) => i.checked).length;
+  const ticked =
+    done === 0
+      ? `${n === 1 ? "It becomes a task" : "Each item becomes a task"}. `
+      : done === n
+        ? `${n === 1 ? "It's ticked, so it arrives" : "They're all ticked, so each arrives"} as a done task. `
+        : `Each item becomes a task, and the ${done === 1 ? "ticked one arrives" : `${done} ticked ones arrive`} done. `;
+
+  const convert = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const scope = project || null;
+      const res = await importChecklistTasks(
+        scope,
+        items.map((i) => ({ title: i.title, done: i.checked })),
+      );
+      onDone(noteId, scope, res.created.length, res.skipped);
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open
+      onClose={busy ? () => {} : onClose}
+      title={`Make a task list from ${n} checklist item${n === 1 ? "" : "s"}`}
+      widthClassName="max-w-md"
+      footer={
+        <>
+          <Button variant="tertiary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => void convert()} disabled={busy}>
+            {busy ? "Converting…" : "Convert"}
+          </Button>
+        </>
+      }
+    >
+      <p className="mt-2 text-sm text-ink3">
+        {ticked}A task list card showing them goes beside the note, and the note stays as it is.
+      </p>
+      <div className="mt-4 flex items-center gap-2">
+        <label htmlFor={selectId} className="text-sm text-ink3">
+          Project
+        </label>
+        <Select
+          id={selectId}
+          value={project}
+          onChange={(e) => setProject(e.target.value)}
+          disabled={busy}
+          className="min-w-0 flex-1"
+        >
+          <option value="">No project</option>
+          {projects.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </Select>
+      </div>
+      {error && (
+        <Callout as="p" className="mt-3">
+          {error}
+        </Callout>
+      )}
+    </Dialog>
   );
 }
 
@@ -1060,6 +1269,7 @@ const NoteBody = memo(function NoteBody({
   onPopOut,
   status,
   onIngested,
+  onMakeTaskList,
 }: {
   widget: Widget;
   /** At `power` depth, show the note's size (w×h) at the right of its footer. */
@@ -1074,8 +1284,14 @@ const NoteBody = memo(function NoteBody({
   onPopOut?: (id: string) => void;
   status?: DocStatus;
   onIngested: () => void;
+  /** "To tasks": turn this note's checklist into real tasks (PinboardView asks which project, then
+   *  imports them and puts a Task list card beside the note). Takes the id, so the board passes one
+   *  stable callback and the memo holds. */
+  onMakeTaskList: (id: string) => void;
 }) {
   const text = widget.text ?? "";
+  // Only offered when the note HAS a checklist — the boxes the note renders, nothing else.
+  const hasChecklist = useMemo(() => checklistItems(text).length > 0, [text]);
   const editorRef = useRef<NoteEditorHandle>(null);
   const richRef = useRef<RichNoteEditorHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -1230,6 +1446,18 @@ const NoteBody = memo(function NoteBody({
         actions={
           <>
             {onPopOut && <PopOutButton onClick={() => onPopOut(widget.id)} />}
+            {hasChecklist && (
+              <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => onMakeTaskList(widget.id)}
+                data-help="pinboard-note-tasks"
+                className="shrink-0 rounded-[var(--radius-sm)] px-1 text-[0.625rem] uppercase tracking-wide text-accent-text hover:bg-surface"
+                title="Make this note's checklist into tasks, with a task list beside it"
+              >
+                To tasks
+              </button>
+            )}
             {ingestControl}
           </>
         }
@@ -1397,6 +1625,122 @@ const TimelineBody = memo(function TimelineBody(props: TimelineBodyProps) {
           />
         ) : (
           <FreeformTimeline {...props} view={view} />
+        )}
+      </div>
+    </div>
+  );
+});
+
+/** The header Select's value for a list whose project was deleted — not a project name a user could
+ *  have (it starts with a NUL), so it can't collide with one. */
+const DELETED_PROJECT = "\u0000deleted";
+
+interface TaskListBodyProps {
+  widget: Widget;
+  onChange: (id: string, patch: Partial<Widget>) => void;
+  onDelete: (id: string) => void;
+  /** The board drag handle. Absent in the in-place folder panel. */
+  onStartDrag?: (e: ReactPointerEvent, w: Widget, mode: "move" | "resize") => void;
+  /** Set for a folder child (which a task list normally never is — see `isFileable` — but a board
+   *  from elsewhere might hold one, and it should still work and still be able to leave). */
+  onPopOut?: (id: string) => void;
+}
+
+/**
+ * A Task list card (PA-1): a live view of the global task list, not a copy of it. The card keeps only
+ * its filter (`widget.project`: unset → every task, a name → that project's); the list is the shared
+ * `TaskList`, which reads the tasks table and re-reads on every `tasks://changed`, so a tick here is a
+ * tick on the project page and the Runway, and the other way round. Task edits go straight to the
+ * backend and never through the board's history — Ctrl+Z on the board can't un-tick a task.
+ *
+ * A deleted project leaves the filter `null` (the backend's unbind), and the card says so instead of
+ * quietly widening to every task. Memoised, with stable props, for the same board-wide drag
+ * re-renders as NoteBody.
+ */
+const TaskListBody = memo(function TaskListBody({
+  widget,
+  onChange,
+  onDelete,
+  onStartDrag,
+  onPopOut,
+}: TaskListBodyProps) {
+  const project = widget.project;
+  const [projects, setProjects] = useState<string[]>([]);
+  const loadProjects = useCallback(() => {
+    listProjects()
+      .then(setProjects)
+      .catch(() => setProjects([]));
+  }, []);
+  useEffect(() => {
+    loadProjects();
+    window.addEventListener("focus", loadProjects);
+    return () => window.removeEventListener("focus", loadProjects);
+  }, [loadProjects]);
+  const selectId = `pm-tasklist-filter-${widget.id}`;
+  // The current filter always has an option, even when it isn't in the list (archived since, or the
+  // list hasn't arrived yet), so the Select never shows a value it doesn't hold.
+  const options =
+    typeof project === "string" && !projects.includes(project) ? [project, ...projects] : projects;
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <WidgetHeader
+        widget={widget}
+        placeholder="Tasks"
+        onRename={(t) => onChange(widget.id, { title: t })}
+        onDelete={() => onDelete(widget.id)}
+        onStartDrag={onStartDrag ? (e) => onStartDrag(e, widget, "move") : undefined}
+        actions={
+          <>
+            <Select
+              id={selectId}
+              compact
+              value={project === null ? DELETED_PROJECT : (project ?? "")}
+              aria-label="Which tasks this list shows"
+              title="Which tasks this list shows"
+              onPointerDown={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                const v = e.target.value;
+                onChange(widget.id, { project: v === "" ? undefined : v });
+              }}
+              className="min-w-0 max-w-[9rem] shrink text-[0.625rem]"
+            >
+              <option value="">All tasks</option>
+              {project === null && (
+                <option value={DELETED_PROJECT} disabled>
+                  Deleted project
+                </option>
+              )}
+              {options.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </Select>
+            {onPopOut && <PopOutButton onClick={() => onPopOut(widget.id)} />}
+          </>
+        }
+      />
+      {/* `data-native-undo`: Ctrl+Z in the add row undoes the typing, not the board. */}
+      <div className="min-h-0 flex-1 overflow-auto px-2 py-1" data-native-undo="">
+        {project === null ? (
+          <div className="flex flex-col items-start gap-2 py-2">
+            <p className="text-xs text-ink3">This list&rsquo;s project was deleted.</p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                size="xs"
+                onClick={() => onChange(widget.id, { project: undefined })}
+              >
+                Show all tasks
+              </Button>
+              <Button variant="tertiary" size="xs" onClick={() => onDelete(widget.id)}>
+                Remove list
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <TaskList project={project} compact showProject={project === undefined} />
         )}
       </div>
     </div>
@@ -1650,6 +1994,7 @@ function FolderBoard({
   onRemoveItem,
   docStatus,
   onIngested,
+  onMakeTaskList,
   onClose,
   face,
   onFace,
@@ -1668,6 +2013,7 @@ function FolderBoard({
   onRemoveItem: (id: string, itemId: string) => void;
   docStatus: Map<string, DocStatus>;
   onIngested: () => void;
+  onMakeTaskList: (id: string) => void;
   onClose: () => void;
 }) {
   const children = useMemo(() => folder.children ?? [], [folder.children]);
@@ -1813,6 +2159,16 @@ function FolderBoard({
                   onPopOut={popOut}
                   status={docStatus.get(`note:${c.id}`)}
                   onIngested={onIngested}
+                  onMakeTaskList={onMakeTaskList}
+                />
+              ) : c.kind === "tasklist" ? (
+                // Never filed in here by this build (`isFileable`); drawn properly if met anyway.
+                <TaskListBody
+                  widget={c}
+                  onChange={onChange}
+                  onDelete={onDelete}
+                  onStartDrag={startDrag}
+                  onPopOut={popOut}
                 />
               ) : (
                 <TimelineBody
@@ -1854,6 +2210,7 @@ function FolderPanel({
   onRemoveItem,
   docStatus,
   onIngested,
+  onMakeTaskList,
   onClose,
 }: {
   folder: Widget;
@@ -1868,6 +2225,7 @@ function FolderPanel({
   onRemoveItem: (id: string, itemId: string) => void;
   docStatus: Map<string, DocStatus>;
   onIngested: () => void;
+  onMakeTaskList: (id: string) => void;
   onClose: () => void;
 }) {
   const children = folder.children ?? [];
@@ -1965,6 +2323,15 @@ function FolderPanel({
                     onPopOut={popOut}
                     status={docStatus.get(`note:${c.id}`)}
                     onIngested={onIngested}
+                    onMakeTaskList={onMakeTaskList}
+                  />
+                ) : c.kind === "tasklist" ? (
+                  // Never filed in here by this build (`isFileable`); drawn properly if met anyway.
+                  <TaskListBody
+                    widget={c}
+                    onChange={onChange}
+                    onDelete={onDelete}
+                    onPopOut={popOut}
                   />
                 ) : (
                   <TimelineBody

@@ -98,3 +98,18 @@ const PINBOARD_HUES: Record<System, string> = {
 export function pinboardColor(system: System): string {
   return PINBOARD_HUES[system];
 }
+
+/** The distinct hue for the tasks overlay (PA-1) — same rules as {@link MILESTONE_HUES}: outside the
+ *  System's accent picker so it can never take a source slot or read as "today/now", and distinct
+ *  from the milestone and pinboard hues so the three overlays never blur together. Not a status
+ *  colour either: a task's lateness is said by its chip's tone, never by this hue.
+ *  DOCUMENTED hex exception, like the source palette above. */
+const TASK_HUES: Record<System, string> = {
+  editorial: "#2f6690", // deep cerulean — cool, clear of the picker's soft blue and the teal milestones
+  slate: "#a3b83a", // lime — off the mint/teal picker hues, the magenta milestones and rust pinboard
+  terminal: "#ff007c", // hot magenta — clear of the picker's red-pink, the orange and the blue
+};
+
+export function taskColor(system: System): string {
+  return TASK_HUES[system];
+}

@@ -1197,6 +1197,9 @@ fn announce_synced(app: &AppHandle, calendar_ids: Vec<String>) {
         return;
     }
     let _ = app.emit_to("main", "calendar://synced", CalendarSynced { calendar_ids });
+    // A task whose deadline follows an event reads that event's date and title (PA-1), so the task
+    // views (project page, pinboard list, Runway) re-read too.
+    let _ = app.emit(crate::tasks::TASKS_CHANGED, ());
 }
 
 /// What a change check did.

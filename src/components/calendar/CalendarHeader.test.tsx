@@ -8,7 +8,7 @@
 // rather than going grey and silent.
 
 import { createRef, type RefObject } from "react";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
@@ -17,6 +17,7 @@ vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
 }));
 
 import { CalendarHeader } from "./CalendarHeader";
+import type { AgendaMode, CalendarViewMode } from "../../lib/calendarPrefs";
 
 afterEach(cleanup);
 
@@ -26,6 +27,9 @@ interface Over {
   onCreate?: () => void;
   createReason?: string | null;
   createRef?: RefObject<HTMLButtonElement | null>;
+  view?: CalendarViewMode;
+  agendaMode?: AgendaMode;
+  onAgendaModeChange?: (mode: AgendaMode) => void;
 }
 
 function header(over: Over = {}) {
@@ -35,7 +39,7 @@ function header(over: Over = {}) {
 function element(over: Over = {}) {
   return (
     <CalendarHeader
-      view="week"
+      view={over.view ?? "week"}
       availableViews={["month", "week", "day", "agenda"]}
       onViewChange={vi.fn()}
       range="day"
@@ -144,5 +148,42 @@ describe("CalendarHeader", () => {
   it("has no New event without a Google account", () => {
     header();
     expect(screen.queryByRole("button", { name: "+ New event" })).toBeNull();
+  });
+});
+
+// The Agenda's two layouts (PA-2): the switch sits beside the view switcher in Agenda alone, and
+// the Runway, which always runs from today, has no paging or date label to show.
+describe("CalendarHeader: the Agenda layout", () => {
+  const layout = () => screen.queryByRole("group", { name: "Agenda layout" });
+
+  it("shows the Runway | List switch in Agenda only", () => {
+    const onAgendaModeChange = vi.fn();
+    const view = header({ view: "week", onAgendaModeChange });
+    expect(layout()).toBeNull();
+    view.rerender(element({ view: "agenda", agendaMode: "list", onAgendaModeChange }));
+    const group = layout();
+    expect(group).not.toBeNull();
+    const runway = within(group!).getByRole("button", { name: "Runway" });
+    expect(within(group!).getByRole("button", { name: "List" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    fireEvent.click(runway);
+    expect(onAgendaModeChange).toHaveBeenCalledWith("runway");
+  });
+
+  it("the Runway hides the paging and the date label, and says it runs from today", () => {
+    header({ view: "agenda", agendaMode: "runway", onAgendaModeChange: vi.fn() });
+    expect(screen.queryByRole("button", { name: "Previous" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Today" })).toBeNull();
+    expect(screen.queryByText("October 2026")).toBeNull();
+    expect(screen.getByText("From today")).toBeTruthy();
+  });
+
+  it("the List keeps them", () => {
+    header({ view: "agenda", agendaMode: "list", onAgendaModeChange: vi.fn() });
+    expect(screen.getByRole("button", { name: "Previous" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Today" })).toBeTruthy();
+    expect(screen.queryByText("From today")).toBeNull();
   });
 });

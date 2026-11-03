@@ -9,7 +9,8 @@
 // the counts are computed live from the rows the delete will actually touch, and the confirmation
 // is type-the-project-name. Milestones are the one thing with no choice — there is nowhere sensible
 // to move a dated milestone whose project is gone — so the dialog warns about them explicitly
-// instead of pretending it's a decision.
+// instead of pretending it's a decision. Tasks are the opposite fixed case: they are the user's
+// to-dos, so they always stay, without a project, and the dialog says so.
 
 import { useEffect, useState } from "react";
 import { deleteProject, deleteProjectPreview } from "../lib/ipc";
@@ -107,12 +108,16 @@ export function DeleteProjectDialog({
             ,{" "}
             <span className="font-medium text-ink2">
               {preview.chats} chat{preview.chats === 1 ? "" : "s"}
+            </span>
+            ,{" "}
+            <span className="font-medium text-ink2">
+              {preview.milestones} milestone{preview.milestones === 1 ? "" : "s"}
             </span>{" "}
             and{" "}
             <span className="font-medium text-ink2">
-              {preview.milestones} milestone{preview.milestones === 1 ? "" : "s"}
+              {preview.tasks} task{preview.tasks === 1 ? "" : "s"}
             </span>
-            . Choose what happens to each.
+            . Choose what happens to its files, chats and name.
           </p>
 
           <fieldset className="mt-4">
@@ -195,6 +200,13 @@ export function DeleteProjectDialog({
             , along with its deadlines, manual priority and the record of when you worked on it.
             There is no way to undo this from inside PM
             {destructive ? ", and deleted files and chats cannot be recovered" : ""}.
+            {preview.tasks > 0 && (
+              <>
+                {" "}
+                Its {preview.tasks} task{preview.tasks === 1 ? "" : "s"} stay
+                {preview.tasks === 1 ? "s" : ""}, without a project.
+              </>
+            )}
           </Callout>
 
           <label className="mt-4 block text-xs text-ink3" htmlFor="delete-confirm">

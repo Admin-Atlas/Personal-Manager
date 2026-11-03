@@ -22,6 +22,9 @@ export interface SegOption<T extends string> {
   value: T;
   label: ReactNode;
   title?: string;
+  /** This one option can't be chosen right now (the task editor's "Milestone's date" before a
+   *  milestone is linked). Put the reason in `title`. */
+  disabled?: boolean;
 }
 
 interface SegmentedControlBaseProps<T extends string> {
@@ -78,7 +81,7 @@ export function SegmentedControl<T extends string>({
             title={opt.title}
             aria-pressed={active}
             aria-disabled={busy || undefined}
-            disabled={disabled}
+            disabled={disabled || opt.disabled}
             onClick={() => {
               if (!busy) onChange(opt.value);
             }}

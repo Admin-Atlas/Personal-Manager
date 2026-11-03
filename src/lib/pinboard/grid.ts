@@ -197,6 +197,19 @@ export function reflowToWidth(widgets: Widget[], cols: number, rows: number): Wi
 // --- folders (pure) ------------------------------------------------------------------------------
 
 /**
+ * Whether a widget of this kind may go INTO a folder — filed under the pointer, or folded with a twin.
+ * Notes and timelines only. Folders never nest; and a task list stays on the board, because a build
+ * from before task lists existed read a folder holding a child it didn't know as broken and dropped
+ * the WHOLE folder, notes and all, then wrote the board back without it. Keeping task lists out of
+ * folders means opening this board in an older build (a downgrade, or restoring a newer backup) can
+ * lose at most the task list card — never a folder of notes. The tasks themselves are rows in the
+ * backend and survive either way.
+ */
+export function isFileable(kind: WidgetKind): boolean {
+  return kind === "note" || kind === "timeline";
+}
+
+/**
  * The folder a move-drop would file into: the TOP-MOST folder whose rect contains the **pointer**.
  *
  * This is the single source of truth for "would this drop file into a folder?" — {@link resolveDrop}
@@ -207,8 +220,8 @@ export function reflowToWidth(widgets: Widget[], cols: number, rows: number): Wi
  * normally (widgets are free to overlap), so filing stays a deliberate aim rather than a graze.
  *
  * Returns undefined when there's no pointer (a drop with no known pointer must never file — see
- * usePinboard), nothing is under it, or the moving widget is itself a folder: **folders never nest,
- * so a dragged folder just stacks.**
+ * usePinboard), nothing is under it, or the moving widget can't be filed ({@link isFileable}):
+ * **folders never nest, so a dragged folder just stacks** — and so does a task list.
  */
 export function folderAtPointer(
   widgets: Widget[],
@@ -217,7 +230,7 @@ export function folderAtPointer(
 ): Widget | undefined {
   if (!pointer) return undefined;
   const moving = widgets.find((w) => w.id === movingId);
-  if (!moving || moving.kind === "folder") return undefined;
+  if (!moving || !isFileable(moving.kind)) return undefined;
   // Array order IS paint order (raiseWidget appends), so search from the top down: with folders
   // free to stack, the one the user can actually see must win.
   return [...widgets]
@@ -245,9 +258,10 @@ function placeInFolder(siblings: Widget[], size: Rect, cols: number, rows: numbe
  *   1. Pointer over a folder → file the widget into it (see {@link folderAtPointer}), laid out clear
  *      of its new siblings.
  *   2. Else another loose widget at the exact same rect → combine the two into a NEW folder at that
- *      spot (the deliberate "stack them to fold" gesture). Folders are excluded on BOTH sides: two
- *      folders share the default 3×3 tile, so they are exact-rect twins the moment they're stacked,
- *      and folding them would destroy both shells and merge their notes.
+ *      spot (the deliberate "stack them to fold" gesture). Only fileable kinds fold, on BOTH sides:
+ *      two folders share the default 3×3 tile, so they are exact-rect twins the moment they're
+ *      stacked, and folding them would destroy both shells and merge their notes; and a task list
+ *      never goes into a folder at all ({@link isFileable}).
  *   3. Else a plain move.
  * Pure: `makeId` is supplied so the function stays deterministic and unit-testable.
  */
@@ -273,17 +287,16 @@ export function resolveDrop(
   }
 
   // 2) Exact-rect twin → fold the two identically-placed widgets into a new folder.
-  const twin =
-    moving.kind === "folder"
-      ? undefined
-      : rest.find(
-          (w) =>
-            w.kind !== "folder" &&
-            w.rect.x === rect.x &&
-            w.rect.y === rect.y &&
-            w.rect.w === rect.w &&
-            w.rect.h === rect.h,
-        );
+  const twin = !isFileable(moving.kind)
+    ? undefined
+    : rest.find(
+        (w) =>
+          isFileable(w.kind) &&
+          w.rect.x === rect.x &&
+          w.rect.y === rect.y &&
+          w.rect.w === rect.w &&
+          w.rect.h === rect.h,
+      );
   if (twin) {
     const folderRect = clampRect(
       { x: rect.x, y: rect.y, w: FOLDER_W, h: FOLDER_H },

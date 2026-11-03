@@ -3,7 +3,8 @@
 
 // The calendar's shared chrome — one header, no second sidebar. ‹ Today › nav first, at the far left
 // where the eye starts, then the date-range label, the view switcher (active = accent), and
-// Refresh-now.
+// Refresh-now. In Agenda, a Runway | List switch sits beside the view switcher; the Runway always
+// runs from today, so with it on, the nav and the date label give way to "From today".
 //
 // "+ New event" (#884, C10) is here only in the views without a grid corner to hold it (Month, Year,
 // Agenda, and Terminal's), at the right end beside Refresh; in Week and Day it sits in the grid's
@@ -17,6 +18,7 @@ import { type Ref } from "react";
 import {
   DAY_COUNT_MAX,
   DAY_COUNT_MIN,
+  type AgendaMode,
   type CalendarRange,
   type CalendarViewMode,
   type RangeBounds,
@@ -61,7 +63,15 @@ interface Props {
   createReason?: string | null;
   /** The "+ New event" button: quick create opens under it, and gives focus back to it. */
   createRef?: Ref<HTMLButtonElement>;
+  /** The Agenda's layout: the Runway board or the dated list. Its switch shows in Agenda only. */
+  agendaMode?: AgendaMode;
+  onAgendaModeChange?: (mode: AgendaMode) => void;
 }
+
+const AGENDA_OPTIONS: SegOption<AgendaMode>[] = [
+  { value: "runway", label: "Runway", title: "Your tasks in columns, from today on" },
+  { value: "list", label: "List", title: "Your events, day by day" },
+];
 
 const VIEW_LABEL: Record<CalendarViewMode, string> = {
   month: "Month",
@@ -94,6 +104,8 @@ export function CalendarHeader({
   onCreate,
   createReason = null,
   createRef,
+  agendaMode = "list",
+  onAgendaModeChange,
 }: Props) {
   const { showMeta } = useDepth();
   const { system } = useTheme();
@@ -107,27 +119,45 @@ export function CalendarHeader({
     value: v,
     label: VIEW_LABEL[v],
   }));
+  // The Runway always runs from today, so paging and the date picker have nothing to move there.
+  const runway = view === "agenda" && agendaMode === "runway" && !!onAgendaModeChange;
 
   return (
     <header
       className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-rule px-4 py-2"
       data-help="calendar-header"
     >
-      <div className="flex items-center gap-1">
-        <Button variant="tertiary" onClick={onPrev} title="Previous" aria-label="Previous">
-          ‹
-        </Button>
-        <Button variant="tertiary" onClick={onToday} title="Jump to today">
-          Today
-        </Button>
-        <Button variant="tertiary" onClick={onNext} title="Next" aria-label="Next">
-          ›
-        </Button>
-      </div>
+      {runway ? (
+        <span className="px-1 font-head text-sm text-ink">From today</span>
+      ) : (
+        <>
+          <div className="flex items-center gap-1">
+            <Button variant="tertiary" onClick={onPrev} title="Previous" aria-label="Previous">
+              ‹
+            </Button>
+            <Button variant="tertiary" onClick={onToday} title="Jump to today">
+              Today
+            </Button>
+            <Button variant="tertiary" onClick={onNext} title="Next" aria-label="Next">
+              ›
+            </Button>
+          </div>
 
-      <MiniCalendarPopover label={label} cursor={cursor} onPick={onPickDate} />
+          <MiniCalendarPopover label={label} cursor={cursor} onPick={onPickDate} />
+        </>
+      )}
 
       <div className="ml-auto flex flex-wrap items-center gap-3">
+        {view === "agenda" && onAgendaModeChange && (
+          // Agenda only, beside the view switcher: it changes how this one view lays out, so it
+          // sits by what it changes and nowhere else (one control, one home).
+          <SegmentedControl
+            ariaLabel="Agenda layout"
+            options={AGENDA_OPTIONS}
+            value={agendaMode}
+            onChange={onAgendaModeChange}
+          />
+        )}
         {view === "day" && (
           // Day only: Week IS the 7-day window, so offering a width control there would be two
           // controls producing the same picture. Sits with the range control because both answer
