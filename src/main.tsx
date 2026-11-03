@@ -5,7 +5,7 @@ import React, { lazy, Suspense } from "react";
 import ReactDOM from "react-dom/client";
 import { ThemeProvider, UserTimeProvider } from "./theme";
 import { CapabilityProvider } from "./lib/capabilities";
-import { ErrorBoundary, TitleBar } from "./components/ui";
+import { ContextMenuHost, ErrorBoundary, TitleBar } from "./components/ui";
 import { PopoverRoot } from "./PopoverRoot";
 import "./theme/fonts";
 import "./index.css";
@@ -19,6 +19,9 @@ const isBriefingWindow = new URLSearchParams(window.location.search).get("window
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
+    {/* PM's right-click menu, in every window: the browser's own page menu (Back, Reload) would
+        reset the app. */}
+    <ContextMenuHost />
     {isBriefingWindow ? (
       <PopoverRoot />
     ) : (

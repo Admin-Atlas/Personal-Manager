@@ -155,6 +155,44 @@ export function findFreeRect(
   return { x: 0, y: 0, w: cw, h: ch };
 }
 
+/** Where a new `w`×`h` card goes when it's made at a spot (the right-click menu's "New note here"):
+ *  with its top-left at `at`, pulled left to fit the width, when that's clear; otherwise the first
+ *  free slot. It may run past the bottom: the board grows downward to hold it. */
+export function placeAt(
+  widgets: Widget[],
+  w: number,
+  h: number,
+  cols: number,
+  rows: number,
+  at?: CellPoint,
+): Rect {
+  if (at) {
+    const cw = Math.min(w, cols);
+    const r: Rect = { x: Math.max(0, Math.min(at.x, cols - cw)), y: Math.max(0, at.y), w: cw, h };
+    if (!widgets.some((x) => rectsOverlap(r, x.rect))) return r;
+  }
+  return findFreeRect(widgets, w, h, cols, rows);
+}
+
+/** A clear `w`×`h` spot beside `near`: to its right, else under it, or null when neither is clear.
+ *  Under may run past the window's rows, as the board grows downward to hold it. */
+export function besideRect(
+  widgets: Widget[],
+  near: Rect,
+  w: number,
+  h: number,
+  cols: number,
+): Rect | null {
+  const clear = (r: Rect) =>
+    r.x >= 0 && r.y >= 0 && r.x + r.w <= cols && !widgets.some((x) => rectsOverlap(r, x.rect));
+  return (
+    [
+      { x: near.x + near.w, y: near.y, w, h },
+      { x: near.x, y: near.y + near.h, w, h },
+    ].find(clear) ?? null
+  );
+}
+
 /**
  * Keep the board a FIXED width of `cols` (the window). Only top-level x/w matter (folder children
  * aren't board-positioned). Used on load so a board authored on a wider window, or before the

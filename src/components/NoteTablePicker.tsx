@@ -18,8 +18,12 @@
 
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Popover, Tooltip } from "./ui";
-import { TABLE_PICKER_COLS, TABLE_PICKER_ROWS } from "../lib/pinboard/noteTables";
-import type { TableAction } from "./RichNoteEditor";
+import {
+  TABLE_ACTIONS as TABLE_MENU,
+  TABLE_PICKER_COLS,
+  TABLE_PICKER_ROWS,
+  type TableAction,
+} from "../lib/pinboard/noteTables";
 
 const CELL_PX = 16;
 const GAP_PX = 3;
@@ -40,16 +44,6 @@ export function TableIcon() {
   );
 }
 
-const TABLE_MENU: { action: TableAction; label: string }[] = [
-  { action: "rowAbove", label: "Insert row above" },
-  { action: "rowBelow", label: "Insert row below" },
-  { action: "colLeft", label: "Insert column left" },
-  { action: "colRight", label: "Insert column right" },
-  { action: "deleteRow", label: "Delete row" },
-  { action: "deleteCol", label: "Delete column" },
-  { action: "deleteTable", label: "Delete table" },
-];
-
 export function NoteTablePicker({
   onPick,
   buttonClassName,
@@ -67,6 +61,9 @@ export function NoteTablePicker({
       onOpenChange={setOpen}
       escapeClipping
       withinDialog
+      // A flex box, not Popover's plain block: in a block the button sat on a text line, and the
+      // line's descender space under it lifted the icon above its neighbours in the toolbar.
+      rootClassName="flex"
       ariaLabel={table ? "Table options" : "Insert a table"}
       panelClassName={table ? "min-w-0 p-1" : "min-w-0 p-2"}
       trigger={({ toggle }) => (

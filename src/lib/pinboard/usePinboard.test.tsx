@@ -620,3 +620,65 @@ describe("usePinboard — the Task list card (PA-1)", () => {
     expect(result.current.board.widgets[0].project).toBeUndefined();
   });
 });
+
+describe("usePinboard: the right-click menu's changes", () => {
+  it("makes a new card where the menu opened, and says when there's something to undo", async () => {
+    ipc.getPref.mockResolvedValue(JSON.stringify(STORED));
+    const { result } = renderHook(() => usePinboard({ cols: 40, rows: 20 }));
+    await settle();
+    expect(result.current.canUndo).toBe(false);
+    act(() => void result.current.addNote({ x: 12, y: 6 }));
+    expect(result.current.board.widgets[1].rect).toEqual({ x: 12, y: 6, w: 7, h: 5 });
+    expect(result.current.canUndo).toBe(true);
+    expect(result.current.canRedo).toBe(false);
+    act(() => result.current.undo());
+    expect(result.current.canRedo).toBe(true);
+  });
+
+  it("duplicates a card beside it as a card of its own: not ingested, its own timeline ids", async () => {
+    const board: Board = {
+      version: BOARD_VERSION,
+      widgets: [
+        {
+          id: "n",
+          kind: "note",
+          rect: { x: 0, y: 0, w: 7, h: 5 },
+          text: "plan",
+          color: "st-due",
+          ingestedAt: "2026-11-01T00:00:00Z",
+          ingestedHash: "abc",
+        },
+        {
+          id: "t",
+          kind: "timeline",
+          rect: { x: 0, y: 6, w: 9, h: 8 },
+          items: [{ id: "i1", date: "2026-11-05", label: "Hand in" }],
+        },
+        { id: "f", kind: "folder", rect: { x: 20, y: 0, w: 3, h: 3 }, children: [] },
+      ],
+    };
+    ipc.getPref.mockResolvedValue(JSON.stringify(board));
+    const { result } = renderHook(() => usePinboard({ cols: 40, rows: 20 }));
+    await settle();
+
+    let copy: string | null = null;
+    act(() => void (copy = result.current.duplicateWidget("n")));
+    const note = result.current.board.widgets.find((w) => w.id === copy)!;
+    expect(note).toMatchObject({ kind: "note", text: "plan", color: "st-due" });
+    expect(note.rect).toEqual({ x: 7, y: 0, w: 7, h: 5 });
+    expect(note.ingestedAt).toBeUndefined();
+    expect(note.ingestedHash).toBeUndefined();
+
+    act(() => void (copy = result.current.duplicateWidget("t")));
+    const timeline = result.current.board.widgets.find((w) => w.id === copy)!;
+    expect(timeline.items).toHaveLength(1);
+    expect(timeline.items![0]).toMatchObject({ date: "2026-11-05", label: "Hand in" });
+    expect(timeline.items![0].id).not.toBe("i1");
+
+    // A folder isn't duplicated.
+    let none: string | null = "x";
+    act(() => void (none = result.current.duplicateWidget("f")));
+    expect(none).toBeNull();
+    expect(result.current.board.widgets).toHaveLength(5);
+  });
+});

@@ -27,6 +27,23 @@ export const TABLE_PICKER_ROWS = 8;
 
 export type Align = "none" | "left" | "center" | "right";
 
+/** A change to the table the cursor is in, from the rich editor's Table button or its right-click
+ *  menu (RichNoteEditor carries them out). */
+export type TableAction =
+  "rowAbove" | "rowBelow" | "colLeft" | "colRight" | "deleteRow" | "deleteCol" | "deleteTable";
+
+/** Both table menus, in order: the Table button's while the cursor is in a table, and right-click on
+ *  a cell. The deletes come last, as a group. */
+export const TABLE_ACTIONS: { action: TableAction; label: string }[] = [
+  { action: "rowAbove", label: "Insert row above" },
+  { action: "rowBelow", label: "Insert row below" },
+  { action: "colLeft", label: "Insert column left" },
+  { action: "colRight", label: "Insert column right" },
+  { action: "deleteRow", label: "Delete row" },
+  { action: "deleteCol", label: "Delete column" },
+  { action: "deleteTable", label: "Delete table" },
+];
+
 /** One table in a note: its line span (`end` exclusive) and its cells, header first. The delimiter
  *  row is not in `rows`; its alignments are kept apart so a re-format writes them back. */
 export interface TableBlock {

@@ -60,8 +60,9 @@ import {
   toggleToken,
 } from "../lib/pinboard/richNote";
 import { isRomanToken } from "../lib/pinboard/notesMarkdown";
-import type { Align } from "../lib/pinboard/noteTables";
+import { TABLE_ACTIONS, type Align, type TableAction } from "../lib/pinboard/noteTables";
 import { openUrl } from "../lib/ipc";
+import { openContextMenu, type MenuItem } from "../lib/contextMenu";
 
 export type RichFormat = "bold" | "italic" | "heading" | "bullet" | "number" | "checkbox";
 
@@ -76,8 +77,7 @@ export interface RichNoteEditorHandle {
   canTable: (action: TableAction) => boolean;
 }
 
-export type TableAction =
-  "rowAbove" | "rowBelow" | "colLeft" | "colRight" | "deleteRow" | "deleteCol" | "deleteTable";
+export type { TableAction };
 
 // --- list helpers --------------------------------------------------------------------------------
 
@@ -225,6 +225,137 @@ const enterInTable: Command = (state, dispatch) => {
   });
   return true;
 };
+
+/** Whether the cursor can't step off a table in direction `dir` onto text of its own: the table opens
+ *  (up) or ends (down) the note, or sits against another table or a rule. A new empty line goes
+ *  there, so you can always write above and below a table, as you can in Google Docs. */
+function needsLine(doc: PMNode, tablePos: number, table: PMNode, dir: 1 | -1): boolean {
+  const next = dir > 0 ? doc.nodeAt(tablePos + table.nodeSize) : doc.resolve(tablePos).nodeBefore;
+  return !next || next.type === S.nodes.table || next.type === S.nodes.horizontal_rule;
+}
+
+/** Leave the table at `tablePos` upward or downward: onto the text beside it, or onto a new empty
+ *  line when there's none (`needsLine`). */
+function leaveTable(
+  state: EditorState,
+  dispatch: ((tr: Transaction) => void) | undefined,
+  tablePos: number,
+  table: PMNode,
+  dir: 1 | -1,
+): boolean {
+  if (!dispatch) return true;
+  const edge = dir > 0 ? tablePos + table.nodeSize : tablePos;
+  const tr = state.tr;
+  if (needsLine(state.doc, tablePos, table, dir)) {
+    tr.insert(edge, S.nodes.paragraph.create());
+    tr.setSelection(TextSelection.create(tr.doc, edge + 1));
+  } else {
+    tr.setSelection(Selection.near(tr.doc.resolve(edge), dir));
+  }
+  dispatch(tr.scrollIntoView());
+  return true;
+}
+
+/** Up or Down in a table: the cell above or below, in the same column. prosemirror-tables does this
+ *  only for cells that hold paragraphs; a note's cells hold their text directly (a Markdown cell is
+ *  one line), so its arrow keys never fired and the browser moved the caret in document order, to the
+ *  next cell along the row. Off the top or bottom row the cursor leaves the table (`leaveTable`). */
+function arrowInTable(dir: 1 | -1): Command {
+  return (state, dispatch, view) => {
+    const sel = state.selection;
+    if (!(sel instanceof TextSelection) || !sel.empty) return false;
+    const $head = sel.$head;
+    const role = $head.parent.type.spec.tableRole as string | undefined;
+    if (role !== "cell" && role !== "header_cell") return false;
+    // A cell whose text wraps: move between its lines first, as anywhere else.
+    if (view && !view.endOfTextblock(dir > 0 ? "down" : "up")) return false;
+    const cellPos = $head.before();
+    const $cell = state.doc.resolve(cellPos);
+    const table = $cell.node(-1);
+    const tableStart = $cell.start(-1);
+    const next = TableMap.get(table).nextCell(cellPos - tableStart, "vert", dir);
+    if (next == null) return leaveTable(state, dispatch, $cell.before(-1), table, dir);
+    if (!dispatch) return true;
+    const target = state.doc.nodeAt(tableStart + next)!;
+    const at = tableStart + next + 1 + Math.min($head.parentOffset, target.content.size);
+    dispatch(state.tr.setSelection(TextSelection.create(state.doc, at)).scrollIntoView());
+    return true;
+  };
+}
+
+/** Enter at the very start of a table's first cell, when nothing can be written above the table
+ *  (`needsLine`), makes a line above it: Google Docs' way to get above a table that opens the page.
+ *  Anywhere else in the table Enter adds a row (`enterInTable`). */
+const lineAboveTable: Command = (state, dispatch) => {
+  const { $from, empty } = state.selection;
+  if (!empty || $from.parentOffset !== 0 || !isInTable(state)) return false;
+  const rect = selectedRect(state);
+  if (rect.top !== 0 || rect.left !== 0) return false;
+  const tablePos = rect.tableStart - 1;
+  if (!needsLine(state.doc, tablePos, rect.table, -1)) return false;
+  return leaveTable(state, dispatch, tablePos, rect.table, -1);
+};
+
+/** Right-click on a table cell: the table's menu, the same changes as the Table button, for the cell
+ *  under the pointer. Bobby: "Make the table edit thing right menu usable". The cursor goes into that
+ *  cell first, unless a selection of several cells already covers it (so deleting two selected rows
+ *  works from here too). The note's other text keeps the system menu, for its spelling suggestions. */
+function tableMenu(view: EditorView, e: MouseEvent): boolean {
+  if (e.shiftKey || !(e.target instanceof Element)) return false;
+  const cell = e.target.closest("td, th");
+  if (!cell || !view.dom.contains(cell)) return false;
+  let start: number;
+  try {
+    start = view.posAtDOM(cell, 0);
+  } catch {
+    return false;
+  }
+  const { state } = view;
+  const sel = state.selection;
+  const covered =
+    sel instanceof CellSelection &&
+    sel.ranges.some((r) => r.$from.pos <= start && start <= r.$to.pos);
+  if (!covered) {
+    const hit = view.posAtCoords({ left: e.clientX, top: e.clientY });
+    const sameCell = hit && state.doc.resolve(hit.pos).parent === state.doc.resolve(start).parent;
+    view.dispatch(
+      state.tr.setSelection(TextSelection.create(state.doc, sameCell ? hit.pos : start)),
+    );
+  }
+  view.focus();
+  const items: MenuItem[] = TABLE_ACTIONS.flatMap(({ action, label }): MenuItem[] => [
+    ...(action === "deleteRow" ? [{ kind: "separator" } as const] : []),
+    {
+      label,
+      danger: action.startsWith("delete"),
+      disabled: !TABLE[action](view.state),
+      onSelect: () => {
+        TABLE[action](view.state, view.dispatch, view);
+        view.focus();
+      },
+    },
+  ]);
+  openContextMenu(e, "Table", items);
+  return true;
+}
+
+/** A click in the empty space under a table that ends the note puts the cursor on a new line under
+ *  it. Left alone, the click lands in the nearest cell and there's no way out of the table to write
+ *  below it. */
+function clickUnderTable(view: EditorView, e: MouseEvent): boolean {
+  if (e.button !== 0) return false;
+  const doc = view.state.doc;
+  const last = doc.lastChild;
+  if (!last || last.type !== S.nodes.table) return false;
+  const tablePos = doc.content.size - last.nodeSize;
+  const dom = view.nodeDOM(tablePos);
+  if (!(dom instanceof HTMLElement) || e.clientY <= dom.getBoundingClientRect().bottom)
+    return false;
+  e.preventDefault();
+  leaveTable(view.state, view.dispatch, tablePos, last, 1);
+  view.focus();
+  return true;
+}
 
 /** A column change that also keeps the table's per-column alignments (`aligns`, from the Markdown
  *  delimiter row) lined up with its columns; prosemirror-tables knows nothing of them. */
@@ -532,7 +663,9 @@ const keys = keymap({
   "Mod-Shift-8": FORMAT.bullet,
   "Mod-Shift-7": FORMAT.number,
   "Mod-Shift-9": FORMAT.checkbox,
-  Enter: chainCommands(enterInTable, enterInList),
+  Enter: chainCommands(lineAboveTable, enterInTable, enterInList),
+  ArrowUp: arrowInTable(-1),
+  ArrowDown: arrowInTable(1),
   // A line break inside a list item would split the note's line; Shift+Enter leaves the list
   // instead, the way an unmarked line under a list item always did.
   "Shift-Enter": chainCommands(
@@ -617,13 +750,14 @@ export const RichNoteEditor = memo(
                   cb.current.onFocus();
                   return false;
                 },
+                contextmenu: tableMenu,
                 // A link opens with Ctrl/Cmd+click, or a plain click while the note isn't being
                 // edited. Web addresses only.
                 mousedown: (view, e) => {
                   const href = (e.target as Element)
                     .closest?.("[data-href]")
                     ?.getAttribute("data-href");
-                  if (!href || !/^https?:\/\//i.test(href)) return false;
+                  if (!href || !/^https?:\/\//i.test(href)) return clickUnderTable(view, e);
                   if (!(e.metaKey || e.ctrlKey) && view.hasFocus()) return false;
                   e.preventDefault();
                   void openUrl(href).catch(() => {});

@@ -19,6 +19,7 @@ import {
   withPrunedRound,
 } from "./game";
 import {
+  besideRect,
   boardExtent,
   clampRect,
   COLS,
@@ -26,7 +27,7 @@ import {
   FOLDER_H,
   FOLDER_W,
   minSize,
-  rectsOverlap,
+  placeAt,
   reflowToWidth,
   resolveDrop,
   ROWS,
@@ -376,26 +377,35 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
   // add* return the new widget's id so the view can scroll it into sight — a note placed on a
   // lower row would otherwise be created off-screen. The id is minted up front (outside the
   // functional update) so it can be returned synchronously.
-  const addNote = useCallback(() => {
-    const id = makeId();
-    change((b) => {
-      const rect = findFreeRect(b.widgets, 7, 5, boundsRef.current.cols, boundsRef.current.rows);
-      const widget: Widget = { id, kind: "note", rect, text: "", color: DEFAULT_TINT };
-      return { ...b, widgets: [...b.widgets, widget] };
-    });
-    return id;
-  }, [change]);
+  //
+  // `at` is where the right-click menu was opened ("New note here"): the card goes there when the
+  // spot is clear (`placeAt`).
+  const addNote = useCallback(
+    (at?: CellPoint) => {
+      const id = makeId();
+      change((b) => {
+        const rect = placeAt(b.widgets, 7, 5, boundsRef.current.cols, boundsRef.current.rows, at);
+        const widget: Widget = { id, kind: "note", rect, text: "", color: DEFAULT_TINT };
+        return { ...b, widgets: [...b.widgets, widget] };
+      });
+      return id;
+    },
+    [change],
+  );
 
-  const addTimeline = useCallback(() => {
-    const id = makeId();
-    change((b) => {
-      const rect = findFreeRect(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows);
-      // Seed an empty title so the header shows its "Timeline" placeholder (matching notes/folders).
-      const widget: Widget = { id, kind: "timeline", rect, title: "", items: [] };
-      return { ...b, widgets: [...b.widgets, widget] };
-    });
-    return id;
-  }, [change]);
+  const addTimeline = useCallback(
+    (at?: CellPoint) => {
+      const id = makeId();
+      change((b) => {
+        const rect = placeAt(b.widgets, 9, 8, boundsRef.current.cols, boundsRef.current.rows, at);
+        // Seed an empty title so the header shows its "Timeline" placeholder (matching notes/folders).
+        const widget: Widget = { id, kind: "timeline", rect, title: "", items: [] };
+        return { ...b, widgets: [...b.widgets, widget] };
+      });
+      return id;
+    },
+    [change],
+  );
 
   /** A Task list card (PA-1): a live view of the global task list, filtered to `project` (unset →
    *  every task). The card stores only that filter; the tasks themselves live in the backend.
@@ -408,28 +418,19 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
    *  board snapshot can take them back. An undo that removed the card would leave the tasks, and
    *  invite a second conversion that only finds them all "already there". The view passes it only
    *  when the conversion wrote tasks (`placeConvertedTaskList`): one that found them all there wrote
-   *  nothing, so its card is an ordinary step and the history before it survives. */
+   *  nothing, so its card is an ordinary step and the history before it survives.
+   *
+   *  `at`, as for a note, is where the right-click menu was opened. */
   const addTaskList = useCallback(
-    (project?: string, near?: Rect, fromConversion = false) => {
+    (project?: string, near?: Rect, fromConversion = false, at?: CellPoint) => {
       const id = makeId();
       change(
         (b) => {
           const { cols, rows } = boundsRef.current;
           const W = 9;
           const H = 8;
-          const clear = (r: Rect) =>
-            r.x >= 0 &&
-            r.y >= 0 &&
-            r.x + r.w <= cols &&
-            !b.widgets.some((w) => rectsOverlap(r, w.rect));
-          const beside = near
-            ? [
-                { x: near.x + near.w, y: near.y, w: W, h: H },
-                // Below may run past the window's rows: the board grows downward to hold it.
-                { x: near.x, y: near.y + near.h, w: W, h: H },
-              ].find(clear)
-            : undefined;
-          const rect = beside ?? findFreeRect(b.widgets, W, H, cols, rows);
+          const beside = near ? besideRect(b.widgets, near, W, H, cols) : null;
+          const rect = beside ?? placeAt(b.widgets, W, H, cols, rows, at);
           const widget: Widget = { id, kind: "tasklist", rect, title: "" };
           if (project !== undefined) widget.project = project;
           return { ...b, widgets: [...b.widgets, widget] };
@@ -444,28 +445,60 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
   /** An EMPTY folder, made on purpose. Nothing auto-dissolves it: it lives until the user ungroups
    *  it, so it can sit there waiting to be filled. `children: []` is not optional — `isValidWidget`
    *  silently drops a folder whose `children` isn't an array, which would lose it on the next load. */
-  const addFolder = useCallback(() => {
-    const id = makeId();
-    change((b) => {
-      const rect = findFreeRect(
-        b.widgets,
-        FOLDER_W,
-        FOLDER_H,
-        boundsRef.current.cols,
-        boundsRef.current.rows,
-      );
-      const widget: Widget = {
-        id,
-        kind: "folder",
-        rect,
-        title: "",
-        children: [],
-        expandMode: "inline",
-      };
-      return { ...b, widgets: [...b.widgets, widget] };
-    });
-    return id;
-  }, [change]);
+  const addFolder = useCallback(
+    (at?: CellPoint) => {
+      const id = makeId();
+      change((b) => {
+        const rect = placeAt(
+          b.widgets,
+          FOLDER_W,
+          FOLDER_H,
+          boundsRef.current.cols,
+          boundsRef.current.rows,
+          at,
+        );
+        const widget: Widget = {
+          id,
+          kind: "folder",
+          rect,
+          title: "",
+          children: [],
+          expandMode: "inline",
+        };
+        return { ...b, widgets: [...b.widgets, widget] };
+      });
+      return id;
+    },
+    [change],
+  );
+
+  /** A copy of a card on the board, beside it where there's room (the right-click menu's Duplicate).
+   *  The copy is a new card in its own right: it isn't the original's document (no ingest marks, so
+   *  it offers its own Ingest), and its timeline entries get ids of their own. A folder isn't
+   *  duplicated: its cards would each need copying, and the menu doesn't offer it. Returns the copy's
+   *  id, or null when there was nothing to copy. */
+  const duplicateWidget = useCallback(
+    (id: string) => {
+      const original = boardRef.current.widgets.find((w) => w.id === id);
+      if (!original || original.kind === "folder") return null;
+      const copyId = makeId();
+      change((b) => {
+        const w = b.widgets.find((x) => x.id === id);
+        if (!w) return b;
+        const { cols, rows } = boundsRef.current;
+        const rect =
+          besideRect(b.widgets, w.rect, w.rect.w, w.rect.h, cols) ??
+          findFreeRect(b.widgets, w.rect.w, w.rect.h, cols, rows);
+        const copy: Widget = { ...w, id: copyId, rect };
+        delete copy.ingestedAt;
+        delete copy.ingestedHash;
+        if (w.items) copy.items = w.items.map((item) => ({ ...item, id: makeId() }));
+        return { ...b, widgets: [...b.widgets, copy] };
+      });
+      return copyId;
+    },
+    [change],
+  );
 
   const updateWidget = useCallback(
     (id: string, patch: Partial<Widget>) => {
@@ -728,7 +761,11 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
     saveFailed,
     undo: undoBoard,
     redo: redoBoard,
+    /** Whether there's anything to undo or redo (the right-click menu greys them otherwise). */
+    canUndo: hist.past.length > 0,
+    canRedo: hist.future.length > 0,
     addNote,
+    duplicateWidget,
     addTimeline,
     addFolder,
     addTaskList,
