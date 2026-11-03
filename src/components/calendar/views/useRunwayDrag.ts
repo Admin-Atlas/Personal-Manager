@@ -13,6 +13,8 @@
 //     and its box is measured with `getBoundingClientRect`, never by which element the event hit
 //     (the #698 lesson: a dragged card's own subtree is what the pointer is over most of the time);
 //   - nothing starts until the pointer has moved 4px, so a click on a card still clicks;
+//   - only the board's visible box takes a drop, and near its top or bottom edge the board scrolls
+//     itself, so a lane scrolled out of view is reached by scrolling to it, never dropped on unseen;
 //   - Escape, pointercancel and the window losing focus abandon it, with nothing written.
 //
 // The drop itself is the caller's: this only says what was dropped, on which zone, and before
@@ -69,17 +71,32 @@ export const DRAG_THRESHOLD_PX = 4;
 const NO_DRAG =
   "input, select, textarea, [data-runway-nodrag], [data-popover-panel], [role='dialog']";
 
-/** The zone under (x, y) inside `root`, and the card the drop would go before. */
+/** Whether a card counts as before the pointer. In a list, its middle is above the pointer. In a
+ *  grid (the parked shelf, `data-runway-grid`), in reading order: a row above the pointer's, or
+ *  the pointer's own row with the card's middle to its left. Grid cards in one row share a top, so
+ *  the list's test would jump a whole row at a time. */
+function cardBefore(b: DOMRect, x: number, y: number, grid: boolean): boolean {
+  if (!grid) return y > b.top + b.height / 2;
+  if (y > b.bottom) return true;
+  return y >= b.top && x > b.left + b.width / 2;
+}
+
+/** The zone under (x, y) inside `root`, and the card the drop would go before. Only the root's
+ *  visible box counts: the board scrolls, and the parts of its lanes scrolled out of it (under the
+ *  header above, or past its bottom edge) can't be dropped on. */
 export function hitTest(
   root: HTMLElement,
   x: number,
   y: number,
   draggingKey: string | null,
 ): RunwayDropAt | null {
+  const box = root.getBoundingClientRect();
+  if (x < box.left || x > box.right || y < box.top || y > box.bottom) return null;
   const zones = root.querySelectorAll<HTMLElement>("[data-runway-zone]");
   for (const z of zones) {
     const r = z.getBoundingClientRect();
     if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+    const grid = z.dataset.runwayGrid !== undefined;
     const zone = z.dataset.runwayZone ?? "";
     let target: RunwayDropAt["target"];
     if (z.dataset.runwayParked !== undefined) target = { kind: "parked" };
@@ -93,12 +110,27 @@ export function hitTest(
     for (const c of z.querySelectorAll<HTMLElement>("[data-runway-card]")) {
       if (c.dataset.runwayCard !== zone) continue;
       if (draggingKey !== null && c.dataset.runwayKey === draggingKey) continue;
-      const b = c.getBoundingClientRect();
-      if (y > b.top + b.height / 2) index += 1;
+      if (cardBefore(c.getBoundingClientRect(), x, y, grid)) index += 1;
     }
     return { zone, target, index };
   }
   return null;
+}
+
+/** How close to the board's top or bottom edge a drag scrolls it, and how fast at most. */
+export const EDGE_SCROLL_PX = 48;
+export const EDGE_SCROLL_MAX = 18;
+
+/** How far a frame of a drag scrolls the board: up (negative) near or above its top edge, down
+ *  near or below its bottom, faster the nearer the edge; 0 elsewhere, or with the pointer off to
+ *  its side. */
+export function edgeScrollStep(x: number, y: number, box: DOMRect): number {
+  if (x < box.left || x > box.right || box.height <= 0) return 0;
+  const edge = Math.min(EDGE_SCROLL_PX, box.height / 3);
+  const into = (d: number) => Math.ceil(EDGE_SCROLL_MAX * Math.min(1, Math.max(0, 1 - d / edge)));
+  if (y < box.top + edge) return -into(y - box.top);
+  if (y > box.bottom - edge) return into(box.bottom - y);
+  return 0;
 }
 
 export function useRunwayDrag(opts: RunwayDragOptions): RunwayDrag {
@@ -119,8 +151,32 @@ export function useRunwayDrag(opts: RunwayDragOptions): RunwayDrag {
     const startX = e.clientX;
     const startY = e.clientY;
     let active = false;
+    // Where the pointer last was, and the edge scroll's frame, while one runs.
+    let last = { x: startX, y: startY };
+    let frame = 0;
+
+    // Near the board's top or bottom edge the board scrolls, a step a frame, so a lane scrolled
+    // out of view can be reached; what's under the pointer is measured again after each step.
+    const scrollTick = () => {
+      frame = 0;
+      const root = optsRef.current.rootRef.current;
+      if (!active || !root) return;
+      const step = edgeScrollStep(last.x, last.y, root.getBoundingClientRect());
+      if (step === 0) return;
+      const before = root.scrollTop;
+      root.scrollTop = before + step;
+      if (root.scrollTop === before) return;
+      setOver(locate(last.x, last.y));
+      frame = requestAnimationFrame(scrollTick);
+    };
+    const startScroll = () => {
+      if (frame !== 0 || typeof requestAnimationFrame === "undefined") return;
+      frame = requestAnimationFrame(scrollTick);
+    };
 
     const end = () => {
+      if (frame !== 0 && typeof cancelAnimationFrame !== "undefined") cancelAnimationFrame(frame);
+      frame = 0;
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
@@ -142,7 +198,9 @@ export function useRunwayDrag(opts: RunwayDragOptions): RunwayDrag {
         setDragging(item);
         optsRef.current.onStart?.(item);
       }
+      last = { x: ev.clientX, y: ev.clientY };
       setOver(locate(ev.clientX, ev.clientY));
+      startScroll();
     };
     const onUp = (ev: PointerEvent) => {
       const was = active;

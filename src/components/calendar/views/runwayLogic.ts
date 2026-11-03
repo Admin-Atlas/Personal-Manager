@@ -18,9 +18,12 @@ import { formatClockIso, formatDateLocal, formatDateOnly } from "../../../lib/fo
 import {
   buildColumns,
   placeCards,
+  placeEvents,
   samePlan,
   type RunwayColumn,
+  type RunwayEventStrip,
   type RunwayModel,
+  type RunwayTaskCard,
   type TaskPlan,
 } from "../../../lib/runway";
 import { runMutation } from "../../../lib/runMutation";
@@ -39,32 +42,43 @@ export interface RunwayProps {
   tasks: Task[];
   stacks: TaskStack[];
   milestones: Milestone[];
-  /** The synced events a task's link can point at (the overlays left out). */
+  /** What the calendar shows, hidden calendars left out, less the task and milestone overlays
+   *  (those are the board's own cards): the synced events and the pinboard's timeline entries.
+   *  The columns' events strips, and what a task's link can point at. */
   events: CalendarEvent[];
+  /** A calendar's colour, for the dot beside an event in a strip. */
+  colorOf?: (calendarId: string) => string;
+  /** Switch the Agenda to its List, where Later's events past the first few are. */
+  onShowList?: () => void;
   /** Archived project names: their tasks and milestones stay off the board. */
   archived: ReadonlySet<string>;
   windows: RunwayWindow[];
   now: Date;
   onWindowsChange: (windows: RunwayWindow[]) => void;
   onOpenProject?: (project: string) => void;
-  /** A linked event's details, anchored at what was clicked. */
+  /** An event's details (a pinboard entry opens the Pinboard), anchored at what was clicked. */
   onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
   /** The tab's polite live region. */
   announce: (text: string) => void;
 }
 
-/** The columns and where everything sits, for `now`'s day. */
+/** The columns, where everything sits and each column's events, for `now`'s day. */
 export function useRunwayModel({
   tasks,
   stacks,
   milestones,
+  events,
   archived,
   windows,
   now,
-}: Pick<RunwayProps, "tasks" | "stacks" | "milestones" | "archived" | "windows" | "now">): {
+}: Pick<
+  RunwayProps,
+  "tasks" | "stacks" | "milestones" | "events" | "archived" | "windows" | "now"
+>): {
   today: Date;
   columns: RunwayColumn[];
   model: RunwayModel;
+  strips: Record<string, RunwayEventStrip>;
 } {
   // Keyed on the day, not the minute tick, so the model is rebuilt only when the date turns.
   const todayKey = dayKey(startOfDay(now));
@@ -74,7 +88,27 @@ export function useRunwayModel({
     () => placeCards({ tasks, stacks, milestones, columns, today, archived }),
     [tasks, stacks, milestones, columns, today, archived],
   );
-  return { today, columns, model };
+  const strips = useMemo(() => placeEvents(events, columns, today), [events, columns, today]);
+  return { today, columns, model, strips };
+}
+
+/** Where a column's events strip says an event is: its clock time in a one-day column (or
+ *  "all-day"), else its day too, as a linked event's chip says it. */
+export function stripWhen(ev: CalendarEvent, column: RunwayColumn): string {
+  const at = parseLocal(ev.start, ev.all_day);
+  // A one-day column whose day the event starts on; one still running from before says its day.
+  if (at && column.start !== null && column.start === column.end) {
+    if (dayKey(startOfDay(at)) === column.start) {
+      return ev.all_day ? "all-day" : formatClockIso(ev.start);
+    }
+  }
+  return eventWhen(ev);
+}
+
+/** Where a stack's task is planned, as its opened card says it: the column's name, or "Parked". */
+export function memberPlace(columns: readonly RunwayColumn[], columnId: string | null): string {
+  if (columnId === null) return "Parked";
+  return columns.find((c) => c.id === columnId)?.label ?? "";
 }
 
 /** "Tomorrow", or "Tomorrow, background" for the background lane. */
@@ -117,7 +151,17 @@ export function useRunwayActions(announce: (text: string) => void) {
     [announce],
   );
 
-  return { error, setError, cycle, replan };
+  /** Put a lane in `order` (the Move… menu's Move up / Move down), then say so. */
+  const reorder = useCallback(
+    (order: number[], said: string) =>
+      void runMutation(async () => {
+        await reorderTasks(order);
+        announce(said);
+      }, setError),
+    [announce],
+  );
+
+  return { error, setError, cycle, replan, reorder };
 }
 
 /** A linked event's day and time, for a card: "06-11 14:00", or the day alone for an all-day one. */
@@ -136,9 +180,12 @@ export function linkedDue(t: Task): string | null {
   return what ? `${when} · ${what}` : when;
 }
 
-/** "planned 2d ago", for a task rolled forward into today. */
-export function rolledWords(daysAgo: number): string {
-  return daysAgo === 1 ? "planned yesterday" : `planned ${daysAgo}d ago`;
+/** "planned 2d ago", for a task whose plan rolled forward into today. Null for one that rolled
+ *  because its deadline passed with no plan: it was never planned, and its deadline chip already
+ *  says how late it is. */
+export function rolledWords(card: RunwayTaskCard): string | null {
+  if (!card.rolled || card.rolledBy !== "plan") return null;
+  return card.daysAgo === 1 ? "planned yesterday" : `planned ${card.daysAgo}d ago`;
 }
 
 /** A new task's starting values on a Runway: it starts today. */

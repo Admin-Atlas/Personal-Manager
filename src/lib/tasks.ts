@@ -18,6 +18,7 @@ import type {
   DeadlineKind,
   Task,
   TaskInput,
+  TaskStack,
   TaskStackKind,
   TaskStatus,
 } from "./types";
@@ -115,6 +116,47 @@ export const STACK_KIND_LABEL: Record<TaskStackKind, string> = {
   waiting_on: "Waiting on someone",
 };
 
+/** Every stack kind, in the order the pickers list them. */
+export const STACK_KINDS: readonly TaskStackKind[] = ["sequential", "in_order", "waiting_on"];
+
+/** What a stack chip's tooltip says: its name, its kind and its note. */
+export function stackTooltip(stack: Pick<TaskStack, "title" | "kind" | "note">): string {
+  const kind = STACK_KIND_LABEL[stack.kind];
+  const head = stack.title ? `${stack.title} · ${kind}` : kind;
+  return stack.note ? `${head}\n${stack.note}` : head;
+}
+
+/** Where a task's deadline comes from, for the deadline chip's tooltip. */
+export function deadlineSource(
+  t: Pick<
+    Task,
+    | "deadline_from"
+    | "deadline_kind"
+    | "deadline_missing"
+    | "milestone_id"
+    | "milestone_label"
+    | "event_uid"
+    | "event_title"
+  >,
+): string {
+  // The link itself is gone (its milestone was deleted, alone or with its project, and the FK
+  // nulled it under the task), not merely undated.
+  if (t.deadline_from === "milestone" && t.milestone_id === null)
+    return "The linked milestone was removed, so this is your own date";
+  if (t.deadline_from === "event" && t.event_uid === null)
+    return "The linked event was removed, so this is your own date";
+  if (t.deadline_missing) {
+    return t.deadline_from === "milestone"
+      ? "The linked milestone has no date, so this is your own date"
+      : "The linked event isn't in your calendars, so this is your own date";
+  }
+  if (t.deadline_from === "milestone")
+    return `Milestone's date${t.milestone_label ? `: ${t.milestone_label}` : ""}`;
+  if (t.deadline_from === "event")
+    return `Event's date${t.event_title ? `: ${t.event_title}` : ""}`;
+  return t.deadline_kind === "soft" ? "A date to aim for" : "Deadline";
+}
+
 /** Where a deadline can come from, as the editor's Deadline row names it. */
 export const DEADLINE_FROM_LABEL: Record<DeadlineFrom, string> = {
   date: "My own date",
@@ -185,8 +227,15 @@ export const EVENT_CHOICE_PAST_DAYS = 30;
  *  series or an event on two calendars is one choice), at its next occurrence on or after `today`,
  *  or, when it has none, its latest occurrence within the last 30 days. Older ones and events with
  *  no UID are left out. Upcoming choices come first, soonest first; then the past ones, latest
- *  first. */
-export function eventChoices(events: readonly CalendarEvent[], today: Date): EventChoice[] {
+ *  first.
+ *
+ *  `keepUid` (the event a task already links to) is kept however long ago it was: the backend
+ *  still resolves a deadline that follows it, so the editor must not call it gone. */
+export function eventChoices(
+  events: readonly CalendarEvent[],
+  today: Date,
+  keepUid?: string | null,
+): EventChoice[] {
   const t0 = startOfDay(today);
   const floor = addDays(t0, -EVENT_CHOICE_PAST_DAYS);
   const next = new Map<string, { day: Date; title: string }>();
@@ -200,7 +249,7 @@ export function eventChoices(events: readonly CalendarEvent[], today: Date): Eve
     if (day >= t0) {
       const cur = next.get(e.uid);
       if (!cur || day < cur.day) next.set(e.uid, { day, title });
-    } else if (day >= floor) {
+    } else if (day >= floor || e.uid === keepUid) {
       const cur = last.get(e.uid);
       if (!cur || day > cur.day) last.set(e.uid, { day, title });
     }

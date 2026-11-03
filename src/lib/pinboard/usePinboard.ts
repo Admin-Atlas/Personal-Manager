@@ -406,7 +406,9 @@ export function usePinboard(viewport: BoardSpace = { cols: COLS, rows: ROWS }) {
    *  `fromConversion` records it as a history BARRIER, the same reason a timeline's project link is
    *  one: "Make this a task list" has already written real task rows before this card lands, and no
    *  board snapshot can take them back. An undo that removed the card would leave the tasks, and
-   *  invite a second conversion that only finds them all "already there". */
+   *  invite a second conversion that only finds them all "already there". The view passes it only
+   *  when the conversion wrote tasks (`placeConvertedTaskList`): one that found them all there wrote
+   *  nothing, so its card is an ordinary step and the history before it survives. */
   const addTaskList = useCallback(
     (project?: string, near?: Rect, fromConversion = false) => {
       const id = makeId();

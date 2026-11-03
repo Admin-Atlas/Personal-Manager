@@ -726,6 +726,7 @@ pub fn list_archived_projects(state: State<'_, AppState>) -> Result<Vec<String>>
 /// first set; blanks clear a field.
 #[tauri::command]
 pub fn set_project_metadata(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     deadline: Option<String>,
@@ -740,7 +741,13 @@ pub fn set_project_metadata(
         return Err(Error::Other("project name is empty".into()));
     }
     let conn = state.conn()?;
-    projects::set_metadata(&conn, name, deadline, size, blocked_by, importance)
+    projects::set_metadata(&conn, name, deadline, size, blocked_by, importance)?;
+    drop(conn);
+    // A deadline moves the project's 'deadline' milestone (`set_primary_deadline`), and a task can
+    // take its deadline from that milestone, so the open task views re-read (as `update_milestone`
+    // has them do).
+    tasks_changed(&app);
+    Ok(())
 }
 
 /// Propose triage metadata (size/blocked-by/deadline) for projects, on

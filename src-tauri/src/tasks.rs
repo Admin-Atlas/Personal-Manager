@@ -13,8 +13,11 @@
 //! **Links are independent and optional.** A task may name a project, a milestone (of that project,
 //! or alone, in which case it inherits the milestone's project) and a calendar event by iCal UID,
 //! in any combination. **The deadline can follow a link** (`deadline_from`): the task's own date, the
-//! linked milestone's resolved date, or the linked event's date in the user's zone. When the link
-//! can't resolve (the event is gone, the milestone has no date or was deleted), the task falls back
+//! linked milestone's resolved date, or the linked event's date in the user's zone. An event
+//! deadline is pinned to one occurrence: the task's own `deadline` holds the date of the occurrence
+//! the user picked, and the deadline is that uid's occurrence nearest the pin (R1), so a recurring
+//! event's chosen Friday goes late once it passes rather than rolling on. When the link can't
+//! resolve (the event is gone, the milestone has no date or was deleted), the task falls back
 //! to its own `deadline` and says so with `deadline_missing`. Every surface uses
 //! `effective_deadline`, never `deadline`, for tone, sorting and next-up.
 //!
@@ -81,7 +84,8 @@ pub struct Task {
     pub event_uid: Option<String>,
     pub do_start: Option<String>,
     pub do_end: Option<String>,
-    /// The task's OWN deadline, as stored. Display logic reads `effective_deadline` instead.
+    /// The task's OWN deadline, as stored. With `deadline_from = 'event'` it is the pin: the date of
+    /// the occurrence the user picked. Display logic reads `effective_deadline` instead.
     pub deadline: Option<String>,
     pub deadline_kind: String,
     /// One of [`DEADLINE_FROM`].
@@ -292,20 +296,24 @@ pub fn validate_fields(f: &TaskFields) -> Result<TaskFields> {
     })
 }
 
-/// The checks that read the database: the milestone exists (and the task inherits its project, or
-/// refuses one that differs) and the stack exists.
+/// The checks that read the database: the project is made canonical ([`canonical_project`]), the
+/// milestone exists (and the task inherits its project, or refuses one that differs) and the stack
+/// exists.
 fn resolve_links(conn: &Connection, f: &mut TaskFields) -> Result<()> {
+    if let Some(typed) = f.project.take() {
+        f.project = Some(canonical_project(conn, &typed)?);
+    }
     if let Some(mid) = f.milestone_id {
         let owner = crate::milestones::project_of(conn, mid)?
             .ok_or_else(|| Error::Other("that milestone no longer exists".into()))?;
         match &f.project {
-            None => f.project = Some(owner),
-            Some(p) if *p != owner => {
+            // A case variant of the owner is the owner: the task takes the milestone's spelling.
+            Some(p) if p.to_lowercase() != owner.to_lowercase() => {
                 return Err(Error::Other(
                     "that milestone belongs to another project".into(),
                 ))
             }
-            Some(_) => {}
+            _ => f.project = Some(owner),
         }
     }
     if let Some(sid) = f.stack_id {
@@ -322,6 +330,44 @@ fn stack_exists(conn: &Connection, id: i64) -> Result<bool> {
         params![id],
         |r| r.get(0),
     )?)
+}
+
+/// The project a typed name means (R1), so a task never lands on a stray spelling that every
+/// project surface, rename, merge and delete would miss (they all match the exact name).
+///
+/// In order: a name a project already goes by exactly (its `projects` row, or its entity's
+/// canonical name, since a project can be an entity before it has a triage row); then the same,
+/// case-insensitively, preferring an entity's canonical name; then the entity aliases, the way
+/// canon.rs resolves a name (`entities::resolve_project`, exact). Otherwise the typed name, trimmed:
+/// a genuinely new project, whose row [`ensure_project`] then mints.
+pub fn canonical_project(conn: &Connection, typed: &str) -> Result<String> {
+    let typed = typed.trim();
+    let mut stmt = conn.prepare(
+        "SELECT p.name, EXISTS(SELECT 1 FROM entities e \
+                                WHERE e.type = 'project' AND e.canonical_name = p.name) \
+           FROM projects p \
+         UNION \
+         SELECT canonical_name, 1 FROM entities WHERE type = 'project'",
+    )?;
+    let names = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if names.iter().any(|(n, _)| n == typed) {
+        return Ok(typed.to_string());
+    }
+    // Rust's case folding, not SQLite's `lower()`, which folds ASCII only.
+    let folded = typed.to_lowercase();
+    if let Some((name, _)) = names
+        .iter()
+        .filter(|(n, _)| n.to_lowercase() == folded)
+        .min_by(|(a, a_entity), (b, b_entity)| b_entity.cmp(a_entity).then_with(|| a.cmp(b)))
+    {
+        return Ok(name.clone());
+    }
+    match crate::entities::resolve_project(conn, typed, false)? {
+        Some(id) => crate::entities::canonical_name(conn, id),
+        None => Ok(typed.to_string()),
+    }
 }
 
 /// Upsert a bare `projects` row so the FK holds for a lazy (never-triaged) project.
@@ -354,6 +400,34 @@ fn effective_deadline(
         Some(Some(d)) => (Some(d.to_string()), false),
         Some(None) => (own.map(str::to_string), true),
     }
+}
+
+/// The one occurrence of a linked event a task's deadline follows, from that uid's occurrence dates
+/// (ascending, as [`crate::milestones::calendar_occurrences_by_uid`] gives them). Pure.
+///
+/// With a pin (the occurrence the user picked, held in the task's own `deadline`, R1): the
+/// occurrence nearest the pin, an earlier one winning a tie. So a recurring event's chosen Friday
+/// stays the deadline and goes late once it passes, and a moved occurrence is still found. With no
+/// pin: the soonest on or after `today`, else the latest past one. `None` when there are none.
+fn event_occurrence<'a>(dates: &'a [String], pin: Option<&str>, today: &str) -> Option<&'a str> {
+    let day = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+    let Some(pin) = pin.and_then(day) else {
+        return dates
+            .iter()
+            .find(|d| d.as_str() >= today)
+            .or_else(|| dates.last())
+            .map(String::as_str);
+    };
+    let mut best: Option<(i64, &str)> = None;
+    for d in dates {
+        let Some(at) = day(d) else { continue };
+        let distance = (at - pin).num_days().abs();
+        // Ascending dates, so keeping only a strictly nearer one lets the earlier win a tie.
+        if best.is_none_or(|(b, _)| distance < b) {
+            best = Some((distance, d.as_str()));
+        }
+    }
+    best.map(|(_, d)| d)
 }
 
 /// The stored rows, joined with the project's archive flag and the linked event's title, links not
@@ -405,9 +479,10 @@ fn load_rows(conn: &Connection, project: Option<&str>) -> Result<Vec<Task>> {
 }
 
 /// Every task (`project = None`) or one project's, in the one global order (`ordinal`, then id),
-/// with links resolved. `today` is the user's zone-local civil date (`clock::today_sql_in`), so a
-/// calendar-linked date resolves the way the milestone surfaces see it: the soonest occurrence on
-/// or after today, else the latest past one.
+/// with links resolved. `today` is the user's zone-local civil date (`clock::today_sql_in`). An event
+/// deadline resolves to the occurrence nearest the task's pin (its own `deadline`), or with no pin
+/// the way the milestone surfaces see it: the soonest occurrence on or after today, else the latest
+/// past one (see [`event_occurrence`]).
 pub fn list(conn: &Connection, project: Option<&str>, today: &str) -> Result<Vec<Task>> {
     let rows = load_rows(conn, project.map(str::trim).filter(|p| !p.is_empty()))?;
     // Resolve the links only when some task has one: both scans read the calendar mirror.
@@ -420,8 +495,13 @@ pub fn list(conn: &Connection, project: Option<&str>, today: &str) -> Result<Vec
         } else {
             HashMap::new()
         };
-    let event_dates: HashMap<String, String> = if rows.iter().any(|t| t.event_uid.is_some()) {
-        crate::milestones::calendar_dates_by_uid(conn, today)?
+    // Only a deadline that follows its event reads the occurrences (an event link alone shows just
+    // the title, which `load_rows` already joined).
+    let event_dates: HashMap<String, Vec<String>> = if rows
+        .iter()
+        .any(|t| t.deadline_from == FROM_EVENT && t.event_uid.is_some())
+    {
+        crate::milestones::calendar_occurrences_by_uid(conn)?
     } else {
         HashMap::new()
     };
@@ -435,7 +515,7 @@ pub fn list(conn: &Connection, project: Option<&str>, today: &str) -> Result<Vec
                 .event_uid
                 .as_deref()
                 .and_then(|uid| event_dates.get(uid))
-                .map(String::as_str);
+                .and_then(|dates| event_occurrence(dates, task.deadline.as_deref(), today));
             let (effective, missing) = effective_deadline(
                 &task.deadline_from,
                 task.deadline.as_deref(),
@@ -633,7 +713,8 @@ pub fn remove(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Turn checklist lines into tasks in one transaction. A line is skipped when its trimmed title is
+/// Turn checklist lines into tasks in one transaction, under the canonical spelling of `project`
+/// ([`canonical_project`]). A line is skipped when its trimmed title is
 /// blank, or matches (case-insensitively) a task already in the same project scope (no project
 /// matches no project) or an earlier line of this batch. A ticked line becomes a done task. A line
 /// longer than [`TITLE_MAX`] is shortened to it rather than failing the whole import.
@@ -642,8 +723,11 @@ pub fn import_checklist(
     project: Option<&str>,
     items: &[ChecklistItem],
 ) -> Result<ImportResult> {
-    let project = clean(project.map(str::to_string));
     let tx = conn.unchecked_transaction()?;
+    let project = match clean(project.map(str::to_string)) {
+        Some(typed) => Some(canonical_project(&tx, &typed)?),
+        None => None,
+    };
     let mut known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT title FROM tasks WHERE project_name IS ?1")?;
         let titles = stmt
@@ -1247,9 +1331,9 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_can_follow_the_event_and_falls_back_when_it_is_gone() {
+    fn with_no_pin_an_event_deadline_takes_the_next_occurrence_and_falls_back_when_it_is_gone() {
         let (_dir, conn) = store();
-        // A repeating event: the next occurrence on or after today wins.
+        // A repeating event and no pin (no own date): the next occurrence on or after today wins.
         event(
             &conn,
             "review@x",
@@ -1311,7 +1395,7 @@ mod tests {
         assert_eq!(t.effective_deadline, None);
         assert!(t.deadline_missing);
         assert_eq!(t.event_title, None);
-        // With an own date it falls back to that.
+        // With an own date (a pin) it falls back to that.
         let f = TaskFields {
             deadline: Some("2026-11-05".into()),
             ..f
@@ -1320,6 +1404,248 @@ mod tests {
         let t = get(&conn, id);
         assert_eq!(t.effective_deadline.as_deref(), Some("2026-11-05"));
         assert!(t.deadline_missing);
+    }
+
+    /// A task following `ical`'s date, pinned to the occurrence on `pin`.
+    fn pinned(ical: &str, pin: &str) -> TaskFields {
+        TaskFields {
+            do_start: Some("2026-11-02".into()),
+            event_uid: Some(ical.into()),
+            deadline: Some(pin.into()),
+            deadline_from: FROM_EVENT.into(),
+            ..fields("prep slides")
+        }
+    }
+
+    fn effective_on(conn: &Connection, id: i64, today: &str) -> (Option<String>, bool) {
+        let t = list(conn, None, today)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == id)
+            .unwrap();
+        (t.effective_deadline, t.deadline_missing)
+    }
+
+    #[test]
+    fn a_pinned_recurring_occurrence_stays_the_deadline_and_goes_late() {
+        let (_dir, conn) = store();
+        event(
+            &conn,
+            "review@x",
+            "Friday review",
+            &[
+                "2026-10-30T15:00:00Z",
+                "2026-11-06T15:00:00Z",
+                "2026-11-13T15:00:00Z",
+            ],
+        );
+        // "Do it Monday, the deadline is this Friday's review."
+        let id = add(&conn, &pinned("review@x", "2026-11-06"), SOURCE_USER).unwrap();
+        let on_time = (Some("2026-11-06".to_string()), false);
+        assert_eq!(effective_on(&conn, id, TODAY), on_time);
+        // Saturday: still the Friday that was picked, so it reads late, not "due on the 13th".
+        assert_eq!(effective_on(&conn, id, "2026-11-07"), on_time);
+        assert_eq!(effective_on(&conn, id, "2026-11-20"), on_time);
+        // A pin already in the past is late today, not rolled on to the next Friday.
+        let past = add(&conn, &pinned("review@x", "2026-10-30"), SOURCE_USER).unwrap();
+        assert_eq!(
+            effective_on(&conn, past, TODAY),
+            (Some("2026-10-30".to_string()), false)
+        );
+        // An occurrence moved in the series is still the nearest one to its pin.
+        conn.execute(
+            "UPDATE calendar_events SET start = '2026-11-05T15:00:00Z' WHERE id = 'review@x#1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            effective_on(&conn, id, TODAY),
+            (Some("2026-11-05".to_string()), false)
+        );
+    }
+
+    #[test]
+    fn a_pinned_single_event_follows_its_move_and_falls_back_when_it_is_gone() {
+        let (_dir, conn) = store();
+        event(&conn, "pitch@x", "Pitch", &["2026-11-06T09:00:00Z"]);
+        let id = add(&conn, &pinned("pitch@x", "2026-11-06"), SOURCE_USER).unwrap();
+        // Moved a week later in Google: the deadline follows it, however far from the pin.
+        conn.execute(
+            "UPDATE calendar_events SET start = '2026-11-20T09:00:00Z' WHERE uid = 'pitch@x'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            effective_on(&conn, id, TODAY),
+            (Some("2026-11-20".to_string()), false)
+        );
+        // Gone: the pin itself, flagged.
+        conn.execute("DELETE FROM calendar_events", []).unwrap();
+        assert_eq!(
+            effective_on(&conn, id, TODAY),
+            (Some("2026-11-06".to_string()), true)
+        );
+    }
+
+    #[test]
+    fn the_occurrence_nearest_the_pin_wins_and_an_earlier_one_wins_a_tie() {
+        let dates: Vec<String> = ["2026-10-30", "2026-11-06", "2026-11-12", "2026-11-20"]
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        // Nearest.
+        assert_eq!(
+            event_occurrence(&dates, Some("2026-11-07"), TODAY),
+            Some("2026-11-06")
+        );
+        assert_eq!(
+            event_occurrence(&dates, Some("2026-12-25"), TODAY),
+            Some("2026-11-20")
+        );
+        // 11-09 is three days from both 11-06 and 11-12: the earlier wins.
+        assert_eq!(
+            event_occurrence(&dates, Some("2026-11-09"), TODAY),
+            Some("2026-11-06")
+        );
+        // No pin: today's rule, soonest on or after today, else the latest past one.
+        assert_eq!(event_occurrence(&dates, None, TODAY), Some("2026-11-06"));
+        assert_eq!(
+            event_occurrence(&dates, None, "2026-12-01"),
+            Some("2026-11-20")
+        );
+        assert_eq!(event_occurrence(&[], Some("2026-11-06"), TODAY), None);
+        assert_eq!(event_occurrence(&[], None, TODAY), None);
+    }
+
+    #[test]
+    fn occurrences_are_bucketed_in_the_users_zone_ascending_without_repeats() {
+        let (_dir, conn) = store();
+        event(
+            &conn,
+            "late@x",
+            "Late call",
+            &[
+                "2026-11-13T23:30:00Z",
+                "2026-11-06T23:30:00Z",
+                "2026-11-06T10:00:00Z",
+            ],
+        );
+        let by_uid = crate::milestones::calendar_occurrences_by_uid(&conn).unwrap();
+        assert_eq!(by_uid["late@x"], vec!["2026-11-06", "2026-11-13"]);
+        crate::db::set_setting(&conn, crate::settings::TIME_ZONE_KEY, "Asia/Tokyo").unwrap();
+        let by_uid = crate::milestones::calendar_occurrences_by_uid(&conn).unwrap();
+        assert_eq!(
+            by_uid["late@x"],
+            vec!["2026-11-06", "2026-11-07", "2026-11-14"]
+        );
+        // The milestone resolver reads the same buckets.
+        let soonest = crate::milestones::calendar_dates_by_uid(&conn, "2026-11-07").unwrap();
+        assert_eq!(soonest["late@x"], "2026-11-07");
+        let soonest = crate::milestones::calendar_dates_by_uid(&conn, "2026-12-01").unwrap();
+        assert_eq!(soonest["late@x"], "2026-11-14");
+    }
+
+    // --- canonical project names (R1) ---
+
+    #[test]
+    fn a_case_variant_of_a_project_lands_on_the_project() {
+        let (_dir, conn) = store();
+        let a = add(&conn, &in_project("first", "Atlas"), SOURCE_USER).unwrap();
+        let b = add(&conn, &in_project("email Sam", " atlas "), SOURCE_USER).unwrap();
+        assert_eq!(get(&conn, b).project_name.as_deref(), Some("Atlas"));
+        assert_eq!(count_for_project(&conn, "Atlas").unwrap(), 2);
+        let stray: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE name = 'atlas'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stray, 0, "no row minted for the variant");
+        // An edit canonicalises too.
+        update(&conn, a, &in_project("first", "ATLAS")).unwrap();
+        assert_eq!(get(&conn, a).project_name.as_deref(), Some("Atlas"));
+        // A name nothing matches is a new project, kept as typed.
+        let c = add(&conn, &in_project("c", "Brand New"), SOURCE_USER).unwrap();
+        assert_eq!(get(&conn, c).project_name.as_deref(), Some("Brand New"));
+    }
+
+    #[test]
+    fn an_alias_or_an_entity_only_project_resolves_to_its_canonical_name() {
+        let (_dir, conn) = store();
+        let pm = crate::entities::resolve_project(&conn, "Personal Manager", true)
+            .unwrap()
+            .unwrap();
+        crate::entities::add_alias(&conn, pm, "PM").unwrap();
+        // An exact alias, with no projects row yet.
+        let a = add(&conn, &in_project("a", "PM"), SOURCE_USER).unwrap();
+        assert_eq!(
+            get(&conn, a).project_name.as_deref(),
+            Some("Personal Manager")
+        );
+        // A case variant of an entity's canonical name.
+        let b = add(&conn, &in_project("b", "personal manager"), SOURCE_USER).unwrap();
+        assert_eq!(
+            get(&conn, b).project_name.as_deref(),
+            Some("Personal Manager")
+        );
+        // With a stray variant row as well, the entity's canonical name wins the case match.
+        conn.execute("INSERT INTO projects(name) VALUES ('personal MANAGER')", [])
+            .unwrap();
+        assert_eq!(
+            canonical_project(&conn, "PERSONAL manager").unwrap(),
+            "Personal Manager"
+        );
+        // But an exact name is kept as is.
+        assert_eq!(
+            canonical_project(&conn, "personal MANAGER").unwrap(),
+            "personal MANAGER"
+        );
+    }
+
+    #[test]
+    fn a_milestone_link_accepts_its_project_by_any_name_it_goes_by() {
+        let (_dir, conn) = store();
+        let mid = crate::milestones::add(&conn, "Atlas", "Pitch", None, None).unwrap();
+        let f = TaskFields {
+            milestone_id: Some(mid),
+            ..in_project("deck", "atlas")
+        };
+        let id = add(&conn, &f, SOURCE_USER).unwrap();
+        assert_eq!(get(&conn, id).project_name.as_deref(), Some("Atlas"));
+        let f = TaskFields {
+            milestone_id: Some(mid),
+            ..in_project("deck", "Other")
+        };
+        assert!(err(add(&conn, &f, SOURCE_USER)).contains("belongs to another project"));
+    }
+
+    #[test]
+    fn an_import_files_under_the_canonical_project() {
+        let (_dir, conn) = store();
+        add(&conn, &in_project("Buy milk", "Home"), SOURCE_USER).unwrap();
+        let r = import_checklist(
+            &conn,
+            Some(" home "),
+            &[
+                ChecklistItem {
+                    title: "buy milk".into(),
+                    done: false,
+                },
+                ChecklistItem {
+                    title: "Fix tap".into(),
+                    done: false,
+                },
+            ],
+        )
+        .unwrap();
+        // The existing Home task is seen (so skipped), and the new one is filed under Home.
+        assert_eq!((r.created.len(), r.skipped), (1, 1));
+        assert_eq!(
+            project_of(&conn, r.created[0]).unwrap().as_deref(),
+            Some("Home")
+        );
+        assert_eq!(count_for_project(&conn, "Home").unwrap(), 2);
     }
 
     #[test]

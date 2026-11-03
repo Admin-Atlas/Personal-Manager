@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The task editor writes what the backend will accept: links stay independent, a deadline can only
-// follow a link that's set (and falls back to the own date when that link is gone), a new stack is
-// made before the task that joins it, and a refused save says why and keeps the dialog open.
+// follow a link that's set (and falls back to the own date when that link is gone), an event
+// deadline pins the occurrence that was picked, a saved link reads as the backend resolved it, a
+// new stack is made before the task that joins it, a stack can be edited or deleted from its row,
+// and a refused save says why and keeps the dialog open.
 //
 // IPC is mocked whole-module, as MilestoneList.test.tsx does, and `useTheme` is stubbed so the
 // primitives render without the ThemeProvider (which pulls in IPC).
@@ -12,6 +14,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { addDays, dayKey } from "../../lib/calendar-layout";
+import { formatDateLocal, formatDateOnly } from "../../lib/format";
 import type { CalendarEvent, Milestone, Task } from "../../lib/types";
 import { TaskEditor } from "./TaskEditor";
 
@@ -25,6 +28,8 @@ vi.mock("../../lib/ipc", () => ({
   listProjects: vi.fn(async () => ["Atlas", "Home"]),
   listTaskStacks: vi.fn(async () => []),
   updateTask: vi.fn(async () => {}),
+  updateTaskStack: vi.fn(async () => {}),
+  deleteTaskStack: vi.fn(async () => {}),
 }));
 
 vi.mock("../../theme/ThemeContext", async (importOriginal) => ({
@@ -96,6 +101,22 @@ function task(over: Partial<Task> = {}): Task {
     source: "user",
     created_at: "",
     updated_at: "",
+    ...over,
+  };
+}
+
+function calEvent(over: Partial<CalendarEvent> = {}): CalendarEvent {
+  return {
+    id: "e1",
+    calendar_id: "c",
+    summary: "Demo day",
+    description: null,
+    location: null,
+    start: dayKey(new Date()),
+    end: null,
+    all_day: true,
+    html_link: null,
+    uid: "uid-demo",
     ...over,
   };
 }
@@ -208,12 +229,204 @@ describe("TaskEditor", () => {
     fireEvent.click(segment("Event's date"));
     // The picker shows the link, and the Deadline row now shows the event's date.
     expect(screen.getAllByText(/Demo day/).some((el) => el.tagName === "P")).toBe(true);
+    expect(screen.getByText(`📅 Demo day: ${formatDateLocal(friday)}`)).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Prep demo" } });
     fireEvent.click(screen.getByRole("button", { name: "Add task" }));
     await waitFor(() => expect(mocked.addTask).toHaveBeenCalled());
+    // The picked occurrence's day is written as the pin.
     expect(mocked.addTask).toHaveBeenCalledWith(
-      expect.objectContaining({ eventUid: "uid-demo", deadlineFrom: "event" }),
+      expect.objectContaining({
+        eventUid: "uid-demo",
+        deadlineFrom: "event",
+        deadline: dayKey(friday),
+      }),
     );
+  });
+
+  it("keeps a recurring event's pinned occurrence after it has passed", async () => {
+    // Pinned to last Friday's review; the mirror's next one is this coming Friday.
+    const lastFriday = dayKey(addDays(new Date(), -4));
+    const nextFriday = addDays(new Date(), 3);
+    mocked.listAllCalendarEvents.mockResolvedValue([
+      calEvent({ summary: "Friday review", start: dayKey(nextFriday), uid: "uid-review" }),
+    ]);
+    render(
+      <TaskEditor
+        open
+        task={task({
+          event_uid: "uid-review",
+          event_title: "Friday review",
+          deadline_from: "event",
+          deadline: lastFriday,
+          effective_deadline: lastFriday,
+        })}
+        onClose={() => {}}
+      />,
+    );
+    const shown = `${formatDateOnly(lastFriday)} · Friday review`;
+    await waitFor(() => expect(screen.getByText(`📅 ${shown}`)).toBeTruthy());
+    expect(screen.getByText(`📅 Friday review: ${formatDateOnly(lastFriday)}`)).toBeTruthy();
+    expect(screen.queryByText(new RegExp(formatDateLocal(nextFriday)))).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mocked.updateTask).toHaveBeenCalled());
+    expect(mocked.updateTask).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ deadlineFrom: "event", deadline: lastFriday }),
+    );
+  });
+
+  it("pins the shown occurrence when switching to the event's date, and keeps the own date", async () => {
+    const soon = addDays(new Date(), 3);
+    mocked.listAllCalendarEvents.mockResolvedValue([
+      calEvent({ summary: "Demo day", start: dayKey(soon), uid: "uid-demo" }),
+    ]);
+    const linked = task({ event_uid: "uid-demo", event_title: "Demo day", deadline: "2030-12-20" });
+
+    render(<TaskEditor open task={linked} onClose={() => {}} />);
+    await waitFor(() => expect(segment("Event's date").hasAttribute("disabled")).toBe(false));
+    await waitFor(() =>
+      expect(screen.getByText(`📅 ${formatDateLocal(soon)} · Demo day`)).toBeTruthy(),
+    );
+    fireEvent.click(segment("Event's date"));
+    expect(screen.getByText(`📅 Demo day: ${formatDateLocal(soon)}`)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mocked.updateTask).toHaveBeenCalledTimes(1));
+    expect(mocked.updateTask).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ deadlineFrom: "event", deadline: dayKey(soon) }),
+    );
+    cleanup();
+
+    // Over to the event's date and back: the own date is still there.
+    render(<TaskEditor open task={linked} onClose={() => {}} />);
+    await waitFor(() => expect(segment("Event's date").hasAttribute("disabled")).toBe(false));
+    fireEvent.click(segment("Event's date"));
+    fireEvent.click(segment("My own date"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mocked.updateTask).toHaveBeenCalledTimes(2));
+    expect(mocked.updateTask).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ deadlineFrom: "date", deadline: "2030-12-20" }),
+    );
+  });
+
+  it("says what the backend resolved a saved event link to, even for an old event", async () => {
+    // The event was 49 days ago: past the picker's 30-day window, but the backend still follows it.
+    const old = dayKey(addDays(new Date(), -49));
+    mocked.listAllCalendarEvents.mockResolvedValueOnce([
+      calEvent({ summary: "Review", start: old, uid: "uid-old" }),
+    ]);
+    const linked = task({
+      event_uid: "uid-old",
+      event_title: "Review",
+      deadline_from: "event",
+      deadline: old,
+      effective_deadline: old,
+    });
+    render(<TaskEditor open task={linked} onClose={() => {}} />);
+    await waitFor(() =>
+      expect(screen.getByText(`📅 ${formatDateOnly(old)} · Review`)).toBeTruthy(),
+    );
+    expect(screen.getByText(`📅 Review: ${formatDateOnly(old)}`)).toBeTruthy();
+    expect(screen.queryByText(/your own date is used/)).toBeNull();
+    expect(screen.queryByText(/not in your calendars/)).toBeNull();
+    cleanup();
+
+    // Only the backend's `deadline_missing` makes it say the own date is used.
+    render(<TaskEditor open task={{ ...linked, deadline_missing: true }} onClose={() => {}} />);
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          `That event isn't in your calendars right now, so your own date is used (${formatDateOnly(old)}).`,
+        ),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("clearing the project lets a linked milestone go, and its deadline back to the own date", async () => {
+    mocked.listAllMilestones.mockResolvedValue([milestone()]);
+    render(
+      <TaskEditor
+        open
+        task={task({
+          milestone_id: 5,
+          milestone_label: "pitch",
+          deadline_from: "milestone",
+          deadline: "2026-11-20",
+        })}
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText(/◆ pitch/)).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Clear the project" }));
+    expect((screen.getByLabelText("Milestone") as HTMLSelectElement).value).toBe("");
+    expect(segment("My own date").getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mocked.updateTask).toHaveBeenCalled());
+    expect(mocked.updateTask).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        project: null,
+        milestoneId: null,
+        deadlineFrom: "date",
+        deadline: "2026-11-20",
+      }),
+    );
+  });
+
+  it("emptying the project field by hand lets a linked milestone go too", async () => {
+    mocked.listAllMilestones.mockResolvedValue([milestone()]);
+    render(<TaskEditor open task={task({ milestone_id: 5 })} onClose={() => {}} />);
+    const select = screen.getByLabelText("Milestone") as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("5"));
+    const field = screen.getByLabelText("Project");
+    fireEvent.change(field, { target: { value: "  " } });
+    fireEvent.blur(field);
+    expect(select.value).toBe("");
+  });
+
+  it("shows the stack's note, and edits or deletes the stack from its row", async () => {
+    mocked.listTaskStacks.mockResolvedValue([
+      {
+        id: 3,
+        title: "Visa paperwork",
+        kind: "waiting_on",
+        note: "ref 4471",
+        created_at: "",
+        updated_at: "",
+      },
+    ]);
+    render(<TaskEditor open task={task({ stack_id: 3 })} onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByText("Waiting on someone · ref 4471")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit the stack" }));
+    const editor = screen.getByRole("dialog", { name: "Edit stack" });
+    fireEvent.change(within(editor).getByLabelText("Stack name"), {
+      target: { value: "Visa forms" },
+    });
+    fireEvent.change(within(editor).getByLabelText("How its tasks relate"), {
+      target: { value: "in_order" },
+    });
+    fireEvent.change(within(editor).getByLabelText("Note (optional)"), {
+      target: { value: "  " },
+    });
+    fireEvent.click(within(editor).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit stack" })).toBeNull());
+    expect(mocked.updateTaskStack).toHaveBeenCalledWith(3, "Visa forms", "in_order", null);
+    const stackSelect = screen.getByLabelText("Stack") as HTMLSelectElement;
+    expect(within(stackSelect).getByRole("option", { name: "Visa forms" })).toBeTruthy();
+    expect(screen.getByText("In order")).toBeTruthy();
+
+    // Deleting asks first; the task stays, out of the stack.
+    fireEvent.click(screen.getByRole("button", { name: "Edit the stack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete stack" }));
+    const confirm = screen.getByRole("dialog", { name: "Delete this stack?" });
+    expect(mocked.deleteTaskStack).not.toHaveBeenCalled();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(mocked.deleteTaskStack).toHaveBeenCalledWith(3));
+    await waitFor(() => expect(stackSelect.value).toBe(""));
+    expect(within(stackSelect).queryByRole("option", { name: "Visa forms" })).toBeNull();
+    expect(mocked.deleteTask).not.toHaveBeenCalled();
   });
 
   it("saves a task whose milestone was deleted on its own date again", async () => {

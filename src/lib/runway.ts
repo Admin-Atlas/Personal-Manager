@@ -12,7 +12,9 @@
 //     effective deadline (its own date, or the linked milestone's or event's); an open task whose
 //     day has passed rolls forward into today; done ones drop back into "Before today" for 14 days.
 //   - `dropPlan`: what a drop (or a pick in the Move… menu) writes: a new plan window, lane and
-//     parked flag, through `planTask` alone.
+//     parked flag, through `planTask` alone. A drop back into the card's own column keeps its days.
+//   - `placeEvents`: the read-only events strip at the head of each column from today on: the
+//     calendar's events and the pinboard's timeline entries on the columns of their days.
 //
 // Days are local `YYYY-MM-DD` keys, compared as strings, as the rest of the Calendar tab buckets
 // them (`dayKey(startOfDay(now))`). A milestone's `due_date` arrives already resolved in the user's
@@ -21,8 +23,13 @@
 import type { RunwayWindow } from "./calendarPrefs";
 import {
   addDays,
+  compareEventsForDay,
   dayDiff,
   dayKey,
+  eventDaySpan,
+  isDraftEvent,
+  isMilestoneEvent,
+  isTaskEvent,
   parseLocal,
   startOfDay,
   startOfWeek,
@@ -53,6 +60,10 @@ export interface RunwayColumn {
   today: boolean;
   /** For a window column, the window it shows. */
   windowId?: string;
+  /** For a window column, the window's own first day. Once the window has begun, the column starts
+   *  at today (its earlier days are past), but a task planned on the window, or dropped into it,
+   *  keeps the window's real dates, and is matched to it by them. */
+  windowStart?: string;
 }
 
 /** The "Before today" column's id. */
@@ -179,6 +190,7 @@ export function buildColumns(today: Date, windows: readonly RunwayWindow[]): Run
       kind: "window",
       today: false,
       windowId: l.w.id,
+      windowStart: l.w.start,
       order: l.start,
       span: l.end - l.start,
     });
@@ -206,6 +218,7 @@ export function buildColumns(today: Date, windows: readonly RunwayWindow[]): Run
       today: false,
     };
     if (c.windowId !== undefined) col.windowId = c.windowId;
+    if (c.windowStart !== undefined) col.windowStart = c.windowStart;
     out.push(col);
   }
   const holder = columnForDay(out, dayKey(t));
@@ -247,6 +260,16 @@ export interface RunwayTaskCard {
   rolled: boolean;
   /** How many days ago its day was, when rolled (else 0). */
   daysAgo: number;
+  /** Why it rolled, when it did: the day that passed was its plan start, or (with no plan) its
+   *  deadline. Only a plan can be "planned 2d ago"; a missed deadline is the chip's to say. */
+  rolledBy: "plan" | "deadline" | null;
+}
+
+/** One task of a stack, wherever it is on the board: what an opened stack lists. */
+export interface RunwayStackMember {
+  card: RunwayTaskCard;
+  /** The column it sits in; null when it's parked. */
+  columnId: string | null;
 }
 
 export interface RunwayMilestoneCard {
@@ -259,12 +282,18 @@ export interface RunwayMilestoneCard {
 export interface RunwayStackCard {
   kind: "stack";
   stack: TaskStack;
-  /** Its tasks in this column and lane, in order. */
+  /** Its tasks in this column and lane, in order: what the card drags and moves as one. */
   tasks: Task[];
   /** The same, as cards (a member keeps its "rolled" flag). */
   members: RunwayTaskCard[];
-  /** How many of them are still open. */
+  /** The whole stack, wherever each task is planned (this column, others, parked), in order:
+   *  what the opened card lists. Archived projects' tasks and done ones gone from the board aren't
+   *  in it. */
+  chain: RunwayStackMember[];
+  /** How many of the whole stack are still open. */
   left: number;
+  /** The whole stack's next open task, in order, or null when all are done. */
+  next: Task | null;
 }
 
 export type RunwayCard = RunwayTaskCard | RunwayMilestoneCard | RunwayStackCard;
@@ -295,6 +324,9 @@ export interface RunwayModel {
   progress: RunwayProgress;
   /** The open task or milestone with the earliest deadline. */
   nextUp: RunwayNextUp | null;
+  /** The column each placed task sits in, by task id (parked and left-off tasks aren't here):
+   *  where a drag or a move comes from. */
+  columnOf: ReadonlyMap<number, string>;
 }
 
 export interface PlaceInput {
@@ -337,14 +369,19 @@ export function planDay(t: Task): string | null {
  *  - Archived projects' tasks and milestones are left off; parked open tasks go to `parked`.
  *  - A task sits on its plan start, else its effective deadline; with neither, in Later. A plan
  *    window that matches a window column exactly sits in that window.
- *  - An open task whose day has passed rolls into today's column (`rolled`), unless its plan window
- *    still runs through today, when it simply sits in today's column.
- *  - A done task whose day has passed (or, undated, that was finished before today) goes to "Before
- *    today", for 14 days by its finished day or its day; older ones are left off.
+ *  - An open task whose day has passed rolls into today's column (`rolled`, saying whether the day
+ *    was its plan or its deadline), unless its plan window still runs through today, when it simply
+ *    sits in today's column. A plan window matching a window's real dates sits in that window even
+ *    once it has begun.
+ *  - A done task whose day has passed stays in today's column on the day it was finished (so ticking
+ *    off rolled work counts as done today), and goes to "Before today" from the next day, for 14
+ *    days by its finished day or its day; older ones are left off. Undated, finished before today:
+ *    "Before today" too.
  *  - Milestones with a date: an unmet one past its day sits in today's column as late; a met one
  *    past its day goes to "Before today" for 14 days. Always in the foreground lane.
  *  - In a lane, tasks run in the global order and milestones follow by date. Two or more tasks of
- *    one stack in the same column and lane are one stack card, where the first of them is. */
+ *    one stack in the same column and lane are one stack card, where the first of them is; its
+ *    "left", its next task and its opened list are the whole stack's, wherever each is planned. */
 export function placeCards(input: PlaceInput): RunwayModel {
   const { tasks, stacks, milestones, columns, archived } = input;
   const t0 = startOfDay(input.today);
@@ -375,22 +412,44 @@ export function placeCards(input: PlaceInput): RunwayModel {
     }
   };
 
+  // Matched on the window's own dates: a running window's column starts at today, not on them.
   const windowMatch = (t: Task): RunwayColumn | undefined =>
     t.do_start && t.do_end
-      ? columns.find((c) => c.kind === "window" && c.start === t.do_start && c.end === t.do_end)
+      ? columns.find(
+          (c) =>
+            c.kind === "window" && (c.windowStart ?? c.start) === t.do_start && c.end === t.do_end,
+        )
       : undefined;
+  const columnOf = new Map<number, string>();
+  // Every task of a stack on the board, in order, for the stack cards' whole-stack view.
+  const stackMembers = new Map<number, RunwayStackMember[]>();
+  const joinStack = (m: RunwayStackMember) => {
+    const sid = m.card.task.stack_id;
+    if (sid === null || !stackById.has(sid)) return;
+    const list = stackMembers.get(sid);
+    if (list) list.push(m);
+    else stackMembers.set(sid, [m]);
+  };
   const sortedTasks = [...tasks].sort(compareTasks);
   sortedTasks.forEach((t, rank) => {
     if (archivedTask(t, archived)) return;
     const open = isOpen(t);
     if (open && t.parked) {
-      parked.push({ kind: "task", task: t, rolled: false, daysAgo: 0 });
+      const c: RunwayTaskCard = {
+        kind: "task",
+        task: t,
+        rolled: false,
+        daysAgo: 0,
+        rolledBy: null,
+      };
+      parked.push(c);
+      joinStack({ card: c, columnId: null });
       return;
     }
     const day = planDay(t);
     const lane = t.lane;
-    const card = (rolled: boolean, daysAgo = 0): Placed => ({
-      card: { kind: "task", task: t, rolled, daysAgo },
+    const card = (rolledBy: "plan" | "deadline" | null = null, daysAgo = 0): Placed => ({
+      card: { kind: "task", task: t, rolled: rolledBy !== null, daysAgo, rolledBy },
       lane,
     });
     let col: RunwayColumn | null | undefined;
@@ -403,26 +462,37 @@ export function placeCards(input: PlaceInput): RunwayModel {
       } else {
         col = later;
       }
-      placed = card(false);
+      placed = card();
     } else if (day < tk) {
       const runsOn = dayOf(t.do_end) !== null && dayOf(t.do_end)! >= tk && t.do_start !== null;
+      const finished = open ? null : dayOf(completedDay(t.completed_at));
       if (runsOn) {
         col = windowMatch(t) ?? todayCol;
-        placed = card(false);
+        placed = card();
       } else if (open) {
         col = todayCol;
-        placed = card(true, dayDiff(parseLocal(day, true)!, t0));
+        placed = card(
+          dayOf(t.do_start) !== null ? "plan" : "deadline",
+          dayDiff(parseLocal(day, true)!, t0),
+        );
+      } else if (finished !== null && finished >= tk) {
+        // Finished today: it stays where it was being worked on until the day is over.
+        col = todayCol;
+        placed = card();
       } else {
-        const finished = dayOf(completedDay(t.completed_at));
         if (day < floor && (finished === null || finished < floor)) return;
         col = past;
-        placed = card(false);
+        placed = card();
       }
     } else {
       col = windowMatch(t) ?? columnForDay(columns, day);
-      placed = card(false);
+      placed = card();
     }
     put(col, placed);
+    if (col) {
+      columnOf.set(t.id, col.id);
+      joinStack({ card: placed.card as RunwayTaskCard, columnId: col.id });
+    }
     if (col && col.kind !== "past") {
       progress.total += 1;
       if (!open) progress.done += 1;
@@ -465,10 +535,12 @@ export function placeCards(input: PlaceInput): RunwayModel {
       foreground: arrange(
         placed.filter((p) => p.lane === "foreground").map((p) => p.card),
         stackById,
+        stackMembers,
       ),
       background: arrange(
         placed.filter((p) => p.lane === "background").map((p) => p.card),
         stackById,
+        stackMembers,
       ),
     };
   }
@@ -480,6 +552,7 @@ export function placeCards(input: PlaceInput): RunwayModel {
     parked,
     progress,
     nextUp: n && info ? { title: n.title, deadlineText: info.text, tone: info.tone } : null,
+    columnOf,
   };
 }
 
@@ -491,10 +564,11 @@ function completedDay(at: string | null): string | null {
 }
 
 /** One lane's cards: tasks in the global order (stacks of two or more folded into one card where
- *  the first of them is), then milestones by date. */
+ *  the first of them is, counted over the whole stack), then milestones by date. */
 function arrange(
   cards: (RunwayTaskCard | RunwayMilestoneCard)[],
   stackById: Map<number, TaskStack>,
+  stackMembers: Map<number, RunwayStackMember[]>,
 ): RunwayCard[] {
   const taskCards = cards
     .filter((c): c is RunwayTaskCard => c.kind === "task")
@@ -526,12 +600,16 @@ function arrange(
     }
     if (emitted.has(sid)) continue;
     emitted.add(sid);
+    // Members joined the stack in the global order, so the chain is in order already.
+    const chain = stackMembers.get(sid) ?? group.map((g) => ({ card: g, columnId: null }));
     out.push({
       kind: "stack",
       stack: stackById.get(sid)!,
       tasks: group.map((g) => g.task),
       members: group,
-      left: group.filter((g) => isOpen(g.task)).length,
+      chain,
+      left: chain.filter((m) => isOpen(m.card.task)).length,
+      next: chain.find((m) => isOpen(m.card.task))?.card.task ?? null,
     });
   }
   return [...out, ...ms];
@@ -552,23 +630,37 @@ export interface TaskPlan {
 }
 
 /** The plan a drop writes, or null where nothing can be dropped ("Before today"; milestones are
- *  never dragged).
+ *  never dragged). `from` is the column the task sits in now (null or absent when parked or not
+ *  known).
  *
- *  Into a column: the plan starts on its first day (Later: its first day too) and, for a window,
- *  runs to its last; a default column leaves no end. The lane is the target's, and a parked task
- *  comes off the shelf. Onto the parked area: the dates and lane stay, and it's parked. */
-export function dropPlan(target: RunwayDropTarget, task: Task): TaskPlan | null {
+ *  Back into the column it already sits in (a reorder, or a move to that column's other lane): its
+ *  dates stay as they are, and only the lane changes. Into another column: the plan starts on its
+ *  first day (Later: its first day too) and, for a window, runs over the window's own days (from
+ *  its real first day, even once it has begun); a default column leaves no end. The lane is the
+ *  target's, and a parked task comes off the shelf. Onto the parked area: the dates and lane stay,
+ *  and it's parked. */
+export function dropPlan(
+  target: RunwayDropTarget,
+  task: Task,
+  from?: RunwayColumn | null,
+): TaskPlan | null {
   if (target.kind === "parked") {
     return { do_start: task.do_start, do_end: task.do_end, lane: task.lane, parked: true };
   }
   const { column, lane } = target;
   if (!isDropColumn(column) || column.start === null) return null;
-  return {
-    do_start: column.start,
-    do_end: column.kind === "window" ? column.end : null,
-    lane,
-    parked: false,
-  };
+  if (from && from.id === column.id && !task.parked) {
+    return { do_start: task.do_start, do_end: task.do_end, lane, parked: false };
+  }
+  if (column.kind === "window") {
+    return {
+      do_start: column.windowStart ?? column.start,
+      do_end: column.end,
+      lane,
+      parked: false,
+    };
+  }
+  return { do_start: column.start, do_end: null, lane, parked: false };
 }
 
 /** A plan that changes nothing about `task`. */
@@ -603,6 +695,82 @@ export function orderAfterDrop(
     i += 1;
   }
   return [...before, ...moved, ...after];
+}
+
+/** The task ids a card stands for (none for a milestone). */
+function cardTaskIds(c: RunwayCard): number[] {
+  return c.kind === "task" ? [c.task.id] : c.kind === "stack" ? c.tasks.map((t) => t.id) : [];
+}
+
+/** A lane's task order with the card holding `moved` one place up (`step` -1) or down (+1) among
+ *  the lane's task cards (a stack counts as one; milestones aren't in the order): what the Move…
+ *  menu's Move up / Move down give `reorderTasks`. Null when it's already first (or last), or not
+ *  in this lane. */
+export function orderAfterStep(
+  cards: readonly RunwayCard[],
+  moved: readonly number[],
+  step: -1 | 1,
+): number[] | null {
+  const taskCards = cards.filter((c) => c.kind !== "milestone");
+  const movedSet = new Set(moved);
+  const from = taskCards.findIndex((c) => cardTaskIds(c).some((id) => movedSet.has(id)));
+  if (from < 0) return null;
+  const to = from + step;
+  if (to < 0 || to >= taskCards.length) return null;
+  // Counted without the moved card, the place before the card at `to` (up) is `to`, and the place
+  // after the card now at `to` (down) is `to` as well.
+  return orderAfterDrop(taskCards, moved, to);
+}
+
+// --- the events strip ------------------------------------------------------------------------------
+
+/** How many events Later lists before it says how many more there are. */
+export const LATER_EVENTS = 10;
+
+/** A column's events, read-only, at its head. */
+export interface RunwayEventStrip {
+  events: CalendarEvent[];
+  /** How many more there are than `events` holds (Later only: the rest are in the List). */
+  more: number;
+}
+
+/** The events strip of each column from today on (R1): the calendar's events and the pinboard's
+ *  timeline entries (as the calendar shows them, hidden calendars already left out), each on the
+ *  column of its day, a multi-day one still running on today. Task and milestone overlays aren't
+ *  here (those are the board's own cards), nor the new-event ghost. "Before today" shows none; an
+ *  open-ended column (Later) lists the next `LATER_EVENTS` and counts the rest. Every column but
+ *  "Before today" has an entry, in day then time order. */
+export function placeEvents(
+  events: readonly CalendarEvent[],
+  columns: readonly RunwayColumn[],
+  today: Date,
+): Record<string, RunwayEventStrip> {
+  const t0 = startOfDay(today).getTime();
+  const at = new Map<string, { ev: CalendarEvent; day: number }[]>();
+  for (const ev of events) {
+    if (isTaskEvent(ev) || isMilestoneEvent(ev) || isDraftEvent(ev)) continue;
+    const span = eventDaySpan(ev);
+    if (!span || span.endDay.getTime() < t0) continue;
+    const day = Math.max(span.startDay.getTime(), t0);
+    const col = columnForDay(columns, dayKey(new Date(day)));
+    if (!col || col.kind === "past") continue;
+    const list = at.get(col.id);
+    if (list) list.push({ ev, day });
+    else at.set(col.id, [{ ev, day }]);
+  }
+  const out: Record<string, RunwayEventStrip> = {};
+  for (const c of columns) {
+    if (c.kind === "past") continue;
+    const list = (at.get(c.id) ?? []).sort(
+      (a, b) => a.day - b.day || compareEventsForDay(a.ev, b.ev),
+    );
+    const cap = c.end === null ? LATER_EVENTS : Infinity;
+    out[c.id] = {
+      events: list.slice(0, cap).map((x) => x.ev),
+      more: Math.max(0, list.length - cap),
+    };
+  }
+  return out;
 }
 
 // --- a task's linked event -------------------------------------------------------------------------

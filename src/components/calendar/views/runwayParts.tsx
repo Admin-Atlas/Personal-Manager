@@ -1,26 +1,119 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The pieces both Runways draw alike (PA-2): the header strip, the Move… menu (the keyboard's way
-// to do what a drag does, and the Terminal's only way) and the dialog that adds, edits or deletes a
-// named window. The hooks and words they share are in `runwayLogic.ts`.
+// The pieces both Runways draw alike (PA-2): the header strip, a column's read-only events strip,
+// the Move… menu (the keyboard's way to do what a drag does, and the Terminal's only way) and the
+// dialog that adds, edits or deletes a named window. The hooks and words they share are in
+// `runwayLogic.ts`.
 
 import { useId, useState } from "react";
 import type { RunwayWindow } from "../../../lib/calendarPrefs";
-import { dayKey } from "../../../lib/calendar-layout";
+import { dayKey, isEventPast, PAST_EVENT_CLASS } from "../../../lib/calendar-layout";
 import {
   dropPlan,
   isDropColumn,
+  orderAfterStep,
+  type RunwayCard,
   type RunwayColumn,
+  type RunwayEventStrip,
   type RunwayModel,
   type TaskPlan,
 } from "../../../lib/runway";
 import { TONE_CLASS } from "../../../lib/tasks";
-import type { Task, TaskLane } from "../../../lib/types";
+import type { CalendarEvent, Task, TaskLane } from "../../../lib/types";
 import { useDepth } from "../../../theme";
 import { DateField } from "../../DateField";
 import { Button, Callout, ConfirmDialog, Dialog, Input, Popover, Progress, cn } from "../../ui";
-import { newWindowId, placeName } from "./runwayLogic";
+import { newWindowId, placeName, stripWhen } from "./runwayLogic";
+
+/** A column's events, read-only, at its head (R1): each opens its details (a pinboard entry opens
+ *  the Pinboard). Nothing is drawn for a column with none. Later's says how many more the List
+ *  has. */
+export function EventsStrip({
+  strip,
+  column,
+  now,
+  colorOf,
+  onEventClick,
+  onShowList,
+  terminal = false,
+}: {
+  strip: RunwayEventStrip | undefined;
+  column: RunwayColumn;
+  now: Date;
+  colorOf?: (calendarId: string) => string;
+  onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
+  onShowList?: () => void;
+  terminal?: boolean;
+}) {
+  if (!strip || (strip.events.length === 0 && strip.more === 0)) return null;
+  const moreWords = `+${strip.more} more in List`;
+  return (
+    <div
+      data-runway-events=""
+      aria-label={`Events, ${column.label}`}
+      role="group"
+      className={cn(
+        "flex flex-col gap-0.5",
+        terminal ? "pl-2" : "border-b border-rule px-2 pb-1.5 pt-1",
+      )}
+    >
+      <p
+        className={cn(
+          "text-ink4",
+          terminal ? "" : "font-mono text-[0.625rem] uppercase tracking-wide",
+        )}
+      >
+        {terminal ? "events" : "Events"}
+      </p>
+      <ul className={cn("flex flex-col", terminal ? "pl-3" : "gap-0.5")}>
+        {strip.events.map((ev) => {
+          const when = stripWhen(ev, column);
+          const color = colorOf?.(ev.calendar_id);
+          return (
+            <li key={ev.id} className="min-w-0">
+              <button
+                type="button"
+                title={ev.summary}
+                onClick={(e) => onEventClick?.(ev, e.currentTarget.getBoundingClientRect())}
+                className={cn(
+                  "flex w-full min-w-0 items-baseline gap-1.5 text-left text-xs text-ink2 hover:text-ink",
+                  isEventPast(ev, now) && PAST_EVENT_CLASS,
+                )}
+              >
+                {terminal ? (
+                  <span aria-hidden className="text-ink4">
+                    ·
+                  </span>
+                ) : (
+                  <span
+                    aria-hidden
+                    className="inline-block h-2 w-2 shrink-0 self-center rounded-full bg-ink4"
+                    style={color ? { background: color } : undefined}
+                  />
+                )}
+                <span className="shrink-0 font-mono text-[0.6875rem] text-ink3">{when}</span>
+                <span className="min-w-0 truncate">{ev.summary}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {strip.more > 0 &&
+        (onShowList ? (
+          <button
+            type="button"
+            onClick={onShowList}
+            className="self-start font-mono text-[0.6875rem] text-ink3 hover:text-ink"
+          >
+            {moreWords}
+          </button>
+        ) : (
+          <p className="font-mono text-[0.6875rem] text-ink4">{moreWords}</p>
+        ))}
+    </div>
+  );
+}
 
 /** The header strip: how far along, what's next, and the two add buttons. */
 export function RunwayStrip({
@@ -73,14 +166,17 @@ export function RunwayStrip({
   );
 }
 
-/** The Move… menu: the columns a task can go to, then the other lane, then parking. For a stack, it
- *  moves all of its tasks. */
+/** The Move… menu: up or down within its lane, then the columns a task can go to, then the other
+ *  lane, then parking. For a stack, it moves all of its tasks. Up and down are the keyboard's (and
+ *  the Terminal's) way to reorder, as a drag within a column is the pointer's. */
 export function MoveMenu({
   name,
   tasks,
   columns,
   here,
   onReplan,
+  laneCards,
+  onReorder,
   terminal = false,
 }: {
   /** What's being moved, for the trigger's name ("Move Draft the deck"). */
@@ -90,6 +186,10 @@ export function MoveMenu({
   /** The column the card is in (null when parked). */
   here: string | null;
   onReplan: (planFor: (t: Task) => TaskPlan | null, where: string) => void;
+  /** The cards of the lane (or the parked shelf) it's in, as drawn: offers Move up / Move down. */
+  laneCards?: readonly RunwayCard[];
+  /** Put the lane in a new order, and say so. */
+  onReorder?: (order: number[], said: string) => void;
   terminal?: boolean;
 }) {
   const first = tasks[0];
@@ -97,6 +197,11 @@ export function MoveMenu({
   const lane = first.lane;
   const parked = first.parked;
   const other: TaskLane = lane === "foreground" ? "background" : "foreground";
+  const from = parked ? null : (columns.find((c) => c.id === here) ?? null);
+  const ids = tasks.map((t) => t.id);
+  const up = laneCards && onReorder ? orderAfterStep(laneCards, ids, -1) : null;
+  const down = laneCards && onReorder ? orderAfterStep(laneCards, ids, 1) : null;
+  const inWords = parked ? "Parked" : from ? placeName(from, lane) : "";
   const item =
     "block w-full rounded-[var(--radius-sm)] px-2 py-1 text-left text-xs text-ink2 hover:bg-surface hover:text-ink disabled:cursor-default disabled:text-ink4 disabled:hover:bg-transparent";
   return (
@@ -124,8 +229,33 @@ export function MoveMenu({
           close();
           onReplan(planFor, where);
         };
+        const step = (order: number[] | null, said: string) => {
+          close();
+          if (order && onReorder) onReorder(order, said);
+        };
         return (
           <div className={cn("flex flex-col", terminal && "font-mono")}>
+            {laneCards && onReorder && (
+              <>
+                <button
+                  type="button"
+                  className={item}
+                  disabled={up === null}
+                  onClick={() => step(up, `Moved up in ${inWords}`)}
+                >
+                  Move up
+                </button>
+                <button
+                  type="button"
+                  className={item}
+                  disabled={down === null}
+                  onClick={() => step(down, `Moved down in ${inWords}`)}
+                >
+                  Move down
+                </button>
+                <div className="my-1 border-t border-rule" />
+              </>
+            )}
             <p className="px-2 pb-1 pt-0.5 text-[0.6875rem] text-ink4">Move to</p>
             {columns.filter(isDropColumn).map((c) => {
               const current = !parked && c.id === here;
@@ -138,7 +268,7 @@ export function MoveMenu({
                   aria-current={current ? "true" : undefined}
                   onClick={() =>
                     pick(
-                      (t) => dropPlan({ kind: "column", column: c, lane: t.lane }, t),
+                      (t) => dropPlan({ kind: "column", column: c, lane: t.lane }, t, from),
                       placeName(c, lane),
                     )
                   }

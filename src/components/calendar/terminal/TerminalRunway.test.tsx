@@ -3,14 +3,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The Terminal Runway (PA-2): the same columns and cards as the board, as mono text. `── Today ──`
-// rules with `fg`/`bg` sub-heads, `[ ]`/`[~]`/`[x]` ticks, accent on today alone, and no pointer
-// drag: a task moves from its Move… menu, a stack opens to its tasks, and windows are added and
-// edited from the same dialog as the board's.
+// rules with `fg`/`bg` sub-heads, `[ ]`/`[~]`/`[x]` ticks, accent on today alone, every column
+// folding from its rule, each column's events under it, and no pointer drag: a task moves (and
+// moves up or down its lane) from its Move… menu, a stack opens to its whole chain, and windows are
+// added and edited from the same dialog as the board's.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { RunwayWindow } from "../../../lib/calendarPrefs";
-import type { Task, TaskStack } from "../../../lib/types";
+import type { CalendarEvent, Task, TaskStack } from "../../../lib/types";
 
 vi.mock("../../../lib/ipc", () => ({
   planTask: vi.fn(async () => {}),
@@ -105,9 +106,11 @@ function runway(over: { tasks?: Task[]; stacks?: TaskStack[]; windows?: RunwayWi
 describe("TerminalRunway", () => {
   it("draws mono column rules with fg/bg lanes, the tick as text, and today in accent", () => {
     runway({ tasks: [task(), task({ id: 2, title: "Done one", status: "done" })] });
-    const today = screen.getByText("── Today ──");
+    const today = screen.getByRole("button", { name: "── Today (2) ▾ ──" });
     expect(today.className).toContain("text-accent-text");
-    expect(screen.getByText("── Tomorrow ──").className).not.toContain("text-accent-text");
+    expect(screen.getByRole("button", { name: "── Tomorrow (0) ▾ ──" }).className).not.toContain(
+      "text-accent-text",
+    );
     const section = screen.getByRole("region", { name: "Today" });
     expect(within(section).getAllByText("fg").length).toBe(1);
     expect(within(section).getByText("bg")).toBeTruthy();
@@ -166,6 +169,109 @@ describe("TerminalRunway", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Add window/ }));
     const [saved] = onWindowsChange.mock.calls[0][0] as RunwayWindow[];
     expect(saved).toMatchObject({ label: "Sprint", start: "2026-11-04", end: "2026-11-06" });
+  });
+
+  it("folds any column from its rule, not only Before today", () => {
+    runway({ tasks: [task({ do_start: null, title: "Someday" })] });
+    const later = screen.getByRole("button", { name: "── Later (1) ▾ ──" });
+    expect(later.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("Someday")).toBeTruthy();
+    fireEvent.click(later);
+    expect(screen.queryByText("Someday")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "── Later (1) ▸ ──" }).getAttribute("aria-expanded"),
+    ).toBe("false");
+    fireEvent.click(screen.getByRole("button", { name: "── Later (1) ▸ ──" }));
+    expect(screen.getByText("Someday")).toBeTruthy();
+  });
+
+  it("lists each column's events under its rule, and a click opens one", () => {
+    const standup: CalendarEvent = {
+      id: "e1",
+      calendar_id: "c",
+      summary: "Standup",
+      description: null,
+      location: null,
+      start: "2026-11-04T09:00:00",
+      end: null,
+      all_day: false,
+      html_link: null,
+      uid: "u1",
+    };
+    const onEventClick = vi.fn();
+    render(
+      <TerminalRunway
+        tasks={[]}
+        stacks={[]}
+        milestones={[
+          {
+            id: 1,
+            project_name: "Atlas",
+            label: "Pitch",
+            due_date: "2026-11-05",
+            event_uid: null,
+            calendar_linked: false,
+            event_missing: false,
+            state: null,
+            status: null,
+            source_type: null,
+            external_id: null,
+            sort_order: 0,
+          },
+        ]}
+        events={[standup]}
+        archived={new Set()}
+        windows={[]}
+        now={NOW}
+        onWindowsChange={vi.fn()}
+        onEventClick={onEventClick}
+        announce={vi.fn()}
+      />,
+    );
+    const strip = within(screen.getByRole("region", { name: "Today" })).getByRole("group", {
+      name: "Events, Today",
+    });
+    fireEvent.click(within(strip).getByRole("button", { name: /09:00\s*Standup/ }));
+    expect(onEventClick).toHaveBeenCalledWith(standup, expect.anything());
+    // A milestone shows its date in its tone, not only once it's late.
+    const tomorrow = within(screen.getByRole("region", { name: "Tomorrow" })).getByText("tomorrow");
+    expect(tomorrow.className).toContain("text-st-look");
+  });
+
+  it("moves a task up its lane from the Move… menu, the Terminal's way to reorder", async () => {
+    const { announce } = runway({
+      tasks: [task({ id: 1 }), task({ id: 2, title: "Call the bank" })],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Move Call the bank" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move up" }));
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenCalledWith([2, 1]));
+    expect(announce).toHaveBeenCalledWith("Moved up in Today");
+  });
+
+  it("opens a stack to its whole chain, saying where each is planned", () => {
+    runway({
+      tasks: [
+        task({ id: 1, title: "Book the slot", stack_id: 7 }),
+        task({ id: 2, title: "Fill the form", stack_id: 7 }),
+        task({ id: 3, title: "Post it", stack_id: 7, do_start: "2026-11-10" }),
+      ],
+      stacks: [
+        {
+          id: 7,
+          title: "Visa",
+          kind: "sequential",
+          note: "ref 4471",
+          created_at: "",
+          updated_at: "",
+        },
+      ],
+    });
+    const today = screen.getByRole("region", { name: "Today" });
+    fireEvent.click(within(today).getByRole("button", { name: /≡ Visa \(3 left\)/ }));
+    const chain = within(today).getByRole("list", { name: "The stack Visa" });
+    expect(within(chain).getByText("Post it")).toBeTruthy();
+    expect(within(chain).getByText("Next week")).toBeTruthy();
+    expect(within(today).getByText("ref 4471")).toBeTruthy();
   });
 
   it("shows a window as its own rule, with an edit beside it", () => {

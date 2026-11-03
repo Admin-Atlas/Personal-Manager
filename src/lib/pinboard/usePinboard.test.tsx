@@ -587,6 +587,21 @@ describe("usePinboard — the Task list card (PA-1)", () => {
     expect(result.current.board.widgets.find((w) => w.id === "kept")?.title).toBe("Plan");
   });
 
+  it("keeps the undo history when a conversion that wrote nothing adds its card", async () => {
+    // Every item "already there": the view adds the card as an ordinary step (no barrier), so an
+    // accidental delete made before it can still be undone.
+    ipc.getPref.mockResolvedValue(JSON.stringify(STORED));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.removeWidget("kept"));
+    act(() => void result.current.addTaskList(undefined, { x: 0, y: 0, w: 7, h: 5 }, false));
+    act(() => result.current.undo());
+    expect(result.current.board.widgets.some((w) => w.kind === "tasklist")).toBe(false);
+    act(() => result.current.undo());
+    expect(result.current.board.widgets.some((w) => w.id === "kept")).toBe(true);
+  });
+
   it("treats a task list's filter change as an undoable step, not a barrier", async () => {
     // A timeline's project link writes milestones, so it ends the history. A task list's project is
     // only a filter, which writes nothing anywhere — Ctrl+Z should simply put the old one back.

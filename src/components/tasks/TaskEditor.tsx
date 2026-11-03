@@ -10,6 +10,8 @@
 // project when none is set, in which case the task takes on the milestone's project) and a calendar
 // event. The deadline can be the task's own date, or follow the linked milestone's or event's date:
 // "do it Monday, the deadline is Friday's event" is a Monday plan with the event's date as deadline.
+// An event deadline is pinned to the occurrence that was picked (written to the task's own
+// `deadline`, spec R1), so a recurring event's Friday stays the deadline once it has passed.
 //
 // The dialog is portalled to <body>: a host inside a transformed or clipped card (a pinboard tile)
 // would otherwise trap a `position: fixed` scrim inside the card. React still bubbles a portal's
@@ -37,6 +39,7 @@ import {
   emptyTaskInput,
   eventChoices,
   STACK_KIND_LABEL,
+  STACK_KINDS,
   TASK_STATUS_LABEL,
   taskToInput,
   type EventChoice,
@@ -65,6 +68,7 @@ import {
   Toggle,
 } from "../ui";
 import { EventPicker } from "./EventPicker";
+import { StackEditor } from "./StackEditor";
 
 /** The longest title and note the backend takes. */
 const TITLE_MAX = 500;
@@ -74,7 +78,6 @@ const WHY_MAX = 10_000;
 const NEW_STACK = "new";
 
 const STATUSES: TaskStatus[] = ["todo", "doing", "done"];
-const STACK_KINDS: TaskStackKind[] = ["sequential", "in_order", "waiting_on"];
 
 export interface TaskEditorProps {
   open: boolean;
@@ -128,6 +131,13 @@ function TaskEditorBody({
   const [project, setProject] = useState(initial.project ?? "");
   const [milestoneId, setMilestoneId] = useState<number | null>(initial.milestoneId);
   const [eventUid, setEventUid] = useState<string | null>(initial.eventUid);
+  // The day of the linked event's occurrence the deadline is pinned to (spec R1): a task whose
+  // deadline follows an event stores it in its own `deadline` column, so a recurring event's chosen
+  // Friday stays the deadline after it passes. Kept apart from the own date while the dialog is
+  // open, so switching between "My own date" and "Event's date" loses neither.
+  const [eventPin, setEventPin] = useState<string | null>(
+    initial.deadlineFrom === "event" ? initial.deadline : null,
+  );
   const [deadline, setDeadline] = useState(initial.deadline ?? "");
   const [deadlineKind, setDeadlineKind] = useState<DeadlineKind>(initial.deadlineKind);
   const [deadlineFrom, setDeadlineFrom] = useState<DeadlineFrom>(initial.deadlineFrom);
@@ -140,6 +150,7 @@ function TaskEditorBody({
   const [newStackKind, setNewStackKind] = useState<TaskStackKind>("sequential");
   const [newStackNote, setNewStackNote] = useState("");
   const [status, setStatus] = useState<TaskStatus>(task?.status ?? "todo");
+  const [editingStack, setEditingStack] = useState<TaskStack | null>(null);
 
   const [projects, setProjects] = useState<string[]>([]);
   const [milestones, setMilestones] = useState<Milestone[] | null>(null);
@@ -186,13 +197,15 @@ function TaskEditorBody({
     listTaskStacks()
       .then((s) => live && setStacks(s))
       .catch(() => {});
+    // The event the task already links to stays a choice however old it is, as the backend still
+    // resolves a deadline that follows it.
     listAllCalendarEvents()
-      .then((ev) => live && setChoices(eventChoices(ev, today)))
+      .then((ev) => live && setChoices(eventChoices(ev, today, initial.eventUid)))
       .catch(() => live && setChoices([]));
     return () => {
       live = false;
     };
-  }, [fixedProject, today]);
+  }, [fixedProject, today, initial.eventUid]);
 
   const scope = fixedProject ?? clean(project);
   const milestoneById = useMemo(
@@ -209,6 +222,17 @@ function TaskEditorBody({
     return inScope;
   }, [milestones, scope, linkedMilestone]);
   const linkedChoice = eventUid === null ? undefined : choices?.find((c) => c.uid === eventUid);
+  // The stored link, unchanged in this dialog: the backend's `effective_deadline` and
+  // `deadline_missing` already say what it resolves to (the pinned occurrence, or a moved one).
+  const savedEventLink =
+    task !== undefined &&
+    task !== null &&
+    task.deadline_from === "event" &&
+    task.event_uid !== null &&
+    eventUid === task.event_uid &&
+    eventPin === task.deadline;
+  const selectedStack =
+    stackSel && stackSel !== NEW_STACK ? stacks.find((s) => String(s.id) === stackSel) : undefined;
 
   function clearMilestone() {
     setMilestoneId(null);
@@ -216,7 +240,21 @@ function TaskEditorBody({
   }
   function changeEvent(uid: string | null) {
     setEventUid(uid);
+    // Picking an event pins its occurrence the picker showed; the deadline takes that day when it
+    // follows the event.
+    setEventPin(uid === null ? null : (choices?.find((c) => c.uid === uid)?.date ?? null));
     if (uid === null && deadlineFrom === "event") setDeadlineFrom("date");
+  }
+  function chooseDeadlineFrom(from: DeadlineFrom) {
+    setDeadlineFrom(from);
+    // Switching to the event's date with no pin yet (a link made earlier, with the task's own date
+    // as its deadline) pins the occurrence the picker shows. An existing pin is kept.
+    if (from === "event" && eventPin === null && linkedChoice) setEventPin(linkedChoice.date);
+  }
+  function clearProject() {
+    setProject("");
+    // A milestone brings its project with it on save, so a cleared project lets it go too.
+    if (milestoneId !== null) clearMilestone();
   }
   function chooseMilestone(value: string) {
     if (!value) return clearMilestone();
@@ -228,10 +266,12 @@ function TaskEditorBody({
     if (m && !fixedProject && !clean(project)) setProject(m.project_name);
   }
   // Leaving the project field on a different project than the linked milestone's lets the
-  // milestone go: the save would be refused for it.
+  // milestone go: the save would be refused for it. Leaving it empty lets it go too: the save
+  // would otherwise file the task under the milestone's project while the field says "No project".
   function settleProject() {
     const p = clean(project);
     if (p && linkedMilestone && linkedMilestone.project_name !== p) clearMilestone();
+    else if (!p && milestoneId !== null) clearMilestone();
   }
   function changeDoStart(iso: string) {
     setDoStart(iso);
@@ -272,7 +312,12 @@ function TaskEditorBody({
         eventUid,
         doStart: doStart || null,
         doEnd: doStart && doEnd ? doEnd : null,
-        deadline: deadline || null,
+        // An event deadline writes its pinned occurrence (the own date only when there is none,
+        // an event that isn't in the calendars).
+        deadline:
+          deadlineFrom === "event"
+            ? (eventPin ?? linkedChoice?.date ?? (deadline || null))
+            : deadline || null,
         deadlineKind,
         deadlineFrom,
         lane,
@@ -322,13 +367,23 @@ function TaskEditorBody({
             deadline ? ` (${formatDateOnly(deadline)})` : ", and you haven't set one"
           }.`;
   } else if (deadlineFrom === "event") {
-    linkedDeadline = linkedChoice
-      ? `📅 ${linkedChoice.label}`
-      : choices === null
-        ? "Reading your calendars…"
-        : `That event isn't in your calendars right now, so your own date is used${
-            deadline ? ` (${formatDateOnly(deadline)})` : ", and you haven't set one"
-          }.`;
+    const ownDate = (iso: string | null) =>
+      `That event isn't in your calendars right now, so your own date is used${
+        iso ? ` (${formatDateOnly(iso)})` : ", and you haven't set one"
+      }.`;
+    if (savedEventLink) {
+      // The link as saved: say what the backend resolved it to, not what the picker's list holds.
+      const eventTitle = linkedChoice?.title ?? task?.event_title ?? "The event";
+      linkedDeadline =
+        task?.deadline_missing || !task?.effective_deadline
+          ? ownDate(task?.effective_deadline ?? task?.deadline ?? null)
+          : `📅 ${eventTitle}: ${formatDateOnly(task.effective_deadline)}`;
+    } else if (linkedChoice) {
+      const pin = eventPin ?? linkedChoice.date;
+      linkedDeadline = `📅 ${linkedChoice.title}: ${formatDateOnly(pin)}`;
+    } else {
+      linkedDeadline = choices === null ? "Reading your calendars…" : ownDate(deadline || null);
+    }
   }
 
   return (
@@ -421,7 +476,7 @@ function TaskEditorBody({
                     <Button
                       variant="tertiary"
                       size="xs"
-                      onClick={() => setProject("")}
+                      onClick={clearProject}
                       aria-label="Clear the project"
                       className="shrink-0"
                     >
@@ -485,6 +540,7 @@ function TaskEditorBody({
                 choices={choices ?? []}
                 loading={choices === null}
                 linkedTitle={task?.event_uid === eventUid ? task?.event_title : null}
+                pinnedDate={eventPin}
                 onChange={changeEvent}
               />
             </div>
@@ -497,7 +553,7 @@ function TaskEditorBody({
             <SegmentedControl
               aria-labelledby={ids.deadlineFrom}
               value={deadlineFrom}
-              onChange={setDeadlineFrom}
+              onChange={chooseDeadlineFrom}
               options={[
                 { value: "date", label: DEADLINE_FROM_LABEL.date },
                 {
@@ -610,21 +666,41 @@ function TaskEditorBody({
             <label htmlFor={ids.stack} className={fieldLabel}>
               Stack
             </label>
-            <Select
-              id={ids.stack}
-              compact
-              value={stackSel}
-              onChange={(e) => setStackSel(e.target.value)}
-              className="w-full"
-            >
-              <option value="">No stack</option>
-              {stacks.map((s) => (
-                <option key={s.id} value={String(s.id)}>
-                  {s.title || STACK_KIND_LABEL[s.kind]}
-                </option>
-              ))}
-              <option value={NEW_STACK}>New stack…</option>
-            </Select>
+            <div className="flex items-center gap-2">
+              <Select
+                id={ids.stack}
+                compact
+                value={stackSel}
+                onChange={(e) => setStackSel(e.target.value)}
+                className="min-w-0 flex-1"
+              >
+                <option value="">No stack</option>
+                {stacks.map((s) => (
+                  <option key={s.id} value={String(s.id)}>
+                    {s.title || STACK_KIND_LABEL[s.kind]}
+                  </option>
+                ))}
+                <option value={NEW_STACK}>New stack…</option>
+              </Select>
+              {selectedStack && (
+                <Button
+                  variant="tertiary"
+                  size="xs"
+                  onClick={() => setEditingStack(selectedStack)}
+                  aria-label="Edit the stack"
+                  title="Rename it, change how its tasks relate, edit its note or delete it"
+                  className="shrink-0"
+                >
+                  Edit
+                </Button>
+              )}
+            </div>
+            {selectedStack && (
+              <p className="mt-1 whitespace-pre-wrap break-words text-xs text-ink4">
+                {STACK_KIND_LABEL[selectedStack.kind]}
+                {selectedStack.note ? ` · ${selectedStack.note}` : ""}
+              </p>
+            )}
             {stackSel === NEW_STACK && (
               <div className="mt-2 flex flex-col gap-2 rounded-[var(--radius-sm)] border border-dashed border-border p-2">
                 <div>
@@ -709,6 +785,16 @@ function TaskEditorBody({
         “{task?.title}” goes from every list it shows on. Its project, milestone and event stay as
         they are.
       </ConfirmDialog>
+      <StackEditor
+        stack={editingStack}
+        onClose={() => setEditingStack(null)}
+        onSaved={(saved) => setStacks((all) => all.map((s) => (s.id === saved.id ? saved : s)))}
+        onDeleted={(id) => {
+          setStacks((all) => all.filter((s) => s.id !== id));
+          // The backend has already taken this task out of the deleted stack.
+          if (stackSel === String(id)) setStackSel("");
+        }}
+      />
     </>
   );
 }

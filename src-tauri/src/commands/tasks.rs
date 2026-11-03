@@ -210,8 +210,10 @@ pub fn import_checklist_tasks(
 ) -> Result<ImportResult> {
     let conn = state.conn()?;
     let result = tasks::import_checklist(&conn, project.as_deref(), &items)?;
-    if !result.created.is_empty() {
-        touch(&conn, &[project.as_deref().map(str::trim)])?;
+    // The project the import resolved the typed name to (its canonical spelling), not the raw one.
+    if let Some(first) = result.created.first() {
+        let project = tasks::project_of(&conn, *first)?;
+        touch(&conn, &[project.as_deref()])?;
     }
     drop(conn);
     changed(&app);

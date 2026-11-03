@@ -12,12 +12,14 @@ import { formatDateLocal } from "./format";
 import {
   compareTasks,
   deadlineInfo,
+  deadlineSource,
   emptyTaskInput,
   eventChoices,
   filterEventChoices,
   isOpen,
   nextStatus,
   STACK_KIND_LABEL,
+  stackTooltip,
   taskToInput,
   TONE_CLASS,
 } from "./tasks";
@@ -170,6 +172,48 @@ describe("STACK_KIND_LABEL", () => {
       waiting_on: "Waiting on someone",
     });
   });
+
+  it("puts the stack's note in its chip tooltip", () => {
+    expect(stackTooltip({ title: "Visa", kind: "waiting_on", note: null })).toBe(
+      "Visa · Waiting on someone",
+    );
+    expect(stackTooltip({ title: "", kind: "in_order", note: "ref 4471" })).toBe(
+      "In order\nref 4471",
+    );
+  });
+});
+
+describe("deadlineSource", () => {
+  it("says a deadline follows its milestone or event, or is the task's own", () => {
+    expect(deadlineSource(task())).toBe("Deadline");
+    expect(deadlineSource(task({ deadline_kind: "soft" }))).toBe("A date to aim for");
+    expect(
+      deadlineSource(
+        task({ deadline_from: "milestone", milestone_id: 5, milestone_label: "Pitch" }),
+      ),
+    ).toBe("Milestone's date: Pitch");
+    expect(
+      deadlineSource(task({ deadline_from: "event", event_uid: "u", event_title: "Review" })),
+    ).toBe("Event's date: Review");
+  });
+
+  it("tells an undated or missing link apart from one that was removed", () => {
+    expect(
+      deadlineSource(task({ deadline_from: "milestone", milestone_id: 5, deadline_missing: true })),
+    ).toBe("The linked milestone has no date, so this is your own date");
+    expect(
+      deadlineSource(task({ deadline_from: "event", event_uid: "u", deadline_missing: true })),
+    ).toBe("The linked event isn't in your calendars, so this is your own date");
+    // Deleting the milestone (alone, or with its project) nulls the link under the task.
+    expect(
+      deadlineSource(
+        task({ deadline_from: "milestone", milestone_id: null, deadline_missing: true }),
+      ),
+    ).toBe("The linked milestone was removed, so this is your own date");
+    expect(
+      deadlineSource(task({ deadline_from: "event", event_uid: null, deadline_missing: true })),
+    ).toBe("The linked event was removed, so this is your own date");
+  });
 });
 
 describe("editor input", () => {
@@ -240,6 +284,18 @@ describe("eventChoices", () => {
     expect(out.map((c) => [c.uid, c.date, c.past])).toEqual([
       ["recent", iso(-5), true],
       ["edge", iso(-30), true],
+    ]);
+  });
+
+  it("keeps the event a task already links to however old it is", () => {
+    const events = [
+      event({ uid: "linked", start: iso(-49) }),
+      event({ uid: "linked", start: iso(-56) }),
+      event({ uid: "other", start: iso(-49) }),
+    ];
+    expect(eventChoices(events, TODAY)).toEqual([]);
+    expect(eventChoices(events, TODAY, "linked").map((c) => [c.uid, c.date, c.past])).toEqual([
+      ["linked", iso(-49), true],
     ]);
   });
 

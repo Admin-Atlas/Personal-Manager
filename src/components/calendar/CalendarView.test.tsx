@@ -32,6 +32,7 @@ import { addDays, dayKey, startOfDay, startOfWeek } from "../../lib/calendar-lay
 import { A11_NOTE } from "../../lib/calendarEdit/editReasons";
 import { COPY_CALL_OFF_NOTE } from "../../lib/calendarEdit/eventDraft";
 import { formatDateLocal, pad2 } from "../../lib/format";
+import { BOARD_VERSION, PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
 
 const ipc = vi.hoisted(() => ({
   calendarOverview: vi.fn(),
@@ -1501,6 +1502,58 @@ describe("CalendarView: tasks", () => {
     render(<View />);
     await screen.findByText("Draft the deck");
     expect(screen.getByText("cal --runway")).toBeTruthy();
-    expect(screen.getByText("── Today ──")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^── Today \(\d+\) ▾ ──$/ })).toBeTruthy();
+  });
+
+  // R1: the Runway heads its columns with what the calendar shows on their days, read-only.
+  const pinboard = JSON.stringify({
+    version: BOARD_VERSION,
+    widgets: [
+      {
+        id: "w1",
+        kind: "timeline",
+        rect: { x: 0, y: 0, w: 3, h: 3 },
+        items: [{ id: "i1", date: today, label: "Seed order" }],
+      },
+    ],
+  });
+
+  it("the Runway's columns show the events and pinboard entries, not the task or milestone overlays", async () => {
+    localStorage.removeItem("pm.calendar.agendaMode");
+    tasks = [task({})];
+    ipc.getPref.mockImplementation((key: string) =>
+      Promise.resolve(key === PINBOARD_PREF_KEY ? pinboard : null),
+    );
+    const View = (await import("./CalendarView")).CalendarView;
+    const onOpenPinboard = vi.fn();
+    render(<View onOpenPinboard={onOpenPinboard} />);
+    const todayCol = await screen.findByRole("region", { name: "Today" });
+    const strip = await within(todayCol).findByRole("group", { name: "Events, Today" });
+    await within(strip).findByRole("button", { name: /Seed order/ });
+    expect(await within(strip).findByRole("button", { name: /Standup/ })).toBeTruthy();
+    // The task and the milestone are the board's own cards, not events in the strip.
+    expect(within(strip).queryByRole("button", { name: /Draft the deck|Plant bulbs/ })).toBeNull();
+    expect(within(todayCol).getByText("Draft the deck")).toBeTruthy();
+    expect(within(todayCol).getByRole("button", { name: "◆ Plant bulbs · Garden" })).toBeTruthy();
+    // A pinboard entry opens the Pinboard, as it does on the grids.
+    fireEvent.click(within(strip).getByRole("button", { name: /Seed order/ }));
+    expect(onOpenPinboard).toHaveBeenCalled();
+  });
+
+  it("the Runway's events strip honours the hidden calendars and overlays", async () => {
+    localStorage.removeItem("pm.calendar.agendaMode");
+    tasks = [task({})];
+    env.hidden = new Set([PERSONAL, "pm:pinboard"]);
+    ipc.getPref.mockImplementation((key: string) =>
+      Promise.resolve(key === PINBOARD_PREF_KEY ? pinboard : null),
+    );
+    const View = (await import("./CalendarView")).CalendarView;
+    render(<View />);
+    const todayCol = await screen.findByRole("region", { name: "Today" });
+    await within(todayCol).findByText("Draft the deck");
+    await act(async () => {});
+    expect(within(todayCol).queryByRole("group", { name: "Events, Today" })).toBeNull();
+    expect(screen.queryByText("Standup")).toBeNull();
+    expect(screen.queryByText("Seed order")).toBeNull();
   });
 });

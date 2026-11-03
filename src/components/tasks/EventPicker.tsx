@@ -3,8 +3,9 @@
 
 // Link a task to one calendar event: a type-ahead over the events in the synced mirror, one per iCal
 // UID at its next occurrence (or its latest within the last 30 days), each listed "DD-MM · title".
-// It only ever hands back a UID; the task stores that and nothing else. A read of the mirror and no
-// more: this file never imports a calendar write wrapper (the calendar write fence).
+// It only ever hands back a UID; the editor pins the picked choice's date as the occurrence an
+// "Event's date" deadline follows (spec R1), and passes it back as `pinnedDate` to show. A read of
+// the mirror and no more: this file never imports a calendar write wrapper (the calendar write fence).
 //
 // The choices come in as a prop (`eventChoices` over `listAllCalendarEvents()`, loaded by the
 // editor), because the editor needs the chosen event's date too, to show what an "Event's date"
@@ -14,6 +15,7 @@
 // scrolling dialog, which would clip a floating list.
 
 import { useId, useState, type KeyboardEvent } from "react";
+import { formatDateOnly } from "../../lib/format";
 import { filterEventChoices, type EventChoice } from "../../lib/tasks";
 import { Button, Input, cn } from "../ui";
 
@@ -26,6 +28,7 @@ export function EventPicker({
   choices,
   loading = false,
   linkedTitle,
+  pinnedDate,
   onChange,
 }: {
   /** The id of the visible words naming this field. */
@@ -38,6 +41,9 @@ export function EventPicker({
   /** The linked event's title as the task last knew it, for a link that isn't among `choices`
    *  (an older event, or one that left the calendars). */
   linkedTitle?: string | null;
+  /** The occurrence the task's deadline is pinned to (`YYYY-MM-DD`), shown in place of the next
+   *  one: a recurring event's chosen Friday still reads as that Friday once it has passed. */
+  pinnedDate?: string | null;
   onChange: (uid: string | null) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -48,12 +54,15 @@ export function EventPicker({
 
   if (value !== null) {
     const chosen = choices.find((c) => c.uid === value);
+    const pinned = pinnedDate ? `${formatDateOnly(pinnedDate)} · ` : "";
     const text = chosen
-      ? chosen.label
+      ? pinnedDate
+        ? `${pinned}${chosen.title}`
+        : chosen.label
       : loading
         ? "Linked event"
         : linkedTitle
-          ? `${linkedTitle} (not in your calendars right now)`
+          ? `${pinned}${linkedTitle} (not in your calendars right now)`
           : "An event that isn't in your calendars right now";
     return (
       <div className="flex min-w-0 items-center gap-2">

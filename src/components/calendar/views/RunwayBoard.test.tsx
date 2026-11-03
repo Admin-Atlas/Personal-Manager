@@ -13,6 +13,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RunwayWindow } from "../../../lib/calendarPrefs";
+import { formatDateLocal } from "../../../lib/format";
 import type { CalendarEvent, Milestone, Task, TaskStack } from "../../../lib/types";
 
 vi.mock("../../../lib/ipc", () => ({
@@ -38,6 +39,7 @@ vi.mock("../../../theme/ThemeContext", async (importOriginal) => ({
 
 import * as ipc from "../../../lib/ipc";
 import { RunwayBoard } from "./RunwayBoard";
+import { EDGE_SCROLL_MAX, edgeScrollStep } from "./useRunwayDrag";
 
 const mocked = vi.mocked(ipc);
 
@@ -343,18 +345,168 @@ describe("RunwayBoard", () => {
     fireEvent.click(screen.getByRole("button", { name: "+ Task" }));
     expect(await screen.findByRole("dialog", { name: "New task" })).toBeTruthy();
   });
+
+  it("heads each column with its events and pinboard entries, read-only, opening their details", () => {
+    const ev = (id: string, start: string, over: Partial<CalendarEvent> = {}): CalendarEvent => ({
+      id,
+      calendar_id: "c",
+      summary: id,
+      description: null,
+      location: null,
+      start,
+      end: null,
+      all_day: !start.includes("T"),
+      html_link: null,
+      uid: id,
+      ...over,
+    });
+    const standup = ev("Standup", "2026-11-04T09:00:00");
+    const later = Array.from({ length: 12 }, (_, i) =>
+      ev(`Later ${i + 1}`, `2026-12-${String(i + 1).padStart(2, "0")}`),
+    );
+    const onShowList = vi.fn();
+    const spies = {
+      onWindowsChange: vi.fn(),
+      onEventClick: vi.fn(),
+      announce: vi.fn(),
+    };
+    render(
+      <RunwayBoard
+        tasks={[]}
+        stacks={[]}
+        milestones={[]}
+        events={[
+          standup,
+          ev("Bulbs", "2026-11-05", { calendar_id: "pm:pinboard", uid: null }),
+          ev("Old", "2026-11-02T09:00:00"),
+          ...later,
+        ]}
+        archived={new Set()}
+        windows={[]}
+        now={NOW}
+        colorOf={() => "var(--ink3)"}
+        onShowList={onShowList}
+        {...spies}
+      />,
+    );
+    const today = within(column("Today")).getByRole("group", { name: "Events, Today" });
+    fireEvent.click(within(today).getByRole("button", { name: /09:00\s*Standup/ }));
+    expect(spies.onEventClick).toHaveBeenCalledWith(standup, expect.anything());
+    // A pinboard entry rides along, on its day.
+    expect(
+      within(column("Tomorrow")).getByRole("button", { name: /all-day\s*Bulbs/ }),
+    ).toBeTruthy();
+    // Nothing for a column with none, nor for Before today.
+    expect(within(column("Next week")).queryByRole("group", { name: /^Events/ })).toBeNull();
+    expect(screen.queryByText("Old")).toBeNull();
+    // Later: the next ten, then the rest are in the List.
+    const laterStrip = within(column("Later")).getByRole("group", { name: "Events, Later" });
+    expect(within(laterStrip).getAllByRole("listitem")).toHaveLength(10);
+    fireEvent.click(within(laterStrip).getByRole("button", { name: "+2 more in List" }));
+    expect(onShowList).toHaveBeenCalled();
+  });
+
+  it("shows a milestone's date in its tone wherever it sits", () => {
+    board({
+      tasks: [],
+      milestones: [
+        milestone,
+        { ...milestone, id: 2, label: "Launch", due_date: "2026-11-20" },
+        { ...milestone, id: 3, label: "Late", due_date: "2026-11-01" },
+      ],
+    });
+    const tomorrow = within(column("Tomorrow")).getByText("tomorrow");
+    expect(tomorrow.className).toContain("text-st-look");
+    expect(within(column("Later")).getByText(formatDateLocal(new Date(2026, 10, 20)))).toBeTruthy();
+    expect(within(column("Today")).getByText("3d late").className).toContain("text-st-due");
+  });
+
+  it("says 'planned' only for a task whose plan rolled, not a missed deadline", () => {
+    board({
+      tasks: [
+        task({ id: 1, title: "Planned Monday", do_start: "2026-11-02" }),
+        task({ id: 2, title: "Due Friday", do_start: null, effective_deadline: "2026-10-30" }),
+      ],
+    });
+    const today = column("Today");
+    expect(within(today).getByText("planned 2d ago")).toBeTruthy();
+    expect(within(today).queryByText(/planned 5d ago/)).toBeNull();
+    // The overdue deadline says it.
+    expect(within(today).getByText("5d late")).toBeTruthy();
+  });
+
+  it("opens a stack to its whole chain, where each is planned, and its note", () => {
+    board({
+      tasks: [
+        task({ id: 1, title: "Book the slot", stack_id: 7 }),
+        task({ id: 2, title: "Fill the form", stack_id: 7 }),
+        task({ id: 3, title: "Post it", stack_id: 7, do_start: "2026-11-10" }),
+        task({ id: 4, title: "Pick up", stack_id: 7, parked: true }),
+      ],
+      stacks: [{ ...stack, note: "ref 4471" }],
+    });
+    // Four left over the whole stack, though two sit here.
+    const card = within(column("Today")).getByRole("button", { name: /^≡ Visa\s*· 4 left/ });
+    fireEvent.click(card);
+    const chain = within(column("Today")).getByRole("list", { name: "The stack Visa" });
+    const rows = within(chain).getAllByRole("listitem");
+    expect(rows.map((r) => within(r).getByText(/^(Book|Fill|Post|Pick)/).textContent)).toEqual([
+      "Book the slot",
+      "Fill the form",
+      "Post it",
+      "Pick up",
+    ]);
+    expect(within(rows[0]).getByText("Today")).toBeTruthy();
+    expect(within(rows[2]).getByText("Next week")).toBeTruthy();
+    expect(within(rows[3]).getByText("Parked")).toBeTruthy();
+    expect(within(column("Today")).getByText("ref 4471")).toBeTruthy();
+  });
+
+  it("moves a task up or down its lane from the Move… menu", async () => {
+    const { announce } = board({
+      tasks: [task({ id: 1 }), task({ id: 2, title: "Call the bank" })],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Move Call the bank" }));
+    let menu = screen.getByRole("group", { name: "Move Call the bank" });
+    expect(within(menu).getByRole("button", { name: "Move down" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    fireEvent.click(within(menu).getByRole("button", { name: "Move up" }));
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenCalledWith([2, 1]));
+    expect(announce).toHaveBeenCalledWith("Moved up in Today");
+    expect(mocked.planTask).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move Draft the deck" }));
+    menu = screen.getByRole("group", { name: "Move Draft the deck" });
+    expect(within(menu).getByRole("button", { name: "Move up" }).hasAttribute("disabled")).toBe(
+      true,
+    );
+    fireEvent.click(within(menu).getByRole("button", { name: "Move down" }));
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenLastCalledWith([2, 1]));
+    expect(announce).toHaveBeenLastCalledWith("Moved down in Today");
+  });
 });
 
 describe("RunwayBoard: dragging", () => {
-  /** Lay the zones out by geometry: each lane gets a box; everything else sits off screen. */
-  function layOut(boxes: Record<string, [number, number, number, number]>) {
+  /** Lay the zones out by geometry: each lane gets a box (and a card, by its key, may too); the
+   *  board's own visible box is `root`; everything else sits off screen. */
+  function layOut(
+    boxes: Record<string, [number, number, number, number]>,
+    root: [number, number, number, number] = [-1000, -1000, 1000, 1000],
+  ) {
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
       this: HTMLElement,
     ) {
       const zone = this.dataset.runwayZone;
-      const [left, top, right, bottom] = (zone ? boxes[zone] : undefined) ?? [
-        -999, -999, -998, -998,
-      ];
+      const key = this.dataset.runwayKey;
+      const isRoot = this.dataset.help === "calendar-runway";
+      const [left, top, right, bottom] = (isRoot
+        ? root
+        : zone
+          ? boxes[zone]
+          : key
+            ? boxes[key]
+            : undefined) ?? [-999, -999, -998, -998];
       return {
         left,
         top,
@@ -466,5 +618,101 @@ describe("RunwayBoard: dragging", () => {
     fireEvent.pointerUp(document.body, { ...at(50, 150), buttons: 0 });
     expect(announce).not.toHaveBeenCalled();
     expect(mocked.planTask).not.toHaveBeenCalled();
+  });
+
+  it("a reorder inside its own column keeps the task's days", async () => {
+    // Friday and Saturday, both in the rest of the week (Fri 06 – Sun 08).
+    board({
+      tasks: [
+        task({ id: 1, title: "Sat thing", do_start: "2026-11-07" }),
+        task({ id: 2, title: "Fri thing", do_start: "2026-11-06" }),
+        task({ id: 3, title: "Window", do_start: "2026-11-06", do_end: "2026-11-08" }),
+      ],
+    });
+    layOut({
+      "rest:foreground": [0, 100, 200, 300],
+      "task:1": [0, 110, 200, 130],
+      "task:2": [0, 140, 200, 160],
+      "task:3": [0, 170, 200, 190],
+    });
+    // Saturday's card dragged below Friday's: the order changes, the days don't.
+    fireEvent.pointerDown(card("Sat thing"), at(10, 120));
+    fireEvent.pointerMove(document.body, at(50, 165));
+    fireEvent.pointerUp(document.body, { ...at(50, 165), buttons: 0 });
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenCalledWith([2, 1, 3]));
+    expect(mocked.planTask).not.toHaveBeenCalled();
+    await act(() => new Promise((r) => setTimeout(r, 0)));
+
+    // The window task dragged to the background lane there: the lane alone changes.
+    layOut({ "rest:background": [0, 400, 200, 500] });
+    fireEvent.pointerDown(card("Window"), at(10, 10));
+    fireEvent.pointerMove(document.body, at(50, 450));
+    fireEvent.pointerUp(document.body, { ...at(50, 450), buttons: 0 });
+    await waitFor(() =>
+      expect(mocked.planTask).toHaveBeenCalledWith(
+        3,
+        "2026-11-06",
+        "2026-11-08",
+        "background",
+        false,
+      ),
+    );
+  });
+
+  it("drops between two parked cards of a row by where across the row it is", async () => {
+    board({
+      tasks: [
+        task({ id: 1, title: "Mover" }),
+        task({ id: 2, title: "P one", parked: true }),
+        task({ id: 3, title: "P two", parked: true }),
+        task({ id: 4, title: "P three", parked: true }),
+      ],
+    });
+    // One row of three on the shelf's grid.
+    layOut({
+      parked: [0, 500, 400, 600],
+      "task:2": [0, 520, 100, 580],
+      "task:3": [110, 520, 210, 580],
+      "task:4": [220, 520, 320, 580],
+    });
+    fireEvent.pointerDown(card("Mover"), at(10, 10));
+    // Right of the first card's middle, left of the second's: between them.
+    fireEvent.pointerMove(document.body, at(105, 560));
+    // No line in the grid's flow; the second card is marked on its leading edge instead.
+    const shelf = screen.getByRole("region", { name: "Parked" });
+    expect(shelf.querySelector("[data-runway-ghost]")).toBeNull();
+    expect(card("P two").getAttribute("data-runway-mark")).toBe("before");
+    fireEvent.pointerMove(document.body, at(390, 560));
+    expect(card("P three").getAttribute("data-runway-mark")).toBe("after");
+    fireEvent.pointerMove(document.body, at(105, 560));
+    fireEvent.pointerUp(document.body, { ...at(105, 560), buttons: 0 });
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenCalledWith([2, 1, 3, 4]));
+    expect(mocked.planTask).toHaveBeenCalledWith(1, "2026-11-04", null, "foreground", true);
+  });
+
+  it("takes no drop outside the board's visible box", async () => {
+    const { announce } = board();
+    // Tomorrow's lane is scrolled up under the header, above the board's top edge at y=200.
+    layOut({ "tomorrow:foreground": [0, 0, 200, 300] }, [0, 200, 1000, 800]);
+    fireEvent.pointerDown(card("Draft the deck"), at(10, 400));
+    fireEvent.pointerMove(document.body, at(50, 100));
+    fireEvent.pointerUp(document.body, { ...at(50, 100), buttons: 0 });
+    expect(announce).toHaveBeenLastCalledWith("Put back.");
+    await act(async () => {});
+    expect(mocked.planTask).not.toHaveBeenCalled();
+  });
+
+  it("scrolls the board near its top and bottom edges while dragging", () => {
+    const box = { left: 0, right: 400, top: 100, bottom: 700, height: 600 } as DOMRect;
+    expect(edgeScrollStep(200, 400, box)).toBe(0);
+    expect(edgeScrollStep(200, 110, box)).toBeLessThan(0);
+    expect(edgeScrollStep(200, 690, box)).toBeGreaterThan(0);
+    // Past the edge (over the header): full speed; nearer the edge, faster.
+    expect(edgeScrollStep(200, 20, box)).toBe(-EDGE_SCROLL_MAX);
+    expect(Math.abs(edgeScrollStep(200, 105, box))).toBeGreaterThan(
+      Math.abs(edgeScrollStep(200, 140, box)),
+    );
+    // Off to the side: nothing.
+    expect(edgeScrollStep(500, 20, box)).toBe(0);
   });
 });

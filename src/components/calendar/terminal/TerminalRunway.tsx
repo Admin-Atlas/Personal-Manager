@@ -4,8 +4,10 @@
 // The Terminal system's Runway (PA-2): the same columns, lanes and cards as `RunwayBoard`, drawn as
 // mono text blocks, never a pixel board. Each column is a `── Today ──` rule with its days beside
 // it, then `fg` and `bg` sub-heads over `[ ]` / `[~]` / `[x]` rows, each deadline in its tone.
-// Green (the accent) is on today alone. There's no pointer drag here (the Terminal rule: nothing is
-// dragged in this look); a task moves from its Move… menu, the same one the board's cards have.
+// Green (the accent) is on today alone. Any column's rule folds it. Under each rule from today on,
+// the column's events, read-only. There's no pointer drag here (the Terminal rule: nothing is
+// dragged in this look); a task moves, and moves up or down its lane, from its Move… menu, the same
+// one the board's cards have.
 
 import { useState } from "react";
 import {
@@ -30,13 +32,14 @@ import { Button, Callout, cn } from "../../ui";
 import {
   eventWhen,
   linkedDue,
+  memberPlace,
   newTaskDefaults,
   rolledWords,
   useRunwayActions,
   useRunwayModel,
   type RunwayProps,
 } from "../views/runwayLogic";
-import { MoveMenu, RunwayStrip, WindowDialog } from "../views/runwayParts";
+import { EventsStrip, MoveMenu, RunwayStrip, WindowDialog } from "../views/runwayParts";
 
 type Editing = { task: Task } | { defaults: Partial<TaskInput> } | null;
 
@@ -46,6 +49,7 @@ interface RowCtx {
   events: CalendarEvent[];
   cycle: (task: Task, next: Task["status"]) => void;
   replan: (tasks: readonly Task[], planFor: (t: Task) => TaskPlan | null, where: string) => void;
+  reorder: (order: number[], said: string) => void;
   edit: (task: Task) => void;
   onOpenProject?: (project: string) => void;
   onEventClick?: (ev: CalendarEvent, anchor: DOMRect) => void;
@@ -57,12 +61,38 @@ const LANES: { lane: TaskLane; label: string }[] = [
 ];
 
 export function TerminalRunway(props: RunwayProps) {
-  const { events, windows, onWindowsChange, onOpenProject, onEventClick, announce } = props;
-  const { today, columns, model } = useRunwayModel(props);
-  const { error, cycle, replan } = useRunwayActions(announce);
+  const {
+    events,
+    windows,
+    now,
+    colorOf,
+    onWindowsChange,
+    onOpenProject,
+    onEventClick,
+    onShowList,
+    announce,
+  } = props;
+  const { today, columns, model, strips } = useRunwayModel(props);
+  const { error, cycle, replan, reorder } = useRunwayActions(announce);
   const [editing, setEditing] = useState<Editing>(null);
   const [windowEdit, setWindowEdit] = useState<{ window: RunwayWindow | null } | null>(null);
   const [pastOpen, setPastOpen] = useState(readRunwayPastOpen);
+  // Any column folds, as on the board: Before today remembered, the rest for this visit.
+  const [folded, setFolded] = useState<Set<string>>(() => new Set());
+  const isOpenCol = (c: RunwayColumn) => (c.kind === "past" ? pastOpen : !folded.has(c.id));
+  const toggle = (c: RunwayColumn) => {
+    if (c.kind === "past") {
+      writeRunwayPastOpen(!pastOpen);
+      setPastOpen(!pastOpen);
+      return;
+    }
+    setFolded((f) => {
+      const next = new Set(f);
+      if (next.has(c.id)) next.delete(c.id);
+      else next.add(c.id);
+      return next;
+    });
+  };
 
   const ctx: RowCtx = {
     today,
@@ -70,6 +100,7 @@ export function TerminalRunway(props: RunwayProps) {
     events,
     cycle,
     replan: (ts, planFor, where) => replan(ts, planFor, where),
+    reorder,
     edit: (task) => setEditing({ task }),
     onOpenProject,
     onEventClick,
@@ -91,28 +122,23 @@ export function TerminalRunway(props: RunwayProps) {
       <div className="flex flex-col gap-3 px-4 py-2 font-mono text-xs">
         {columns.map((c) => {
           const lanes = model.lanes[c.id] ?? { foreground: [], background: [] };
-          const open = c.kind !== "past" || pastOpen;
+          const open = isOpenCol(c);
           const count = lanes.foreground.length + lanes.background.length;
           return (
             <section key={c.id} aria-label={c.label}>
               <div className="flex items-baseline gap-2">
-                {c.kind === "past" ? (
-                  <button
-                    type="button"
-                    aria-expanded={open}
-                    onClick={() => {
-                      writeRunwayPastOpen(!pastOpen);
-                      setPastOpen(!pastOpen);
-                    }}
-                    className="text-ink3 hover:text-ink"
-                  >
-                    ── {c.label} ({count}) {open ? "▾" : "▸"} ──
-                  </button>
-                ) : (
-                  <span className={c.today ? "text-accent-text" : "text-ink2"}>
-                    ── {c.label} ──
-                  </span>
-                )}
+                <button
+                  type="button"
+                  aria-expanded={open}
+                  title={open ? "Fold this column" : "Show this column"}
+                  onClick={() => toggle(c)}
+                  className={cn(
+                    "hover:text-ink",
+                    c.today ? "text-accent-text" : c.kind === "past" ? "text-ink3" : "text-ink2",
+                  )}
+                >
+                  ── {c.label} ({count}) {open ? "▾" : "▸"} ──
+                </button>
                 <span className={c.today ? "text-accent-text" : "text-ink4"}>{c.sub}</span>
                 {c.windowId && (
                   <Button
@@ -129,6 +155,17 @@ export function TerminalRunway(props: RunwayProps) {
                   </Button>
                 )}
               </div>
+              {open && (
+                <EventsStrip
+                  strip={strips[c.id]}
+                  column={c}
+                  now={now}
+                  colorOf={colorOf}
+                  onEventClick={onEventClick}
+                  onShowList={onShowList}
+                  terminal
+                />
+              )}
               {open &&
                 LANES.map(({ lane, label }) => (
                   <div key={lane} className="pl-2">
@@ -142,6 +179,7 @@ export function TerminalRunway(props: RunwayProps) {
                             key={rowKey(card)}
                             card={card}
                             column={isDropColumn(c) ? c : null}
+                            laneCards={lanes[lane]}
                             ctx={ctx}
                           />
                         ))}
@@ -159,7 +197,13 @@ export function TerminalRunway(props: RunwayProps) {
           ) : (
             <ul className="flex flex-col pl-2">
               {model.parked.map((card) => (
-                <TaskRow key={card.task.id} card={card} column={null} ctx={ctx} />
+                <TaskRow
+                  key={card.task.id}
+                  card={card}
+                  column={null}
+                  laneCards={model.parked}
+                  ctx={ctx}
+                />
               ))}
             </ul>
           )}
@@ -192,18 +236,21 @@ function rowKey(card: RunwayCard): string {
 function Row({
   card,
   column,
+  laneCards,
   ctx,
 }: {
   card: RunwayCard;
   column: RunwayColumn | null;
+  laneCards: readonly RunwayCard[];
   ctx: RowCtx;
 }) {
-  if (card.kind === "task") return <TaskRow card={card} column={column} ctx={ctx} />;
+  if (card.kind === "task")
+    return <TaskRow card={card} column={column} laneCards={laneCards} ctx={ctx} />;
   if (card.kind === "milestone") {
     const m = card.milestone;
     const met = m.state === "met" || m.status === "done";
-    const info =
-      card.late && m.due_date ? deadlineInfo(m.due_date.slice(0, 10), "hard", ctx.today) : null;
+    // Its deadline in its tone wherever it sits (plain once met), as a task's is.
+    const info = m.due_date ? deadlineInfo(m.due_date.slice(0, 10), "hard", ctx.today, met) : null;
     return (
       <li className="flex items-baseline gap-2 pl-3">
         <button
@@ -218,18 +265,21 @@ function Row({
       </li>
     );
   }
-  return <StackRow card={card} column={column} ctx={ctx} />;
+  return <StackRow card={card} column={column} laneCards={laneCards} ctx={ctx} />;
 }
 
 function StackRow({
   card,
   column,
+  laneCards,
   ctx,
 }: {
   card: Extract<RunwayCard, { kind: "stack" }>;
   column: RunwayColumn | null;
+  laneCards: readonly RunwayCard[];
   ctx: RowCtx;
 }) {
+  const { showMeta } = useDepth();
   const [open, setOpen] = useState(false);
   const title = card.stack.title || STACK_KIND_LABEL[card.stack.kind];
   return (
@@ -243,21 +293,38 @@ function StackRow({
         >
           ≡ {title} ({card.left} left) {open ? "▾" : "▸"}
         </button>
+        {card.next && showMeta && <span className="text-ink3">next: {card.next.title}</span>}
         <MoveMenu
           name={`the stack ${title}`}
           tasks={card.tasks}
           columns={ctx.columns}
           here={column?.id ?? null}
           onReplan={(planFor, where) => ctx.replan(card.tasks, planFor, where)}
+          laneCards={laneCards}
+          onReorder={ctx.reorder}
           terminal
         />
       </div>
       {open && (
-        <ul className="flex flex-col pl-3">
-          {card.members.map((m) => (
-            <TaskRow key={m.task.id} card={m} column={column} ctx={ctx} />
-          ))}
-        </ul>
+        <div className="flex flex-col pl-3">
+          {card.stack.note && <p className="whitespace-pre-wrap text-ink3">{card.stack.note}</p>}
+          {/* The whole stack, each task saying where it is planned. */}
+          <ul className="flex flex-col" aria-label={`The stack ${title}`}>
+            {card.chain.map((m) => (
+              <TaskRow
+                key={m.card.task.id}
+                card={m.card}
+                column={
+                  m.columnId === null
+                    ? null
+                    : (ctx.columns.find((c) => c.id === m.columnId) ?? null)
+                }
+                place={memberPlace(ctx.columns, m.columnId)}
+                ctx={ctx}
+              />
+            ))}
+          </ul>
+        </div>
       )}
     </li>
   );
@@ -266,10 +333,16 @@ function StackRow({
 function TaskRow({
   card,
   column,
+  laneCards,
+  place,
   ctx,
 }: {
   card: RunwayTaskCard;
   column: RunwayColumn | null;
+  /** Its lane's rows, as drawn: its Move… menu's up and down. */
+  laneCards?: readonly RunwayCard[];
+  /** In an opened stack: where it is planned. */
+  place?: string;
   ctx: RowCtx;
 }) {
   const { showMeta } = useDepth();
@@ -277,6 +350,7 @@ function TaskRow({
   const t = card.task;
   const ev = linkedEvent(ctx.events, t.event_uid, ctx.today);
   const due = linkedDue(t);
+  const rolled = rolledWords(card);
   const titleCls = cn(
     "min-w-0 text-left",
     t.status === "done" ? "text-ink3 line-through" : "text-ink",
@@ -298,8 +372,9 @@ function TaskRow({
         ) : (
           <span className={titleCls}>{t.title}</span>
         )}
+        {place !== undefined && <span className="text-ink3">{place}</span>}
         <DeadlineChip task={t} today={ctx.today} />
-        {card.rolled && <span className="text-st-look">{rolledWords(card.daysAgo)}</span>}
+        {rolled && <span className="text-st-look">{rolled}</span>}
         {t.project_name && (
           <button
             type="button"
@@ -337,6 +412,8 @@ function TaskRow({
           columns={ctx.columns}
           here={t.parked ? null : (column?.id ?? null)}
           onReplan={(planFor, where) => ctx.replan([t], planFor, where)}
+          laneCards={laneCards}
+          onReorder={ctx.reorder}
           terminal
         />
       </div>

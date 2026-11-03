@@ -24,7 +24,8 @@
 // Agenda has two layouts (PA-2): the dated list, and the Runway, a board of tasks in columns from
 // today (`views/RunwayBoard`, Terminal's `terminal/TerminalRunway`). The tasks come from the one
 // global list, read here and again on every `tasks://changed`; the Runway writes them through the
-// task IPC only, never a calendar write.
+// task IPC only, never a calendar write. Its columns also show, read-only, the events and pinboard
+// entries this tab shows on their days.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -1172,12 +1173,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     [quickOpen, milestones, tasks, onOpenProject, onOpenPinboard],
   );
 
-  // What the Runway is given: the synced events a task can link to (no overlays), and the
-  // milestones unless the Milestones overlay is hidden.
+  // What the Runway is given: what the calendar shows (hidden calendars already out), less the
+  // task and milestone overlays, which are the board's own cards. So its columns' events strips
+  // hold the synced events and the pinboard's timeline entries (R1), and a task's link finds its
+  // event there. The milestones come unless the Milestones overlay is hidden.
   const runwayEvents = useMemo(
-    () => visibleEvents.filter((e) => !isOverlayEvent(e)),
+    () => visibleEvents.filter((e) => !isTaskEvent(e) && !isMilestoneEvent(e)),
     [visibleEvents],
   );
+  const showAgendaList = useCallback(() => onAgendaModeChange("list"), [onAgendaModeChange]);
   const runwayMilestones = useMemo(
     () => (hidden.has(MILESTONE_CALENDAR_ID) ? [] : milestones),
     [hidden, milestones],
@@ -1388,12 +1392,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     stacks,
     milestones: runwayMilestones,
     events: runwayEvents,
+    colorOf,
     archived,
     windows,
     now,
     onWindowsChange,
     onOpenProject,
     onEventClick,
+    onShowList: showAgendaList,
     announce,
   };
 

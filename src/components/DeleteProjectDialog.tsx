@@ -204,7 +204,11 @@ export function DeleteProjectDialog({
               <>
                 {" "}
                 Its {preview.tasks} task{preview.tasks === 1 ? "" : "s"} stay
-                {preview.tasks === 1 ? "s" : ""}, without a project.
+                {preview.tasks === 1 ? "s" : ""}, without a project
+                {preview.milestones > 0
+                  ? ", and a deadline that followed one of its milestones goes back to the task's own date"
+                  : ""}
+                .
               </>
             )}
           </Callout>

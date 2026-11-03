@@ -65,6 +65,11 @@ import { todayIso } from "../lib/dateField";
 import { isDialogOpenOutside } from "../lib/useDialogLayer";
 import { isLetterKey } from "../lib/letterKey";
 import { usePinboard } from "../lib/pinboard/usePinboard";
+import {
+  keepsNativeUndo,
+  placeConvertedTaskList,
+  taskListDeleteCost,
+} from "../lib/pinboard/taskLists";
 // The tint set + names live in one place (src/lib/pinboard/palette.ts) so the board's colours
 // stay consistent; the colour VALUES are the global `--st-*` tokens in index.css.
 import { NOTE_COLORS, TINT_NAME } from "../lib/pinboard/palette";
@@ -135,9 +140,7 @@ function deleteCost(w: Widget, status?: DocStatus): string | null {
   if (w.kind === "timeline" && w.project) {
     return `This timeline is linked to ${w.project}. Only the card goes — the project's milestones stay exactly as they are.`;
   }
-  if (w.kind === "tasklist") {
-    return "Only the card goes — your tasks stay, on the project page and the calendar's Runway.";
-  }
+  if (w.kind === "tasklist") return taskListDeleteCost(w.project);
   return null;
 }
 
@@ -372,6 +375,15 @@ export function PinboardView() {
   );
   // A just-added widget id to scroll into view (set by the add buttons; cleared once scrolled).
   const [pendingScrollId, setPendingScrollId] = useState<string | null>(null);
+  // A card already on the board that an action pointed at rather than adding a twin — today, the
+  // task list a repeat "To tasks" reuses. Ringed briefly so it reads as "here it is" even when it was
+  // already in view and nothing scrolled.
+  const [flashId, setFlashId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!flashId) return;
+    const t = setTimeout(() => setFlashId(null), 1600);
+    return () => clearTimeout(t);
+  }, [flashId]);
 
   // The widget list, which the drag reads to find the folder under the pointer, is likewise read
   // through a ref: as a dep it would re-subscribe the pointer listeners on every keystroke (a note's
@@ -420,14 +432,14 @@ export function PinboardView() {
   // the Delete then cleared the redo. The folder overlay is a dialog inside the board surface, so the
   // board's Undo still works in it.
   useEffect(() => {
-    // A field whose text is NOT board state keeps its own native undo — a task list's add row, whose
-    // typing reaches the board's history nowhere (tasks are backend rows).
-    const nativeUndo = (t: EventTarget | null) =>
-      t instanceof Element && !!t.closest("[data-native-undo]");
+    // A text field whose text is NOT board state keeps its own native undo — a task list's add row
+    // and inline edit fields, whose typing reaches the board's history nowhere (tasks are backend
+    // rows). The list's ticks and buttons have no undo of their own, so there the board keeps it
+    // (`keepsNativeUndo`).
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
       if (isDialogOpenOutside(boardRef.current)) return;
-      if (nativeUndo(e.target)) return;
+      if (keepsNativeUndo(e.target)) return;
       // The letter the layout types (a German Z sits where QWERTY has Y), falling back to the
       // physical key on a layout with no Latin letters.
       const isZ = isLetterKey(e, "z");
@@ -444,7 +456,7 @@ export function PinboardView() {
     const onBeforeInput = (e: Event) => {
       const t = (e as InputEvent).inputType;
       if (t !== "historyUndo" && t !== "historyRedo") return;
-      if (nativeUndo(e.target)) return;
+      if (keepsNativeUndo(e.target)) return;
       e.preventDefault();
       if (t === "historyRedo") redo();
       else undo();
@@ -509,14 +521,22 @@ export function PinboardView() {
     if (items.length > 0) setConverting({ noteId: id, items });
   }, []);
   /** The task list lands on the board's top level, beside the note — or beside the note's folder
-   *  when it is inside one, since a task list never goes into a folder (`isFileable`). */
+   *  when it is inside one, since a task list never goes into a folder (`isFileable`). When a card
+   *  with the same filter is already on the board, that one is shown instead and the board is left
+   *  alone; a new card is a history barrier only when tasks were written (`placeConvertedTaskList`). */
   const finishTaskList = useCallback(
     (noteId: string, project: string | null, created: number, skipped: number) => {
       const ws = widgetsRef.current;
-      const near =
-        ws.find((w) => w.id === noteId)?.rect ??
-        ws.find((w) => w.children?.some((c) => c.id === noteId))?.rect;
-      setPendingScrollId(addTaskList(project ?? undefined, near, true));
+      const place = placeConvertedTaskList(ws, project, created);
+      if ("reuse" in place) {
+        setPendingScrollId(place.reuse);
+        setFlashId(place.reuse);
+      } else {
+        const near =
+          ws.find((w) => w.id === noteId)?.rect ??
+          ws.find((w) => w.children?.some((c) => c.id === noteId))?.rect;
+        setPendingScrollId(addTaskList(project ?? undefined, near, place.add === "barrier"));
+      }
       setConverting(null);
       const added =
         created === 0 ? "No new tasks" : `${created} task${created === 1 ? "" : "s"} added`;
@@ -569,6 +589,7 @@ export function PinboardView() {
   const expandedFace: FolderFace =
     expanded?.view === "play" && expandedFolder && playsGame(expandedFolder) ? "play" : "cards";
 
+  const flashed = flashId ? board.widgets.find((w) => w.id === flashId) : undefined;
   const dropFolder = dropFolderId
     ? board.widgets.find((w) => w.id === dropFolderId && w.kind === "folder")
     : undefined;
@@ -788,6 +809,16 @@ export function PinboardView() {
             />
           )}
 
+          {/* The existing card a repeat "To tasks" pointed at (`flashId`), ringed for a moment. An
+              overlay for the same reason as the folder cue: a raised card would hide a tile's ring. */}
+          {flashed && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute z-20 rounded-[var(--radius-sm)] ring-2 ring-accent"
+              style={rectToPxStyle(flashed.rect)}
+            />
+          )}
+
           {/* Expanded folder (transient UI, at most one). Rendered as a board sibling so the inline
               panel escapes the tiles' overflow-hidden and paints above them; the tile's rect never moves. */}
           {expandedFolder &&
@@ -920,13 +951,15 @@ export function PinboardView() {
 }
 
 /**
- * "Make this a task list": a note's checklist becomes real tasks, and a Task list card showing them
- * lands beside the note. The note itself is left exactly as it was.
+ * "Make this a task list": a note's checklist becomes real tasks, and a Task list card lands beside
+ * the note. The card is the ordinary filtered list — the chosen project's tasks, or all your tasks for
+ * No project — not just the imported ones, and the copy says so. The note is left exactly as it was.
  *
  * The tasks are written FIRST, and only once they're in does the card go on the board (as a history
- * barrier — see `addTaskList`). A failed import puts nothing on the board and keeps the dialog open
- * with the reason. Importing skips any item already a task with the same title in the same project,
- * so converting the same note twice never doubles up.
+ * barrier when any were written — see `addTaskList`). A failed import puts nothing on the board and
+ * keeps the dialog open with the reason. Importing skips any item already a task with the same title
+ * in the same project, and a card with the same filter already on the board is reused, so converting
+ * the same note twice never doubles up.
  */
 function MakeTaskListDialog({
   noteId,
@@ -992,7 +1025,8 @@ function MakeTaskListDialog({
       }
     >
       <p className="mt-2 text-sm text-ink3">
-        {ticked}A task list card showing them goes beside the note, and the note stays as it is.
+        {ticked}A task list card of {project ? `${project}'s tasks` : "all your tasks"} goes beside
+        the note (or the one already on the board is shown), and the note stays as it is.
       </p>
       <div className="mt-4 flex items-center gap-2">
         <label htmlFor={selectId} className="text-sm text-ink3">
@@ -1721,7 +1755,9 @@ const TaskListBody = memo(function TaskListBody({
           </>
         }
       />
-      {/* `data-native-undo`: Ctrl+Z in the add row undoes the typing, not the board. */}
+      {/* `data-native-undo`: Ctrl+Z in the add row or an edit field undoes the typing, not the
+          board. Only text fields opt out (`keepsNativeUndo`): on a tick or a button it still undoes
+          the board. */}
       <div className="min-h-0 flex-1 overflow-auto px-2 py-1" data-native-undo="">
         {project === null ? (
           <div className="flex flex-col items-start gap-2 py-2">

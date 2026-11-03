@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // The Runway's pure model (PA-2): which columns a day has (week edges, windows laid over the
-// defaults, cut, split, overlapping, ended), where each task and milestone sits (roll-forward, done
-// ones dropping back for 14 days, stacks of one and of two, archived and parked), what a drop
-// writes, and the tasks overlay the calendar grids draw.
+// defaults, cut, split, overlapping, ended, running), where each task and milestone sits
+// (roll-forward and why, done ones staying the day they're ticked and then dropping back for 14
+// days, stacks of one and of two counted over the whole stack, archived and parked), what a drop
+// writes (a new plan, or the same days back in its own column), a step up or down a lane, the
+// columns' events strips, and the tasks overlay the calendar grids draw.
 
 import { describe, expect, it } from "vitest";
 import type { RunwayWindow } from "./calendarPrefs";
@@ -15,9 +17,12 @@ import {
   columnForDay,
   dropPlan,
   laneTaskIds,
+  LATER_EVENTS,
   linkedEvent,
   orderAfterDrop,
+  orderAfterStep,
   placeCards,
+  placeEvents,
   samePlan,
   taskOverlayEvents,
   type RunwayColumn,
@@ -351,12 +356,97 @@ describe("placeCards", () => {
       ],
       { stacks: [stack(7), stack(8)] },
     );
+    // "3 left": the whole stack's open tasks, the background one too.
     expect(where(model)).toEqual({
-      "today/foreground": "1 s7[2,4,5]2 3 6",
+      "today/foreground": "1 s7[2,4,5]3 3 6",
       "today/background": "9",
     });
     const card = model.lanes.today.foreground[1];
     expect(card.kind === "stack" && card.members.map((m) => m.task.id)).toEqual([2, 4, 5]);
+    expect(card.kind === "stack" && card.chain.map((m) => m.card.task.id)).toEqual([2, 4, 5, 9]);
+  });
+
+  it("counts a stack's left and next over the whole stack, wherever each is planned", () => {
+    const { model } = place(
+      [
+        task({ id: 1, title: "Book", do_start: "2026-11-04", stack_id: 7, status: "done" }),
+        task({ id: 2, title: "Fill", do_start: "2026-11-04", stack_id: 7 }),
+        task({ id: 3, title: "Post", do_start: "2026-11-04", stack_id: 7 }),
+        task({ id: 4, title: "Chase", do_start: "2026-11-10", stack_id: 7 }),
+        task({ id: 5, title: "Collect", do_start: "2026-11-11", stack_id: 7 }),
+        task({ id: 6, title: "Shelved", stack_id: 7, parked: true }),
+        // An archived project's task isn't in the stack's count.
+        task({ id: 7, title: "Old", do_start: "2026-11-11", stack_id: 7, project_archived: true }),
+      ],
+      { stacks: [stack(7)] },
+    );
+    expect(where(model)).toEqual({
+      "today/foreground": "s7[1,2,3]5",
+      "next/foreground": "s7[4,5]5",
+      parked: "6",
+    });
+    const today = model.lanes.today.foreground[0];
+    const next = model.lanes.next.foreground[0];
+    for (const c of [today, next]) {
+      expect(c.kind).toBe("stack");
+      if (c.kind !== "stack") continue;
+      // The next open one in the stack's order, and the whole chain with where each sits.
+      expect(c.next?.title).toBe("Fill");
+      expect(c.chain.map((m) => `${m.card.task.id}@${m.columnId ?? "parked"}`)).toEqual([
+        "1@today",
+        "2@today",
+        "3@today",
+        "4@next",
+        "5@next",
+        "6@parked",
+      ]);
+    }
+    // Only this column's part drags and moves as one.
+    expect(next.kind === "stack" && next.tasks.map((t) => t.id)).toEqual([4, 5]);
+  });
+
+  it("keeps a rolled task ticked off today in today, counted as done, and lets it go tomorrow", () => {
+    const tasks = [
+      task({ id: 1, do_start: "2026-11-02", status: "done", completed_at: "2026-11-04T09:00:00" }),
+      task({ id: 2, do_start: "2026-11-02" }),
+      task({ id: 3, do_start: "2026-11-02" }),
+    ];
+    const { model } = place(tasks);
+    expect(where(model)).toEqual({ "today/foreground": "1 2↻2 3↻2" });
+    expect(model.progress).toEqual({ done: 1, total: 3, doing: 0 });
+    // The next day it has gone back to Before today, with the open ones still rolled.
+    const { model: tomorrow } = place(tasks, { today: day("2026-11-05") });
+    expect(where(tomorrow)).toEqual({ "past/foreground": "1", "today/foreground": "2↻3 3↻3" });
+    expect(tomorrow.progress).toEqual({ done: 0, total: 2, doing: 0 });
+  });
+
+  it("says why a task rolled: its plan, or a deadline it was never planned for", () => {
+    const { model } = place([
+      task({ id: 1, do_start: "2026-11-02", effective_deadline: "2026-11-01" }),
+      task({ id: 2, effective_deadline: "2026-10-30", deadline_from: "milestone" }),
+    ]);
+    const [a, b] = model.lanes.today.foreground;
+    expect(a.kind === "task" && [a.rolled, a.rolledBy, a.daysAgo]).toEqual([true, "plan", 2]);
+    expect(b.kind === "task" && [b.rolled, b.rolledBy, b.daysAgo]).toEqual([true, "deadline", 5]);
+  });
+
+  it("keeps a task planned on a running window in it, though a shorter window holds today", () => {
+    const windows = [
+      win("trip", "2026-11-10", "2026-11-20"),
+      win("conf", "2026-11-12", "2026-11-13"),
+    ];
+    const tasks = [task({ id: 1, do_start: "2026-11-10", do_end: "2026-11-20" })];
+    // Before the trip, on its first day, and once the conference holds today.
+    for (const d of ["2026-11-04", "2026-11-10", "2026-11-12"]) {
+      const { model, columns } = place(tasks, { today: day(d), windows });
+      expect(where(model)).toEqual({ "window:trip/foreground": "1" });
+      const trip = columns.find((c) => c.id === "window:trip")!;
+      expect(trip.windowStart).toBe("2026-11-10");
+    }
+    const { columns } = place(tasks, { today: day("2026-11-12"), windows });
+    // The column starts at today; the window's own first day stays on it.
+    expect(columns.find((c) => c.id === "window:trip")?.start).toBe("2026-11-12");
+    expect(columns.find((c) => c.today)?.id).toBe("window:conf");
   });
 
   it("leaves off archived projects' tasks and milestones, and shelves parked ones", () => {
@@ -465,6 +555,58 @@ describe("dropPlan", () => {
     expect(dropPlan({ kind: "column", column: col("past"), lane: "foreground" }, t)).toBeNull();
   });
 
+  it("back into its own column keeps its days and changes only the lane", () => {
+    // Planned Friday, in the rest of the week (Fri 06 – Sun 08): a reorder there, or a move to
+    // that column's background lane, leaves Friday alone.
+    const fri = task({ id: 1, do_start: "2026-11-06" });
+    const rest = col("rest");
+    expect(dropPlan({ kind: "column", column: rest, lane: "foreground" }, fri, rest)).toEqual({
+      do_start: "2026-11-06",
+      do_end: null,
+      lane: "foreground",
+      parked: false,
+    });
+    expect(dropPlan({ kind: "column", column: rest, lane: "background" }, fri, rest)).toMatchObject(
+      { do_start: "2026-11-06", do_end: null, lane: "background" },
+    );
+    // A running plan window in Today, a far-off day in Later, a deadline-only task: all kept.
+    const running = task({ id: 2, do_start: "2026-10-31", do_end: "2026-11-06" });
+    expect(
+      dropPlan({ kind: "column", column: col("today"), lane: "foreground" }, running, col("today")),
+    ).toMatchObject({ do_start: "2026-10-31", do_end: "2026-11-06" });
+    const far = task({ id: 3, do_start: "2027-02-10" });
+    expect(
+      dropPlan({ kind: "column", column: col("later"), lane: "foreground" }, far, col("later")),
+    ).toMatchObject({ do_start: "2027-02-10", do_end: null });
+    const dueOnly = task({ id: 4, effective_deadline: "2026-11-13", deadline_from: "event" });
+    expect(
+      dropPlan({ kind: "column", column: col("next"), lane: "foreground" }, dueOnly, col("next")),
+    ).toMatchObject({ do_start: null, do_end: null });
+    // From another column it's a new plan, as before.
+    expect(
+      dropPlan({ kind: "column", column: rest, lane: "foreground" }, fri, col("today"))?.do_start,
+    ).toBe("2026-11-06");
+    expect(
+      dropPlan({ kind: "column", column: col("next"), lane: "foreground" }, fri, rest)?.do_start,
+    ).toBe("2026-11-09");
+  });
+
+  it("into a window that has begun, the plan runs over the window's own days", () => {
+    const running = buildColumns(day("2026-11-12"), [win("trip", "2026-11-10", "2026-11-20")]);
+    const trip = running.find((c) => c.id === "window:trip")!;
+    const plan = dropPlan(
+      { kind: "column", column: trip, lane: "foreground" },
+      task({ id: 1, do_start: "2026-11-14" }),
+    );
+    expect(plan).toMatchObject({ do_start: "2026-11-10", do_end: "2026-11-20" });
+    // And the next day it's still in the trip.
+    const { model } = place([task({ id: 1, do_start: plan!.do_start, do_end: plan!.do_end })], {
+      today: day("2026-11-13"),
+      windows: [win("trip", "2026-11-10", "2026-11-20")],
+    });
+    expect(where(model)).toEqual({ "window:trip/foreground": "1" });
+  });
+
   it("knows a plan that changes nothing", () => {
     const t = task({ id: 1, do_start: "2026-11-05" });
     expect(
@@ -505,6 +647,102 @@ describe("the order after a drop", () => {
     expect(orderAfterDrop(cards, [1], 1)).toEqual([2, 3, 1, 4]);
     // The whole stack moved to the top.
     expect(orderAfterDrop(cards, [2, 3], 0)).toEqual([2, 3, 1, 4]);
+  });
+
+  it("moves a card one place up or down its lane, a stack as one, past no milestone", () => {
+    expect(orderAfterStep(cards, [4], -1)).toEqual([1, 4, 2, 3]);
+    expect(orderAfterStep(cards, [1], 1)).toEqual([2, 3, 1, 4]);
+    expect(orderAfterStep(cards, [2, 3], -1)).toEqual([2, 3, 1, 4]);
+    expect(orderAfterStep(cards, [2, 3], 1)).toEqual([1, 4, 2, 3]);
+    // Already first, already last (the milestone after it doesn't count), or not in this lane.
+    expect(orderAfterStep(cards, [1], -1)).toBeNull();
+    expect(orderAfterStep(cards, [4], 1)).toBeNull();
+    expect(orderAfterStep(cards, [99], 1)).toBeNull();
+  });
+});
+
+describe("the events strip", () => {
+  const ev = (id: string, start: string, over: Partial<CalendarEvent> = {}): CalendarEvent => ({
+    id,
+    calendar_id: "c",
+    summary: id,
+    description: null,
+    location: null,
+    start,
+    end: null,
+    all_day: !start.includes("T"),
+    html_link: null,
+    uid: id,
+    ...over,
+  });
+  const strips = (events: CalendarEvent[], windows: RunwayWindow[] = []) => {
+    const columns = buildColumns(WED, windows);
+    const out = placeEvents(events, columns, WED);
+    return Object.fromEntries(
+      Object.entries(out)
+        .filter(([, s]) => s.events.length > 0 || s.more > 0)
+        .map(([id, s]) => [
+          id,
+          `${s.events.map((e) => e.id).join(" ")}${s.more ? ` +${s.more}` : ""}`,
+        ]),
+    );
+  };
+
+  it("puts each event and pinboard entry on its day's column, in day and time order", () => {
+    expect(
+      strips([
+        ev("standup", "2026-11-04T09:00:00"),
+        ev("allday", "2026-11-04"),
+        ev("fri", "2026-11-06T14:00:00"),
+        ev("mon", "2026-11-09"),
+        ev("entry", "2026-11-05", { calendar_id: "pm:pinboard", uid: null }),
+        ev("thu", "2026-11-05T08:00:00"),
+        // A multi-day one still running shows on today; one over, and one before today, don't.
+        ev("trip", "2026-11-02", { end: "2026-11-06" }),
+        ev("gone", "2026-11-01", { end: "2026-11-03" }),
+        ev("monday", "2026-11-02T10:00:00"),
+      ]),
+    ).toEqual({
+      today: "trip allday standup",
+      tomorrow: "entry thu",
+      rest: "fri",
+      next: "mon",
+    });
+  });
+
+  it("leaves out the task and milestone overlays and the new event's ghost", () => {
+    expect(
+      strips([
+        ev("task:1", "2026-11-04", { calendar_id: "pm:tasks", uid: null }),
+        ev("milestone:1", "2026-11-04", { calendar_id: "pm:milestones", uid: null }),
+        ev("draft:new", "2026-11-04T10:00:00", { uid: null }),
+        ev("real", "2026-11-04T11:00:00"),
+      ]),
+    ).toEqual({ today: "real" });
+  });
+
+  it("fills a window's column, and lists Later's next ten, counting the rest", () => {
+    const later = Array.from({ length: 13 }, (_, i) =>
+      ev(`l${i + 1}`, `2026-12-${String(i + 1).padStart(2, "0")}`),
+    );
+    const out = strips(
+      [ev("in-trip", "2026-11-11"), ...later],
+      [win("trip", "2026-11-10", "2026-11-12")],
+    );
+    expect(out["window:trip"]).toBe("in-trip");
+    expect(out.later).toBe(
+      `${later
+        .slice(0, 10)
+        .map((e) => e.id)
+        .join(" ")} +3`,
+    );
+    expect(LATER_EVENTS).toBe(10);
+  });
+
+  it("has a strip for every column but Before today", () => {
+    const columns = buildColumns(WED, []);
+    const out = placeEvents([], columns, WED);
+    expect(Object.keys(out)).toEqual(columns.filter((c) => c.kind !== "past").map((c) => c.id));
   });
 });
 

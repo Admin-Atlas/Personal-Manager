@@ -307,7 +307,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "calendar-runway": {
     title: "The Runway",
-    body: "Your tasks and milestones laid out in columns of days: Before today (folded), Today, Tomorrow, the rest of this week, next week and later, each with a Foreground and a Background lane. Add a named window, such as a trip or a conference week, with + Window, and its days get a column of their own. A card sits on the day you plan to do it; its deadline shows separately, red when it's due or late and amber when it's close, and a deadline that follows a milestone or an event says which. Something you didn't finish rolls into Today. Drag a task to another column, lane or Parked to plan it again, or use Move… on the card from the keyboard. Tick the box to go from to do, to doing, to done. Tasks grouped into a stack fold into one card with how many are left; click it to open them. Milestones open their project and calendar events open their details, but neither moves here. + Task adds a task for today.",
+    body: "Your tasks and milestones laid out in columns of days: Before today (folded), Today, Tomorrow, the rest of this week, next week and later, each with a Foreground and a Background lane, and that day's calendar events and pinboard entries at the head of each column. Add a named window, such as a trip or a conference week, with + Window, and its days get a column of their own. A card sits on the day you plan to do it; its deadline shows separately, red when it's due or late and amber when it's close, and a deadline that follows a milestone or an event says which. Something you didn't finish rolls into Today. Use Move… on a card to plan it for another column, lane or Parked, or to move it up or down; outside the Terminal look you can also drag it. Tick the box to go from to do, to doing, to done. A stack folds into one card with how many are left; click it to open them. Milestones open their project and events open their details, but neither moves here. + Task adds a task for today.",
   },
   "calendar-description-format": {
     title: "Format the description",
@@ -685,7 +685,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "pinboard-note-tasks": {
     title: "Turn checkboxes into tasks",
-    body: "Copies this note's checkbox lines into real tasks, ticked ones as done, and puts a task list beside the note so you can work from it. Choose a project for them or leave them on their own. The note stays exactly as it is, and a line that's already a task isn't added twice.",
+    body: "Copies this note's checkbox lines into real tasks, ticked ones as done, and puts a task list beside the note (or shows the one already on the board): that project's tasks, or all your tasks if you leave them without a project. The note stays exactly as it is, and a line that's already a task in the same project isn't added twice.",
   },
   "pinboard-folder": {
     title: "A folder",

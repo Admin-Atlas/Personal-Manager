@@ -7,8 +7,10 @@
 
 import {
   deadlineInfo,
+  deadlineSource,
   nextStatus,
   STACK_KIND_LABEL,
+  stackTooltip,
   TASK_STATUS_LABEL,
   TONE_CLASS,
 } from "../../lib/tasks";
@@ -71,20 +73,6 @@ export function TaskStatusButton({
   );
 }
 
-/** Where a task's deadline comes from, for the chip's tooltip. */
-function deadlineSource(t: Task): string {
-  if (t.deadline_missing) {
-    return t.deadline_from === "milestone"
-      ? "The linked milestone has no date, so this is your own date"
-      : "The linked event isn't in your calendars, so this is your own date";
-  }
-  if (t.deadline_from === "milestone")
-    return `Milestone's date${t.milestone_label ? `: ${t.milestone_label}` : ""}`;
-  if (t.deadline_from === "event")
-    return `Event's date${t.event_title ? `: ${t.event_title}` : ""}`;
-  return t.deadline_kind === "soft" ? "A date to aim for" : "Deadline";
-}
-
 /** A task's deadline as a small toned chip (from `effective_deadline`), or nothing without one. A
  *  deadline that follows a milestone or event carries ◆ or a calendar mark; one whose link didn't
  *  resolve carries a ⚠. */
@@ -126,18 +114,37 @@ export function DeadlineChip({
   );
 }
 
-/** A small chip naming the stack a task belongs to (its title, or its kind when untitled). */
-export function StackChip({ stack, className }: { stack: TaskStack; className?: string }) {
-  const kind = STACK_KIND_LABEL[stack.kind];
-  return (
+/** A small chip naming the stack a task belongs to (its title, or its kind when untitled). Its
+ *  tooltip carries the stack's note; `showNote` also writes the note out beside the name, for a
+ *  surface with room for it (an opened stack card). */
+export function StackChip({
+  stack,
+  showNote = false,
+  className,
+}: {
+  stack: TaskStack;
+  showNote?: boolean;
+  className?: string;
+}) {
+  const name = stack.title || STACK_KIND_LABEL[stack.kind];
+  const chip = (
     <span
-      title={stack.title ? `${stack.title} · ${kind}` : kind}
+      title={stackTooltip(stack)}
       className={cn(
         "max-w-[8rem] shrink-0 truncate rounded-[var(--radius-sm)] border border-border px-1 text-[0.6875rem] text-ink3",
-        className,
+        !(showNote && stack.note) && className,
       )}
     >
-      ≡ {stack.title || kind}
+      ≡ {name}
+    </span>
+  );
+  if (!showNote || !stack.note) return chip;
+  return (
+    <span className={cn("inline-flex min-w-0 items-baseline gap-1", className)}>
+      {chip}
+      <span className="min-w-0 truncate text-[0.6875rem] text-ink4" title={stack.note}>
+        {stack.note}
+      </span>
     </span>
   );
 }
