@@ -37,7 +37,7 @@ import {
   weekdayShort,
 } from "./calendar-layout";
 import { formatDateLocal, pad2 } from "./format";
-import { compareTasks, deadlineInfo, isOpen, type DeadlineTone } from "./tasks";
+import { compareTasks, deadlineInfo, deadlineKindOf, isOpen, type DeadlineTone } from "./tasks";
 import type { CalendarEvent, Milestone, Task, TaskLane, TaskStack } from "./types";
 
 // --- columns ---------------------------------------------------------------------------------------
@@ -497,7 +497,7 @@ export function placeCards(input: PlaceInput): RunwayModel {
       progress.total += 1;
       if (!open) progress.done += 1;
       else if (t.status === "doing") progress.doing += 1;
-      if (open) consider(dayOf(t.effective_deadline), rank, t.title, t.deadline_kind);
+      if (open) consider(dayOf(t.effective_deadline), rank, t.title, deadlineKindOf(t));
     }
   });
 
@@ -764,7 +764,10 @@ export function placeEvents(
     const list = (at.get(c.id) ?? []).sort(
       (a, b) => a.day - b.day || compareEventsForDay(a.ev, b.ev),
     );
-    const cap = c.end === null ? LATER_EVENTS : Infinity;
+    // Every piece of Later is capped, not just an open-ended one: a window inside Later's range cuts
+    // it, and the first piece can still span months.
+    const later = c.id === LATER_COLUMN_ID || c.id.startsWith(`${LATER_COLUMN_ID}:`);
+    const cap = c.end === null || later ? LATER_EVENTS : Infinity;
     out[c.id] = {
       events: list.slice(0, cap).map((x) => x.ev),
       more: Math.max(0, list.length - cap),
@@ -781,8 +784,19 @@ export function linkedEvent(
   events: readonly CalendarEvent[],
   uid: string | null,
   today: Date,
+  onDay: string | null = null,
 ): CalendarEvent | null {
   if (!uid) return null;
+  // A deadline that follows the event is pinned to one occurrence (R1): show that one, so the chip
+  // and the deadline on the same card name the same day.
+  if (onDay) {
+    const pinned = events.find((ev) => {
+      if (ev.uid !== uid) return false;
+      const start = parseLocal(ev.start, ev.all_day);
+      return start !== null && dayKey(start) === onDay;
+    });
+    if (pinned) return pinned;
+  }
   const t0 = startOfDay(today).getTime();
   let next: { ev: CalendarEvent; at: number } | null = null;
   let last: { ev: CalendarEvent; at: number } | null = null;

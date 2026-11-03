@@ -571,7 +571,12 @@ function TaskCardView({
   const key = `task:${t.id}`;
   const done = t.status === "done";
   const stack = t.stack_id !== null && zone !== null ? ctx.stackById.get(t.stack_id) : undefined;
-  const ev = linkedEvent(ctx.events, t.event_uid, ctx.today);
+  const ev = linkedEvent(
+    ctx.events,
+    t.event_uid,
+    ctx.today,
+    t.deadline_from === "event" ? t.effective_deadline : null,
+  );
   const due = linkedDue(t);
   const rolled = rolledWords(card);
   const titleCls = cn(

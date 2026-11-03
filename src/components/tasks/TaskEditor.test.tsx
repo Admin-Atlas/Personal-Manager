@@ -374,6 +374,27 @@ describe("TaskEditor", () => {
     );
   });
 
+  it("shows a moved event's new day in the event field, as the deadline line does", async () => {
+    const pin = dayKey(addDays(new Date(), 3));
+    const moved = dayKey(addDays(new Date(), 6));
+    mocked.listAllCalendarEvents.mockResolvedValueOnce([
+      calEvent({ summary: "Review", start: moved, uid: "uid-moved" }),
+    ]);
+    const linked = task({
+      event_uid: "uid-moved",
+      event_title: "Review",
+      deadline_from: "event",
+      deadline: pin,
+      effective_deadline: moved,
+    });
+    render(<TaskEditor open task={linked} onClose={() => {}} />);
+    await waitFor(() =>
+      expect(screen.getByText(`📅 ${formatDateOnly(moved)} · Review`)).toBeTruthy(),
+    );
+    expect(screen.getByText(`📅 Review: ${formatDateOnly(moved)}`)).toBeTruthy();
+    expect(screen.queryByText(new RegExp(formatDateOnly(pin)))).toBeNull();
+  });
+
   it("emptying the project field by hand lets a linked milestone go too", async () => {
     mocked.listAllMilestones.mockResolvedValue([milestone()]);
     render(<TaskEditor open task={task({ milestone_id: 5 })} onClose={() => {}} />);
@@ -383,6 +404,17 @@ describe("TaskEditor", () => {
     fireEvent.change(field, { target: { value: "  " } });
     fireEvent.blur(field);
     expect(select.value).toBe("");
+  });
+
+  it("keeps the milestone when the project is retyped in another case", async () => {
+    mocked.listAllMilestones.mockResolvedValue([milestone()]);
+    render(<TaskEditor open task={task({ milestone_id: 5 })} onClose={() => {}} />);
+    const select = screen.getByLabelText("Milestone") as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("5"));
+    const field = screen.getByLabelText("Project");
+    fireEvent.change(field, { target: { value: "atlas" } });
+    fireEvent.blur(field);
+    expect(select.value).toBe("5");
   });
 
   it("shows the stack's note, and edits or deletes the stack from its row", async () => {
@@ -427,6 +459,37 @@ describe("TaskEditor", () => {
     await waitFor(() => expect(stackSelect.value).toBe(""));
     expect(within(stackSelect).queryByRole("option", { name: "Visa forms" })).toBeNull();
     expect(mocked.deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("closes only the stack editor, or only the confirm, on one Escape", async () => {
+    mocked.listTaskStacks.mockResolvedValue([
+      {
+        id: 3,
+        title: "Visa paperwork",
+        kind: "sequential",
+        note: null,
+        created_at: "",
+        updated_at: "",
+      },
+    ]);
+    const onClose = vi.fn();
+    render(<TaskEditor open task={task({ stack_id: 3 })} onClose={onClose} />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Edit the stack" })).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit the stack" }));
+    expect(screen.getByRole("dialog", { name: "Edit stack" })).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit stack" })).toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
+    expect(screen.getByRole("dialog", { name: "Delete this task?" })).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Delete this task?" })).toBeNull(),
+    );
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("saves a task whose milestone was deleted on its own date again", async () => {

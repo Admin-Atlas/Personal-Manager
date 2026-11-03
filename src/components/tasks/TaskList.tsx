@@ -22,7 +22,13 @@ import {
 import { startOfDay } from "../../lib/calendar-layout";
 import { runMutation } from "../../lib/runMutation";
 import { subscribeUntilCleanup } from "../../lib/subscribe";
-import { compareTasks, deadlineInfo, emptyTaskInput, isOpen } from "../../lib/tasks";
+import {
+  compareTasks,
+  deadlineInfo,
+  deadlineKindOf,
+  emptyTaskInput,
+  isOpen,
+} from "../../lib/tasks";
 import type { Task, TaskInput, TaskStack } from "../../lib/types";
 import { useNowTick } from "../../lib/useNowTick";
 import { useDepth } from "../../theme";
@@ -208,7 +214,7 @@ function TaskSummary({
   if (open.length + parked.length + done.length === 0)
     return <p className="font-mono text-xs text-ink4">No tasks yet.</p>;
   const line = (t: Task, note?: string) => {
-    const due = deadlineInfo(t.effective_deadline, t.deadline_kind, today, t.status === "done");
+    const due = deadlineInfo(t.effective_deadline, deadlineKindOf(t), today, t.status === "done");
     return (
       <li key={t.id} className={t.status === "done" ? "line-through opacity-60" : ""}>
         {t.status === "doing" ? "▸ " : ""}

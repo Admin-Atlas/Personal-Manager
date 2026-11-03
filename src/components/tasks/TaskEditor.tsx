@@ -106,6 +106,12 @@ export function TaskEditor(props: TaskEditorProps) {
   );
 }
 
+/** Two spellings of one project, as the backend matches them (case-insensitive; it also resolves
+ *  aliases, which the editor can't see, so an alias still reads as another project here). */
+function sameProject(a: string, b: string): boolean {
+  return a.toLocaleLowerCase() === b.toLocaleLowerCase();
+}
+
 /** Empty text is no value. */
 function clean(s: string): string | null {
   const t = s.trim();
@@ -215,7 +221,7 @@ function TaskEditorBody({
   const linkedMilestone = milestoneId === null ? undefined : milestoneById.get(milestoneId);
   const milestoneOptions = useMemo(() => {
     const all = milestones ?? [];
-    const inScope = scope ? all.filter((m) => m.project_name === scope) : all;
+    const inScope = scope ? all.filter((m) => sameProject(m.project_name, scope)) : all;
     // Keep the linked one listed even when the project field has moved off it, so the Select never
     // shows a value it has no option for.
     if (linkedMilestone && !inScope.includes(linkedMilestone)) return [linkedMilestone, ...inScope];
@@ -231,6 +237,15 @@ function TaskEditorBody({
     task.event_uid !== null &&
     eventUid === task.event_uid &&
     eventPin === task.deadline;
+  // The date the event field shows beside the title. For the link as saved, the occurrence the
+  // backend resolved (a moved event shows its new day, as the deadline line does); for one chosen
+  // here, the pin; and none while the deadline isn't the event's, where the pin does nothing.
+  const pickerDate =
+    deadlineFrom !== "event"
+      ? null
+      : savedEventLink && task && !task.deadline_missing && task.effective_deadline
+        ? task.effective_deadline
+        : eventPin;
   const selectedStack =
     stackSel && stackSel !== NEW_STACK ? stacks.find((s) => String(s.id) === stackSel) : undefined;
 
@@ -270,7 +285,7 @@ function TaskEditorBody({
   // would otherwise file the task under the milestone's project while the field says "No project".
   function settleProject() {
     const p = clean(project);
-    if (p && linkedMilestone && linkedMilestone.project_name !== p) clearMilestone();
+    if (p && linkedMilestone && !sameProject(linkedMilestone.project_name, p)) clearMilestone();
     else if (!p && milestoneId !== null) clearMilestone();
   }
   function changeDoStart(iso: string) {
@@ -540,7 +555,7 @@ function TaskEditorBody({
                 choices={choices ?? []}
                 loading={choices === null}
                 linkedTitle={task?.event_uid === eventUid ? task?.event_title : null}
-                pinnedDate={eventPin}
+                pinnedDate={pickerDate}
                 onChange={changeEvent}
               />
             </div>
@@ -772,29 +787,32 @@ function TaskEditorBody({
 
           {error && <Callout as="p">{error}</Callout>}
         </div>
+        {/* The confirm and the stack editor sit inside this dialog, not beside it: a dialog is the
+            topmost one when no open dialog is its DOM descendant (useDialogLayer), so a sibling
+            would be topmost too and one Escape would close both, losing this editor's edits. */}
+        <ConfirmDialog
+          open={confirmDelete}
+          title="Delete this task?"
+          confirmLabel="Delete"
+          danger
+          busy={busy}
+          onConfirm={() => void remove()}
+          onClose={() => setConfirmDelete(false)}
+        >
+          “{task?.title}” goes from every list it shows on. Its project, milestone and event stay as
+          they are.
+        </ConfirmDialog>
+        <StackEditor
+          stack={editingStack}
+          onClose={() => setEditingStack(null)}
+          onSaved={(saved) => setStacks((all) => all.map((s) => (s.id === saved.id ? saved : s)))}
+          onDeleted={(id) => {
+            setStacks((all) => all.filter((s) => s.id !== id));
+            // The backend has already taken this task out of the deleted stack.
+            if (stackSel === String(id)) setStackSel("");
+          }}
+        />
       </Dialog>
-      <ConfirmDialog
-        open={confirmDelete}
-        title="Delete this task?"
-        confirmLabel="Delete"
-        danger
-        busy={busy}
-        onConfirm={() => void remove()}
-        onClose={() => setConfirmDelete(false)}
-      >
-        “{task?.title}” goes from every list it shows on. Its project, milestone and event stay as
-        they are.
-      </ConfirmDialog>
-      <StackEditor
-        stack={editingStack}
-        onClose={() => setEditingStack(null)}
-        onSaved={(saved) => setStacks((all) => all.map((s) => (s.id === saved.id ? saved : s)))}
-        onDeleted={(id) => {
-          setStacks((all) => all.filter((s) => s.id !== id));
-          // The backend has already taken this task out of the deleted stack.
-          if (stackSel === String(id)) setStackSel("");
-        }}
-      />
     </>
   );
 }

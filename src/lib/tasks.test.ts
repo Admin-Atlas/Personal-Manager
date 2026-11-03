@@ -12,6 +12,7 @@ import { formatDateLocal } from "./format";
 import {
   compareTasks,
   deadlineInfo,
+  deadlineKindOf,
   deadlineSource,
   emptyTaskInput,
   eventChoices,
@@ -345,5 +346,16 @@ describe("eventChoices", () => {
     expect(filterEventChoices(choices, "DEMO").map((c) => c.uid)).toEqual(["a"]);
     expect(filterEventChoices(choices, "team lunch").map((c) => c.uid)).toEqual(["b"]);
     expect(filterEventChoices(choices, "team demo")).toEqual([]);
+  });
+});
+
+describe("deadlineKindOf", () => {
+  it("keeps aim-for only on a date the user set", () => {
+    const t = { deadline_kind: "soft" as const, deadline_missing: false };
+    expect(deadlineKindOf({ ...t, deadline_from: "date" })).toBe("soft");
+    expect(deadlineKindOf({ ...t, deadline_from: "milestone" })).toBe("hard");
+    expect(deadlineKindOf({ ...t, deadline_from: "event" })).toBe("hard");
+    // A link that can't resolve hands the deadline back to the own date, and its kind with it.
+    expect(deadlineKindOf({ ...t, deadline_from: "event", deadline_missing: true })).toBe("soft");
   });
 });

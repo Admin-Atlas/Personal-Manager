@@ -7,6 +7,7 @@
 
 import {
   deadlineInfo,
+  deadlineKindOf,
   deadlineSource,
   nextStatus,
   STACK_KIND_LABEL,
@@ -87,7 +88,7 @@ export function DeadlineChip({
 }) {
   const info = deadlineInfo(
     task.effective_deadline,
-    task.deadline_kind,
+    deadlineKindOf(task),
     today,
     task.status === "done",
   );

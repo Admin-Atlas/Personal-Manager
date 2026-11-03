@@ -53,6 +53,16 @@ export interface DeadlineInfo {
  *  A soft deadline ("aim for") reads `aim …` and is never toned late: its tone caps at soon. A done
  *  task keeps the words but loses the tone, since nothing is pressing any more. `null` when there's
  *  no date (or it can't be read). */
+/** The kind that governs a task's deadline on screen. "Aim for" belongs to a date the user set: a
+ *  deadline that follows a milestone or an event is that thing's real date, so it is always firm
+ *  (the editor hides the control there, and a kind left over from before must not keep it from
+ *  ever going late). It applies again when the link can't resolve and the own date stands in. */
+export function deadlineKindOf(
+  t: Pick<Task, "deadline_kind" | "deadline_from" | "deadline_missing">,
+): DeadlineKind {
+  return t.deadline_from === "date" || t.deadline_missing ? t.deadline_kind : "hard";
+}
+
 export function deadlineInfo(
   deadline: string | null,
   kind: DeadlineKind,
@@ -154,7 +164,7 @@ export function deadlineSource(
     return `Milestone's date${t.milestone_label ? `: ${t.milestone_label}` : ""}`;
   if (t.deadline_from === "event")
     return `Event's date${t.event_title ? `: ${t.event_title}` : ""}`;
-  return t.deadline_kind === "soft" ? "A date to aim for" : "Deadline";
+  return deadlineKindOf(t) === "soft" ? "A date to aim for" : "Deadline";
 }
 
 /** Where a deadline can come from, as the editor's Deadline row names it. */

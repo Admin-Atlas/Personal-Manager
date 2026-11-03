@@ -248,6 +248,21 @@ describe("TerminalRunway", () => {
     expect(announce).toHaveBeenCalledWith("Moved up in Today");
   });
 
+  it("names Before today when a done task moves up there", async () => {
+    const done = { status: "done" as const, completed_at: "2026-11-02T10:00:00Z" };
+    const { announce } = runway({
+      tasks: [
+        task({ id: 1, do_start: "2026-11-02", ...done }),
+        task({ id: 2, title: "Call the bank", do_start: "2026-11-02", ...done }),
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: /── Before today \(2\) ▸ ──/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Move Call the bank" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move up" }));
+    await waitFor(() => expect(mocked.reorderTasks).toHaveBeenCalledWith([2, 1]));
+    expect(announce).toHaveBeenCalledWith(expect.stringMatching(/^Moved up in Before today/));
+  });
+
   it("opens a stack to its whole chain, saying where each is planned", () => {
     runway({
       tasks: [

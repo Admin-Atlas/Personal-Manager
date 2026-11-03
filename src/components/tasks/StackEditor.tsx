@@ -11,7 +11,6 @@
 // handler.
 
 import { useId, useState } from "react";
-import { createPortal } from "react-dom";
 import { deleteTaskStack, updateTaskStack } from "../../lib/ipc";
 import { runMutation } from "../../lib/runMutation";
 import { STACK_KIND_LABEL, STACK_KINDS } from "../../lib/tasks";
@@ -32,14 +31,11 @@ export interface StackEditorProps {
   onDeleted?: (id: number) => void;
 }
 
+/** Rendered inside the dialog that opens it (the task editor), so the layer stack sees it as the
+ *  topmost dialog and Escape closes only it. */
 export function StackEditor(props: StackEditorProps) {
   if (!props.stack) return null;
-  return createPortal(
-    <div onPointerDown={(e) => e.stopPropagation()}>
-      <StackEditorBody key={props.stack.id} {...props} stack={props.stack} />
-    </div>,
-    document.body,
-  );
+  return <StackEditorBody key={props.stack.id} {...props} stack={props.stack} />;
 }
 
 function StackEditorBody({
@@ -166,18 +162,18 @@ function StackEditorBody({
           </div>
           {error && <Callout as="p">{error}</Callout>}
         </div>
+        <ConfirmDialog
+          open={confirmDelete}
+          title="Delete this stack?"
+          confirmLabel="Delete"
+          danger
+          busy={busy}
+          onConfirm={() => void remove()}
+          onClose={() => setConfirmDelete(false)}
+        >
+          “{shownName}” goes. Its tasks stay where they are, just not in a stack.
+        </ConfirmDialog>
       </Dialog>
-      <ConfirmDialog
-        open={confirmDelete}
-        title="Delete this stack?"
-        confirmLabel="Delete"
-        danger
-        busy={busy}
-        onConfirm={() => void remove()}
-        onClose={() => setConfirmDelete(false)}
-      >
-        “{shownName}” goes. Its tasks stay where they are, just not in a stack.
-      </ConfirmDialog>
     </>
   );
 }

@@ -739,6 +739,19 @@ describe("the events strip", () => {
     expect(LATER_EVENTS).toBe(10);
   });
 
+  it("caps the first piece of Later too, when a window inside it cuts it in two", () => {
+    const before = Array.from({ length: 12 }, (_, i) =>
+      ev(`b${i + 1}`, `2026-12-${String(i + 1).padStart(2, "0")}`),
+    );
+    const out = strips(before, [win("spring", "2027-03-20", "2027-03-28")]);
+    expect(out.later).toBe(
+      `${before
+        .slice(0, 10)
+        .map((e) => e.id)
+        .join(" ")} +2`,
+    );
+  });
+
   it("has a strip for every column but Before today", () => {
     const columns = buildColumns(WED, []);
     const out = placeEvents([], columns, WED);
@@ -772,6 +785,18 @@ describe("a task's linked event", () => {
     expect(linkedEvent(events.slice(0, 1).concat(events[3]), "u", WED)?.id).toBe("d");
     expect(linkedEvent(events, "nope", WED)).toBeNull();
     expect(linkedEvent(events, null, WED)).toBeNull();
+  });
+
+  it("is the pinned occurrence when the deadline follows the event, even once it has passed", () => {
+    const events = [
+      ev("past", "2026-10-30T14:00:00"),
+      ev("next", "2026-11-06T14:00:00"),
+      ev("after", "2026-11-13T14:00:00"),
+    ];
+    expect(linkedEvent(events, "u", WED, "2026-10-30")?.id).toBe("past");
+    expect(linkedEvent(events, "u", WED, "2026-11-13")?.id).toBe("after");
+    // A pinned day the mirror no longer holds falls back to the usual rule.
+    expect(linkedEvent(events, "u", WED, "2026-10-23")?.id).toBe("next");
   });
 });
 

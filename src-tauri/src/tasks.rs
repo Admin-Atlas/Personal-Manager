@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -402,6 +402,19 @@ fn effective_deadline(
     }
 }
 
+/// The first day the calendar mirror holds, from `today`: the start of last month, as
+/// `calendar::time_window` anchors it (`MIRROR_BACK`). Worked out from the `today` the caller passes
+/// rather than the wall clock, so `list` stays a function of its inputs. Empty for a bad date, which
+/// turns the aged-out rule off.
+fn mirror_start(today: &str) -> String {
+    NaiveDate::parse_from_str(today, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.with_day(1))
+        .and_then(|d| d.checked_sub_months(chrono::Months::new(1)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
 /// The one occurrence of a linked event a task's deadline follows, from that uid's occurrence dates
 /// (ascending, as [`crate::milestones::calendar_occurrences_by_uid`] gives them). Pure.
 ///
@@ -409,15 +422,29 @@ fn effective_deadline(
 /// occurrence nearest the pin, an earlier one winning a tie. So a recurring event's chosen Friday
 /// stays the deadline and goes late once it passes, and a moved occurrence is still found. With no
 /// pin: the soonest on or after `today`, else the latest past one. `None` when there are none.
-fn event_occurrence<'a>(dates: &'a [String], pin: Option<&str>, today: &str) -> Option<&'a str> {
+///
+/// `mirror_from` is the first day the calendar mirror still holds (`calendar::time_window`). A pin
+/// before it is an occurrence that has aged out of the mirror while the series' later ones remain,
+/// so the nearest survivor would be a different, later occurrence and the deadline would creep
+/// forward each month. The pin itself is the answer then: it is the day the user chose.
+fn event_occurrence<'a>(
+    dates: &'a [String],
+    pin: Option<&'a str>,
+    today: &str,
+    mirror_from: &str,
+) -> Option<&'a str> {
     let day = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
-    let Some(pin) = pin.and_then(day) else {
+    let Some(pin_day) = pin.and_then(day) else {
         return dates
             .iter()
             .find(|d| d.as_str() >= today)
             .or_else(|| dates.last())
             .map(String::as_str);
     };
+    if !dates.is_empty() && day(mirror_from).is_some_and(|from| pin_day < from) {
+        return pin;
+    }
+    let pin = pin_day;
     let mut best: Option<(i64, &str)> = None;
     for d in dates {
         let Some(at) = day(d) else { continue };
@@ -497,13 +524,16 @@ pub fn list(conn: &Connection, project: Option<&str>, today: &str) -> Result<Vec
         };
     // Only a deadline that follows its event reads the occurrences (an event link alone shows just
     // the title, which `load_rows` already joined).
-    let event_dates: HashMap<String, Vec<String>> = if rows
+    let (event_dates, mirror_from): (HashMap<String, Vec<String>>, String) = if rows
         .iter()
         .any(|t| t.deadline_from == FROM_EVENT && t.event_uid.is_some())
     {
-        crate::milestones::calendar_occurrences_by_uid(conn)?
+        (
+            crate::milestones::calendar_occurrences_by_uid(conn)?,
+            mirror_start(today),
+        )
     } else {
-        HashMap::new()
+        (HashMap::new(), String::new())
     };
     Ok(rows
         .into_iter()
@@ -515,12 +545,15 @@ pub fn list(conn: &Connection, project: Option<&str>, today: &str) -> Result<Vec
                 .event_uid
                 .as_deref()
                 .and_then(|uid| event_dates.get(uid))
-                .and_then(|dates| event_occurrence(dates, task.deadline.as_deref(), today));
+                .and_then(|dates| {
+                    event_occurrence(dates, task.deadline.as_deref(), today, &mirror_from)
+                        .map(str::to_string)
+                });
             let (effective, missing) = effective_deadline(
                 &task.deadline_from,
                 task.deadline.as_deref(),
                 milestone_date,
-                event_date,
+                event_date.as_deref(),
             );
             task.effective_deadline = effective;
             task.deadline_missing = missing;
@@ -1487,6 +1520,41 @@ mod tests {
         );
     }
 
+    /// The mirror's first day in these pure tests: before every fixture date, so the aged-out rule
+    /// stays out of the way unless a test asks for it.
+    const MIRROR_FROM: &str = "2026-10-01";
+
+    #[test]
+    fn the_mirror_starts_at_the_start_of_last_month() {
+        assert_eq!(mirror_start("2026-11-03"), "2026-10-01");
+        assert_eq!(mirror_start("2027-01-31"), "2026-12-01");
+        assert_eq!(mirror_start("nonsense"), "");
+    }
+
+    #[test]
+    fn a_pin_older_than_the_mirror_stays_the_deadline_rather_than_creeping_forward() {
+        // A weekly series whose pinned 06-11 occurrence has aged out: the mirror now starts 01-12 and
+        // holds only later Fridays. The deadline stays the chosen Friday, never the oldest survivor.
+        let dates: Vec<String> = ["2026-12-04", "2026-12-11", "2026-12-18"]
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(
+            event_occurrence(&dates, Some("2026-11-06"), "2027-01-04", "2026-12-01"),
+            Some("2026-11-06")
+        );
+        // A pin inside the mirror is still matched to its nearest occurrence (an event moved later).
+        assert_eq!(
+            event_occurrence(&dates, Some("2026-12-02"), "2026-12-01", "2026-12-01"),
+            Some("2026-12-04")
+        );
+        // With no occurrences at all the caller's fallback applies, flagged missing.
+        assert_eq!(
+            event_occurrence(&[], Some("2026-11-06"), "2027-01-04", "2026-12-01"),
+            None
+        );
+    }
+
     #[test]
     fn the_occurrence_nearest_the_pin_wins_and_an_earlier_one_wins_a_tie() {
         let dates: Vec<String> = ["2026-10-30", "2026-11-06", "2026-11-12", "2026-11-20"]
@@ -1495,26 +1563,32 @@ mod tests {
             .collect();
         // Nearest.
         assert_eq!(
-            event_occurrence(&dates, Some("2026-11-07"), TODAY),
+            event_occurrence(&dates, Some("2026-11-07"), TODAY, MIRROR_FROM),
             Some("2026-11-06")
         );
         assert_eq!(
-            event_occurrence(&dates, Some("2026-12-25"), TODAY),
+            event_occurrence(&dates, Some("2026-12-25"), TODAY, MIRROR_FROM),
             Some("2026-11-20")
         );
         // 11-09 is three days from both 11-06 and 11-12: the earlier wins.
         assert_eq!(
-            event_occurrence(&dates, Some("2026-11-09"), TODAY),
+            event_occurrence(&dates, Some("2026-11-09"), TODAY, MIRROR_FROM),
             Some("2026-11-06")
         );
         // No pin: today's rule, soonest on or after today, else the latest past one.
-        assert_eq!(event_occurrence(&dates, None, TODAY), Some("2026-11-06"));
         assert_eq!(
-            event_occurrence(&dates, None, "2026-12-01"),
+            event_occurrence(&dates, None, TODAY, MIRROR_FROM),
+            Some("2026-11-06")
+        );
+        assert_eq!(
+            event_occurrence(&dates, None, "2026-12-01", MIRROR_FROM),
             Some("2026-11-20")
         );
-        assert_eq!(event_occurrence(&[], Some("2026-11-06"), TODAY), None);
-        assert_eq!(event_occurrence(&[], None, TODAY), None);
+        assert_eq!(
+            event_occurrence(&[], Some("2026-11-06"), TODAY, MIRROR_FROM),
+            None
+        );
+        assert_eq!(event_occurrence(&[], None, TODAY, MIRROR_FROM), None);
     }
 
     #[test]

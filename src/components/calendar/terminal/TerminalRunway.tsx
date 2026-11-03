@@ -16,7 +16,6 @@ import {
   type RunwayWindow,
 } from "../../../lib/calendarPrefs";
 import {
-  isDropColumn,
   linkedEvent,
   type RunwayCard,
   type RunwayColumn,
@@ -178,7 +177,7 @@ export function TerminalRunway(props: RunwayProps) {
                           <Row
                             key={rowKey(card)}
                             card={card}
-                            column={isDropColumn(c) ? c : null}
+                            column={c}
                             laneCards={lanes[lane]}
                             ctx={ctx}
                           />
@@ -348,7 +347,12 @@ function TaskRow({
   const { showMeta } = useDepth();
   const [whyOpen, setWhyOpen] = useState(false);
   const t = card.task;
-  const ev = linkedEvent(ctx.events, t.event_uid, ctx.today);
+  const ev = linkedEvent(
+    ctx.events,
+    t.event_uid,
+    ctx.today,
+    t.deadline_from === "event" ? t.effective_deadline : null,
+  );
   const due = linkedDue(t);
   const rolled = rolledWords(card);
   const titleCls = cn(
