@@ -5,7 +5,10 @@
  *  timelines), so it is persisted to the encrypted `settings` table over IPC — see usePinboard.
  *  All geometry is in **grid cells**, not pixels, so the board renders crisply at any cell size. */
 
-export type WidgetKind = "note" | "timeline" | "folder";
+/** `tasklist` (PA-1) is a live view of the global task list (the backend `tasks` table): the widget
+ *  stores only its filter (`project`), never a task, so the board blob holds no task data. A task
+ *  list is never filed into a folder — see `isFileable` in grid.ts. */
+export type WidgetKind = "note" | "timeline" | "folder" | "tasklist";
 
 /** The games a folder can play — see `game.ts` for the rules and `FolderGame.tsx` for the table.
  *  Lives here rather than beside the rules because it is part of the persisted board shape, and
@@ -58,8 +61,18 @@ export interface Widget {
   /** When set, a timeline widget is *bound* to this project: it shows and edits that project's
    *  real milestones (backend `project_milestones`) instead of the freeform `items` above, so
    *  changes flow to the daily brief and the project's Focus/sidebar. Unset → freeform (default).
-   *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1. */
-  project?: string;
+   *  Optional and additive, so old boards parse unchanged and `BOARD_VERSION` stays 1.
+   *
+   *  A task list (`tasklist`) reuses this field as its filter: unset → every task, a string → that
+   *  project's tasks. `null` is what the backend writes when the project is deleted
+   *  (`unbind_pinboard_project`), so it means "this list's project was deleted" and the card says so
+   *  rather than silently widening to every task. A timeline reads `null` as unbound (it tests
+   *  truthiness). Rename and merge rewrite the string through `rekey_pinboard_project`. */
+  project?: string | null;
+  /** A task list's sort: which order (`TaskSortKey`) and whether reversed. Read through
+   *  `readTaskSort`, so a value this build doesn't know is the default. Unset → the global order.
+   *  Optional and additive, so `BOARD_VERSION` stays 1. */
+  taskSort?: { by: string; desc: boolean };
   /** Freeform timelines only: whether this widget's dated entries also appear on the Calendar tab
    *  (the pinboard overlay). Unset → shown, so entries land on the calendar by default. A
    *  project-bound timeline ignores it — those entries are real milestones, already drawn by the

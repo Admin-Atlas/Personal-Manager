@@ -95,6 +95,14 @@ import type {
   EventKind,
   Milestone,
   MilestoneStatus,
+  ChecklistItem,
+  ImportResult,
+  Task,
+  TaskInput,
+  TaskLane,
+  TaskStack,
+  TaskStackKind,
+  TaskStatus,
   PlaintextExportOutcome,
   ProjectOverview,
   ProjectProposalEvent,
@@ -891,8 +899,8 @@ export const reapDeletedVaultDocuments = () => invoke<number>("reap_deleted_vaul
 export const deleteProjectPreview = (project: string) =>
   invoke<DeletePreview>("delete_project_preview", { project });
 
-/** Delete `project`, disposing of its contents as chosen. Milestones are ALWAYS destroyed.
- *  Irreversible in every combination. */
+/** Delete `project`, disposing of its contents as chosen. Milestones are ALWAYS destroyed; tasks
+ *  are ALWAYS kept, without a project. Irreversible in every combination. */
 export const deleteProject = (
   project: string,
   disposition: {
@@ -1018,6 +1026,69 @@ export const deleteMilestone = (id: number) => invoke<void>("delete_milestone", 
 /** Persist a new ordering of a project's milestones (ids in display order). */
 export const reorderMilestones = (project: string, orderedIds: number[]) =>
   invoke<void>("reorder_milestones", { project, orderedIds });
+
+// --- Personal Assistant: tasks (PA-1) ---
+//
+// One global list with one owner (`tasks.rs`). Every surface (project page, pinboard Task list,
+// Runway, calendar overlay) is a live view: it reads through `listTasks`, writes through these
+// wrappers, and re-reads on `onTasksChanged`, which every write fires.
+
+/** Every task (no project) or one project's, in the global order, links resolved. */
+export const listTasks = (project?: string | null) =>
+  invoke<Task[]>("list_tasks", { project: project ?? null });
+
+/** Add a task. A milestone link fills in the project when none is given. Resolves to the new id. */
+export const addTask = (input: TaskInput) => invoke<number>("add_task", { ...input });
+
+/** Rewrite a task's editable fields (not its status: see `changeTaskStatus`). */
+export const updateTask = (id: number, input: TaskInput) =>
+  invoke<void>("update_task", { id, ...input });
+
+/** Re-plan a task: its plan window, lane and parked flag. */
+export const planTask = (
+  id: number,
+  doStart: string | null,
+  doEnd: string | null,
+  lane: TaskLane,
+  parked: boolean,
+) => invoke<void>("plan_task", { id, doStart, doEnd, lane, parked });
+
+/** Move a task to `status`; done stamps when it was completed, anything else clears it. */
+export const changeTaskStatus = (id: number, status: TaskStatus) =>
+  invoke<void>("change_task_status", { id, status });
+
+/** Put these tasks in this order, within their own places in the global order. */
+export const reorderTasks = (orderedIds: number[]) => invoke<void>("reorder_tasks", { orderedIds });
+
+/** Delete a task. */
+export const deleteTask = (id: number) => invoke<void>("delete_task", { id });
+
+/** Turn checklist lines into tasks, skipping blanks and ones already in that project. */
+export const importChecklistTasks = (project: string | null, items: ChecklistItem[]) =>
+  invoke<ImportResult>("import_checklist_tasks", { project, items });
+
+/** Every task stack. */
+export const listTaskStacks = () => invoke<TaskStack[]>("list_task_stacks");
+
+/** Add a task stack. Resolves to its id. */
+export const addTaskStack = (title: string, kind: TaskStackKind, note: string | null) =>
+  invoke<number>("add_task_stack", { title, kind, note });
+
+/** Rewrite a task stack. */
+export const updateTaskStack = (
+  id: number,
+  title: string,
+  kind: TaskStackKind,
+  note: string | null,
+) => invoke<void>("update_task_stack", { id, title, kind, note });
+
+/** Delete a task stack. Its tasks stay, unstacked. */
+export const deleteTaskStack = (id: number) => invoke<void>("delete_task_stack", { id });
+
+/** Fire after any task or stack write, from any surface (and after a project rename, merge or
+ *  delete, which re-key or unlink tasks). */
+export const onTasksChanged = (handler: () => void): Promise<UnlistenFn> =>
+  listen("tasks://changed", () => handler());
 
 // --- Personal Assistant: Calendar connectors (multi-provider, read-only — cards 6A/6B) ---
 

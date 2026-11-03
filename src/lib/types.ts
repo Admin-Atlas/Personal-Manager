@@ -777,6 +777,104 @@ export interface Milestone {
  *  `milestones::STATUSES` in Rust. */
 export type MilestoneStatus = "not_started" | "in_progress" | "almost_done" | "done";
 
+// --- Personal Assistant: tasks (PA-1) ---
+
+/** A task's progress. Mirrors `tasks::STATUSES`. */
+export type TaskStatus = "todo" | "doing" | "done";
+/** Which Runway lane a task sits in. Mirrors `tasks::LANES`. */
+export type TaskLane = "foreground" | "background";
+/** A hard deadline, or a date to aim for. Mirrors `tasks::DEADLINE_KINDS`. */
+export type DeadlineKind = "hard" | "soft";
+/** Where a task's deadline comes from: its own date, or a linked milestone's or event's date.
+ *  Mirrors `tasks::DEADLINE_FROM`. */
+export type DeadlineFrom = "date" | "milestone" | "event";
+/** How a stack's tasks relate. Mirrors `tasks::STACK_KINDS`. */
+export type TaskStackKind = "sequential" | "in_order" | "waiting_on";
+/** Who made a task. Mirrors `tasks::SOURCES`. */
+export type TaskSource = "user" | "assistant";
+
+/** One task from the global list (`tasks::Task`). Every link is optional and independent. Display
+ *  logic (tone, sorting, next-up) reads `effective_deadline`, never `deadline`. */
+export interface Task {
+  id: number;
+  title: string;
+  why: string | null;
+  project_name: string | null;
+  /** The linked project is archived. Lists hide these by default. */
+  project_archived: boolean;
+  milestone_id: number | null;
+  /** A calendar event's iCal UID: a soft link into the mirror. */
+  event_uid: string | null;
+  /** The planned window, `YYYY-MM-DD` local days; `do_end` only with `do_start`. */
+  do_start: string | null;
+  do_end: string | null;
+  /** The task's OWN deadline, as stored. */
+  deadline: string | null;
+  deadline_kind: DeadlineKind;
+  deadline_from: DeadlineFrom;
+  /** The date every surface uses: the own deadline, or the linked milestone's or event's date per
+   *  `deadline_from`, falling back to the own deadline when that link can't resolve. */
+  effective_deadline: string | null;
+  /** `deadline_from` names a link that couldn't resolve (event gone, milestone undated or
+   *  deleted), so `effective_deadline` fell back to the task's own date. */
+  deadline_missing: boolean;
+  /** The linked milestone's label, while it exists. */
+  milestone_label: string | null;
+  /** The linked event's title from the calendar mirror, while it's there. */
+  event_title: string | null;
+  status: TaskStatus;
+  completed_at: string | null;
+  lane: TaskLane;
+  stack_id: number | null;
+  parked: boolean;
+  /** Position in the one global order. */
+  ordinal: number;
+  source: TaskSource;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A named group of tasks (`tasks::TaskStack`). */
+export interface TaskStack {
+  id: number;
+  title: string;
+  kind: TaskStackKind;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** What the task editor writes (everything but status, ordinal and source). `deadlineFrom`
+ *  `"milestone"` needs `milestoneId`, and `"event"` needs `eventUid`. */
+export interface TaskInput {
+  title: string;
+  why: string | null;
+  project: string | null;
+  milestoneId: number | null;
+  eventUid: string | null;
+  doStart: string | null;
+  doEnd: string | null;
+  deadline: string | null;
+  deadlineKind: DeadlineKind;
+  deadlineFrom: DeadlineFrom;
+  lane: TaskLane;
+  stackId: number | null;
+  parked: boolean;
+}
+
+/** One checklist line to import as a task. */
+export interface ChecklistItem {
+  title: string;
+  done: boolean;
+}
+
+/** What a checklist import did: the ids it created, and how many lines it skipped (blank,
+ *  already a task in that scope, or repeated). */
+export interface ImportResult {
+  created: number[];
+  skipped: number;
+}
+
 /** An explicit judgement on a grounded answer (Stage-4 card 10). */
 export type AnswerRating = "up" | "down";
 
@@ -824,6 +922,8 @@ export interface MergePreview {
   files: number;
   milestones: number;
   chats: number;
+  /** Tasks linked to the project; they move with it. */
+  tasks: number;
   /** The target's canonical name — what the source's documents end up filed under, and so the
    *  exact string the user must type to confirm. */
   into_canonical: string;
@@ -848,6 +948,8 @@ export interface DeletePreview {
   files: number;
   chats: number;
   milestones: number;
+  /** Tasks linked to the project. They stay, without a project. */
+  tasks: number;
   canonical: string;
 }
 

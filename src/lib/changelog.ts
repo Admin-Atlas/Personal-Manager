@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.167.0-alpha",
+    date: "2026-11-03",
+    highlights: [
+      "Tasks are here: real to-dos that live in PM, not just lines in a note. Give one a reason it matters, a day you plan to do it, and a deadline that's either firm or one to aim for. Link it to a project, one of its milestones, or a calendar event, and its deadline can follow that milestone or event, so you can plan the work for Monday when the deadline is an event on Friday. Put tasks in the foreground or background, group the steps of one job into a stack (done in sequence, in a suggested order, or waiting on someone), or park them for later. Fold away the links when you don't need them, and new tasks open the same way.",
+      "The same tasks show everywhere at once. A project's page has its tasks under its milestones; the pinboard has a new Task list card, for all your tasks or one project's; and a note with checkboxes has a To tasks button that turns them into real tasks beside it, leaving the note as it was. Sort a Task list by your own order, nearest date, deadline, A–Z or date added, either way round. Tick a task anywhere and it's ticked everywhere.",
+      "The Calendar's Agenda is now the Runway: your tasks and milestones in columns of days (today, tomorrow, the rest of the week, next week and later) with each day's events at the top (hide them when your calendar is busy), each split into foreground and background, with deadlines shown apart from the day you plan the work and coloured as they get close. Drag a task to plan it again, add a named window such as a trip, and fold stacks into one card. A task with no date yet waits in Parked until you give it a day. The dated list is one click away under List. Your tasks also show on the other calendar views as one chip on the day you start them, moving on to today until they're done, or on their deadline if you haven't planned them; untick Tasks under Personal Manager in the calendar list to hide them.",
+    ],
+  },
+  {
     version: "3.166.1-alpha",
     date: "2026-11-02",
     release: true,

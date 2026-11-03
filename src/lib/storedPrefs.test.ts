@@ -17,10 +17,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getPref, setPref } from "./ipc";
 import {
+  readAgendaMode,
   readCursorDay,
   readDayCount,
   readHidden,
   readOpenOn,
+  readRunwayPastOpen,
   readSwipeDays,
   readRange,
   readRangeBounds,
@@ -216,10 +218,12 @@ describe("the backup dismissal prefix scan", () => {
 });
 
 describe("what deliberately stays in localStorage", () => {
-  it("moves only pm.calendar.hidden — the other nine calendar keys are untouched", async () => {
-    // calendarPrefs holds ten keys and exactly ONE is user content (a calendar id is routinely the
-    // account's email). The rest are view state, and dragging them behind an IPC round trip would be
-    // against the decision this change implements, not for it.
+  it("moves only pm.calendar.hidden — the other eleven calendar keys are untouched", async () => {
+    // calendarPrefs holds twelve localStorage keys and exactly ONE of them is user content (a
+    // calendar id is routinely the account's email). The rest are view state, and dragging them
+    // behind an IPC round trip would be against the decision this change implements, not for it.
+    // (The other user content, the last calendar created in and the Runway's named windows, was
+    // born in the encrypted store and never had a localStorage key to move.)
     const stays: Record<string, string> = {
       "pm.calendar.view": "week",
       "pm.calendar.range": "work",
@@ -232,6 +236,9 @@ describe("what deliberately stays in localStorage", () => {
       // not user content.
       "pm.calendar.cursor": "2026-07-31",
       "pm.calendar.swipeDays": "view",
+      // The Agenda's layout and the Runway's "Before today" fold (PA-2).
+      "pm.calendar.agendaMode": "list",
+      "pm.calendar.runwayPastOpen": "true",
     };
     for (const [k, v] of Object.entries(stays)) localStorage.setItem(k, v);
     localStorage.setItem("pm.calendar.hidden", JSON.stringify(["a@example.com"]));
@@ -252,6 +259,8 @@ describe("what deliberately stays in localStorage", () => {
     expect(readOpenOn()).toBe("last");
     expect(readCursorDay()?.getDate()).toBe(31);
     expect(readSwipeDays()).toBe("view");
+    expect(readAgendaMode()).toBe("list");
+    expect(readRunwayPastOpen()).toBe(true);
     // The one that moved reads from the store instead.
     expect([...readHidden()]).toEqual(["a@example.com"]);
   });

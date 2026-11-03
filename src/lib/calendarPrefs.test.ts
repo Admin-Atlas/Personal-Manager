@@ -5,17 +5,24 @@
 // How far a sideways swipe moves the day grids (Settings > General). Pinned: the one-day default
 // nobody's swipe changes from, what a stored value from a newer or broken build falls back to, and
 // "All the days on screen" following whichever grid is swiped. Also the calendar a new event starts
-// on (#884, C10), kept beside the hidden set in the encrypted store.
+// on (#884, C10), kept beside the hidden set in the encrypted store, and the Agenda's layout, the
+// Runway's "Before today" fold and its named windows (PA-2), the last of them in that store too.
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { getPref, setPref } from "./ipc";
 import {
+  readAgendaMode,
   readHidden,
   readLastCreate,
+  readRunwayPastOpen,
+  readRunwayWindows,
   readSwipeDays,
   swipeDays,
+  writeAgendaMode,
   writeHidden,
   writeLastCreate,
+  writeRunwayPastOpen,
+  writeRunwayWindows,
   writeSwipeDays,
 } from "./calendarPrefs";
 import { __resetStoredPrefs, hydrateStoredPrefs } from "./storedPrefs";
@@ -95,5 +102,84 @@ describe("the calendar a new event starts on", () => {
       await hydrateStoredPrefs();
       expect(readLastCreate()).toBeNull();
     }
+  });
+});
+
+describe("the Agenda's layout and the Runway (PA-2)", () => {
+  it("opens on the Runway, and remembers the list once chosen", () => {
+    expect(readAgendaMode()).toBe("runway");
+    writeAgendaMode("list");
+    expect(localStorage.getItem("pm.calendar.agendaMode")).toBe("list");
+    expect(readAgendaMode()).toBe("list");
+    writeAgendaMode("runway");
+    expect(readAgendaMode()).toBe("runway");
+    // Anything it doesn't know is the Runway.
+    localStorage.setItem("pm.calendar.agendaMode", "board");
+    expect(readAgendaMode()).toBe("runway");
+  });
+
+  it("keeps Before today folded until it's opened", () => {
+    expect(readRunwayPastOpen()).toBe(false);
+    writeRunwayPastOpen(true);
+    expect(readRunwayPastOpen()).toBe(true);
+    writeRunwayPastOpen(false);
+    expect(readRunwayPastOpen()).toBe(false);
+  });
+
+  it("windows round-trip in calendar_ui beside hidden and last create", async () => {
+    vi.mocked(getPref).mockImplementation(async (key: string) =>
+      key === "calendar_ui"
+        ? JSON.stringify({ hidden: ["gcal:me@x.com:work"], last_create: "gcal:me@x.com:me@x.com" })
+        : null,
+    );
+    await hydrateStoredPrefs();
+    expect(readRunwayWindows()).toEqual([]);
+
+    const trip = { id: "w1", label: "Lisbon trip", start: "2026-11-10", end: "2026-11-14" };
+    writeRunwayWindows([trip]);
+    expect(readRunwayWindows()).toEqual([trip]);
+    // One blob, merged: the hidden set and the last create are still there.
+    expect([...readHidden()]).toEqual(["gcal:me@x.com:work"]);
+    expect(readLastCreate()).toBe("gcal:me@x.com:me@x.com");
+    expect(setPref).toHaveBeenLastCalledWith(
+      "calendar_ui",
+      JSON.stringify({
+        hidden: ["gcal:me@x.com:work"],
+        last_create: "gcal:me@x.com:me@x.com",
+        runway_windows: [trip],
+      }),
+    );
+    // Never in localStorage: a window's name is the user's own words.
+    expect(Object.keys(localStorage).some((k) => k.includes("runway_windows"))).toBe(false);
+  });
+
+  it("drops a stored window that isn't a whole one", async () => {
+    const good = { id: "w1", label: "Sprint", start: "2026-11-02", end: "2026-11-06" };
+    vi.mocked(getPref).mockImplementation(async (key: string) =>
+      key === "calendar_ui"
+        ? JSON.stringify({
+            runway_windows: [
+              good,
+              { ...good }, // the same id again
+              { id: "w2", label: "", start: "2026-11-02", end: "2026-11-06" },
+              { id: "w3", label: "Backwards", start: "2026-11-06", end: "2026-11-02" },
+              { id: "w4", label: "Not a day", start: "soon", end: "2026-11-06" },
+              { label: "No id", start: "2026-11-02", end: "2026-11-06" },
+              "w5",
+              null,
+            ],
+          })
+        : null,
+    );
+    await hydrateStoredPrefs();
+    expect(readRunwayWindows()).toEqual([good]);
+  });
+
+  it("reads no windows from a blob that has none to give", async () => {
+    vi.mocked(getPref).mockImplementation(async (key: string) =>
+      key === "calendar_ui" ? JSON.stringify({ runway_windows: "w1" }) : null,
+    );
+    await hydrateStoredPrefs();
+    expect(readRunwayWindows()).toEqual([]);
   });
 });

@@ -351,6 +351,36 @@ export function toggleTaskAt(raw: string, index: number, checked?: boolean): str
   return null;
 }
 
+/** One checklist line, read for "Make this a task list" (PA-1). */
+export interface ChecklistLine {
+  title: string;
+  checked: boolean;
+}
+
+/**
+ * The note's checklist, in line order: every line that renders as a tickable box — both dialects,
+ * fenced code skipped — exactly what {@link countTasks} counts, so "N checklist items" names the boxes
+ * the user can see. Each title has its inline marks (`**`, `*`, `~~`, `` ` ``) stripped, since a task
+ * title is plain text, and its spaces collapsed and trimmed. A box with nothing after it is not a task
+ * and is left out. Nesting is not kept: an indented item becomes a task like any other.
+ */
+export function checklistItems(raw: string): ChecklistLine[] {
+  const lines = raw.split("\n");
+  const code = fenceMask(lines);
+  const out: ChecklistLine[] = [];
+  lines.forEach((line, i) => {
+    if (code[i]) return;
+    const m = NOTE_TASK_RE.exec(line) ?? GFM_TASK_RE.exec(line);
+    if (!m) return;
+    const title = m[4]
+      .replace(/\*\*|~~|`|\*/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (title) out.push({ title, checked: m[2].toLowerCase() === "x" });
+  });
+  return out;
+}
+
 // --- toolbar / keyboard formatting helpers (pure) -------------------------------------------
 // Back the note editor's formatting buttons and their keyboard shortcuts. Each returns the new
 // text plus the selection to restore, so the caller round-trips through the controlled <textarea>

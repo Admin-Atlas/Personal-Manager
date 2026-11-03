@@ -18,7 +18,14 @@
 // row or a day in Month opens quick create beside it (C17); everything else stays read-only. The two
 // first-party overlays — project milestones (click opens their project) and freeform pinboard
 // timeline entries (click opens the Pinboard) — are each an all-day event in its own hue, injected
-// here and never written back to any calendar.
+// here and never written back to any calendar. A third, open tasks (PA-1), rides the same way on
+// their plan window or deadline, and a click opens the task editor.
+//
+// Agenda has two layouts (PA-2): the dated list, and the Runway, a board of tasks in columns from
+// today (`views/RunwayBoard`, Terminal's `terminal/TerminalRunway`). The tasks come from the one
+// global list, read here and again on every `tasks://changed`; the Runway writes them through the
+// task IPC only, never a calendar write. Its columns also show, read-only, the events and pinboard
+// entries this tab shows on their days.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -27,12 +34,18 @@ import {
   getPref,
   listAllCalendarEvents,
   listAllMilestones,
+  listArchivedProjects,
+  listTasks,
+  listTaskStacks,
   onCalendarSynced,
   onCalendarWriteLanded,
+  onTasksChanged,
   requestCalendarAccess,
   syncCalendar,
 } from "../../lib/ipc";
-import type { CalendarEvent, CalendarOverview, Milestone } from "../../lib/types";
+import type { CalendarEvent, CalendarOverview, Milestone, Task, TaskStack } from "../../lib/types";
+import { subscribeUntilCleanup } from "../../lib/subscribe";
+import { taskOverlayEvents } from "../../lib/runway";
 import { askOwnerFor, copyRank, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
 import { guestSuggestions } from "../../lib/calendarEdit/guests";
 import { applyPending, DEFAULT_LENGTH_MIN, dragCapability } from "../../lib/calendarDrag";
@@ -63,6 +76,7 @@ import {
 import { slotSeed } from "../../lib/calendarEdit/slotSeed";
 import {
   clampDayCount,
+  readAgendaMode,
   readCursorDay,
   readDayCount,
   readHidden,
@@ -70,18 +84,23 @@ import {
   readOpenOn,
   readRange,
   readRangeBounds,
+  readRunwayWindows,
   readView,
   readZones,
   swipeDays,
+  writeAgendaMode,
   writeCursorDay,
   writeDayCount,
   writeRange,
   writeRangeBounds,
+  writeRunwayWindows,
   writeView,
   writeZones,
+  type AgendaMode,
   type CalendarRange,
   type CalendarViewMode,
   type RangeBounds,
+  type RunwayWindow,
 } from "../../lib/calendarPrefs";
 import { useHorizontalWheelShift } from "../../lib/useHorizontalWheelShift";
 import { calendarNavKey, calendarUndoKey } from "../../lib/calendarNavKey";
@@ -98,12 +117,15 @@ import {
   isMilestoneEvent,
   isOverlayEvent,
   isPinboardEvent,
+  isTaskEvent,
   MILESTONE_CALENDAR_ID,
   occurrenceKey,
   parseLocal,
   PINBOARD_CALENDAR_ID,
   startOfDay,
   startOfWeek,
+  TASK_CALENDAR_ID,
+  taskIdOfEvent,
   type DraftState,
   type LandedGhost,
 } from "../../lib/calendar-layout";
@@ -115,9 +137,11 @@ import {
   pinboardColor,
   sourceColors,
   sourceShapeIndex,
+  taskColor,
   useTheme,
   useUserTime,
 } from "../../theme";
+import { TaskEditor } from "../tasks/TaskEditor";
 import { Callout, Skeleton, VisuallyHidden } from "../ui";
 import { useNowTick } from "../../lib/useNowTick";
 import {
@@ -139,6 +163,8 @@ import { useMoveDrops } from "./edit/useMoveDrops";
 import { undoLatest, useDeleteDialog, useEventWrites, useMirrorReads } from "./edit/useEventWrites";
 import { overlayShown, sayAgain, useCalendarGesture } from "./useCalendarGesture";
 import { AgendaView } from "./views/AgendaView";
+import { RunwayBoard } from "./views/RunwayBoard";
+import { TerminalRunway } from "./terminal/TerminalRunway";
 import { TimeGridView } from "./views/TimeGridView";
 import { MonthView } from "./views/MonthView";
 import { YearView } from "./views/YearView";
@@ -158,6 +184,9 @@ let cachedEvents: CalendarEvent[] = [];
 let cachedOverview: CalendarOverview | null = null;
 let cachedMilestones: Milestone[] = [];
 let cachedPinboard: PinboardEntry[] = [];
+let cachedTasks: Task[] = [];
+let cachedStacks: TaskStack[] = [];
+let cachedArchived: Set<string> = new Set();
 // A quick-create draft whose box went with the tab, titled and with nothing sent (a click in the
 // sidebar switches tabs, and a titled box stays through a click): it opens again on return.
 let leftQuick: LeftDraft | null = null;
@@ -253,8 +282,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const [events, setEvents] = useState<CalendarEvent[]>(() => cachedEvents);
   const [milestones, setMilestones] = useState<Milestone[]>(() => cachedMilestones);
   const [pinboardItems, setPinboardItems] = useState<PinboardEntry[]>(() => cachedPinboard);
+  const [tasks, setTasks] = useState<Task[]>(() => cachedTasks);
+  const [stacks, setStacks] = useState<TaskStack[]>(() => cachedStacks);
+  const [archived, setArchived] = useState<Set<string>>(() => cachedArchived);
+  // The Runway's named windows (user content, in the encrypted `calendar_ui` blob).
+  const [windows, setWindows] = useState<RunwayWindow[]>(() => readRunwayWindows());
+  // The task open in the editor from the tasks overlay (null = closed).
+  const [taskEditing, setTaskEditing] = useState<Task | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(() => readHidden());
   const [view, setView] = useState<CalendarViewMode>(() => readView(AVAILABLE_VIEWS, DEFAULT_VIEW));
+  const [agendaMode, setAgendaMode] = useState<AgendaMode>(() => readAgendaMode());
   const [range, setRange] = useState<CalendarRange>(() => readRange());
   // Extra gutter timezones + any custom Work/Day hour windows (both per-device view prefs).
   const [zones, setZones] = useState<string[]>(() => readZones());
@@ -360,6 +397,38 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     }
   }, []);
 
+  // The one global task list (PA-1), its stacks and which projects are archived: the Runway's cards
+  // and the tasks overlay. Each keeps its last-good value on a failed read, as the milestones do.
+  // Only the newest read applies, so a burst of `tasks://changed` can't land an older list last.
+  const tasksRead = useRef(0);
+  const loadTasks = useCallback(async () => {
+    const n = ++tasksRead.current;
+    await Promise.all([
+      listTasks(null)
+        .then((ts) => {
+          if (!aliveRef.current || n !== tasksRead.current) return;
+          setTasks(ts);
+          cachedTasks = ts;
+        })
+        .catch(() => {}),
+      listTaskStacks()
+        .then((ss) => {
+          if (!aliveRef.current || n !== tasksRead.current) return;
+          setStacks(ss);
+          cachedStacks = ss;
+        })
+        .catch(() => {}),
+      listArchivedProjects()
+        .then((names) => {
+          if (!aliveRef.current || n !== tasksRead.current) return;
+          const set = new Set(names);
+          setArchived(set);
+          cachedArchived = set;
+        })
+        .catch(() => {}),
+    ]);
+  }, []);
+
   const loadOverview = useCallback(async () => {
     try {
       const ov = await calendarOverview();
@@ -422,32 +491,54 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     void loadEvents();
     void loadMilestones();
     void loadPinboard();
-    // Re-read EVERYTHING on focus — events, overview, milestones AND the board. The background poll can
-    // have shifted the synced band, added a calendar, or changed the last-sync time while we were
-    // away, and milestone/board edits happen in other tabs (which unmount this one), so refreshing
-    // events alone would leave the range hint, source colours, "synced" label, and overlays stale.
+    void loadTasks();
+    // Re-read EVERYTHING on focus — events, overview, milestones, the board AND the tasks. The
+    // background poll can have shifted the synced band, added a calendar, or changed the last-sync
+    // time while we were away, and milestone/board/task edits happen in other tabs (which unmount
+    // this one), so refreshing events alone would leave the range hint, source colours, "synced"
+    // label, overlays and the Runway stale.
     const onFocus = () => {
       void loadEvents();
       void loadOverview();
       void loadMilestones();
       void loadPinboard();
+      void loadTasks();
+      setWindows(readRunwayWindows());
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [loadOverview, loadEvents, loadMilestones, loadPinboard]);
+  }, [loadOverview, loadEvents, loadMilestones, loadPinboard, loadTasks]);
+
+  // Any task write, from any surface (this tab's Runway, the editor, the pinboard's list, a project
+  // rename), fires `tasks://changed`: read the list again.
+  useEffect(
+    () =>
+      subscribeUntilCleanup(() =>
+        onTasksChanged(() => {
+          void loadTasks();
+        }),
+      ),
+    [loadTasks],
+  );
 
   const onRefresh = useCallback(async () => {
     setSyncing(true);
     setError(null);
     try {
       await syncCalendar();
-      await Promise.all([loadEvents(), loadOverview(), loadMilestones(), loadPinboard()]);
+      await Promise.all([
+        loadEvents(),
+        loadOverview(),
+        loadMilestones(),
+        loadPinboard(),
+        loadTasks(),
+      ]);
     } catch (e) {
       if (aliveRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (aliveRef.current) setSyncing(false);
     }
-  }, [loadEvents, loadOverview, loadMilestones, loadPinboard]);
+  }, [loadEvents, loadOverview, loadMilestones, loadPinboard, loadTasks]);
 
   // The visibility TOGGLES moved to the sidebar block (one control, one home), so this view only
   // reads the set — but the sidebar is mounted right beside it, so a tick there has to land here
@@ -461,6 +552,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   const onViewChange = useCallback((v: CalendarViewMode) => {
     setView(v);
     writeView(v);
+  }, []);
+
+  const onAgendaModeChange = useCallback((m: AgendaMode) => {
+    setAgendaMode(m);
+    writeAgendaMode(m);
+  }, []);
+  // The Runway is on screen: Agenda in its board layout. It always runs from today, so paging,
+  // the date label and the out-of-range hint have nothing to say there.
+  const runwayShown = view === "agenda" && agendaMode === "runway";
+
+  const onWindowsChange = useCallback((next: RunwayWindow[]) => {
+    setWindows(next);
+    writeRunwayWindows(next);
   }, []);
 
   const onRangeChange = useCallback((r: CalendarRange) => {
@@ -681,6 +785,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         return;
       }
       const nav = calendarNavKey(e, isAnyDialogOpen() || popoverOpenRef.current);
+      // The Runway runs from today: ←, → and t would move a cursor nothing on screen follows.
+      if (runwayShown && (nav === "prev" || nav === "next" || nav === "today")) return;
       if (nav === "prev") {
         e.preventDefault();
         onPrev();
@@ -699,7 +805,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onPrev, onNext, onToday, startCreate]);
+  }, [onPrev, onNext, onToday, startCreate, runwayShown]);
 
   const colorOf = useMemo(() => {
     const ids = overview?.calendars.map((c) => c.id) ?? [];
@@ -707,6 +813,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     return (calendarId: string) => {
       if (calendarId === MILESTONE_CALENDAR_ID) return milestoneColor(system);
       if (calendarId === PINBOARD_CALENDAR_ID) return pinboardColor(system);
+      if (calendarId === TASK_CALENDAR_ID) return taskColor(system);
       return map.get(calendarId) ?? "var(--ink4)";
     };
   }, [overview, system, accent, colorblind]);
@@ -767,6 +874,17 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         uid: null,
       })),
     [pinboardItems],
+  );
+
+  // Open tasks as synthetic all-day events — the third first-party overlay (PA-1): one chip on the
+  // plan's first day (today once that has passed, so unfinished work moves on daily), else on the
+  // effective deadline ("Due: …"). Parked ones, done ones and archived projects' aren't drawn.
+  // Inert to the grid's drag (`dragCapability` refuses every overlay): a task is re-planned on the
+  // Runway, never by dragging it here. Keyed on the day, not the minute tick.
+  const todayKey = dayKey(startOfDay(now));
+  const taskEvents = useMemo<CalendarEvent[]>(
+    () => taskOverlayEvents(tasks, archived, parseLocal(todayKey, true) ?? new Date()),
+    [tasks, archived, todayKey],
   );
 
   const writes = useEventWrites();
@@ -835,12 +953,14 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // cleanly.
     if (!hidden.has(MILESTONE_CALENDAR_ID)) shown.push(...milestoneEvents);
     if (!hidden.has(PINBOARD_CALENDAR_ID)) shown.push(...pinboardEvents);
+    if (!hidden.has(TASK_CALENDAR_ID)) shown.push(...taskEvents);
     return shown;
   }, [
     events,
     hidden,
     milestoneEvents,
     pinboardEvents,
+    taskEvents,
     writes.hiddenIds,
     writes.removalIds,
     writes.twins,
@@ -1044,9 +1164,29 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         if (m) onOpenProject?.(m.project_name);
         return;
       }
+      if (isTaskEvent(ev)) {
+        const id = taskIdOfEvent(ev);
+        const t = tasks.find((x) => x.id === id);
+        if (t) setTaskEditing(t);
+        return;
+      }
       setEventPopup({ ev, anchor });
     },
-    [quickOpen, milestones, onOpenProject, onOpenPinboard],
+    [quickOpen, milestones, tasks, onOpenProject, onOpenPinboard],
+  );
+
+  // What the Runway is given: what the calendar shows (hidden calendars already out), less the
+  // task and milestone overlays, which are the board's own cards. So its columns' events strips
+  // hold the synced events and the pinboard's timeline entries (R1), and a task's link finds its
+  // event there. The milestones come unless the Milestones overlay is hidden.
+  const runwayEvents = useMemo(
+    () => visibleEvents.filter((e) => !isTaskEvent(e) && !isMilestoneEvent(e)),
+    [visibleEvents],
+  );
+  const showAgendaList = useCallback(() => onAgendaModeChange("list"), [onAgendaModeChange]);
+  const runwayMilestones = useMemo(
+    () => (hidden.has(MILESTONE_CALENDAR_ID) ? [] : milestones),
+    [hidden, milestones],
   );
 
   // Both day grids are the same thing now — N consecutive days starting at the cursor. Week is
@@ -1181,7 +1321,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // mirror_end (the mirror is a fixed −1…+13-month band, so paging far enough leaves it). Neutral, not
   // an error — the band is by design. Today/now logic elsewhere never assumes today is inside the band.
   const rangeHint = useMemo(() => {
-    if (!overview) return null;
+    if (!overview || runwayShown) return null;
     const ms = new Date(overview.mirror_start);
     const me = new Date(overview.mirror_end);
     if (Number.isNaN(ms.getTime()) || Number.isNaN(me.getTime())) return null;
@@ -1196,12 +1336,22 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     const lastVisible = startOfDay(addDays(end, -1)).getTime();
     if (firstVisible >= bandStart && lastVisible <= bandEnd) return null;
     return `Outside the synced range — only ${formatDateLocal(ms)} – ${formatDateLocal(me)} is mirrored.`;
-  }, [overview, view, cursor, dayCount]);
+  }, [overview, view, cursor, dayCount, runwayShown]);
 
   // The count the Terminal chrome strip shows at Power depth. For the bounded grids it's the events
   // touching the visible period (so it matches what's on screen, not the whole −1..+13-month mirror);
   // for the open-ended agenda it's everything from the anchor day forward.
   const chromeCount = useMemo(() => {
+    // The Runway counts the open tasks it can show (not parked, not an archived project's).
+    if (runwayShown) {
+      return tasks.filter(
+        (t) =>
+          t.status !== "done" &&
+          !t.parked &&
+          !t.project_archived &&
+          !(t.project_name !== null && archived.has(t.project_name)),
+      ).length;
+    }
     if (view === "agenda") {
       const fromMs = startOfDay(cursor).getTime();
       return visibleEvents.filter((e) => {
@@ -1218,7 +1368,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
       const span = eventDaySpan(e);
       return span && span.startDay.getTime() < endMs && span.endDay.getTime() >= startMs;
     }).length;
-  }, [visibleEvents, view, cursor, dayCount]);
+  }, [visibleEvents, view, cursor, dayCount, runwayShown, tasks, archived]);
 
   if (loading && !overview) {
     return (
@@ -1235,7 +1385,25 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
   // connected yet." over data the Calendars menu is simultaneously offering to show/hide. Read the raw
   // overlay memos, not `visibleEvents`: hiding an overlay should empty the grid, never swap the whole
   // body for an onboarding message. The empty state is then honest — it means nothing to draw at all.
-  const hasOverlay = milestoneEvents.length > 0 || pinboardEvents.length > 0;
+  const hasOverlay =
+    milestoneEvents.length > 0 || pinboardEvents.length > 0 || taskEvents.length > 0;
+
+  // Both Runways get the same props; `announce` is the tab's live region.
+  const runwayProps = {
+    tasks,
+    stacks,
+    milestones: runwayMilestones,
+    events: runwayEvents,
+    colorOf,
+    archived,
+    windows,
+    now,
+    onWindowsChange,
+    onOpenProject,
+    onEventClick,
+    onShowList: showAgendaList,
+    announce,
+  };
 
   // The active body for the current System + view. Terminal forks to the mono set and never mounts the
   // pixel TimeGridView; both branches enumerate all five views so none falls through to the wrong body.
@@ -1273,7 +1441,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           );
         case "agenda":
         default:
-          return (
+          return agendaMode === "runway" ? (
+            <TerminalRunway {...runwayProps} />
+          ) : (
             <TerminalAgenda
               events={visibleEvents}
               colorOf={colorOf}
@@ -1288,7 +1458,9 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
     // overview and the Terminal tables show what's in the calendar only.
     switch (view) {
       case "agenda":
-        return (
+        return agendaMode === "runway" ? (
+          <RunwayBoard {...runwayProps} />
+        ) : (
           <AgendaView
             events={shownEvents}
             fromDay={cursor}
@@ -1387,9 +1559,19 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         onCreate={hasGoogle && !createInCorner ? openCreate : undefined}
         createReason={createReason}
         createRef={createButtonRef}
+        agendaMode={agendaMode}
+        onAgendaModeChange={onAgendaModeChange}
       />
 
-      {isTerminal && <TerminalChrome view={view} label={label} count={chromeCount} />}
+      {isTerminal && (
+        <TerminalChrome
+          view={view}
+          flag={runwayShown ? "runway" : undefined}
+          label={runwayShown ? "from today" : label}
+          count={chromeCount}
+          noun={runwayShown ? "task" : "event"}
+        />
+      )}
 
       {error && (
         <Callout variant="strip" size="md" className="font-ui">
@@ -1411,13 +1593,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
 
       {/* Overlays but no connected calendar: the grid below is real (milestones / pinboard entries), so
           the connect-a-calendar nudge demotes to a hint strip rather than replacing the body. */}
-      {!hasCalendars && hasOverlay && (
+      {!hasCalendars && hasOverlay && !runwayShown && (
         <div className="border-b border-rule bg-panel px-4 py-1.5 text-center font-mono text-xs text-ink4">
-          No calendars connected — showing your milestones and pinboard entries only.
+          No calendars connected — showing your milestones, tasks and pinboard entries only.
         </div>
       )}
 
-      {!hasCalendars && !hasOverlay ? (
+      {/* The Runway is the tasks' own board: it shows with no calendar connected and no task yet,
+          so the first one can be added there. */}
+      {!hasCalendars && !hasOverlay && !runwayShown ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
           <p className="text-sm text-ink2">No calendars connected yet.</p>
           <p className="max-w-sm text-xs text-ink4">
@@ -1442,7 +1626,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
               date rolls over at midnight, so every view's "today" highlight advances without an
               interaction. */}
           <div
-            key={`${view}:${dayKey(startOfDay(now))}`}
+            key={`${view}:${view === "agenda" ? agendaMode : ""}:${dayKey(startOfDay(now))}`}
             className="flex min-h-0 flex-1 flex-col"
             style={{ animation: "pm-fade-up 0.25s ease-out" }}
           >
@@ -1644,6 +1828,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
           {gesture.chip}
         </div>
       )}
+      {/* A task opened from the tasks overlay: the same editor every task surface opens. It saves
+          through the task IPC, and the `tasks://changed` that follows redraws the overlay. */}
+      <TaskEditor
+        open={taskEditing !== null}
+        task={taskEditing}
+        onClose={() => setTaskEditing(null)}
+      />
       <VisuallyHidden role="status" aria-live="polite">
         {said}
       </VisuallyHidden>

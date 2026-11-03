@@ -263,6 +263,8 @@ fn db_holds_user_data(conn: &rusqlite::Connection) -> bool {
         "calendar_events",
         "conversations",
         "chat_sessions",
+        "tasks",
+        "task_stacks",
     ];
     for table in ANY_ROW {
         let q = format!("SELECT EXISTS(SELECT 1 FROM {table})");
@@ -1642,6 +1644,11 @@ mod tests {
             (
                 "conversations",
                 "INSERT INTO conversations(title) VALUES ('chat')",
+            ),
+            ("tasks", "INSERT INTO tasks(title) VALUES ('call Sam')"),
+            (
+                "task_stacks",
+                "INSERT INTO task_stacks(title) VALUES ('launch')",
             ),
             (
                 "entities beyond the seeded inbox",

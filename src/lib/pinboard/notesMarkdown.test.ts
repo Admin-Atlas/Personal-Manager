@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  checklistItems,
   countTasks,
   indentLines,
   listIndentBeforeCaret,
@@ -57,6 +58,44 @@ describe("toggleTaskAt / countTasks — ticking a box in the RENDERED note", () 
     expect(toggleTaskAt("no boxes here", 0)).toBeNull();
     expect(toggleTaskAt("[] x", -1)).toBeNull();
     expect(countTasks("no boxes here")).toBe(0);
+  });
+});
+
+describe("checklistItems — a note's checklist, for Make this a task list", () => {
+  it("reads both dialects in line order, with each line's ticked state", () => {
+    const note = "Plan\n[] book venue\n- a bullet\n- [x] send invites\n* [ ] order cake\n[X] pay";
+    expect(checklistItems(note)).toEqual([
+      { title: "book venue", checked: false },
+      { title: "send invites", checked: true },
+      { title: "order cake", checked: false },
+      { title: "pay", checked: true },
+    ]);
+  });
+
+  it("finds exactly the boxes countTasks counts, skipping fenced code", () => {
+    const note = "[] real one\n```\n[] not a box\n- [ ] nor this\n```\n[x] real two";
+    expect(checklistItems(note).map((i) => i.title)).toEqual(["real one", "real two"]);
+    expect(checklistItems(note)).toHaveLength(countTasks(note));
+  });
+
+  it("strips inline marks and collapses spaces, keeping the words", () => {
+    expect(checklistItems("[] **ship** the *new* `build`   ~~today~~ ")).toEqual([
+      { title: "ship the new build today", checked: false },
+    ]);
+  });
+
+  it("keeps nested items as tasks of their own", () => {
+    expect(checklistItems("[] parent\n  [] child\n    - [x] grandchild")).toEqual([
+      { title: "parent", checked: false },
+      { title: "child", checked: false },
+      { title: "grandchild", checked: true },
+    ]);
+  });
+
+  it("leaves out a box with nothing after it, and a note with no checklist reads empty", () => {
+    expect(checklistItems("[] \n[] ** **\n[] real")).toEqual([{ title: "real", checked: false }]);
+    expect(checklistItems("just prose\n- a bullet\n1. a step")).toEqual([]);
+    expect(checklistItems("")).toEqual([]);
   });
 });
 

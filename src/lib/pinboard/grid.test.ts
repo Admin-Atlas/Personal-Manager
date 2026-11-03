@@ -7,6 +7,7 @@ import {
   clampRect,
   FOLDER_MIN,
   folderAtPointer,
+  isFileable,
   minSize,
   rectContains,
   rectsOverlap,
@@ -159,6 +160,18 @@ describe("folderAtPointer — the pointer decides, not the dragged rect", () => 
     expect(folderAtPointer(ws, "c", { x: 5, y: 5 })).toBeUndefined();
   });
 
+  it("never targets a folder for a moving TASK LIST — it isn't fileable", () => {
+    // A build from before task lists dropped a whole folder over one child it didn't know, so a task
+    // list stays on the board: an older build can then lose at most that card, never the notes.
+    const f = folder("f", { x: 4, y: 4, w: 3, h: 3 }, [note("a", size)]);
+    const list = note("t", { x: 20, y: 0, w: 9, h: 8 }, { kind: "tasklist" });
+    expect(folderAtPointer([f, list], "t", { x: 5, y: 5 })).toBeUndefined();
+    expect(isFileable("tasklist")).toBe(false);
+    expect(isFileable("folder")).toBe(false);
+    expect(isFileable("note")).toBe(true);
+    expect(isFileable("timeline")).toBe(true);
+  });
+
   it("picks the TOP-most folder when two stack (array order is paint order)", () => {
     const under = folder("under", { x: 4, y: 4, w: 3, h: 3 }, [note("a", size)]);
     const over = folder("over", { x: 4, y: 4, w: 3, h: 3 }, [note("b", size)]);
@@ -218,6 +231,44 @@ describe("resolveDrop — file / fold / move", () => {
     expect(kids[0].rect).toEqual({ x: 0, y: 0, w: 7, h: 5 }); // sibling untouched
     expect(kids[1].rect).toMatchObject({ w: 9, h: 8 }); // size preserved exactly
     expect(rectsOverlap(kids[0].rect, kids[1].rect)).toBe(false); // and it doesn't sit on top of it
+  });
+
+  it("never files or folds a task list — pointer over a folder, or exact twins, it just moves", () => {
+    const f = folder("f", { x: 4, y: 4, w: 3, h: 3 }, [note("a", size)]);
+    const list = note("t", { x: 20, y: 0, w: 9, h: 8 }, { kind: "tasklist" });
+    const filed = resolveDrop([f, list], "t", { x: 4, y: 4, w: 9, h: 8 }, 44, 28, stubId, {
+      x: 5,
+      y: 5,
+    });
+    expect(filed.map((w) => w.id)).toEqual(["f", "t"]);
+    expect(filed[0].children?.map((c) => c.id)).toEqual(["a"]);
+    expect(filed[1].rect).toEqual({ x: 4, y: 4, w: 9, h: 8 });
+
+    // Exact-rect twins fold only when BOTH are fileable: a note dropped on a task list, or a task
+    // list on a note, is a plain move.
+    const twinRect: Rect = { x: 4, y: 4, w: 9, h: 8 };
+    const n = note("n", { x: 0, y: 0, w: 9, h: 8 });
+    const onList = resolveDrop(
+      [note("t", twinRect, { kind: "tasklist" }), n],
+      "n",
+      twinRect,
+      44,
+      28,
+      stubId,
+      null,
+    );
+    expect(onList.every((w) => w.kind !== "folder")).toBe(true);
+    const onNote = resolveDrop(
+      [note("n", twinRect), note("t", { x: 0, y: 0, w: 9, h: 8 }, { kind: "tasklist" })],
+      "t",
+      twinRect,
+      44,
+      28,
+      stubId,
+      null,
+    );
+    expect(onNote.every((w) => w.kind !== "folder")).toBe(true);
+    expect(onNote).toHaveLength(2);
   });
 
   it("lays BOTH twins out when folding, so one isn't hidden under the other", () => {

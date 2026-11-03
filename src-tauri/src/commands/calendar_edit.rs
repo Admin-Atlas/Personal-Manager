@@ -3800,6 +3800,7 @@ pub async fn delete_calendar_event(
                 result,
             },
         );
+        tasks_changed(&task_app);
     });
     Ok(DeleteStart::Held {
         undo_token,
@@ -7177,6 +7178,7 @@ async fn start_series_delete(
                     result,
                 },
             );
+            tasks_changed(&task_app);
         }
     });
     Ok(DeleteStart::Held {
@@ -9655,7 +9657,16 @@ impl Host for AppHandle {
                 calendar_id: calendar_id.to_string(),
             },
         );
+        tasks_changed(self);
     }
+}
+
+/// A task whose deadline follows an event reads that event's date (PA-1), so a write that moved or
+/// removed one in the mirror, or a delete that settled, has the task views re-read too. Every view
+/// listens app-wide (the pinboard and project page as well as the calendar), so this is a plain
+/// `emit`, not `emit_to("main")`. Called with no lock held.
+fn tasks_changed(app: &AppHandle) {
+    let _ = app.emit(crate::tasks::TASKS_CHANGED, ());
 }
 
 /// Write Google's copy into the mirror, remember it for the next sync, and tell the briefing and the

@@ -8,7 +8,12 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { DRAFT_EVENT_ID, MILESTONE_CALENDAR_ID, timedSegments } from "./calendar-layout";
+import {
+  DRAFT_EVENT_ID,
+  MILESTONE_CALENDAR_ID,
+  TASK_CALENDAR_ID,
+  timedSegments,
+} from "./calendar-layout";
 import {
   addWall,
   applyPending,
@@ -870,6 +875,10 @@ describe("dragCapability", () => {
 
   it("says what a press may do, and why not", () => {
     expect(dragCapability(row({ calendar_id: MILESTONE_CALENDAR_ID }), ctx())).toEqual(none(null));
+    // A task on the tasks overlay (PA-1) is re-planned on the Runway, never dragged on the grid.
+    expect(
+      dragCapability(row({ id: "task:3", calendar_id: TASK_CALENDAR_ID, all_day: true }), ctx()),
+    ).toEqual(none(null));
     expect(dragCapability(row({ id: DRAFT_EVENT_ID }), ctx())).toEqual(none(null));
     expect(dragCapability(row(), ctx({ pending: true }))).toEqual(none(SAVING));
     const refused = { canEdit: true, canRetime: false, reason: THEIRS };

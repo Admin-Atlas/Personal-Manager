@@ -23,7 +23,20 @@ import {
   type PowerTag,
 } from "../lib/powerRoute";
 import { useDevMode } from "../lib/capabilities";
-import { useDepth, useTheme, sourceColors, sourceShapeIndex } from "../theme";
+import {
+  useDepth,
+  useTheme,
+  milestoneColor,
+  pinboardColor,
+  sourceColors,
+  sourceShapeIndex,
+  taskColor,
+} from "../theme";
+import {
+  MILESTONE_CALENDAR_ID,
+  PINBOARD_CALENDAR_ID,
+  TASK_CALENDAR_ID,
+} from "../lib/calendar-layout";
 import { CalendarSourceList } from "./calendar/CalendarSourceList";
 import { Button, Collapsible, ConfirmDialog, Dialog, NavItem, Select } from "./ui";
 import { globalChats, projectChats } from "../lib/chatNav";
@@ -317,7 +330,14 @@ export function Sidebar({
   const calColorOf = useMemo(() => {
     const ids = calOverview?.calendars.map((c) => c.id) ?? [];
     const map = sourceColors(ids, system, accent, colorblind);
-    return (id: string) => map.get(id) ?? "var(--ink4)";
+    // The Personal Manager rows take the colours their entries have on the calendar (as
+    // CalendarView's `colorOf` does), not the grey fallback for an unknown calendar.
+    return (id: string) => {
+      if (id === MILESTONE_CALENDAR_ID) return milestoneColor(system);
+      if (id === PINBOARD_CALENDAR_ID) return pinboardColor(system);
+      if (id === TASK_CALENDAR_ID) return taskColor(system);
+      return map.get(id) ?? "var(--ink4)";
+    };
   }, [calOverview, system, accent, colorblind]);
   const calShapeOf = useMemo(() => {
     const slots = sourceShapeIndex(calOverview?.calendars.map((c) => c.id) ?? []);

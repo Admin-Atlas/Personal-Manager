@@ -24,8 +24,8 @@ export const CALENDAR_RANGES: readonly CalendarRange[] = ["work", "day", "full"]
 
 const VIEW_KEY = "pm.calendar.view";
 const RANGE_KEY = "pm.calendar.range";
-/** The encrypted store's home for the hidden set and the last calendar an event was created in —
- *  NOT a localStorage key. */
+/** The encrypted store's home for the hidden set, the last calendar an event was created in and the
+ *  Runway's named windows — NOT a localStorage key. */
 const PREF_KEY = "calendar_ui";
 
 /** The last view the user had open, clamped to `allowed` (so a value from a newer build that isn't
@@ -55,12 +55,14 @@ export function writeView(view: CalendarViewMode): void {
 
 /** The set of calendar ids the user has hidden from the aggregator (visibility, not sync).
  *
- *  One of the two keys in this module that are user content, not view state (the other is the last
- *  calendar an event was created in, `readLastCreate`): a Google/Outlook calendar id is routinely the
- *  account's email address. Both therefore live in the encrypted `settings` table under
- *  `calendar_ui` (see storedPrefs.ts) while the other nine keys here — view, range, roster fold,
- *  zones, bounds, day count, openOn, the cursor and the swipe distance — stay in localStorage, which
- *  is what they are for. */
+ *  One of the three keys in this module that are user content, not view state (the others are the
+ *  last calendar an event was created in, `readLastCreate`, and the Runway's named windows,
+ *  `readRunwayWindows`): a Google/Outlook calendar id is routinely the account's email address, and a
+ *  window's name is the user's own words ("Lisbon trip"). All three therefore live in the encrypted
+ *  `settings` table under `calendar_ui` (see storedPrefs.ts) while the other eleven keys here —
+ *  view, range, roster fold, zones, bounds, day count, openOn, the cursor, the swipe distance, the
+ *  agenda layout and the Runway's "Before today" fold — stay in localStorage, which is what they are
+ *  for. */
 export function readHidden(): Set<string> {
   const arr = readStored(PREF_KEY).hidden;
   if (Array.isArray(arr)) {
@@ -92,6 +94,110 @@ export function readLastCreate(): string | null {
 /** Remember the calendar an event was just created in. Only a create Google holds moves it. */
 export function writeLastCreate(calendarId: string): void {
   writeStored(PREF_KEY, { last_create: calendarId });
+}
+
+// --- the Agenda's two layouts, and the Runway's windows (PA-2) -----------------------------------
+
+/** How the Agenda view lays out: the Runway board (tasks in columns from today) or the dated list
+ *  of events it always was. */
+export type AgendaMode = "runway" | "list";
+
+const AGENDA_MODE_KEY = "pm.calendar.agendaMode";
+const RUNWAY_PAST_OPEN_KEY = "pm.calendar.runwayPastOpen";
+const RUNWAY_EVENTS_KEY = "pm.calendar.runwayEvents";
+
+/** The Agenda layout last chosen on this device. Defaults to the Runway. View state, so
+ *  localStorage, like the view itself. */
+export function readAgendaMode(): AgendaMode {
+  try {
+    return localStorage.getItem(AGENDA_MODE_KEY) === "list" ? "list" : "runway";
+  } catch {
+    return "runway";
+  }
+}
+
+export function writeAgendaMode(mode: AgendaMode): void {
+  try {
+    localStorage.setItem(AGENDA_MODE_KEY, mode);
+  } catch {
+    // Best-effort; a failed write just means the layout isn't remembered.
+  }
+}
+
+/** Is the Runway's "Before today" column folded open? Closed until the user opens it. */
+export function readRunwayPastOpen(): boolean {
+  try {
+    return localStorage.getItem(RUNWAY_PAST_OPEN_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function writeRunwayPastOpen(open: boolean): void {
+  try {
+    localStorage.setItem(RUNWAY_PAST_OPEN_KEY, open ? "true" : "false");
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** Does the Runway show each column's events strip (calendar events and pinboard entries)? Shown
+ *  until the user hides it: a busy calendar can fill a column with events and push its tasks
+ *  out of sight. */
+export function readRunwayShowEvents(): boolean {
+  try {
+    return localStorage.getItem(RUNWAY_EVENTS_KEY) !== "hidden";
+  } catch {
+    return true;
+  }
+}
+
+export function writeRunwayShowEvents(show: boolean): void {
+  try {
+    localStorage.setItem(RUNWAY_EVENTS_KEY, show ? "shown" : "hidden");
+  } catch {
+    // Best-effort.
+  }
+}
+
+/** A named stretch of days on the Runway ("Lisbon trip", 10-11 to 14-11): its own column, cut out
+ *  of the default ones. Days are `YYYY-MM-DD`, both inclusive. */
+export interface RunwayWindow {
+  id: string;
+  label: string;
+  start: string;
+  end: string;
+}
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The Runway's named windows. User content (a window's name is the user's own words), so they live
+ *  in the encrypted `calendar_ui` blob beside `hidden` and `last_create`, never in localStorage. A
+ *  stored entry that isn't a whole window (no id or label, a date that isn't a day, an end before
+ *  its start) is dropped rather than drawn wrong. */
+export function readRunwayWindows(): RunwayWindow[] {
+  const arr = readStored(PREF_KEY).runway_windows;
+  if (!Array.isArray(arr)) return [];
+  const out: RunwayWindow[] = [];
+  const seen = new Set<string>();
+  for (const w of arr as unknown[]) {
+    if (!w || typeof w !== "object") continue;
+    const { id, label, start, end } = w as Record<string, unknown>;
+    if (typeof id !== "string" || id === "" || seen.has(id)) continue;
+    if (typeof label !== "string" || label.trim() === "") continue;
+    if (typeof start !== "string" || typeof end !== "string") continue;
+    if (!ISO_DAY.test(start) || !ISO_DAY.test(end) || end < start) continue;
+    seen.add(id);
+    out.push({ id, label, start, end });
+  }
+  return out;
+}
+
+/** Save the Runway's windows (the whole list). */
+export function writeRunwayWindows(windows: RunwayWindow[]): void {
+  writeStored(PREF_KEY, {
+    runway_windows: windows.map(({ id, label, start, end }) => ({ id, label, start, end })),
+  });
 }
 
 const ROSTER_OPEN_KEY = "pm.calendar.rosterOpen";

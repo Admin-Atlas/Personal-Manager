@@ -8,7 +8,7 @@
 //
 // The ceremony is deliberately heavier than the Teach tab's entity merge, because this one is
 // reached from Focus where the user is triaging rather than fixing name variants. A merge moves
-// files, chats, milestones and the whole activity history, then HARD-DELETES the source project
+// files, chats, milestones, tasks and the whole activity history, then HARD-DELETES the source project
 // row — there is no in-app undo. So the counts are computed live from the same rows the merge
 // will move (never estimated), and the user types the target's canonical name to proceed.
 
@@ -27,6 +27,7 @@ export function movesClause(preview: MergePreview): string | null {
   if (preview.milestones > 0) {
     parts.push(`${preview.milestones} milestone${preview.milestones === 1 ? "" : "s"}`);
   }
+  if (preview.tasks > 0) parts.push(`${preview.tasks} task${preview.tasks === 1 ? "" : "s"}`);
   if (parts.length === 0) return null;
   if (parts.length === 1) return parts[0];
   return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;

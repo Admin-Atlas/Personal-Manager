@@ -16,6 +16,7 @@ function preview(over: Partial<MergePreview> = {}): MergePreview {
     files: 0,
     chats: 0,
     milestones: 0,
+    tasks: 0,
     into_canonical: "Marketing",
     ...over,
   };
@@ -38,6 +39,14 @@ describe("movesClause", () => {
     expect(movesClause(preview({ files: 1, chats: 1, milestones: 1 }))).toBe(
       "1 file, 1 chat and 1 milestone",
     );
+  });
+
+  it("counts the tasks that move with the project", () => {
+    expect(movesClause(preview({ files: 12, chats: 5, milestones: 3, tasks: 2 }))).toBe(
+      "12 files, 5 chats, 3 milestones and 2 tasks",
+    );
+    expect(movesClause(preview({ tasks: 1 }))).toBe("1 task");
+    expect(movesClause(preview({ files: 2, tasks: 4 }))).toBe("2 files and 4 tasks");
   });
 
   // An empty source is a real case (a project whose documents were already re-filed by hand).

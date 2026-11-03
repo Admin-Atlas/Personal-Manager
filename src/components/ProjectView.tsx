@@ -15,6 +15,8 @@ import {
   listDocuments,
   listMilestones,
   listProjects,
+  listTasks,
+  onTasksChanged,
   reapDeletedVaultDocuments,
   setDocumentMetadata,
   setProjectArchived,
@@ -29,6 +31,8 @@ import { Button, Callout } from "./ui";
 import { ImportancePicker } from "./ImportancePicker";
 import { LinkedBadge, ProjectPicker, projectsOf } from "./ProjectPicker";
 import { MilestoneList } from "./MilestoneList";
+import { TaskList } from "./tasks/TaskList";
+import { subscribeUntilCleanup } from "../lib/subscribe";
 import { TagEditor } from "./TagEditor";
 import { ChatBadge } from "./ChatBadge";
 import { DeleteDocumentButton, DeleteDocumentDialog } from "./DeleteDocumentDialog";
@@ -235,6 +239,26 @@ export function ProjectView({
       .catch(() => {});
   };
 
+  // Whether the project has any tasks, for the sidebar layout only (the Tasks panel's TaskList keeps
+  // its own live list). Re-read on every task write, from any surface.
+  const [hasTasks, setHasTasks] = useState(false);
+  useEffect(() => {
+    let live = true;
+    const refresh = () => {
+      listTasks(project)
+        .then((t) => {
+          if (live) setHasTasks(t.length > 0);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const off = subscribeUntilCleanup(() => onTasksChanged(refresh));
+    return () => {
+      live = false;
+      off();
+    };
+  }, [project]);
+
   // Reload just this project's documents — shared by the project-change effect and the delete
   // dialog, so a deleted file leaves the list immediately rather than lingering until a tab switch.
   // Membership, not just home (#275): a document linked into this project belongs in its file list
@@ -347,11 +371,13 @@ export function ProjectView({
       ? idleSince(chat.messages, Date.now())
       : null;
 
-  // Split the sidebar 50-50 (draggable) only when there are actual milestones to balance against
-  // Files. With none, Files fills the space — the add-a-milestone control (Depth-gated) just sits
-  // above it at its natural height, no divider. So an empty project doesn't waste half the sidebar.
+  // Split the sidebar 50-50 (draggable) only when there are actual milestones or tasks to balance
+  // against Files. With neither, Files fills the space — the add-a-milestone and add-a-task controls
+  // (Depth-gated) just sit above it at their natural height, no divider. So an empty project doesn't
+  // waste half the sidebar.
   const hasMilestones = milestones.length > 0;
-  const showAddMilestone = showMeta && !hasMilestones;
+  const hasTopPane = hasMilestones || hasTasks;
+  const showAddMilestone = showMeta && !hasTopPane;
 
   const filesPanel = (
     <>
@@ -509,6 +535,16 @@ export function ProjectView({
     </div>
   );
 
+  // The project's tasks: the same live list the pinboard's Task list shows, scoped to this project.
+  const tasksPanel = (
+    <div className="px-4 pb-3 pt-3" data-help="project-tasks">
+      <span className="font-mono text-xs uppercase tracking-wide text-ink4">Tasks</span>
+      <div className="mt-2">
+        <TaskList project={project} />
+      </div>
+    </div>
+  );
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center gap-3 border-b border-border bg-panel px-6 py-3">
@@ -638,21 +674,24 @@ export function ProjectView({
                 resizing ? "bg-[color-mix(in_oklab,var(--accent)_60%,transparent)]" : ""
               }`}
             />
-            {hasMilestones ? (
-              // Milestones (top) + Files (bottom), split by a draggable divider (hard-pref ratio).
+            {hasTopPane ? (
+              // Milestones and Tasks (top) + Files (bottom), split by a draggable divider
+              // (hard-pref ratio). An empty half shows only where it can be added to (Standard depth
+              // and up), so a lower depth doesn't carry a bare heading.
               <div ref={splitRef} className="flex min-h-0 flex-1 flex-col">
                 <div
                   style={{ flexBasis: `${topFrac * 100}%` }}
                   className="min-h-0 shrink-0 grow-0 overflow-y-auto overflow-x-hidden"
                   data-help="project-milestones-panel"
                 >
-                  {milestonesPanel}
+                  {(hasMilestones || showMeta) && milestonesPanel}
+                  {(hasTasks || showMeta) && tasksPanel}
                 </div>
                 <div
                   onPointerDown={startSplit}
                   role="separator"
                   aria-orientation="horizontal"
-                  aria-label="Resize milestones and files"
+                  aria-label="Resize milestones and tasks against files"
                   title="Drag to resize"
                   data-help="project-split"
                   className={`h-1.5 shrink-0 cursor-row-resize touch-none border-y border-border transition-colors hover:bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] ${
@@ -662,11 +701,14 @@ export function ProjectView({
                 <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">{filesPanel}</div>
               </div>
             ) : (
-              // No milestones yet: the (Depth-gated) add control sits at its natural height, Files
-              // fills the rest of the sidebar.
+              // No milestones or tasks yet: the (Depth-gated) add controls sit at their natural
+              // height, Files fills the rest of the sidebar.
               <div className="flex min-h-0 flex-1 flex-col">
                 {showAddMilestone && (
-                  <div className="shrink-0 border-b border-border">{milestonesPanel}</div>
+                  <div className="shrink-0 border-b border-border">
+                    {milestonesPanel}
+                    {tasksPanel}
+                  </div>
                 )}
                 <div
                   className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"

@@ -12,7 +12,11 @@
 
 import { useMemo } from "react";
 import type { Calendar, CalendarAccount } from "../../lib/types";
-import { MILESTONE_CALENDAR_ID, PINBOARD_CALENDAR_ID } from "../../lib/calendar-layout";
+import {
+  MILESTONE_CALENDAR_ID,
+  PINBOARD_CALENDAR_ID,
+  TASK_CALENDAR_ID,
+} from "../../lib/calendar-layout";
 import { cn } from "../ui";
 import { SourceDot } from "./parts/SourceDot";
 
@@ -105,7 +109,8 @@ export function CalendarSourceList({
   return (
     <>
       {/* The first-party overlays — pseudo-calendars you can show/hide like any synced one. Shown even
-          with no calendars connected, since milestones and pinboard entries exist independently. */}
+          with no calendars connected, since milestones, tasks and pinboard entries exist
+          independently. */}
       <div className="mb-1">
         <p className="truncate px-2 pb-0.5 pt-1 font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
           Personal Manager
@@ -114,6 +119,13 @@ export function CalendarSourceList({
           <SourceRow
             id={MILESTONE_CALENDAR_ID}
             label="Milestones"
+            hidden={hidden}
+            onToggle={onToggle}
+            colorOf={colorOf}
+          />
+          <SourceRow
+            id={TASK_CALENDAR_ID}
+            label="Tasks"
             hidden={hidden}
             onToggle={onToggle}
             colorOf={colorOf}

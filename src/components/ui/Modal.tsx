@@ -106,7 +106,13 @@ export function Modal({
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // One Escape closes one dialog. The topmost test alone isn't enough: a host that re-renders
+      // re-binds an outer dialog's listener after an inner one's, and React can commit the inner
+      // close before the outer listener runs, which then finds itself topmost. Whoever handles the
+      // key marks it, and nobody acts on a marked one.
+      if (e.defaultPrevented) return;
       if (!isTopmost()) return;
+      e.preventDefault();
       onClose();
     };
     window.addEventListener("keydown", onKey);

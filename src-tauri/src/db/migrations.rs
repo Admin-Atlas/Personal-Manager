@@ -1669,6 +1669,51 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE projects ADD COLUMN archived_at TEXT;
     "#,
+    // v59: tasks and task stacks (PA-1, #1035). One global to-do list that every surface reads and
+    // edits through `tasks.rs`: the project page, the pinboard Task list widget, the calendar's Runway
+    // agenda and its overlay, and later the briefing and chat. Every link is optional and independent:
+    // a project (by name, SET NULL so a task outlives its project, unlike milestones), a milestone (by
+    // its stable id, SET NULL), and a calendar event by iCal UID (a soft link, no FK, because the
+    // mirror is refilled by delete-and-reinsert). `deadline_from` says where the deadline comes from:
+    // the task's own date, or a linked milestone's or event's date (falling back to its own when the
+    // link can't resolve). A stack groups tasks (in sequence / in order / waiting on someone); deleting
+    // it leaves its tasks unstacked. `ordinal` is one global order. Every CHECK set has one owner in
+    // `tasks.rs` (I-12). Purely additive.
+    r#"
+    CREATE TABLE task_stacks (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        title      TEXT NOT NULL DEFAULT '',
+        kind       TEXT NOT NULL DEFAULT 'sequential' CHECK (kind IN ('sequential','in_order','waiting_on')),
+        note       TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE TABLE tasks (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        title         TEXT NOT NULL,
+        why           TEXT,
+        project_name  TEXT REFERENCES projects(name) ON DELETE SET NULL,
+        milestone_id  INTEGER REFERENCES project_milestones(id) ON DELETE SET NULL,
+        event_uid     TEXT,                    -- soft link (no FK) by iCal UID, like milestones
+        do_start      TEXT,                    -- 'YYYY-MM-DD' (local day), the planned window
+        do_end        TEXT,
+        deadline      TEXT,                    -- 'YYYY-MM-DD'
+        deadline_kind TEXT NOT NULL DEFAULT 'hard' CHECK (deadline_kind IN ('hard','soft')),
+        deadline_from TEXT NOT NULL DEFAULT 'date' CHECK (deadline_from IN ('date','milestone','event')),
+        status        TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo','doing','done')),
+        completed_at  TEXT,
+        lane          TEXT NOT NULL DEFAULT 'foreground' CHECK (lane IN ('foreground','background')),
+        stack_id      INTEGER REFERENCES task_stacks(id) ON DELETE SET NULL,
+        parked        INTEGER NOT NULL DEFAULT 0 CHECK (parked IN (0,1)),
+        ordinal       INTEGER NOT NULL DEFAULT 0,
+        source        TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user','assistant')),
+        created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_tasks_project ON tasks(project_name, ordinal);
+    CREATE INDEX idx_tasks_stack   ON tasks(stack_id);
+    CREATE INDEX idx_tasks_status  ON tasks(status);
+    "#,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -1721,7 +1766,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
         conn.execute_batch(
-            "DROP TABLE document_locations;              ALTER TABLE documents DROP COLUMN source_folder_path;
+            "DROP TABLE tasks;
+             DROP TABLE task_stacks;
+             DROP TABLE document_locations;              ALTER TABLE documents DROP COLUMN source_folder_path;
              ALTER TABLE calendar_events DROP COLUMN etag;
              ALTER TABLE calendar_events DROP COLUMN event_type;
              ALTER TABLE calendar_events DROP COLUMN organizer_self;
@@ -1818,7 +1865,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 58,
+            version, 59,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1848,7 +1895,8 @@ mod tests {
              documents.reviewed index for the review queue is v50; duplicate-pair dismissals is v51; \n             source-provided author/editor/created/size is v52; \n             per-document PM refresh stamp is v53; \n             every place a document's file lives is v54; \n             which file a location points at is v55; \
              the folder trail above a file is v56; \
              what editing a Google event needs to know is v57; \
-             archiving a project is v58)"
+             archiving a project is v58; \
+             tasks and task_stacks are v59)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).

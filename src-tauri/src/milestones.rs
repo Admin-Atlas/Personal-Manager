@@ -182,9 +182,29 @@ pub fn governing_info(milestones: &[Milestone], today: &str) -> Option<Governing
 /// expand to many rows sharing a UID), falling back to the latest past instance so an
 /// overdue calendar milestone still governs. Computed once per `list_overviews`.
 pub fn calendar_dates_by_uid(conn: &Connection, today: &str) -> Result<HashMap<String, String>> {
+    Ok(calendar_occurrences_by_uid(conn)?
+        .into_iter()
+        .filter_map(|(uid, dates)| {
+            // Ascending, so the first on or after today is the soonest upcoming one, and the last
+            // is the latest past one when nothing is upcoming. Lexicographic compare is
+            // chronological for ISO dates.
+            let date = dates
+                .iter()
+                .find(|d| d.as_str() >= today)
+                .or_else(|| dates.last())
+                .cloned()?;
+            Some((uid, date))
+        })
+        .collect())
+}
+
+/// uid → every civil date its event occurs on, ascending with no repeats. The one bucketing every
+/// calendar-linked date reads: [`calendar_dates_by_uid`] picks the soonest upcoming one from it, and
+/// a task pinned to one occurrence (PA-1 R1) picks the one nearest its pin.
+pub fn calendar_occurrences_by_uid(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
     // Bucket each event by the civil date the USER sees it on (its zone-local date), not its raw UTC
     // date — otherwise a timed event near midnight resolves a calendar-linked milestone to the wrong
-    // day west/east of UTC. `today` is already the zone-local date, so the two agree.
+    // day west/east of UTC. Callers compare these with a zone-local `today`, so the two agree.
     let zone = crate::commands::resolve_zone(conn);
     // NB: this deliberately does NOT filter out quiet calendars. A milestone links to an event by its
     // iCal UID only when the user EXPLICITLY attached it — a deliberate project deadline, distinct
@@ -197,35 +217,19 @@ pub fn calendar_dates_by_uid(conn: &Connection, today: &str) -> Result<HashMap<S
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
 
-    // Track, per uid, the soonest upcoming date and (separately) the latest past one;
-    // merge with upcoming winning. Lexicographic compare is chronological for ISO dates.
-    let mut upcoming: HashMap<String, String> = HashMap::new();
-    let mut past: HashMap<String, String> = HashMap::new();
+    let mut by_uid: HashMap<String, Vec<String>> = HashMap::new();
     for row in rows {
         let (uid, start) = row?;
-        let date = crate::clock::zone_date_of(&start, zone);
-        if date.as_str() >= today {
-            let keep = match upcoming.get(&uid) {
-                Some(cur) => date < *cur,
-                None => true,
-            };
-            if keep {
-                upcoming.insert(uid, date);
-            }
-        } else {
-            let keep = match past.get(&uid) {
-                Some(cur) => date > *cur,
-                None => true,
-            };
-            if keep {
-                past.insert(uid, date);
-            }
-        }
+        by_uid
+            .entry(uid)
+            .or_default()
+            .push(crate::clock::zone_date_of(&start, zone));
     }
-    for (uid, date) in past {
-        upcoming.entry(uid).or_insert(date);
+    for dates in by_uid.values_mut() {
+        dates.sort_unstable();
+        dates.dedup();
     }
-    Ok(upcoming)
+    Ok(by_uid)
 }
 
 /// Resolve a raw row against the uid→date map into the frontend `Milestone`.

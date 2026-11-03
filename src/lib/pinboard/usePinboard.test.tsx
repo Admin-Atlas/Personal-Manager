@@ -463,3 +463,160 @@ describe("usePinboard — a game setting is not an undo step", () => {
     expect(folderOf(result.current.board).title).toBe("Chores");
   });
 });
+
+describe("usePinboard — the Task list card (PA-1)", () => {
+  /** The board as last written to the store. */
+  const written = (): Board => JSON.parse(ipc.setPref.mock.lastCall![1] as string) as Board;
+
+  it("keeps a task list, its filter and a deleted project's null through a load and a save", async () => {
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [
+          { id: "all", kind: "tasklist", rect: { x: 0, y: 0, w: 9, h: 8 }, title: "" },
+          { id: "one", kind: "tasklist", rect: { x: 9, y: 0, w: 9, h: 8 }, project: "Atlas" },
+          { id: "gone", kind: "tasklist", rect: { x: 18, y: 0, w: 9, h: 8 }, project: null },
+        ],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+    expect(result.current.board.widgets.map((w) => w.kind)).toEqual([
+      "tasklist",
+      "tasklist",
+      "tasklist",
+    ]);
+
+    act(() => void result.current.addNote());
+    await flushDebounce();
+    const lists = written().widgets.filter((w) => w.kind === "tasklist");
+    expect(lists.map((w) => w.id)).toEqual(["all", "one", "gone"]);
+    expect(lists[0]).not.toHaveProperty("project");
+    expect(lists[1].project).toBe("Atlas");
+    // `null` is the backend's "this project was deleted" — it must not be read back as "all tasks".
+    expect(lists[2].project).toBeNull();
+    // The card stores its filter and nothing else: no task data ever lands in the board blob.
+    expect(Object.keys(lists[1]).sort()).toEqual(["id", "kind", "project", "rect"]);
+  });
+
+  it("drops a folder child it can't read but keeps the folder and its other children", async () => {
+    // A newer build's kind inside a folder used to fail the WHOLE folder, and the next write then
+    // saved the board without it — every note in it gone for one card this build didn't know.
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [
+          {
+            id: "f",
+            kind: "folder",
+            rect: { x: 0, y: 0, w: 3, h: 3 },
+            children: [
+              { id: "a", kind: "note", rect: { x: 0, y: 0, w: 7, h: 5 }, text: "keep me" },
+              { id: "x", kind: "someday-kind", rect: { x: 7, y: 0, w: 7, h: 5 } },
+              { id: "bad", kind: "note" },
+            ],
+          },
+          { id: "empty", kind: "folder", rect: { x: 4, y: 0, w: 3, h: 3 }, children: [] },
+          {
+            id: "lost",
+            kind: "folder",
+            rect: { x: 8, y: 0, w: 3, h: 3 },
+            children: [{ id: "y", kind: "someday-kind", rect: { x: 0, y: 0, w: 7, h: 5 } }],
+          },
+        ],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+    const ids = result.current.board.widgets.map((w) => w.id);
+    // The emptied-by-filtering folder goes (nothing of it is left to show); the one the user left
+    // empty on purpose stays.
+    expect(ids).toEqual(["f", "empty"]);
+    expect(folderOf(result.current.board).children?.map((c) => c.id)).toEqual(["a"]);
+
+    act(() => void result.current.addNote());
+    await flushDebounce();
+    expect(JSON.stringify(written())).toContain("keep me");
+  });
+
+  it("places a new task list beside the rect it's given, else in the first free slot", async () => {
+    ipc.getPref.mockResolvedValue(JSON.stringify(STORED)); // a 7×5 note at the origin
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    let id = "";
+    act(() => {
+      id = result.current.addTaskList("Atlas", { x: 0, y: 0, w: 7, h: 5 });
+    });
+    const beside = result.current.board.widgets.find((w) => w.id === id)!;
+    expect(beside).toMatchObject({ kind: "tasklist", project: "Atlas" });
+    expect(beside.rect).toEqual({ x: 7, y: 0, w: 9, h: 8 });
+
+    // No room to the right (it would run off the 44-column board), so it goes below.
+    act(() => {
+      id = result.current.addTaskList(undefined, { x: 30, y: 10, w: 7, h: 5 });
+    });
+    const below = result.current.board.widgets.find((w) => w.id === id)!;
+    expect(below.rect).toEqual({ x: 30, y: 15, w: 9, h: 8 });
+    expect(below).not.toHaveProperty("project");
+
+    // Right and below of the note are both covered now, so it takes the first free slot instead.
+    act(() => {
+      id = result.current.addTaskList(undefined, { x: 0, y: 0, w: 7, h: 5 });
+    });
+    const free = result.current.board.widgets.find((w) => w.id === id)!;
+    expect(free.rect).toEqual({ x: 16, y: 0, w: 9, h: 8 });
+  });
+
+  it("makes a converted task list a history barrier, and a plain one an ordinary step", async () => {
+    // "Make this a task list" has already written real task rows by the time the card lands; an undo
+    // that took the card away would leave them, and invite a second conversion that duplicates them.
+    ipc.getPref.mockResolvedValue(JSON.stringify(STORED));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => void result.current.addTaskList());
+    act(() => result.current.undo());
+    expect(result.current.board.widgets.some((w) => w.kind === "tasklist")).toBe(false);
+
+    act(() => void result.current.updateWidget("kept", { title: "Plan" }));
+    act(() => void result.current.addTaskList(undefined, { x: 0, y: 0, w: 7, h: 5 }, true));
+    act(() => result.current.undo());
+    // Nothing behind the barrier: the card stays, and so does the edit made before it.
+    expect(result.current.board.widgets.some((w) => w.kind === "tasklist")).toBe(true);
+    expect(result.current.board.widgets.find((w) => w.id === "kept")?.title).toBe("Plan");
+  });
+
+  it("keeps the undo history when a conversion that wrote nothing adds its card", async () => {
+    // Every item "already there": the view adds the card as an ordinary step (no barrier), so an
+    // accidental delete made before it can still be undone.
+    ipc.getPref.mockResolvedValue(JSON.stringify(STORED));
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.removeWidget("kept"));
+    act(() => void result.current.addTaskList(undefined, { x: 0, y: 0, w: 7, h: 5 }, false));
+    act(() => result.current.undo());
+    expect(result.current.board.widgets.some((w) => w.kind === "tasklist")).toBe(false);
+    act(() => result.current.undo());
+    expect(result.current.board.widgets.some((w) => w.id === "kept")).toBe(true);
+  });
+
+  it("treats a task list's filter change as an undoable step, not a barrier", async () => {
+    // A timeline's project link writes milestones, so it ends the history. A task list's project is
+    // only a filter, which writes nothing anywhere — Ctrl+Z should simply put the old one back.
+    ipc.getPref.mockResolvedValue(
+      JSON.stringify({
+        version: BOARD_VERSION,
+        widgets: [{ id: "t", kind: "tasklist", rect: { x: 0, y: 0, w: 9, h: 8 } }],
+      }),
+    );
+    const { result } = renderHook(() => usePinboard());
+    await settle();
+
+    act(() => result.current.updateWidget("t", { project: "Atlas" }));
+    expect(result.current.board.widgets[0].project).toBe("Atlas");
+    act(() => result.current.undo());
+    expect(result.current.board.widgets[0].project).toBeUndefined();
+  });
+});
