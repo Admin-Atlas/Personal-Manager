@@ -97,6 +97,27 @@ describe("Modal", () => {
     expect(inner).toHaveBeenCalledTimes(1);
   });
 
+  it("marks the Escape it handles, and leaves one already handled alone", () => {
+    // A host that re-renders re-binds the outer dialog's listener after the inner one's; React can
+    // then commit the inner close before the outer listener runs, which would find itself topmost.
+    // The mark is what keeps one Escape to one dialog in that order.
+    const onClose = vi.fn();
+    render(
+      <Modal open onClose={onClose} label="Edit task">
+        <p>editor</p>
+      </Modal>,
+    );
+    const handled = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    handled.preventDefault();
+    window.dispatchEvent(handled);
+    expect(onClose).not.toHaveBeenCalled();
+
+    const fresh = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    window.dispatchEvent(fresh);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(fresh.defaultPrevented).toBe(true);
+  });
+
   it("cannot be rendered without an accessible name", () => {
     // The point of the whole batch, and the reason `designGuards`' allow-list could be deleted:
     // this is a `tsc` failure now, not an audit finding. Enforced by the check gate's

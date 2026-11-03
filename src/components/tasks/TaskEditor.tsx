@@ -109,7 +109,7 @@ export function TaskEditor(props: TaskEditorProps) {
 /** Two spellings of one project, as the backend matches them (case-insensitive; it also resolves
  *  aliases, which the editor can't see, so an alias still reads as another project here). */
 function sameProject(a: string, b: string): boolean {
-  return a.toLocaleLowerCase() === b.toLocaleLowerCase();
+  return a.toLowerCase() === b.toLowerCase();
 }
 
 /** Empty text is no value. */

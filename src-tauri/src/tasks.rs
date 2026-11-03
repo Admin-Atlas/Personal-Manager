@@ -426,7 +426,9 @@ fn mirror_start(today: &str) -> String {
 /// `mirror_from` is the first day the calendar mirror still holds (`calendar::time_window`). A pin
 /// before it is an occurrence that has aged out of the mirror while the series' later ones remain,
 /// so the nearest survivor would be a different, later occurrence and the deadline would creep
-/// forward each month. The pin itself is the answer then: it is the day the user chose.
+/// forward each month. The pin itself is the answer then: it is the day the user chose. Only for a
+/// series (two or more occurrences still held): a lone occurrence is the event itself, perhaps moved
+/// far from its old day, and following the move is right however old the pin is.
 fn event_occurrence<'a>(
     dates: &'a [String],
     pin: Option<&'a str>,
@@ -441,7 +443,7 @@ fn event_occurrence<'a>(
             .or_else(|| dates.last())
             .map(String::as_str);
     };
-    if !dates.is_empty() && day(mirror_from).is_some_and(|from| pin_day < from) {
+    if dates.len() >= 2 && day(mirror_from).is_some_and(|from| pin_day < from) {
         return pin;
     }
     let pin = pin_day;
@@ -1547,6 +1549,12 @@ mod tests {
         assert_eq!(
             event_occurrence(&dates, Some("2026-12-02"), "2026-12-01", "2026-12-01"),
             Some("2026-12-04")
+        );
+        // A one-off event moved far past its pin, the pin now older than the mirror: follow the move.
+        let moved = vec!["2026-11-20".to_string()];
+        assert_eq!(
+            event_occurrence(&moved, Some("2026-09-28"), "2026-11-03", "2026-10-01"),
+            Some("2026-11-20")
         );
         // With no occurrences at all the caller's fallback applies, flagged missing.
         assert_eq!(
