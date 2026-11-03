@@ -275,6 +275,10 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Move around & choose a view",
     body: "‹ Today › steps through time and jumps back to now; the buttons beside it switch between Day, Week, Month, Year and Agenda, and the label shows the range you're looking at. + New event (or c) creates an event in Google, on an account with editing turned on: in Day and Week it's in the grid's top-left corner with the time zones, and elsewhere beside Refresh, which reads your calendars again now. In Agenda, Runway | List switches between the Runway board of your tasks and milestones and a dated list of events; the Runway always starts from today, so the stepping buttons give way to \"From today\". Everything else here only changes what you see.",
   },
+  "calendar-popout": {
+    title: "Pop out the calendar",
+    body: "Opens the whole Calendar in a window of its own, to keep beside PM or on another screen: every view, the Runway, your tasks, and editing your events. Press it again to bring that window forward. Both windows stay in step: a change in one, such as an event moved or a calendar hidden, shows in the other. A project or the pinboard opened from the pop-out opens in PM's main window. The pop-out shows nothing while PM is locked, and closes when PM quits.",
+  },
   // In the calendar view only: Focus › Upcoming's details pop-up keeps `focus-agenda`'s help.
   "calendar-event": {
     title: "Event details",

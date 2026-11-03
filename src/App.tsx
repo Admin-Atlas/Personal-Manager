@@ -59,7 +59,7 @@ import { isNewChatTrigger } from "./lib/chatSession";
 import { useUpdater } from "./lib/useUpdater";
 import { useExternalLinks } from "./lib/useExternalLinks";
 import { useFollowSignIns } from "./lib/signInPages";
-import { hydrateStoredPrefs } from "./lib/storedPrefs";
+import { followStoredPrefs, hydrateStoredPrefs } from "./lib/storedPrefs";
 import { isDevBuild, useDevMode } from "./lib/capabilities";
 import { useTheme } from "./theme";
 
@@ -79,9 +79,11 @@ import {
   onDriveSync,
   onLocalSync,
   onOneDriveSync,
+  onMainNavigate,
   onVaultAcquired,
   onVaultCurtain,
   onVaultFault,
+  openCalendarWindow,
   localBetterFitNotice,
   onVaultMetaWarning,
   driveStatus,
@@ -802,6 +804,23 @@ export default function App() {
   // vertically, never getting translated into sideways motion over a horizontally-scrollable table.
   useEffect(() => installAxisScrollNormalizer(), []);
 
+  // The pop-out Calendar (#1039) is a second window with its own copy of the stored preferences:
+  // re-read a blob it wrote, before this window writes its own copy back over it.
+  useEffect(() => followStoredPrefs(), []);
+
+  // The pop-out Calendar's links to a project or the pinboard land here (popout.rs `show_in_main`).
+  // Through a ref, so the subscription is made once and always calls the current `openProject`.
+  const navigateRef = useRef<(view: string, project?: string) => void>(() => {});
+  navigateRef.current = (to, project) => {
+    if (to === "project" && project) openProject(project);
+    else if (to === "pinboard" || to === "calendar") setView(to);
+  };
+  useEffect(
+    () =>
+      subscribeUntilCleanup(() => onMainNavigate((to) => navigateRef.current(to.view, to.project))),
+    [],
+  );
+
   // The left navigation sidebar's width (fraction of the window, so it stays proportional). It's
   // drag-resizable and snap-collapsible: drag the grip to the window edge and it hides behind a slim
   // reopen tab (see useResizable + CollapseTab).
@@ -1222,6 +1241,7 @@ export default function App() {
                     <CalendarView
                       onOpenProject={openProject}
                       onOpenPinboard={() => setView("pinboard")}
+                      onPopOut={() => void openCalendarWindow().catch(() => {})}
                     />
                   </main>
                 ) : view === "documents" ? (

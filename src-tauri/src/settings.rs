@@ -395,6 +395,12 @@ pub struct AppLockStatus {
 /// stored preference + this process's verified flag so it can't be flipped from the webview.
 #[tauri::command]
 pub fn app_lock_status(state: State<'_, AppState>) -> Result<AppLockStatus> {
+    app_lock_status_of(&state)
+}
+
+/// [`app_lock_status`] for Rust callers holding the state directly: the pop-out Calendar checks it
+/// before it opens (`popout::open`). Errors while the store is closed.
+pub fn app_lock_status_of(state: &AppState) -> Result<AppLockStatus> {
     let enabled = {
         let conn = state.conn()?;
         db::get_bool(&conn, APP_LOCK_ENABLED_KEY, false)?

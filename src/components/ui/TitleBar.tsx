@@ -45,7 +45,8 @@ function baseVersion(v: string): string {
   return dash === -1 ? v : v.slice(0, dash);
 }
 
-function SystemLabel() {
+/** "PM alpha 3.x", and after it what this window shows when it isn't the main one ("Calendar"). */
+function SystemLabel({ subtitle }: { subtitle?: string }) {
   const { system } = useTheme();
   const version = useAppVersion();
   const num = version ? baseVersion(version) : null;
@@ -54,6 +55,7 @@ function SystemLabel() {
       <span className="pointer-events-none font-mono text-xs text-ink3">
         <span style={{ color: "var(--accent)" }}>●</span> pm{" "}
         <span className="text-ink4">[alpha{num ? ` ${num}` : ""}]</span>
+        {subtitle && <span className="text-ink2"> {subtitle.toLowerCase()}</span>}
       </span>
     );
   }
@@ -63,6 +65,7 @@ function SystemLabel() {
       <span className="font-mono text-[0.625rem] uppercase tracking-wide text-ink4">
         alpha{num ? ` ${num}` : ""}
       </span>
+      {subtitle && <span className="font-head text-sm text-ink2"> · {subtitle}</span>}
     </span>
   );
 }
@@ -170,7 +173,7 @@ function FullscreenIcon({ active }: { active: boolean }) {
   );
 }
 
-export function TitleBar() {
+export function TitleBar({ subtitle }: { subtitle?: string } = {}) {
   const { system } = useTheme();
   const [maximized, setMaximized] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
@@ -263,7 +266,7 @@ export function TitleBar() {
             />
           </div>
         )}
-        <SystemLabel />
+        <SystemLabel subtitle={subtitle} />
       </div>
 
       <div data-tauri-drag-region className="flex-1" />

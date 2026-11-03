@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { announceSettingSaved, isSettingWrite } from "./settingsSaved";
 import { pushLanding } from "./documentFeed";
 import type { RepairOutcome, VaultFault } from "./types";
@@ -1738,6 +1738,43 @@ export const showMainWindow = () => invoke<void>("show_main_window");
  *  stop claiming to be on top. */
 export const onBriefingWindowClosed = (handler: () => void): Promise<UnlistenFn> =>
   listen("briefing://closed", () => handler());
+
+// --- The pop-out Calendar (popout.rs, #1039) ---
+
+/** Open the Calendar in a window of its own, or bring it forward. Rejects while PM is locked. */
+export const openCalendarWindow = () => invoke<void>("open_calendar_window");
+
+/** Destroy the pop-out Calendar, for "Remove PM data" (a second JS context on the same store). */
+export const destroyCalendarWindow = () => invoke<void>("destroy_calendar_window");
+
+/** Where the main window should go, from a link in the pop-out Calendar. */
+export interface MainNavigate {
+  view: string;
+  project?: string;
+}
+
+/** Show `to` in the main window and bring it forward: the pop-out's links to a project or the
+ *  pinboard. */
+export const showInMainWindow = (to: MainNavigate) =>
+  invoke<void>("show_in_main_window", { view: to.view, project: to.project ?? null });
+
+/** Subscribe to `main://navigate` (popout.rs's `NAVIGATE_EVENT`), sent to the main window only. */
+export const onMainNavigate = (handler: (to: MainNavigate) => void): Promise<UnlistenFn> =>
+  listen<MainNavigate>("main://navigate", (e) => handler(e.payload));
+
+/** Tell PM's other windows that a stored preference blob (`storedPrefs`) was just written, so they
+ *  re-read it instead of writing their stale copy back over it. `from` names the writing window's
+ *  JS context, so it can ignore its own announcement. */
+export const announceStoredPref = (key: string, from: string) =>
+  emit("prefs://stored", { key, from }).catch(() => {
+    /* a window that can't emit (the briefing panel) writes no stored prefs */
+  });
+
+/** Subscribe to {@link announceStoredPref}. Every window hears every announcement, its own too. */
+export const onStoredPref = (handler: (key: string, from: string) => void): Promise<UnlistenFn> =>
+  listen<{ key: string; from: string }>("prefs://stored", (e) =>
+    handler(e.payload.key, e.payload.from),
+  );
 
 /** Mark a structured flag done (board card 9) — a deliberate user assertion that outranks detection,
  *  removing it from the rendered set. Optionally names the satisfying artifact by its

@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "calendar-window",
+  "description": "The pop-out Calendar (popout.rs, #1039): the whole Calendar tab in a window of its own. It gets the core defaults, because the Calendar listens for events (calendar, tasks and the vault's curtain) and emits one (a stored preference changed, so the other window re-reads it). It also gets the window controls its title bar drives, since it is frameless like the main window: drag, minimize, maximize/restore, fullscreen and close. Deliberately NOT the main window's dialog, process or updater permissions: the Calendar opens no file pickers, never restarts or exits PM, and never installs an update. Everything else it needs from PM goes through PM's own commands, which aren't ACL-gated, including bringing the main window forward on a project or the pinboard (`show_in_main_window`).",
+  "windows": ["calendar"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen"
+  ]
+}

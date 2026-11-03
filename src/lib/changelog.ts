@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.169.0-alpha",
+    date: "2026-11-03",
+    highlights: [
+      "Pop the Calendar out into a window of its own, to keep beside whatever you're working on or put on another screen. Press Pop out in the Calendar's header: you get the whole Calendar there, with every view, the Runway, your tasks and editing your events. The two windows stay in step, so an event you move or a calendar you hide in one shows in the other, and a project or the pinboard you open from the pop-out opens in PM's main window. It shows nothing while PM is locked.",
+    ],
+  },
+  {
     version: "3.168.0-alpha",
     date: "2026-11-03",
     highlights: [

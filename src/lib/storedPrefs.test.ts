@@ -15,7 +15,7 @@
 //     — behind an IPC round trip it has no business being behind.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getPref, setPref } from "./ipc";
+import { announceStoredPref, getPref, onStoredPref, setPref } from "./ipc";
 import {
   readAgendaMode,
   readCursorDay,
@@ -32,6 +32,7 @@ import {
 } from "./calendarPrefs";
 import {
   __resetStoredPrefs,
+  followStoredPrefs,
   hydrateStoredPrefs,
   readStored,
   storedPrefsHydrated,
@@ -41,6 +42,8 @@ import {
 vi.mock("./ipc", () => ({
   getPref: vi.fn(async () => null),
   setPref: vi.fn(async () => undefined),
+  announceStoredPref: vi.fn(async () => undefined),
+  onStoredPref: vi.fn(async () => () => {}),
 }));
 
 const get = vi.mocked(getPref);
@@ -263,5 +266,68 @@ describe("what deliberately stays in localStorage", () => {
     expect(readRunwayPastOpen()).toBe(true);
     // The one that moved reads from the store instead.
     expect([...readHidden()]).toEqual(["a@example.com"]);
+  });
+});
+
+describe("two windows (the pop-out Calendar, #1039)", () => {
+  const announce = vi.mocked(announceStoredPref);
+  const subscribe = vi.mocked(onStoredPref);
+  /** Settle the mocked IPC promises. */
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it("announces a write once it lands, naming this window", async () => {
+    await hydrateStoredPrefs();
+    writeStored("calendar_ui", { hidden: ["work"] });
+    await settle();
+    expect(announce).toHaveBeenCalledWith("calendar_ui", expect.any(String));
+  });
+
+  it("re-reads a blob another window wrote, so its own next write can't undo that change", async () => {
+    storeHolds({ calendar_ui: { hidden: [] } });
+    await hydrateStoredPrefs();
+    let handler: (key: string, from: string) => void = () => {};
+    subscribe.mockImplementation(async (h) => {
+      handler = h;
+      return () => {};
+    });
+    const stop = followStoredPrefs();
+    await settle();
+    const changed = vi.fn();
+    window.addEventListener("pm:settings-changed", changed);
+
+    // The other window hid a calendar.
+    storeHolds({ calendar_ui: { hidden: ["work"] } });
+    handler("calendar_ui", "the-other-window");
+    await settle();
+    expect(readStored("calendar_ui")).toEqual({ hidden: ["work"] });
+    expect(changed).toHaveBeenCalledOnce();
+
+    // This window's next change keeps it.
+    set.mockClear();
+    writeStored("calendar_ui", { windows: [] });
+    expect(JSON.parse(set.mock.calls[0][1] as string)).toEqual({ hidden: ["work"], windows: [] });
+
+    window.removeEventListener("pm:settings-changed", changed);
+    stop();
+  });
+
+  it("skips its own announcements and keys it doesn't hold", async () => {
+    await hydrateStoredPrefs();
+    let handler: (key: string, from: string) => void = () => {};
+    subscribe.mockImplementation(async (h) => {
+      handler = h;
+      return () => {};
+    });
+    const stop = followStoredPrefs();
+    await settle();
+    writeStored("calendar_ui", { hidden: ["mine"] });
+    await settle();
+    const self = announce.mock.calls[announce.mock.calls.length - 1][1];
+    get.mockClear();
+    handler("calendar_ui", self);
+    handler("pinboard", "the-other-window");
+    await settle();
+    expect(get).not.toHaveBeenCalled();
+    stop();
   });
 });

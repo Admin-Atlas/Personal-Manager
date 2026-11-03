@@ -273,9 +273,11 @@ interface CalendarViewProps {
   onOpenProject?: (project: string) => void;
   /** Open the Pinboard tab — wired to the pinboard overlay events, which have no project to open. */
   onOpenPinboard?: () => void;
+  /** Open the Calendar in a window of its own (#1039). Absent in that window itself. */
+  onPopOut?: () => void;
 }
 
-export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProps) {
+export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: CalendarViewProps) {
   const { system, accent, colorblind } = useTheme();
   const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
@@ -1561,6 +1563,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard }: CalendarViewProp
         createRef={createButtonRef}
         agendaMode={agendaMode}
         onAgendaModeChange={onAgendaModeChange}
+        onPopOut={onPopOut}
       />
 
       {isTerminal && (
