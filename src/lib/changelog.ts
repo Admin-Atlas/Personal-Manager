@@ -24,6 +24,18 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.169.1-alpha",
+    date: "2026-11-03",
+    release: true,
+    highlights: [
+      "Tasks are here: real to-dos that live in PM, not just lines in a note. Give one a reason it matters, a day you plan to do it, and a deadline that's either firm or one to aim for, and link it to a project, a milestone or a calendar event. Put tasks in the foreground or background, group the steps of one job into a stack, or park them for later. The same tasks show on a project's page, on a new Task list card on the pinboard, and in a note with checkboxes through a To tasks button, and ticking one ticks it everywhere.",
+      "The Calendar's Agenda is now the Runway: your tasks and milestones in columns of days, with each day's events at the top, deadlines shown apart from the day you plan the work and coloured as they get close. Drag a task to plan it again, add a named window such as a trip, and park tasks that have no day yet. Your tasks also show on the other calendar views; untick Tasks under Personal Manager in the calendar list to hide them.",
+      "Pop the Calendar out into a window of its own, to keep beside whatever you're working on or put on another screen. Press Pop out in the Calendar's header: you get every view, the Runway, your tasks and editing your events, and the two windows stay in step.",
+      "Right-click works on the Pinboard: right-click the empty board for a new note, timeline, task list or folder right where you clicked, a card to rename, duplicate, colour or delete it, and a table in a note to add or delete rows and columns. Everywhere else in PM, right-click copies the selected text or opens a link, and no longer offers Reload or Back. Text boxes keep your system's menu.",
+      "Tables in notes are easier to move around: Up and Down now go to the cell above or below, and you can always write above or below a table. The Pinboard's scrollbars no longer show up when everything fits.",
+    ],
+  },
+  {
     version: "3.169.0-alpha",
     date: "2026-11-03",
     highlights: [

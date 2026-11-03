@@ -1,4 +1,4 @@
-PM desktop release — **v3.166.1-alpha**.
+PM desktop release — **v3.169.1-alpha**.
 
 ## Install
 
@@ -47,50 +47,39 @@ install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "
 update" note when a new version lands; download the new package (see the Linux guide below) and
 run the same install command. Your notes, projects and settings are kept.
 
-## What's new in 3.166.1-alpha
+## What's new in 3.169.1-alpha
 
-The big one: **Pinboard notes now work like a document**, tables included. Plus folders in
-Documents, an Archive for finished projects, and the fixes since v3.161.2.
+The big one: **tasks are here**, with a Runway to plan them on. Plus the Calendar in a window of its
+own, right-click on the Pinboard, and the fixes since v3.166.1.
 
-- **Notes read like a document while you write them.** No Markdown on screen: typing `.` `-` `1.`
-  `[]` `#` or `>` at the start of a line makes a bullet, dash, number, checkbox, heading or quote,
-  and a checkbox ticks with one click. Press **Table** and sweep across the grid to add a table;
-  **Tab** moves from cell to cell. A note with formatting the document view can't keep exactly opens
-  as Markdown instead, formatted as you type, so nothing in it changes.
+- **Tasks that live in PM.** Give a task a reason it matters, a day you plan to do it, and a deadline
+  that's either firm or one to aim for, and link it to a project, a milestone or a calendar event.
+  Put tasks in the foreground or background, group the steps of one job into a stack, or park them
+  for later.
 
-- **Documents can be shown as folders.** Beside **Columns**, choose **All files**, **Folders** to
-  sort them by where they came from, or **Projects** for a folder per project. PM remembers your
-  choice and the folder you had open.
+- **The same tasks show everywhere.** A project's page has its tasks under its milestones, the
+  Pinboard has a new **Task list** card, and a note with checkboxes has a **To tasks** button that
+  turns them into real tasks and leaves the note as it was. Tick a task anywhere and it's ticked
+  everywhere.
 
-- **Archive a project you're done with.** It moves to an Archive folder at the bottom of Focus and
-  stops nudging you or raising deadline reminders. Nothing is deleted, search and chat still find
-  its files, and **Unarchive** puts it back exactly as it was.
+- **The Calendar's Agenda is now the Runway.** Your tasks and milestones sit in columns of days, with
+  each day's events at the top. Deadlines are shown apart from the day you plan the work and are
+  coloured as they get close. Drag a task to plan it again, add a named window such as a trip, and
+  park tasks that have no day yet. Your tasks also show on the other calendar views; untick **Tasks**
+  under Personal Manager in the calendar list to hide them.
 
-- **Clearing out is easier.** The Documents tab offers to delete every file PM can't reach in one
-  go. **Reset…** removes every file PM indexed from Google Drive, OneDrive and your watched folders,
-  along with its project, importance and tags, then fetches them again so they come back unsorted
-  for Review. The files at the source are never touched.
+- **Pop the Calendar out.** Press **Pop out** in the Calendar's header to get it in a window of its
+  own, to keep beside your work or put on another screen. You get every view, the Runway, your tasks
+  and event editing, and the two windows stay in step.
 
-- **Projects stay until you say otherwise.** A project no longer disappears when its files do: it
-  stays in Focus until you delete or merge it. You may see some old, empty projects come back after
-  this update; delete any you don't want. Files you delete from the vault folder outside PM now
-  leave the Documents list the next time you open it.
+- **Right-click on the Pinboard.** Right-click the empty board for a new note, timeline, task list or
+  folder right where you clicked, a card to rename, duplicate, colour or delete it, and a table in a
+  note to add or delete rows and columns. Everywhere else in PM, right-click copies the text you've
+  selected or opens a link, and no longer offers Reload or Back. Text boxes keep your system's menu.
 
-- **Settings saves as you go.** The Save button is gone and every change is kept the moment you make
-  it. Unticking a calendar takes effect at once, and Settings remembers which connector groups you
-  folded.
-
-- **A tidier Calendar.** **Today** sits at the far left, **+ New event** moves into the grid's
-  top-left corner in Day and Week, and you can drag from one day to another to make an event that
-  runs across them. When an invitation reaches more than one of your Google accounts, **Going?**
-  shows which one you're answering as.
-
-- **Smoother all round.** The Pinboard no longer shakes or flickers its scrollbars, deleting large
-  files no longer freezes PM, and on a Mac the window buttons are red, yellow and green.
-
-- **Under the hood.** A newer encryption library under your database, third-party licence notices
-  that now include each licence's text, and PM's home on GitHub has moved, so its links and update
-  check point to the new address.
+- **Easier tables.** In a note's table, **Up** and **Down** go to the cell above or below, and you can
+  always write above or below a table. The Pinboard's scrollbars no longer show up when everything
+  fits.
 
 Every line above has its full story inside the app: open **What's New** from the
 sidebar for the release-by-release detail.
