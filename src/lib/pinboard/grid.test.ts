@@ -3,12 +3,14 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  besideRect,
   boardExtent,
   clampRect,
   FOLDER_MIN,
   folderAtPointer,
   isFileable,
   minSize,
+  placeAt,
   rectContains,
   rectsOverlap,
   reflowToWidth,
@@ -391,5 +393,33 @@ describe("the space a board has, and its extent", () => {
       cols: 10,
       rows: 7,
     });
+  });
+});
+
+describe("placeAt (a new card where the right-click menu opened)", () => {
+  const board = [note("a", { x: 0, y: 0, w: 7, h: 5 })];
+  it("puts it at the spot when that's clear", () => {
+    expect(placeAt(board, 7, 5, 40, 20, { x: 10, y: 3 })).toEqual({ x: 10, y: 3, w: 7, h: 5 });
+  });
+  it("pulls it left to fit the board's width", () => {
+    expect(placeAt(board, 7, 5, 40, 20, { x: 38, y: 8 })).toEqual({ x: 33, y: 8, w: 7, h: 5 });
+  });
+  it("takes the first free slot when the spot overlaps a card, or when there's no spot", () => {
+    expect(placeAt(board, 7, 5, 40, 20, { x: 2, y: 2 })).toEqual({ x: 7, y: 0, w: 7, h: 5 });
+    expect(placeAt(board, 7, 5, 40, 20)).toEqual({ x: 7, y: 0, w: 7, h: 5 });
+  });
+  it("may run past the bottom: the board grows to hold it", () => {
+    expect(placeAt(board, 7, 5, 40, 20, { x: 0, y: 18 })).toEqual({ x: 0, y: 18, w: 7, h: 5 });
+  });
+});
+
+describe("besideRect", () => {
+  const a = note("a", { x: 0, y: 0, w: 7, h: 5 });
+  it("goes right of the card, else under it, else nowhere", () => {
+    expect(besideRect([a], a.rect, 7, 5, 40)).toEqual({ x: 7, y: 0, w: 7, h: 5 });
+    expect(besideRect([a], a.rect, 7, 5, 10)).toEqual({ x: 0, y: 5, w: 7, h: 5 });
+    const b = note("b", { x: 7, y: 0, w: 7, h: 5 });
+    const c = note("c", { x: 0, y: 5, w: 7, h: 5 });
+    expect(besideRect([a, b, c], a.rect, 7, 5, 40)).toBeNull();
   });
 });

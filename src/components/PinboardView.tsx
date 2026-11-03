@@ -11,9 +11,11 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
+import { openContextMenu, wantsAppMenu, type MenuItem } from "../lib/contextMenu";
 import { formatDateOnly } from "../lib/format";
 import { runMutation } from "../lib/runMutation";
 import {
@@ -28,6 +30,7 @@ import {
   updateMilestone,
 } from "../lib/ipc";
 import { boardExtent, CELL, folderAtPointer, spaceOf, type BoardSpace } from "../lib/pinboard/grid";
+import { measureSpace } from "../lib/pinboard/measure";
 import {
   applyLineMarker,
   checklistItems,
@@ -87,7 +90,7 @@ import { DateField } from "./DateField";
 // The status vocabulary + the "what does a pre-status row read as" fallback live with the project
 // milestone list, so the two surfaces can never drift into offering different options.
 import { MILESTONE_STATUSES, milestoneStatus } from "./MilestoneList";
-import { MOD, SHIFT } from "../lib/setupGuide";
+import { IS_MAC, MOD, SHIFT } from "../lib/setupGuide";
 import {
   BulletIcon,
   Button,
@@ -169,9 +172,9 @@ const PANEL_H = 17 * CELL;
 /** The share of the main board an opened folder's overlay takes up. */
 const OVERLAY_SHARE = 0.8;
 
-/** The padding across each axis of the main board's scroller (p-6) and a folder board's (p-3). */
+/** The main board scroller's padding across each axis (p-6) at the default text size, for the first
+ *  guess before the scroller is measured. */
 const BOARD_INSET = 48;
-const FOLDER_BOARD_INSET = 24;
 
 /** A no-break space, written as its code so it stays visible in the source (and prettier can't turn
  *  it into a literal one). */
@@ -218,6 +221,19 @@ const BoardSurface = forwardRef<
   );
 });
 
+/** A card's right-click menu's name: its title, or what kind of card it is. */
+function cardLabel(w: Widget): string {
+  const kind =
+    w.kind === "note"
+      ? "Note"
+      : w.kind === "timeline"
+        ? "Timeline"
+        : w.kind === "tasklist"
+          ? "Task list"
+          : "Folder";
+  return w.title?.trim() || kind;
+}
+
 /** One widget's tile on a board: positioned at its cell rect, tinted, with the size strip (at power)
  *  and the resize grip. Shared by the main board and a folder's overlay board — a card should look
  *  and behave the same wherever it is, which is the whole point of giving a folder a real board. */
@@ -249,6 +265,8 @@ function WidgetTile({
               : "pinboard-folder"
       }
       aria-label={dimmed ? "Already drawn this round" : undefined}
+      // Which card a right-click landed on (the board's menu).
+      data-widget-id={widget.id}
       className={`absolute flex flex-col overflow-hidden rounded-[var(--radius-sm)] border shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none ${
         dimmed ? "opacity-60 saturate-[0.4]" : ""
       }`}
@@ -298,7 +316,7 @@ export function PinboardView() {
   // The board is sized to the WINDOW, not the whole device screen. It used to be a fixed canvas the
   // size of `screen.avail*`; on a window that isn't maximised (common on macOS/Linux) that overflowed
   // the viewport and showed scrollbars — the board read as "bigger than the screen". Measure the
-  // scroller instead (its p-6 gives a 24px inset each side → −48), floored on the CELL grid, and seed
+  // scroller instead, less its padding as rendered (`measureSpace`), floored on the CELL grid, and seed
   // from the window so the first load reflow has a sane width before the layout effect measures.
   //
   // The scroller's OWN box (`getBoundingClientRect`, to the subpixel), not `clientWidth`, which is the
@@ -313,8 +331,7 @@ export function PinboardView() {
     const el = scrollRef.current;
     if (!el) return;
     const measure = () => {
-      const box = el.getBoundingClientRect();
-      const next = spaceOf(box.width, box.height, BOARD_INSET);
+      const next = measureSpace(el);
       // Same cells, same object: no render for a resize that moved nothing.
       setMeasured((was) => (sameSpace(was, next) ? was : next));
     };
@@ -334,10 +351,13 @@ export function PinboardView() {
     saveFailed,
     undo,
     redo,
+    canUndo,
+    canRedo,
     addNote,
     addTimeline,
     addFolder,
     addTaskList,
+    duplicateWidget,
     updateWidget,
     moveWidget,
     dropWidget,
@@ -622,6 +642,83 @@ export function PinboardView() {
     setPendingDelete(null);
   }, [pendingDelete, dontAskAgain, removeWidget]);
 
+  // Right-click (#1038). On the board's empty grid: a new card where you clicked, and undo/redo. On a
+  // card: its own actions. Text you type into (a note's words, a title) keeps the system menu, and a
+  // note's table has its own (RichNoteEditor). A card inside an open folder has no menu of its own.
+  const onBoardMenu = (e: ReactMouseEvent) => {
+    if (!wantsAppMenu(e) || load !== "ready") return;
+    const target = e.target as Element;
+    const tile = target.closest<HTMLElement>("[data-widget-id]");
+    if (tile && boardRef.current?.contains(tile)) {
+      const w = board.widgets.find((x) => x.id === tile.dataset.widgetId);
+      if (w) openContextMenu(e, cardLabel(w), cardMenu(w));
+      return;
+    }
+    // Only the grid itself (or the scroller's margin round it): never a folder's open panel.
+    if (target !== boardRef.current && target !== scrollRef.current) return;
+    const box = boardRef.current!.getBoundingClientRect();
+    const at: CellPoint = {
+      x: Math.max(0, Math.floor((e.clientX - box.left) / CELL)),
+      y: Math.max(0, Math.floor((e.clientY - box.top) / CELL)),
+    };
+    openContextMenu(e, "Pinboard", [
+      { label: "New note here", onSelect: () => setPendingScrollId(addNote(at)) },
+      { label: "New timeline here", onSelect: () => setPendingScrollId(addTimeline(at)) },
+      {
+        label: "New task list here",
+        onSelect: () => setPendingScrollId(addTaskList(undefined, undefined, false, at)),
+      },
+      { label: "New folder here", onSelect: () => setPendingScrollId(addFolder(at)) },
+      { kind: "separator" },
+      { label: "Undo", hint: `${MOD}Z`, disabled: !canUndo, onSelect: undo },
+      { label: "Redo", hint: IS_MAC ? "⌘⇧Z" : "Ctrl+Y", disabled: !canRedo, onSelect: redo },
+    ]);
+  };
+
+  const cardMenu = (w: Widget): MenuItem[] => {
+    const rename = () =>
+      boardRef.current
+        ?.querySelector<HTMLInputElement>(`[data-widget-id="${w.id}"] input`)
+        ?.select();
+    if (w.kind === "folder")
+      return [
+        {
+          label: "Open",
+          onSelect: () => setExpanded({ id: w.id, view: playsGame(w) ? "play" : "cards" }),
+        },
+        { label: "Rename", onSelect: rename },
+        { kind: "separator" },
+        // A folder's ✕ does the same: its cards go back onto the board, and nothing is lost.
+        { label: "Ungroup", onSelect: () => removeWidget(w.id) },
+      ];
+    return [
+      { label: "Rename", onSelect: rename },
+      {
+        label: "Duplicate",
+        onSelect: () => {
+          const copy = duplicateWidget(w.id);
+          if (copy) setPendingScrollId(copy);
+        },
+      },
+      ...(w.kind === "note"
+        ? [
+            {
+              kind: "swatches" as const,
+              label: "Colour",
+              options: NOTE_COLORS.map((c) => ({
+                name: TINT_NAME[c] ?? c.replace("st-", ""),
+                color: c,
+                active: w.color === c,
+                onSelect: () => updateWidget(w.id, { color: c }),
+              })),
+            },
+          ]
+        : []),
+      { kind: "separator" },
+      { label: "Delete", danger: true, onSelect: () => requestDelete(w.id) },
+    ];
+  };
+
   // An opened folder's overlay is 80% of the board (now window-sized), clamped to the scrim's own box
   // — which starts below the h-9 title bar and is inset by its p-6 — so it always fits the window.
   const overlaySize = useMemo(() => {
@@ -712,7 +809,11 @@ export function PinboardView() {
         </div>
       </header>
 
-      <div ref={scrollRef} className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-6">
+      <div
+        ref={scrollRef}
+        onContextMenu={onBoardMenu}
+        className="pm-scrollbars min-h-0 min-w-0 flex-1 overflow-auto p-6"
+      >
         <BoardSurface
           ref={boardRef}
           bounds={boardBounds}
@@ -2078,8 +2179,7 @@ function FolderBoard({
     const el = scrollRef.current;
     if (!el) return;
     const measure = () => {
-      const box = el.getBoundingClientRect();
-      const next = spaceOf(box.width, box.height, FOLDER_BOARD_INSET);
+      const next = measureSpace(el);
       setMeasured((was) => (sameSpace(was, next) ? was : next));
     };
     measure();

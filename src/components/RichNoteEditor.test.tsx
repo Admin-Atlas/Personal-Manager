@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createRef } from "react";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { RichNoteEditor, type RichNoteEditorHandle } from "./RichNoteEditor";
+import { ContextMenuHost } from "./ui/ContextMenuHost";
+import { closeContextMenu } from "../lib/contextMenu";
 
 vi.mock("../lib/ipc", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
 
@@ -24,7 +26,10 @@ beforeAll(() => {
   document.elementFromPoint = () => null;
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  act(() => closeContextMenu());
+  cleanup();
+});
 
 function mount(value: string) {
   const onChange = vi.fn();
@@ -221,6 +226,94 @@ describe("RichNoteEditor", () => {
     expect(onInTable).toHaveBeenLastCalledWith(true);
     into("x");
     expect(onInTable).toHaveBeenLastCalledWith(false);
+  });
+
+  it("moves up and down a column with the arrow keys, not along the row", () => {
+    const { container, caretAfter } = mount("| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |");
+    const pm = container.querySelector(".ProseMirror")!;
+    const at = () => window.getSelection()!.anchorNode?.textContent;
+    caretAfter("b");
+    fireEvent.keyDown(pm, { key: "ArrowDown" });
+    expect(at()).toBe("2");
+    fireEvent.keyDown(pm, { key: "ArrowDown" });
+    expect(at()).toBe("4");
+    fireEvent.keyDown(pm, { key: "ArrowUp" });
+    expect(at()).toBe("2");
+  });
+
+  it("makes a line under a table that ends the note when Down leaves its last row", () => {
+    const { container, onChange, caretAfter } = mount("before\n| a |\n| --- |\n| 1 |");
+    const pm = container.querySelector(".ProseMirror")!;
+    caretAfter("1");
+    fireEvent.keyDown(pm, { key: "ArrowDown" });
+    expect(onChange).toHaveBeenLastCalledWith("before\n| a   |\n| --- |\n| 1   |\n");
+    // Up from the header row goes to the text above: nothing new is made.
+    onChange.mockClear();
+    caretAfter("a");
+    fireEvent.keyDown(pm, { key: "ArrowUp" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(window.getSelection()!.anchorNode?.textContent).toBe("before");
+  });
+
+  it("makes a line above a table that opens the note, from Up or from Enter at its first cell's start", () => {
+    const up = mount("| a |\n| --- |\nafter");
+    up.caretAfter("a");
+    fireEvent.keyDown(up.container.querySelector(".ProseMirror")!, { key: "ArrowUp" });
+    expect(up.onChange).toHaveBeenLastCalledWith("\n| a   |\n| --- |\nafter");
+    cleanup();
+
+    const enter = mount("| ab |\n| --- |\nafter");
+    const pm = enter.container.querySelector(".ProseMirror") as HTMLElement;
+    const cell = pm.querySelector("th")!;
+    const range = document.createRange();
+    range.setStart(cell.firstChild!, 0);
+    pm.focus();
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    fireEvent.keyDown(pm, { key: "Enter" });
+    expect(enter.onChange).toHaveBeenLastCalledWith("\n| ab  |\n| --- |\nafter");
+  });
+
+  it("puts the cursor on a new line under a table that ends the note, from a click under it", () => {
+    const { container, onChange } = mount("| a |\n| --- |\n| 1 |");
+    const pm = container.querySelector(".ProseMirror")!;
+    // jsdom lays nothing out, so the table's bottom is 0 and any click below the top is under it.
+    fireEvent.mouseDown(pm, { button: 0, clientY: 40 });
+    expect(onChange).toHaveBeenLastCalledWith("| a   |\n| --- |\n| 1   |\n");
+  });
+
+  it("opens the table's menu from a right-click on a cell", () => {
+    const onChange = vi.fn();
+    const { container } = render(
+      <>
+        <RichNoteEditor
+          value={"before\n| a | b |\n| --- | --- |\n| 1 | 2 |"}
+          onChange={onChange}
+          onFocus={() => {}}
+          placeholder=""
+        />
+        <ContextMenuHost />
+      </>,
+    );
+    const cell = [...container.querySelectorAll("td")].find((c) => c.textContent === "2")!;
+    expect(fireEvent.contextMenu(cell)).toBe(false);
+    const menu = screen.getByRole("menu", { name: "Table" });
+    expect([...menu.querySelectorAll("[role=menuitem]")].map((b) => b.textContent)).toEqual([
+      "Insert row above",
+      "Insert row below",
+      "Insert column left",
+      "Insert column right",
+      "Delete row",
+      "Delete column",
+      "Delete table",
+    ]);
+    // The cursor went into the cell that was right-clicked: its column goes.
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete column" }));
+    expect(onChange).toHaveBeenLastCalledWith("before\n| a   |\n| --- |\n| 1   |");
+    // Outside a table the note's text keeps the system menu, for its spelling suggestions.
+    const text = [...container.querySelectorAll("p")].find((p) => p.textContent === "before")!;
+    expect(fireEvent.contextMenu(text)).toBe(true);
   });
 
   it("takes a new value from outside without echoing it back", () => {

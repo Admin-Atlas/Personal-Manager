@@ -53,6 +53,7 @@ export { BulletIcon, ClearFormatIcon, LinkIcon, NumberIcon } from "./FormatIcons
 export { ConfirmDialog, type ConfirmDialogProps } from "./ConfirmDialog";
 export { NavItem, type NavItemProps } from "./NavItem";
 export { Popover } from "./Popover";
+export { ContextMenuHost } from "./ContextMenuHost";
 export { Progress, type ProgressProps } from "./Progress";
 export { HScroll } from "./HScroll";
 export { Skeleton, type SkeletonProps } from "./Skeleton";

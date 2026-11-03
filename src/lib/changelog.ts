@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.168.0-alpha",
+    date: "2026-11-03",
+    highlights: [
+      "Right-click works on the Pinboard. Right-click the empty board for a new note, timeline, task list or folder right where you clicked, or Undo and Redo; right-click a card to rename, duplicate, colour or delete it; and right-click a table in a note to add or delete rows and columns. Everywhere else in PM, right-click copies the text you've selected or opens a link, and no longer offers Reload or Back, which could reset the app. Text boxes keep your system's menu, with its spelling suggestions, and Shift+right-click always gives it.",
+      "Tables in notes are easier to move around. The Up and Down arrows now go to the cell above or below, instead of along the row. You can always write above or below a table: press Down from its last row, Up from its first, or click under it, and you get a new line to type on.",
+      "The Pinboard's scrollbars no longer show up when everything fits. With a larger text size the board came out a few pixels too big for the window; it now measures its edges properly. The Table button in a note's toolbar also lines up with the buttons beside it.",
+    ],
+  },
+  {
     version: "3.167.0-alpha",
     date: "2026-11-03",
     highlights: [
