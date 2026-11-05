@@ -206,11 +206,15 @@ impl RecentWrites {
                     }
                     may_settle && (landed || upstream_won)
                 }
+                // A fetch of another band says nothing of the save, and writes nothing over its row:
+                // the row stays as the mirror holds it (which may be newer than the save, from a fetch
+                // that couldn't settle it), and the entry waits for its own band's fetch.
+                (Entry::Upsert { row: saved, .. }, None) if !holds(Some(&saved.start)) => false,
                 // Missing from a complete fetch that began after the save, of a band that holds it:
                 // deleted in Google since (or moved out of the band), and upstream wins. Not for a
                 // row PM created: a list can lag behind a new event, so it stays on screen until a
-                // fetch shows it or the entry expires. An incomplete or older fetch, or one of another
-                // band, proves nothing, so it shows the save.
+                // fetch shows it or the entry expires. An incomplete or older fetch proves nothing,
+                // so it shows the save.
                 (
                     Entry::Upsert {
                         row: saved,
@@ -218,7 +222,7 @@ impl RecentWrites {
                     },
                     None,
                 ) => {
-                    if complete && may_settle && !created && holds(Some(&saved.start)) {
+                    if complete && may_settle && !created {
                         true
                     } else {
                         rows.push((**saved).clone());
@@ -317,12 +321,8 @@ mod tests {
         w.record_delete("cal", "cal:b", Some("\"1\"".into()), Some(T0.into()), saved);
         let elsewhere = |_: Option<&str>| false;
         let merged = w.merge_band("cal", vec![], true, after.mono, after, elsewhere);
-        assert_eq!(
-            summaries(&merged),
-            vec!["Old event, renamed"],
-            "the save is kept"
-        );
-        assert!(merged.deletes.is_empty());
+        // Nothing written over the row either: the mirror's copy may be newer than the save.
+        assert!(merged.rows.is_empty() && merged.deletes.is_empty());
         assert_eq!(w.entries.len(), 2, "neither is settled");
         // Its own band's listing, lagging, shows the old version: the save still wins.
         let merged = w.merge_band(

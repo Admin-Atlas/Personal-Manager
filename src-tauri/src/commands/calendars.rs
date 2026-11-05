@@ -693,7 +693,9 @@ pub async fn add_ics_feed(
     let band = feed_band(&live);
     let (events, complete) = calendar::sync_feed(&feed, &band, tz).await?;
     let band = match live.from {
-        Some(from) => band.of_feed_listing(events.iter().map(|e| e.start.as_str()), from),
+        Some(from) => {
+            band.of_feed_listing(events.iter().map(|e| (e.start.as_str(), e.recurring)), from)
+        }
         None => band,
     };
     let state = app.state::<AppState>();
@@ -932,12 +934,14 @@ async fn sync_one_calendar(
     let count = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    // A feed asked for its whole history speaks only from its first listed event (or the live band,
-    // if that's earlier): one that publishes only a window mustn't take history with it.
+    // A feed asked for its whole history speaks only from its first one-off event
+    // (`Band::of_feed_listing`): one that publishes only a window mustn't take history with it.
     let band = if is_feed(cal) && band.from.is_none() {
         let live_from = calendar::live_band(&conn)?.from;
         match live_from {
-            Some(from) => band.of_feed_listing(events.iter().map(|e| e.start.as_str()), from),
+            Some(from) => {
+                band.of_feed_listing(events.iter().map(|e| (e.start.as_str(), e.recurring)), from)
+            }
             None => *band,
         }
     } else {
@@ -1904,7 +1908,8 @@ mod tests {
     };
 
     /// A save to last year's event, then a complete fetch of the live band that (rightly) doesn't
-    /// list it: the save is settled there, and the row stays, as no band but history's may remove it.
+    /// list it: the row stays, as no band but history's may remove it, and the save isn't settled
+    /// there, so history's own fetch, lagging behind the save, can't put the old version back.
     #[test]
     fn a_live_fetch_leaves_a_saved_history_row_alone() {
         let (_d, conn, cal) = store();
@@ -1933,6 +1938,23 @@ mod tests {
         let at = |s: &str| crate::calendar_history::start_instant(s).unwrap();
         let band = calendar::Band::live(at("2026-10-01T00:00:00Z"), at("2027-12-01T00:00:00Z"));
         write_fetched_events(&conn, &edit, &cal, &band, vec![live], true, Instant::now()).unwrap();
+        assert_eq!(titles(&conn), vec!["Offsite (renamed)", "Dentist"]);
+        assert!(
+            !edit.recent.lock().unwrap().is_empty(),
+            "not settled by a band that doesn't hold it"
+        );
+        // History's fetch, begun after the save but still listing the old version.
+        let history = calendar::Band::before(at("2026-10-01T00:00:00Z"));
+        write_fetched_events(
+            &conn,
+            &edit,
+            &cal,
+            &history,
+            vec![old],
+            true,
+            Instant::now(),
+        )
+        .unwrap();
         assert_eq!(titles(&conn), vec!["Offsite (renamed)", "Dentist"]);
     }
 

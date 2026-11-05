@@ -108,24 +108,37 @@ impl Band {
         self.from.is_none_or(|f| at >= f) && self.to.is_none_or(|t| at < t)
     }
 
-    /// What one download of an iCal feed, asked for with [`Band::through_live`], speaks for. A feed
-    /// lists what its publisher keeps, and many keep only a window (the last few weeks and the year
-    /// ahead, say), so an event older than everything the feed lists — and older than the live band
-    /// — has rolled out of the feed rather than been deleted, and history keeps it. So the band
-    /// starts at the earlier of the listing's first start and `live_from`; an empty listing starts it
-    /// at `live_from`. The live band itself is always the feed's to clear, as before. Any other band
-    /// is returned as it is.
+    /// What one download of an iCal feed, asked for with [`Band::through_live`], speaks for, from the
+    /// listing's `(start, recurring)` pairs. A feed lists what its publisher keeps, and many keep only
+    /// a window (the last few weeks and the year ahead, or only what's to come), so an event older
+    /// than the feed's window has rolled out of it rather than been deleted, and history keeps it.
+    ///
+    /// The window starts at the feed's first one-off event. Not its first start overall: a repeating
+    /// event still in the feed is expanded from its own first day (a weekly meeting since 2019, say),
+    /// however short the window the publisher keeps for one-offs. A feed of repeating events alone
+    /// starts at its first occurrence. The window isn't held to the live band either: a feed of only
+    /// what's to come drops yesterday's event, and history keeps it. An empty listing starts at
+    /// `live_from`, clearing the live band as before. Any other band is returned as it is.
     pub fn of_feed_listing<'a>(
         self,
-        starts: impl IntoIterator<Item = &'a str>,
+        listed: impl IntoIterator<Item = (&'a str, bool)>,
         live_from: DateTime<Utc>,
     ) -> Band {
         if self.from.is_some() {
             return self;
         }
-        let first = starts.into_iter().filter_map(start_instant).min();
+        let (mut one_off, mut any) = (None::<DateTime<Utc>>, None::<DateTime<Utc>>);
+        for (start, recurring) in listed {
+            let Some(at) = start_instant(start) else {
+                continue;
+            };
+            any = Some(any.map_or(at, |a| a.min(at)));
+            if !recurring {
+                one_off = Some(one_off.map_or(at, |a| a.min(at)));
+            }
+        }
         Band {
-            from: Some(first.map_or(live_from, |f| f.min(live_from))),
+            from: Some(one_off.or(any).unwrap_or(live_from)),
             ..self
         }
     }
@@ -399,30 +412,49 @@ mod tests {
     /// Review of #1047: a feed that publishes only a window must not take history with it as the
     /// window moves on; one that lists everything still clears what it no longer lists.
     #[test]
-    fn a_feed_listing_speaks_only_from_its_first_event() {
+    fn a_feed_listing_speaks_only_from_its_first_one_off_event() {
         let l0 = at("2026-10-01T00:00:00Z");
         let feed = Band::through_live(at("2027-12-01T00:00:00Z"));
-        let windowed = feed.of_feed_listing(["2026-09-20T09:00:00Z", "2027-01-05"], l0);
+        let one_off = |s| (s, false);
+        let repeat = |s| (s, true);
+
+        // A window of one-offs from 20-09, beside a weekly meeting expanded from 2019: the window
+        // starts at the one-offs, so a one-off from 2023 that rolled out is kept.
+        let windowed = feed.of_feed_listing(
+            [
+                repeat("2019-01-07T09:00:00Z"),
+                one_off("2026-09-20T09:00:00Z"),
+                one_off("2027-01-05"),
+                repeat("2026-11-02T09:00:00Z"),
+            ],
+            l0,
+        );
         assert_eq!(windowed.from, Some(at("2026-09-20T09:00:00Z")));
         assert!(
-            !windowed.holds("2025-06-01"),
+            !windowed.holds("2023-06-01"),
             "rolled out of the feed: kept"
         );
         assert!(
             windowed.holds("2026-09-25"),
-            "inside what the feed lists: its to clear"
+            "inside the window: the feed's to clear"
         );
-        let only_ahead = feed.of_feed_listing(["2026-12-01"], l0);
-        assert_eq!(
-            only_ahead.from,
-            Some(l0),
-            "the live band is always the feed's"
-        );
+
+        // Only what's to come: yesterday's event drops out, and history keeps it, even inside the
+        // live band.
+        let ahead = feed.of_feed_listing([one_off("2026-11-06")], l0);
+        assert_eq!(ahead.from, Some(at("2026-11-06")));
+        assert!(!ahead.holds("2026-11-04"));
+
+        // Repeating events alone: from the first occurrence. Nothing: the live band, as before.
+        let repeats = feed.of_feed_listing([repeat("2024-02-05"), repeat("2026-11-02")], l0);
+        assert_eq!(repeats.from, Some(at("2024-02-05")));
         assert_eq!(feed.of_feed_listing([], l0).from, Some(l0));
-        let whole = feed.of_feed_listing(["1999-01-01", "?"], l0);
-        assert!(whole.holds("2003-04-05") && whole.live);
+
+        // A feed of everything since 1999 clears what it no longer lists, unreadable starts too.
+        let whole = feed.of_feed_listing([one_off("1999-01-01"), one_off("?")], l0);
+        assert!(whole.holds("2003-04-05") && whole.holds("?") && whole.live);
         let later = Band::between(l0, at("2027-01-01T00:00:00Z"));
-        assert_eq!(later.of_feed_listing(["1999-01-01"], l0), later);
+        assert_eq!(later.of_feed_listing([one_off("1999-01-01")], l0), later);
     }
 
     #[test]
