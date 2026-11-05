@@ -692,7 +692,12 @@ pub async fn add_ics_feed(
     };
     let band = feed_band(&live);
     let (events, complete) = calendar::sync_feed(&feed, &band, tz).await?;
-    let band = band.of_feed_listing(feed_listing(&events), chrono::Utc::now());
+    let now = chrono::Utc::now();
+    let band = band.of_feed_listing(
+        feed_listing(&events),
+        now,
+        crate::clock::today_in_at(tz, now),
+    );
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::save_new_feed(&feed)?;
@@ -938,9 +943,17 @@ async fn sync_one_calendar(
     let conn = state.conn()?;
     // A feed asked for its whole history speaks for what's to come, and back only as far as it
     // shows it keeps (`Band::of_feed_listing`): one that publishes a window mustn't take history
-    // with it.
-    let band = if is_feed(cal) {
-        band.of_feed_listing(feed_listing(&events), chrono::Utc::now())
+    // with it. The repeating events it lists are the whole of themselves, wherever their rows fall.
+    let band = if is_feed(cal) && band.from.is_none() {
+        let now = chrono::Utc::now();
+        if complete {
+            calendar::clear_unlisted_series_rows(&conn, &cal.id, &events)?;
+        }
+        band.of_feed_listing(
+            feed_listing(&events),
+            now,
+            crate::clock::today_in_at(tz, now),
+        )
     } else {
         *band
     };

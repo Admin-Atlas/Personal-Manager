@@ -2444,6 +2444,47 @@ pub fn mark_history_stale(conn: &Connection, calendar_id: &str) -> Result<()> {
     db::set_setting(conn, &history_key(calendar_id), &raw)
 }
 
+/// After a complete download of an iCal feed: remove the rows of each repeating event the feed lists
+/// (by its iCal UID) that the listing no longer has, wherever they fall. PM expands a series the
+/// feed still lists from its own first day, so the listing is the whole of it: a series retimed from
+/// 09:00 to 10:00 leaves no 09:00 copies in the weeks before the feed's window
+/// ([`calendar_history::Band::of_feed_listing`] keeps those weeks for one-offs only). Returns how many
+/// rows it removed. A feed is read-only, so no save of PM's can be waiting on these rows.
+pub fn clear_unlisted_series_rows(
+    conn: &Connection,
+    calendar_id: &str,
+    listed: &[CalendarEvent],
+) -> Result<usize> {
+    let ids: std::collections::HashSet<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+    let mut uids: Vec<&str> = listed
+        .iter()
+        .filter(|e| e.recurring)
+        .filter_map(|e| e.uid.as_deref())
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    let tx = conn.unchecked_transaction()?;
+    let mut removed = 0;
+    {
+        let mut stmt =
+            tx.prepare("SELECT id FROM calendar_events WHERE calendar_id = ?1 AND uid = ?2")?;
+        for uid in uids {
+            let stored: Vec<String> = stmt
+                .query_map(params![calendar_id, uid], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for id in stored.iter().filter(|id| !ids.contains(id.as_str())) {
+                tx.execute(
+                    "DELETE FROM calendar_events WHERE id = ?1 AND calendar_id = ?2",
+                    params![id, calendar_id],
+                )?;
+                removed += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
 /// Forget what PM knew of these calendars' history, beside removing their rows.
 fn forget_history(conn: &Connection, calendar_ids: &[String]) -> Result<()> {
     for id in calendar_ids {
@@ -3058,6 +3099,30 @@ mod tests {
             ["early", "later"],
             "the margin's row belongs to the live band"
         );
+    }
+
+    /// Verify pass of #1047: a feed's repeating event retimed for every occurrence leaves no old
+    /// copies before the feed's window, while a one-off there and another series are left alone.
+    #[test]
+    fn a_feeds_listed_series_is_kept_whole_wherever_its_rows_fall() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let row = |id: &str, start: &str, uid: &str, recurring: bool| {
+            let mut e = ev(id, "Class", start);
+            e.uid = Some(uid.into());
+            e.recurring = recurring;
+            e
+        };
+        let old_nine = row("class-0900-2024", "2024-03-04T09:00:00Z", "class", true);
+        let old_one_off = row("fair-2024", "2024-05-01T09:00:00Z", "fair", false);
+        let other_series = row("choir-2024", "2024-03-05T18:00:00Z", "choir", true);
+        replace_events(&conn, "cal-1", &[old_nine, old_one_off, other_series], true).unwrap();
+        let new_ten = row("class-1000-2024", "2024-03-04T10:00:00Z", "class", true);
+        replace_events(&conn, "cal-1", std::slice::from_ref(&new_ten), false).unwrap();
+        let removed = clear_unlisted_series_rows(&conn, "cal-1", &[new_ten]).unwrap();
+        assert_eq!(removed, 1);
+        let left: Vec<String> = mirrored(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(left, ["choir-2024", "class-1000-2024", "fair-2024"]);
     }
 
     /// Verify pass of #1047: an iCal feed's band starts at what it keeps, while its repeats are

@@ -108,38 +108,51 @@ impl Band {
         self.from.is_none_or(|f| at >= f) && self.to.is_none_or(|t| at < t)
     }
 
-    /// What one download of an iCal feed, asked for with [`Band::through_live`], speaks for at `now`,
-    /// from the listing's `(start, end, recurring)`. A feed lists what its publisher keeps, and many
-    /// keep only a window (the last few weeks and the year ahead, or only what's to come), so an event
-    /// that has rolled out of the feed's window hasn't been deleted, and history keeps it.
+    /// What one download of an iCal feed, asked for with [`Band::through_live`], speaks for at `now`
+    /// (`today` being the user's own date then), from the listing's `(start, end, recurring)`. A feed
+    /// lists what its publisher keeps, and many keep only a window (the last few weeks and the year
+    /// ahead, or only what's to come), so an event that has rolled out of the feed's window hasn't
+    /// been deleted, and history keeps it.
     ///
-    /// - **From `now` on, the feed is always the one to say.** No publisher rolls out what hasn't
+    /// - **From today on, the feed is always the one to say.** No publisher rolls out what hasn't
     ///   happened yet, so an upcoming event missing from the feed was cancelled or moved, and goes.
-    /// - **Before `now`, only as far back as the feed shows it keeps**: the earliest END of its
-    ///   one-off events. A row that starts after a listed one-off ended would have been listed too.
-    ///   Not their starts (a "season" event under way since March would reach back over months the
-    ///   feed may not keep), and not repeating events at all (a weekly meeting since 2019 is expanded
-    ///   from its own first day, however short the publisher's window). A feed with no past one-offs
-    ///   keeps everything before `now`.
+    ///   "Today" is the earlier of `now` and the user's date read as UTC midnight, as an all-day row
+    ///   is stored: today's all-day event, and tomorrow's west of UTC, are still the feed's.
+    /// - **Before that, only as far back as the feed shows it keeps**: the earliest END of its
+    ///   one-off events (an end before its start reads as the start). A row that starts after a
+    ///   listed one-off ended would have been listed too. Not their starts (a "season" event under
+    ///   way since March would reach back over months the feed may not keep), and not repeating
+    ///   events at all (a weekly meeting since 2019 is expanded from its own first day, however short
+    ///   the publisher's window; [`crate::calendar::clear_unlisted_series_rows`] keeps a listed
+    ///   series whole instead). A feed with no past one-offs keeps everything before today.
     ///
     /// Any other band is returned as it is.
     pub fn of_feed_listing<'a>(
         self,
         listed: impl IntoIterator<Item = (&'a str, Option<&'a str>, bool)>,
         now: DateTime<Utc>,
+        today: NaiveDate,
     ) -> Band {
         if self.from.is_some() {
             return self;
         }
+        let floor = today
+            .and_hms_opt(0, 0, 0)
+            .map_or(now, |midnight| midnight.and_utc().min(now));
         let earliest_end = listed
             .into_iter()
             .filter(|(_, _, recurring)| !recurring)
             .filter_map(|(start, end, _)| {
-                end.and_then(start_instant).or_else(|| start_instant(start))
+                let start = start_instant(start);
+                let end = end.and_then(start_instant);
+                match (start, end) {
+                    (Some(s), Some(e)) => Some(e.max(s)),
+                    (s, e) => e.or(s),
+                }
             })
             .min();
         Band {
-            from: Some(earliest_end.map_or(now, |e| e.min(now))),
+            from: Some(earliest_end.map_or(floor, |e| e.min(floor))),
             ..self
         }
     }
@@ -416,6 +429,8 @@ mod tests {
     #[test]
     fn a_feed_speaks_for_what_is_to_come_and_back_to_its_earliest_finished_one_off() {
         let now = at("2026-11-05T12:00:00Z");
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let floor = at("2026-11-05T00:00:00Z");
         let feed = Band::through_live(at("2027-12-01T00:00:00Z"));
         let one_off = |s, e| (s, Some(e), false);
         let repeat = |s| (s, None, true);
@@ -430,6 +445,7 @@ mod tests {
                 repeat("2026-11-02T09:00:00Z"),
             ],
             now,
+            today,
         );
         assert_eq!(windowed.from, Some(at("2026-09-20T10:00:00Z")));
         assert!(
@@ -441,37 +457,46 @@ mod tests {
             "inside the window: the feed's to clear"
         );
 
-        // Only what's to come: yesterday's event drops out and history keeps it; the next one,
-        // cancelled, goes (no ghost left at its old time).
-        let ahead = feed.of_feed_listing([one_off("2026-11-20", "2026-11-21")], now);
-        assert_eq!(ahead.from, Some(now));
+        // Only what's to come: last week's event drops out and history keeps it; the next one,
+        // cancelled, goes (no ghost left at its old time), today's all-day one included.
+        let ahead = feed.of_feed_listing([one_off("2026-11-20", "2026-11-21")], now, today);
+        assert_eq!(ahead.from, Some(floor));
         assert!(!ahead.holds("2026-11-04"));
-        assert!(
-            ahead.holds("2026-11-10"),
-            "cancelled before it happened: the feed's to clear"
-        );
+        assert!(ahead.holds("2026-11-05"), "today's all-day event");
+        assert!(ahead.holds("2026-11-10"), "cancelled before it happened");
 
-        // Repeating events alone, or nothing: everything before now is kept, so a feed whose
+        // West of UTC, in the evening, tomorrow's all-day row (06-11, UTC midnight) is before `now`
+        // already, and still the feed's.
+        let la_now = at("2026-11-06T02:00:00Z");
+        let la = feed.of_feed_listing([], la_now, today);
+        assert!(la.holds("2026-11-06") && la.holds("2026-11-05"));
+
+        // Repeating events alone, or nothing: everything before today is kept, so a feed whose
         // window holds no one-offs this week can't reach back over its 2019 series.
-        let repeats = feed.of_feed_listing([repeat("2019-02-05"), repeat("2026-11-02")], now);
-        assert_eq!(repeats.from, Some(now));
+        let repeats =
+            feed.of_feed_listing([repeat("2019-02-05"), repeat("2026-11-02")], now, today);
+        assert_eq!(repeats.from, Some(floor));
         assert!(!repeats.holds("2023-06-01"));
-        assert_eq!(feed.of_feed_listing([], now).from, Some(now));
+        assert_eq!(feed.of_feed_listing([], now, today).from, Some(floor));
 
         // A "season" event under way since March doesn't reach back over the months since: it
-        // hasn't ended.
-        let season = feed.of_feed_listing([one_off("2026-03-01", "2026-12-20")], now);
-        assert_eq!(season.from, Some(now));
+        // hasn't ended. Nor does one whose end the feed wrote before its start.
+        let season = feed.of_feed_listing([one_off("2026-03-01", "2026-12-20")], now, today);
+        assert_eq!(season.from, Some(floor));
+        let backwards =
+            feed.of_feed_listing([one_off("2026-10-10T09:00:00Z", "2020-01-01")], now, today);
+        assert_eq!(backwards.from, Some(at("2026-10-10T09:00:00Z")));
 
         // A feed of everything since 1999 clears what it no longer lists, unreadable starts too.
         let whole = feed.of_feed_listing(
             [one_off("1999-01-01", "1999-01-02"), ("?", None, false)],
             now,
+            today,
         );
         assert!(whole.holds("2003-04-05") && whole.holds("?") && whole.live);
         let later = Band::between(now, at("2027-01-01T00:00:00Z"));
         assert_eq!(
-            later.of_feed_listing([one_off("1999-01-01", "1999-01-02")], now),
+            later.of_feed_listing([one_off("1999-01-01", "1999-01-02")], now, today),
             later
         );
     }
