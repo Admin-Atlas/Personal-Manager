@@ -1422,6 +1422,12 @@ mod tests {
                 .version_dir(&id("atlas.map"), &VersionName::parse(v).unwrap())
         }
 
+        /// The folder as the registry holds it: canonical, which on Windows is the `\\?\` long
+        /// form, not the temp folder's 8.3 name.
+        fn canonical_version_dir(&self, v: &str) -> PathBuf {
+            fs::canonicalize(self.version_dir(v)).unwrap()
+        }
+
         fn served_from(&self) -> Option<PathBuf> {
             self.runtime.installed_root(&id("atlas.map"))
         }
@@ -2113,14 +2119,15 @@ mod tests {
             b.sql::<String>("SELECT state FROM mods"),
             store::STATE_ACTIVE
         );
-        assert_eq!(b.served_from(), Some(b.version_dir("1.0.0")));
+        assert_eq!(b.served_from(), Some(b.canonical_version_dir("1.0.0")));
         assert_eq!(b.installed_tree(), a_tree);
         assert_eq!(a.installed_tree(), a_tree, "copied, never moved");
         assert!(b.staging_is_empty());
         // A pass that finds nothing missing copies nothing and leaves the registry as it is.
         let report = b.ledger().recover_missing(now(), &serve_all).unwrap();
         assert_eq!(report, StartupReport::default());
-        assert_eq!(b.served_from(), Some(b.version_dir("1.0.0")));
+        let served = b.canonical_version_dir("1.0.0");
+        assert_eq!(b.served_from(), Some(served.clone()));
         // Begun for B while another store is open, it copies nothing and leaves the registry alone
         // (the open store's own load decides it): B's files go missing again, and stay missing.
         fs::remove_dir_all(b.version_dir("1.0.0")).unwrap();
@@ -2130,7 +2137,7 @@ mod tests {
             Err(LedgerError::VaultChanged)
         ));
         assert!(!b.version_dir("1.0.0").exists());
-        assert_eq!(b.served_from(), Some(b.version_dir("1.0.0")));
+        assert_eq!(b.served_from(), Some(served));
         *b.store.vault_id.lock().unwrap() = VAULT.into();
         let report = a.ledger().startup(now(), &serve_all);
         assert_eq!(report.loaded, ["atlas.map"]);
@@ -2190,7 +2197,7 @@ mod tests {
         *b.store.before_step.lock().unwrap() = None;
         let report = b.ledger().startup(now(), &serve_all);
         assert_eq!(report.unparked, ["atlas.map", "atlas.pinboard"]);
-        assert_eq!(b.served_from(), Some(b.version_dir("1.0.0")));
+        assert_eq!(b.served_from(), Some(b.canonical_version_dir("1.0.0")));
         assert!(pinboard_served().is_some());
     }
 
@@ -2240,7 +2247,7 @@ mod tests {
         );
         assert!(report.unrecovered.is_empty());
         assert_eq!(b.installed_tree(), a_tree);
-        assert_eq!(b.served_from(), Some(b.version_dir("1.0.0")));
+        assert_eq!(b.served_from(), Some(b.canonical_version_dir("1.0.0")));
         assert!(!a.layout.store_dir().exists());
     }
 
