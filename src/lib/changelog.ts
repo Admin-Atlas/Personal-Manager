@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.171.0-alpha",
+    date: "2026-11-05",
+    highlights: [
+      "Arrange the sidebar your way: right-click a tab to pin it to the top, hide it, or bring back one you hid. A hidden tab is still there in Search (Ctrl+K). Settings' separate switches for Review & Teach and for the Map are now one Reset sidebar placement, and whatever you had set there carries over.",
+      "Local AI can be turned off, at the top of its tab in Settings, and back on from AI & Models. While it's off, PM never sends work meant for your own computer to the cloud instead; anything set to use Local AI asks you to pick a model in AI & Models. Your server settings are kept, so turning it back on is one click.",
+      "Voice input has a switch of its own, in Settings → Storage. The speech engine (about 240 MB) is no longer part of every install: turning voice on downloads it, and turning it off can remove it again. If you already use voice or Local AI, they stay on.",
+    ],
+  },
+  {
     version: "3.170.0-alpha",
     date: "2026-11-05",
     highlights: [
