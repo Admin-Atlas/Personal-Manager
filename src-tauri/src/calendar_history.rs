@@ -46,6 +46,10 @@ fn margin() -> TimeDelta {
 pub struct Band {
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+    /// Where the band starts for an all-day row (a bare date, read as UTC midnight), when that
+    /// differs from `from`: an iCal feed speaks for today's all-day events from the start of the
+    /// user's date, but for timed ones only from now ([`Band::of_feed_listing`]). `None`: `from`.
+    pub day_from: Option<DateTime<Utc>>,
     /// The live band also speaks for a row whose start PM can't read, so a complete listing still
     /// removes one that's gone (the old wipe removed them every sync). Every fetch sees the live band,
     /// so that's the band that keeps them honest.
@@ -58,6 +62,7 @@ impl Band {
         Band {
             from: Some(from),
             to: Some(to),
+            day_from: None,
             live: true,
         }
     }
@@ -67,6 +72,7 @@ impl Band {
         Band {
             from: None,
             to: Some(to),
+            day_from: None,
             live: false,
         }
     }
@@ -76,6 +82,7 @@ impl Band {
         Band {
             from: Some(from),
             to: Some(to),
+            day_from: None,
             live: false,
         }
     }
@@ -86,16 +93,42 @@ impl Band {
         Band {
             from: None,
             to: Some(to),
+            day_from: None,
             live: true,
         }
     }
 
+    /// Every row and every time at once: what a test means by a calendar's whole set.
+    #[cfg(test)]
+    pub const fn everything() -> Self {
+        Band {
+            from: None,
+            to: None,
+            day_from: None,
+            live: true,
+        }
+    }
+
+    /// The band's start for a row starting at `start`: [`Band::day_from`] for a bare date.
+    fn start_for(&self, start: &str) -> Option<DateTime<Utc>> {
+        let bare_date = NaiveDate::parse_from_str(start.trim(), "%Y-%m-%d").is_ok();
+        if bare_date {
+            self.day_from.or(self.from)
+        } else {
+            self.from
+        }
+    }
+
     /// The request's `[timeMin, timeMax)` (RFC 3339, UTC): the band widened by [`margin`] on each
-    /// bounded side.
+    /// bounded side (from the earlier of its two starts).
     pub fn request(&self) -> (Option<String>, Option<String>) {
         let at = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let from = match (self.from, self.day_from) {
+            (Some(f), Some(d)) => Some(f.min(d)),
+            (f, _) => f,
+        };
         (
-            self.from.map(|f| at(f - margin())),
+            from.map(|f| at(f - margin())),
             self.to.map(|t| at(t + margin())),
         )
     }
@@ -105,7 +138,7 @@ impl Band {
         let Some(at) = start_instant(start) else {
             return self.live;
         };
-        self.from.is_none_or(|f| at >= f) && self.to.is_none_or(|t| at < t)
+        self.start_for(start).is_none_or(|f| at >= f) && self.to.is_none_or(|t| at < t)
     }
 
     /// What one download of an iCal feed, asked for with [`Band::through_live`], speaks for at `now`
@@ -114,10 +147,12 @@ impl Band {
     /// ahead, or only what's to come), so an event that has rolled out of the feed's window hasn't
     /// been deleted, and history keeps it.
     ///
-    /// - **From today on, the feed is always the one to say.** No publisher rolls out what hasn't
+    /// - **From now on, the feed is always the one to say.** No publisher rolls out what hasn't
     ///   happened yet, so an upcoming event missing from the feed was cancelled or moved, and goes.
-    ///   "Today" is the earlier of `now` and the user's date read as UTC midnight, as an all-day row
-    ///   is stored: today's all-day event, and tomorrow's west of UTC, are still the feed's.
+    ///   For an all-day row "now" is the user's date, read as UTC midnight as the row is stored
+    ///   ([`Band::day_from`]): today's all-day event, and tomorrow's west of UTC, are still the
+    ///   feed's, while a timed one from this morning that a feed of what's to come has dropped is
+    ///   kept.
     /// - **Before that, only as far back as the feed shows it keeps**: the earliest END of its
     ///   one-off events (an end before its start reads as the start). A row that starts after a
     ///   listed one-off ended would have been listed too. Not their starts (a "season" event under
@@ -136,7 +171,7 @@ impl Band {
         if self.from.is_some() {
             return self;
         }
-        let floor = today
+        let day_floor = today
             .and_hms_opt(0, 0, 0)
             .map_or(now, |midnight| midnight.and_utc().min(now));
         let earliest_end = listed
@@ -151,8 +186,10 @@ impl Band {
                 }
             })
             .min();
+        let back_to = |floor: DateTime<Utc>| Some(earliest_end.map_or(floor, |e| e.min(floor)));
         Band {
-            from: Some(earliest_end.map_or(floor, |e| e.min(floor))),
+            from: back_to(now),
+            day_from: back_to(day_floor),
             ..self
         }
     }
@@ -460,29 +497,35 @@ mod tests {
         // Only what's to come: last week's event drops out and history keeps it; the next one,
         // cancelled, goes (no ghost left at its old time), today's all-day one included.
         let ahead = feed.of_feed_listing([one_off("2026-11-20", "2026-11-21")], now, today);
-        assert_eq!(ahead.from, Some(floor));
+        assert_eq!((ahead.from, ahead.day_from), (Some(now), Some(floor)));
         assert!(!ahead.holds("2026-11-04"));
         assert!(ahead.holds("2026-11-05"), "today's all-day event");
         assert!(ahead.holds("2026-11-10"), "cancelled before it happened");
+        // This morning's meeting, over and dropped by the feed, is kept; this afternoon's is the
+        // feed's.
+        assert!(!ahead.holds("2026-11-05T09:00:00Z"));
+        assert!(ahead.holds("2026-11-05T13:00:00Z"));
 
         // West of UTC, in the evening, tomorrow's all-day row (06-11, UTC midnight) is before `now`
         // already, and still the feed's.
         let la_now = at("2026-11-06T02:00:00Z");
         let la = feed.of_feed_listing([], la_now, today);
         assert!(la.holds("2026-11-06") && la.holds("2026-11-05"));
+        // ...while yesterday evening's timed event there, over, is kept.
+        assert!(!la.holds("2026-11-06T01:00:00Z"));
 
-        // Repeating events alone, or nothing: everything before today is kept, so a feed whose
+        // Repeating events alone, or nothing: everything before now is kept, so a feed whose
         // window holds no one-offs this week can't reach back over its 2019 series.
         let repeats =
             feed.of_feed_listing([repeat("2019-02-05"), repeat("2026-11-02")], now, today);
-        assert_eq!(repeats.from, Some(floor));
+        assert_eq!((repeats.from, repeats.day_from), (Some(now), Some(floor)));
         assert!(!repeats.holds("2023-06-01"));
-        assert_eq!(feed.of_feed_listing([], now, today).from, Some(floor));
+        assert_eq!(feed.of_feed_listing([], now, today).from, Some(now));
 
         // A "season" event under way since March doesn't reach back over the months since: it
         // hasn't ended. Nor does one whose end the feed wrote before its start.
         let season = feed.of_feed_listing([one_off("2026-03-01", "2026-12-20")], now, today);
-        assert_eq!(season.from, Some(floor));
+        assert_eq!(season.from, Some(now));
         let backwards =
             feed.of_feed_listing([one_off("2026-10-10T09:00:00Z", "2020-01-01")], now, today);
         assert_eq!(backwards.from, Some(at("2026-10-10T09:00:00Z")));

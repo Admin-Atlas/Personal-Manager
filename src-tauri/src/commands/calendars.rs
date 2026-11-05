@@ -943,11 +943,12 @@ async fn sync_one_calendar(
     let conn = state.conn()?;
     // A feed asked for its whole history speaks for what's to come, and back only as far as it
     // shows it keeps (`Band::of_feed_listing`): one that publishes a window mustn't take history
-    // with it. The repeating events it lists are the whole of themselves, wherever their rows fall.
+    // with it. The repeating events it lists are the whole of themselves, at any date up to where it
+    // reaches (`band.to`: the months loaded further ahead aren't in this listing).
     let band = if is_feed(cal) && band.from.is_none() {
         let now = chrono::Utc::now();
         if complete {
-            calendar::clear_unlisted_series_rows(&conn, &cal.id, &events)?;
+            calendar::clear_unlisted_series_rows(&conn, &cal.id, &events, band.to)?;
         }
         band.of_feed_listing(
             feed_listing(&events),
@@ -1911,11 +1912,7 @@ mod tests {
     }
 
     /// A listing of the whole calendar.
-    const WHOLE: calendar::Band = calendar::Band {
-        from: None,
-        to: None,
-        live: true,
-    };
+    const WHOLE: calendar::Band = calendar::Band::everything();
 
     /// A save to last year's event, then a complete fetch of the live band that (rightly) doesn't
     /// list it: the row stays, as no band but history's may remove it, and the save isn't settled
