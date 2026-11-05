@@ -152,13 +152,14 @@ impl Band {
     ///   For an all-day row "now" is the user's date, read as UTC midnight as the row is stored
     ///   ([`Band::day_from`]): today's all-day event, and tomorrow's west of UTC, are still the
     ///   feed's, while a timed one from this morning that a feed of what's to come has dropped is
-    ///   kept.
+    ///   kept (unless the feed lists its UID at another time: it was moved, and
+    ///   [`crate::calendar::clear_unlisted_uid_rows`] removes it).
     /// - **Before that, only as far back as the feed shows it keeps**: the earliest END of its
     ///   one-off events (an end before its start reads as the start). A row that starts after a
     ///   listed one-off ended would have been listed too. Not their starts (a "season" event under
     ///   way since March would reach back over months the feed may not keep), and not repeating
     ///   events at all (a weekly meeting since 2019 is expanded from its own first day, however short
-    ///   the publisher's window; [`crate::calendar::clear_unlisted_series_rows`] keeps a listed
+    ///   the publisher's window; [`crate::calendar::clear_unlisted_uid_rows`] keeps a listed
     ///   series whole instead). A feed with no past one-offs keeps everything before today.
     ///
     /// Any other band is returned as it is.

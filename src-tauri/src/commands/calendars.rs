@@ -943,18 +943,21 @@ async fn sync_one_calendar(
     let conn = state.conn()?;
     // A feed asked for its whole history speaks for what's to come, and back only as far as it
     // shows it keeps (`Band::of_feed_listing`): one that publishes a window mustn't take history
-    // with it. The repeating events it lists are the whole of themselves, at any date up to where it
-    // reaches (`band.to`: the months loaded further ahead aren't in this listing).
+    // with it. The events it lists by UID say where their other rows went: a series is the whole of
+    // itself at any date, and a one-off listed at another time was moved, from the start of today
+    // (`clear_unlisted_uid_rows`). Neither reaches past `band.to`: the months loaded further ahead
+    // aren't in this listing.
     let band = if is_feed(cal) && band.from.is_none() {
         let now = chrono::Utc::now();
-        if complete {
-            calendar::clear_unlisted_series_rows(&conn, &cal.id, &events, band.to)?;
-        }
-        band.of_feed_listing(
+        let band = band.of_feed_listing(
             feed_listing(&events),
             now,
             crate::clock::today_in_at(tz, now),
-        )
+        );
+        if complete {
+            calendar::clear_unlisted_uid_rows(&conn, &cal.id, &events, band.day_from, band.to)?;
+        }
+        band
     } else {
         *band
     };

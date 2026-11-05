@@ -1755,7 +1755,7 @@ pub fn calendar_by_id(conn: &Connection, id: &str) -> Result<Option<Calendar>> {
     .map_err(Error::from)
 }
 
-/// One mirrored event by its row id, or `None` (read back exactly as [`list_all_events`] does).
+/// One mirrored event by its row id, or `None` (read back exactly as [`list_events_between`] does).
 pub fn event_by_id(conn: &Connection, id: &str) -> Result<Option<CalendarEvent>> {
     Ok(list_events_where(conn, "WHERE id = ?1", params![id])?
         .into_iter()
@@ -2439,46 +2439,59 @@ pub fn mark_history_stale(conn: &Connection, calendar_id: &str) -> Result<()> {
     db::set_setting(conn, &history_key(calendar_id), &raw)
 }
 
-/// After a complete download of an iCal feed reaching up to `until` (its request's end): remove the
-/// repeating rows of each repeating event the feed lists (by its iCal UID) that the listing no
-/// longer has, at any date before `until`. PM expands a series the feed still lists from its own
-/// first day, so up to there the listing is the whole of it: a series retimed from 09:00 to 10:00
-/// leaves no 09:00 copies in the weeks before the feed's window
-/// ([`calendar_history::Band::of_feed_listing`] keeps those weeks for one-offs only). Only rows
-/// stored as repeating go (a feed may reuse a series' UID for one-offs), and none from `until` on (the
-/// months the view loaded further ahead aren't in this listing). Returns how many rows it removed. A
-/// feed is read-only, so no save of PM's can be waiting on these rows.
-pub fn clear_unlisted_series_rows(
+/// After a complete download of an iCal feed whose band ends at `until`: remove the rows the listing
+/// no longer has of each event it lists by iCal UID, where a row of that UID can only have moved.
+///
+/// - **Repeating events, at any date before `until`.** PM expands a series the feed still lists
+///   from its own first day, so the listing is the whole of it: a series retimed from 09:00 to 10:00
+///   leaves no 09:00 copies in the weeks before the feed's window
+///   ([`calendar_history::Band::of_feed_listing`] keeps those weeks for one-offs).
+/// - **One-offs, from `one_offs_from` on** (the band's all-day floor, the start of today; `None`
+///   clears none). A one-off the feed lists at another time was moved, so its old row goes, even
+///   when the old time had passed before the sync ran: the band speaks for timed rows only from
+///   now. Further back, a feed that reuses one UID for many events could reach into history.
+///
+/// Rows are matched only with their own kind (a feed may reuse a series' UID for one-offs). None go
+/// from `until` on: the months the view loaded past the live band aren't in this listing. The
+/// request's 2-day margin past `until` is left too, since an all-day date there may fall outside
+/// what the feed was expanded to; a copy left there goes when that month loads or the live band
+/// moves on. Returns how many rows it removed. A feed is read-only, so no save of PM's can be
+/// waiting on these rows.
+pub fn clear_unlisted_uid_rows(
     conn: &Connection,
     calendar_id: &str,
     listed: &[CalendarEvent],
+    one_offs_from: Option<chrono::DateTime<chrono::Utc>>,
     until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<usize> {
     let ids: std::collections::HashSet<&str> = listed.iter().map(|e| e.id.as_str()).collect();
-    let mut uids: Vec<&str> = listed
+    let mut uids: Vec<(&str, bool)> = listed
         .iter()
-        .filter(|e| e.recurring)
-        .filter_map(|e| e.uid.as_deref())
+        .filter_map(|e| Some((e.uid.as_deref()?, e.recurring)))
         .collect();
     uids.sort_unstable();
     uids.dedup();
-    let before_until = |start: &str| {
-        calendar_history::start_instant(start).is_some_and(|at| until.is_none_or(|u| at < u))
+    let in_reach = |start: &str, recurring: bool| {
+        calendar_history::start_instant(start).is_some_and(|at| {
+            until.is_none_or(|u| at < u) && (recurring || one_offs_from.is_some_and(|f| at >= f))
+        })
     };
     let tx = conn.unchecked_transaction()?;
     let mut removed = 0;
     {
         let mut stmt = tx.prepare(
             "SELECT id, start FROM calendar_events \
-             WHERE calendar_id = ?1 AND uid = ?2 AND recurring = 1",
+             WHERE calendar_id = ?1 AND uid = ?2 AND recurring = ?3",
         )?;
-        for uid in uids {
+        for (uid, recurring) in uids {
             let stored: Vec<(String, String)> = stmt
-                .query_map(params![calendar_id, uid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map(params![calendar_id, uid, recurring as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
                 .collect::<rusqlite::Result<_>>()?;
             let gone = stored
                 .iter()
-                .filter(|(id, start)| !ids.contains(id.as_str()) && before_until(start))
+                .filter(|(id, start)| !ids.contains(id.as_str()) && in_reach(start, recurring))
                 .map(|(id, _)| id);
             for id in gone {
                 tx.execute(
@@ -2789,12 +2802,8 @@ pub fn focus_agenda(conn: &Connection, days: i64, zone: chrono_tz::Tz) -> Result
     )
 }
 
-/// Every mirrored event, for the unified calendar VIEW (card 8): the whole synced band — the
-/// previous month included — so the Month/Week/Year grids render and page without a per-view
-/// fetch. Ordered by start. Contrast [`list_upcoming`], the narrow forward agenda for the focus
-/// view. Read-only; the client filters to the visible range and by locally-hidden calendars.
-/// Deliberately NOT filtered by `quiet`: a quiet calendar is kept out of the assistant paths
-/// ([`agenda_query`]) but still shown here on the Calendar tab — that's the whole point of quiet.
+/// Every mirrored event, ordered by start: the tests' whole-calendar read. The app reads by range
+/// ([`list_events_between`]), since the mirror keeps every event (#1047).
 #[cfg(test)]
 pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
     list_events_between(conn, None, None, None)
@@ -2804,7 +2813,10 @@ pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
 /// after `from` and start before `to` — and only `uid`'s when it's given, ordered by start: the read
 /// behind the calendar view, which asks for the months it shows now that the mirror keeps every
 /// event (#1047). An all-day date reads as UTC midnight, so a caller asking by local days pads a day
-/// each side. Not filtered by `quiet`, as [`list_all_events`] says.
+/// each side. Contrast [`list_upcoming`], the narrow forward agenda. Read-only; the client filters
+/// by locally hidden calendars. Deliberately NOT filtered by `quiet`: a quiet calendar is kept out
+/// of the assistant paths ([`agenda_query`]) but still shown on the Calendar tab — that's the whole
+/// point of quiet.
 pub fn list_events_between(
     conn: &Connection,
     from: Option<&str>,
@@ -3138,8 +3150,8 @@ mod tests {
         .unwrap();
         let new_ten = row("class-1000-2024", "2024-03-04T10:00:00Z", "class", true);
         replace_events(&conn, "cal-1", std::slice::from_ref(&new_ten), false).unwrap();
-        let reach = crate::calendar_history::start_instant("2027-12-03T00:00:00Z");
-        let removed = clear_unlisted_series_rows(&conn, "cal-1", &[new_ten], reach).unwrap();
+        let reach = crate::calendar_history::start_instant("2027-12-01T00:00:00Z");
+        let removed = clear_unlisted_uid_rows(&conn, "cal-1", &[new_ten], None, reach).unwrap();
         assert_eq!(removed, 1);
         let left: Vec<String> = mirrored(&conn).into_iter().map(|(id, _)| id).collect();
         assert_eq!(
@@ -3150,6 +3162,50 @@ mod tests {
                 "class-1000-2024",
                 "class-open-day",
                 "fair-2024"
+            ]
+        );
+    }
+
+    /// Verify pass of #1047: a feed that lists only what's to come moved this morning's 09:00 review
+    /// to 15:00, and PM first synced after 09:00. The old row goes, since the feed still lists its UID;
+    /// a dropped event of today's with no UID listed stays, and so do last week's row of the same
+    /// UID and a series that shares it.
+    #[test]
+    fn a_feeds_one_off_moved_after_its_old_time_leaves_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let row = |id: &str, start: &str, uid: &str, recurring: bool| {
+            let mut e = ev(id, "Review", start);
+            e.uid = Some(uid.into());
+            e.recurring = recurring;
+            e
+        };
+        replace_events(
+            &conn,
+            "cal-1",
+            &[
+                row("review-0900", "2026-11-09T09:00:00Z", "review", false),
+                row("lunch-0800", "2026-11-09T08:00:00Z", "lunch", false),
+                row("review-last-week", "2026-11-02T09:00:00Z", "review", false),
+                row("review-series", "2026-11-09T07:00:00Z", "review", true),
+            ],
+            true,
+        )
+        .unwrap();
+        let moved = row("review-1500", "2026-11-09T15:00:00Z", "review", false);
+        replace_events(&conn, "cal-1", std::slice::from_ref(&moved), false).unwrap();
+        let today = crate::calendar_history::start_instant("2026-11-09");
+        let until = crate::calendar_history::start_instant("2027-12-01T00:00:00Z");
+        let removed = clear_unlisted_uid_rows(&conn, "cal-1", &[moved], today, until).unwrap();
+        assert_eq!(removed, 1);
+        let left: Vec<String> = mirrored(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            left,
+            [
+                "lunch-0800",
+                "review-1500",
+                "review-last-week",
+                "review-series"
             ]
         );
     }
