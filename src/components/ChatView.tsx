@@ -28,6 +28,7 @@ import { useDevMode } from "../lib/capabilities";
 import { useReader } from "../lib/reader";
 import { Markdown } from "../lib/markdown";
 import { citationTarget, linkCitations } from "../lib/chatMarkdown";
+import { chatNoteId } from "../lib/chatNote";
 import { splitMentions } from "../lib/mentions";
 import { listTags } from "../lib/ipc";
 import { formatDate, formatDateLocal, shortModel } from "../lib/format";
@@ -420,7 +421,10 @@ function SaveAsNoteButton({ message }: { message: Message }) {
     setState("saving");
     try {
       const stamp = `_Saved from a chat, ${formatDateLocal(new Date())}_`;
-      await ingestNote(`chat:${message.id}`, "", `${message.content}\n\n${stamp}`);
+      // `chat-` keeps saved answers apart from pinboard notes (whose ids are UUIDs or `w-…`), and
+      // stays inside the backend's note-id charset: a `chat:` prefix was refused as an invalid id,
+      // so every save failed.
+      await ingestNote(chatNoteId(message.id), "", `${message.content}\n\n${stamp}`);
       setState("saved");
     } catch {
       setState("error");

@@ -146,6 +146,34 @@ fn dir_nonempty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The Whisper model's own folder inside `runtime/models`. The sidecar loads
+/// `WhisperModel(WHISPER_MODEL, download_root=<runtime/models>)` (`pm_sidecar.py`, `get_whisper`), and
+/// faster-whisper passes that root to huggingface_hub as its `cache_dir`, which lays the repo out as
+/// `models--<org>--<name>`. The same root also holds the embedder and reranker (`fastembed/`), the
+/// hf and xet caches (`hf/`) and the photo-OCR weights (`rapidocr/`), so the Speech-model row must
+/// measure and remove this folder only, never the root: removing the root used to delete the search
+/// models with it, and the total counted the embedder twice.
+const WHISPER_REPO_DIR: &str = "models--Systran--faster-whisper-base.en";
+
+/// Every path the Whisper download leaves under `models`: the repo folder and huggingface_hub's lock
+/// folder for it.
+fn whisper_paths(models: &Path) -> [PathBuf; 2] {
+    [
+        models.join(WHISPER_REPO_DIR),
+        models.join(".locks").join(WHISPER_REPO_DIR),
+    ]
+}
+
+/// Remove the Whisper model's folders and nothing else under `models`.
+fn remove_whisper(models: &Path) -> std::io::Result<()> {
+    for p in whisper_paths(models) {
+        if p.exists() {
+            std::fs::remove_dir_all(&p)?;
+        }
+    }
+    Ok(())
+}
+
 /// The venv's `site-packages` (per-OS layout), if it exists.
 fn site_packages_dir(venv: &Path) -> Option<PathBuf> {
     if cfg!(windows) {
@@ -350,9 +378,10 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
     let base = venv_total.saturating_sub(optional_size);
 
     let models = data.join("runtime").join("models");
-    let whisper_present = dir_nonempty(&models);
+    let [whisper_dir, whisper_locks] = whisper_paths(&models);
+    let whisper_present = dir_nonempty(&whisper_dir);
     let whisper_size = if whisper_present {
-        dir_size(&models)
+        dir_size(&whisper_dir) + dir_size(&whisper_locks)
     } else {
         0
     };
@@ -540,12 +569,7 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
         "opencv-python" => sidecar.pip_uninstall(&["opencv-python-headless", "opencv-python"])?,
         "shapely" => sidecar.pip_uninstall(&["shapely"])?,
         "pyclipper" => sidecar.pip_uninstall(&["pyclipper"])?,
-        "whisper" => {
-            let m = data.join("runtime").join("models");
-            if m.exists() {
-                std::fs::remove_dir_all(&m)?;
-            }
-        }
+        "whisper" => remove_whisper(&data.join("runtime").join("models"))?,
         other => {
             return Err(Error::Other(format!("'{other}' can't be removed here.")));
         }
@@ -654,6 +678,87 @@ mod tests {
             (absent.size_bytes, absent.approximate),
             (OCR_INSTALL_ESTIMATE_BYTES, true)
         );
+    }
+
+    /// A `runtime/models` laid out the way a real install fills it: the embedder and reranker, the hf
+    /// and xet caches, the photo-OCR weights, and the Whisper repo with its lock folder.
+    fn seeded_models(data: &Path) -> PathBuf {
+        let models = data.join("runtime").join("models");
+        let put = |rel: &str, bytes: usize| {
+            let p = models.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; bytes]).unwrap();
+        };
+        put(
+            "fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx",
+            1000,
+        );
+        put("hf/xet/chunk", 100);
+        put("rapidocr/det.onnx", 300);
+        put(&format!("{WHISPER_REPO_DIR}/snapshots/abc/model.bin"), 50);
+        put(&format!(".locks/{WHISPER_REPO_DIR}/x.lock"), 7);
+        models
+    }
+
+    #[test]
+    fn removing_the_speech_model_leaves_the_search_and_ocr_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = seeded_models(dir.path());
+        remove_whisper(&models).unwrap();
+        assert!(!models.join(WHISPER_REPO_DIR).exists());
+        assert!(!models.join(".locks").join(WHISPER_REPO_DIR).exists());
+        assert!(models
+            .join("fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx")
+            .is_file());
+        assert!(models.join("hf/xet/chunk").is_file());
+        assert!(models.join("rapidocr/det.onnx").is_file());
+        // Removing again (nothing left) is not an error.
+        remove_whisper(&models).unwrap();
+    }
+
+    #[test]
+    fn the_speech_model_row_measures_only_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded_models(dir.path());
+        let venv = dir.path().join("runtime").join("venv");
+        let embedder = crate::registry::active_embedder();
+        let report = build_report(&venv, dir.path(), &embedder, false);
+        let whisper = report
+            .components
+            .iter()
+            .find(|c| c.id == "whisper")
+            .expect("a Whisper row while its folder is present");
+        assert_eq!(whisper.size_bytes, 57);
+        // The total adds the embedder's estimate once; the seeded embedder bytes are not counted
+        // a second time through the Whisper row.
+        assert_eq!(
+            report.total_bytes,
+            57 + embedder_estimate_bytes(embedder.id)
+        );
+    }
+
+    #[test]
+    fn no_speech_model_row_when_only_other_models_are_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = seeded_models(dir.path());
+        remove_whisper(&models).unwrap();
+        let venv = dir.path().join("runtime").join("venv");
+        let report = build_report(
+            &venv,
+            dir.path(),
+            &crate::registry::active_embedder(),
+            false,
+        );
+        assert!(report.components.iter().all(|c| c.id != "whisper"));
+    }
+
+    #[test]
+    fn whisper_folder_name_matches_the_sidecar_model() {
+        // `WHISPER_REPO_DIR` is derived from the sidecar's model name; if that changes, the Storage
+        // row would silently stop finding the download.
+        let sidecar = include_str!("../../sidecar/pm_sidecar.py");
+        assert!(sidecar.contains("WHISPER_MODEL = \"base.en\""));
+        assert_eq!(WHISPER_REPO_DIR, "models--Systran--faster-whisper-base.en");
     }
 
     #[test]
