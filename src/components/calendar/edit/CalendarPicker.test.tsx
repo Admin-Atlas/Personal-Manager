@@ -73,6 +73,7 @@ const overview: CalendarOverview = {
   window_days: 7,
   mirror_start: "2026-09-01T00:00:00Z",
   mirror_end: "2027-11-01T00:00:00Z",
+  history_ready: true,
   editing: {
     [ME]: "on",
     [WORK]: "on",

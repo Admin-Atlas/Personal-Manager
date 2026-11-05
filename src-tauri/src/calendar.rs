@@ -15,32 +15,45 @@
 //!
 //! Everything Google sends is untrusted DATA, never instructions (rule #6).
 //!
+//! The mirror keeps every event it has seen, split into bands by time and fetched at different
+//! rates (`crate::calendar_history`, #1047): a sync compares what it holds in a band with what the
+//! band's listing returned, instead of deleting the calendar and writing it back.
+//!
 //! This module only reads. Changing a Google event (#884) goes through the write core
 //! (`crate::calendar_write`) and `commands::calendar_edit`, which writes Google's reply back here
 //! with [`apply_write_effect`].
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub use crate::calendar_history::{Band, Changed};
+use crate::calendar_history::{Held, HistoryState};
 use crate::error::{Error, Result};
-use crate::{clock, db, google, ics, secrets};
+use crate::{calendar_history, clock, db, google, ics, secrets};
 
 const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
 /// How far ahead to mirror events (and the agenda horizon). Resolves the spec §11
 /// "how far ahead" question; the louder "Due soon" cutoff is narrower (below).
 pub const AGENDA_DAYS: i64 = 21;
-/// The unified calendar VIEW (card 8) mirrors a far wider band than the 21-day agenda
-/// horizon — the full previous month through a year ahead — so Month/Week/Year navigation
-/// renders and pages without a per-view fetch. Anchored to `start of month` so paging back
-/// one month always lands on fully-mirrored data. Deliberately separate from [`AGENDA_DAYS`]:
-/// chat, briefing, and the focus agenda keep their narrow forward horizon.
+/// The LIVE band every sync fetches — the full previous month through a year ahead — far wider
+/// than the 21-day agenda horizon so Month/Week/Year navigation renders without a fetch. Anchored to
+/// `start of month` so paging back one month always lands on data the last sync read. Everything
+/// before it is history, kept and fetched far less often; months after it load as the view scrolls
+/// to them ([`crate::calendar_history`], #1047). Deliberately separate from [`AGENDA_DAYS`]: chat,
+/// briefing, and the focus agenda keep their narrow forward horizon.
 const MIRROR_BACK: &str = "-1 month";
 const MIRROR_FWD: &str = "+13 months";
 /// Page-follow backstop for the paginated Google fetch (250 events/page × 100 ≈ 25k — far above
-/// any real personal calendar over the mirror band, but bounds a hostile or runaway response).
-const MAX_PAGES: usize = 100;
+/// any real personal calendar over the live band, but bounds a hostile or runaway response).
+pub const MAX_PAGES: usize = 100;
+/// The same backstop for one calendar's whole history (250 × 400 ≈ 100k events): years of a busy
+/// calendar, a birthday for every contact repeated every year since their birth year included. A
+/// history cut there is incomplete, so it adds and updates without removing anything.
+pub const HISTORY_PAGES: usize = 400;
 /// Settings keys (plain key/value — no schema needed).
 const SELECTED_KEY: &str = "google_calendar_ids";
 const LAST_SYNC_KEY: &str = "google_last_sync";
@@ -57,7 +70,7 @@ const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
 /// One attendee on an event, as surfaced in the detail popup. Stored as a JSON array in the
 /// `calendar_events.attendees` column (so no per-attendee table), parsed back on read. Every field is
 /// optional/defaulted so a sparse provider record (email-only, or name-only) still round-trips.
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Attendee {
     pub name: Option<String>,
     pub email: Option<String>,
@@ -72,7 +85,9 @@ pub struct Attendee {
     pub is_self: bool,
 }
 
-#[derive(Clone, Serialize, Default)]
+/// Equality is field by field, which is how a sync tells a changed row from an unchanged one
+/// ([`replace_band`] compares the row it holds with the fetched event as it would store it).
+#[derive(Clone, Debug, PartialEq, Serialize, Default)]
 pub struct CalendarEvent {
     pub id: String,
     pub calendar_id: String,
@@ -506,15 +521,10 @@ where
     }
 }
 
-/// Fetch events from one Google calendar within `[time_min, time_max]` (RFC3339), with recurring
-/// events expanded to single instances and ordered by start. `mirror_calendar_id` is the owning
-/// [`Calendar::id`] the events are stored under; `remote_id` is Google's own calendar id for the API
-/// path. Authorised with the account's `token_key`.
-///
 /// One Google calendar's events, as [`fetch_events`] read them.
 pub struct GoogleFetch {
     pub events: Vec<CalendarEvent>,
-    /// `false` when the page-run hit the runaway guard, so [`replace_events`] can withhold its delete
+    /// `false` when the page-run hit the runaway guard, so [`replace_band`] can withhold its delete
     /// half rather than reap the tail we never reached — the same contract [`register_calendars`]
     /// already honours for the calendar LIST (I-09.3).
     pub complete: bool,
@@ -523,23 +533,20 @@ pub struct GoogleFetch {
     pub server_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Fetch the events of one Google calendar that a [`Band`]'s request reaches, with recurring events
+/// expanded to single instances and ordered by start. History's request has no `timeMin`, so it
+/// reads back to the calendar's first event. `mirror_calendar_id` is the owning [`Calendar::id`] the
+/// events are stored under; `remote_id` is Google's own calendar id for the API path. Authorised
+/// with the account's `token_key`; at most `max_pages` pages of 250 ([`MAX_PAGES`],
+/// [`HISTORY_PAGES`]).
 pub async fn fetch_events(
     token_key: &str,
     mirror_calendar_id: &str,
     remote_id: &str,
-    time_min: &str,
-    time_max: &str,
+    band: &Band,
+    max_pages: usize,
 ) -> Result<GoogleFetch> {
-    let mut base = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
-    base.path_segments_mut()
-        .map_err(|_| Error::Other("invalid calendar API base".into()))?
-        .extend(["calendars", remote_id, "events"]);
-    base.query_pairs_mut()
-        .append_pair("singleEvents", "true")
-        .append_pair("orderBy", "startTime")
-        .append_pair("timeMin", time_min)
-        .append_pair("timeMax", time_max)
-        .append_pair("maxResults", "250");
+    let base = events_url(remote_id, band)?;
 
     // The first page's time: a change made while later pages load is in them or in the next
     // listing, so the earliest answer is the safe one to count from.
@@ -548,7 +555,7 @@ pub async fn fetch_events(
     // Follow `nextPageToken` so the wide mirror band isn't silently truncated at one page — over a
     // year a single daily-recurring series alone exceeds 250 expanded instances. `singleEvents` +
     // `orderBy=startTime` keep the pages start-ordered, so appending preserves order.
-    let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |page_token| {
+    let (out, truncated) = crate::connector_sync::paginate(max_pages, |page_token| {
         let mut url = base.clone();
         let first_answer = &first_answer;
         async move {
@@ -584,12 +591,12 @@ pub async fn fetch_events(
         }
     })
     .await?;
-    // Runaway guard tripped (~25k events/calendar): the set is partial. The breadcrumb stays (it is
-    // the only clue on a dev build), but the flag now travels with it — an eprintln is invisible on
-    // a GUI build, so it was never the thing keeping the mirror honest.
+    // Runaway guard tripped: the set is partial. The breadcrumb stays (it is the only clue on a dev
+    // build), but the flag now travels with it — an eprintln is invisible on a GUI build, so it was
+    // never the thing keeping the mirror honest.
     if truncated {
         eprintln!(
-            "calendar: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more \
+            "calendar: '{mirror_calendar_id}' hit the {max_pages}-page fetch cap with more \
              pages pending; its mirror may be truncated this sync"
         );
     }
@@ -601,13 +608,36 @@ pub async fn fetch_events(
     })
 }
 
+/// The first page's request for [`fetch_events`] (pure, so the parameters are pinned by a test):
+/// each bound the band has, and none it hasn't.
+fn events_url(remote_id: &str, band: &Band) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(CALENDAR_API).map_err(|e| Error::Other(e.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| Error::Other("invalid calendar API base".into()))?
+        .extend(["calendars", remote_id, "events"]);
+    let (time_min, time_max) = band.request();
+    let mut query = url.query_pairs_mut();
+    query
+        .append_pair("singleEvents", "true")
+        .append_pair("orderBy", "startTime");
+    if let Some(t) = &time_min {
+        query.append_pair("timeMin", t);
+    }
+    if let Some(t) = &time_max {
+        query.append_pair("timeMax", t);
+    }
+    query.append_pair("maxResults", "250");
+    drop(query);
+    Ok(url)
+}
+
 /// What a change check found ([`check_for_changes`]).
 #[derive(Debug, PartialEq)]
 pub enum Changes {
-    /// The events changed since the asked-about time, as (event id, `updated`) pairs (a recurring
-    /// series by its own id, a changed occurrence by its own), and when Google answered.
+    /// The events changed since the asked-about time (a recurring series by its own id, a changed
+    /// occurrence by its own), and when Google answered.
     Listed {
-        items: Vec<(String, String)>,
+        items: Vec<Changed>,
         /// More than one page changed: there's no need to read the rest to know.
         more: bool,
         server_time: Option<chrono::DateTime<chrono::Utc>>,
@@ -622,8 +652,9 @@ const CHECK_PAGE: &str = "50";
 /// Ask Google which of one calendar's events changed since `since` (by Google's clock): a cheap
 /// listing of ids and timestamps only, deleted events included, so the change check
 /// ([`crate::calendar_fresh`]) fetches only the calendars that did change. No `timeMin`/`timeMax`,
-/// `orderBy` or `singleEvents`: a change outside the mirrored months costs at most one extra fetch,
-/// and one occurrence moved shows as that occurrence's own entry.
+/// `orderBy` or `singleEvents`: one occurrence moved shows as that occurrence's own entry, and a
+/// change to an old event shows too, which is how history hears of it
+/// ([`crate::calendar_history::reaches_history`]).
 pub async fn check_for_changes(
     token_key: &str,
     remote_id: &str,
@@ -653,12 +684,12 @@ fn change_check_url(remote_id: &str, since: chrono::DateTime<chrono::Utc>) -> Re
         )
         .append_pair("showDeleted", "true")
         .append_pair("maxResults", CHECK_PAGE)
-        .append_pair("fields", "items(id,updated),nextPageToken");
+        .append_pair("fields", "items(id,updated,status),nextPageToken");
     Ok(url)
 }
 
-/// The (id, updated) pairs of a change listing; an entry missing either is skipped.
-fn changed_items(body: &serde_json::Value) -> Vec<(String, String)> {
+/// The entries of a change listing; one missing its id or time is skipped.
+fn changed_items(body: &serde_json::Value) -> Vec<Changed> {
     body.get("items")
         .and_then(|v| v.as_array())
         .map(|items| {
@@ -667,7 +698,11 @@ fn changed_items(body: &serde_json::Value) -> Vec<(String, String)> {
                 .filter_map(|it| {
                     let id = it.get("id")?.as_str()?;
                     let updated = it.get("updated")?.as_str()?;
-                    Some((id.to_string(), updated.to_string()))
+                    Some(Changed {
+                        id: id.to_string(),
+                        updated: updated.to_string(),
+                        cancelled: it.get("status").and_then(|s| s.as_str()) == Some("cancelled"),
+                    })
                 })
                 .collect()
         })
@@ -788,18 +823,17 @@ pub fn remove_feed(conn: &Connection, id: &str) -> Result<()> {
     remove_source(conn, id)
 }
 
-/// Fetch + parse one feed's events within `[time_min, time_max]` (RFC3339, as produced by
-/// [`time_window`]; network, no DB lock held — rule #4). `tz` is the user's zone, used to anchor
-/// floating/all-day ICS times (the feed itself carries no viewer zone), resolved by the caller
-/// before the await.
+/// Fetch + parse the events of one feed that a [`Band`]'s request reaches (network, no DB lock held
+/// — rule #4). A feed is one download whatever the band, so a sync asks for its whole history with
+/// the live band ([`Band::through_live`]). `tz` is the user's zone, used to anchor floating/all-day
+/// ICS times (the feed itself carries no viewer zone), resolved by the caller before the await.
 ///
 /// Returns `(events, complete)` — see [`ics::parse_feed_within_reporting`]. An over-size body is an
 /// error from `read_capped`, but a body cut mid-`VEVENT` or a feed past the parser's block/event
 /// caps comes back looking clean, so the parse's own verdict is what gates the mirror's delete.
 pub async fn sync_feed(
     feed: &IcsFeed,
-    time_min: &str,
-    time_max: &str,
+    band: &Band,
     tz: chrono_tz::Tz,
 ) -> Result<(Vec<CalendarEvent>, bool)> {
     // Re-validate at fetch time: a feed stored before this guard existed — or one
@@ -873,15 +907,30 @@ pub async fn sync_feed(
         }
         break read_capped(resp, MAX_FEED_BYTES).await?;
     };
-    let (win_start, win_end) = parse_window(time_min, time_max)?;
+    let (win_start, win_end) = feed_window(band)?;
     Ok(ics::parse_feed_within_reporting(
         &text, &feed.id, win_start, win_end, tz,
     ))
 }
 
-/// Parse the RFC3339 `[time_min, time_max]` bounds from [`time_window`] into absolute instants for
-/// the ICS path, which filters expanded occurrences by instant rather than by an API query param
-/// (so every provider mirrors the exact same band).
+/// The earliest instant an open-ended request means, for a provider that needs a lower bound (an
+/// iCal feed's expansion, Outlook's `calendarView`): before any calendar app existed, so "from the
+/// first event" loses nothing.
+pub const EARLIEST: &str = "1900-01-01T00:00:00Z";
+
+/// A band's request as the instants an iCal feed is expanded between: from [`EARLIEST`] when the
+/// band has no start. A feed is never asked for an open end (repeats without one would never stop).
+fn feed_window(
+    band: &Band,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let (from, to) = band.request();
+    let to = to.ok_or_else(|| Error::Other("a calendar feed needs an end to expand to".into()))?;
+    parse_window(from.as_deref().unwrap_or(EARLIEST), &to)
+}
+
+/// Parse RFC3339 `[time_min, time_max]` bounds into absolute instants for the ICS path, which
+/// filters expanded occurrences by instant rather than by an API query param (so every provider
+/// mirrors the exact same band).
 fn parse_window(
     time_min: &str,
     time_max: &str,
@@ -1346,10 +1395,11 @@ pub fn set_last_sync(conn: &Connection) -> Result<()> {
     db::set_setting(conn, LAST_SYNC_KEY, &now)
 }
 
-/// The `[timeMin, timeMax]` RFC3339 window a sync mirrors: the start of last month through the
+/// The `[start, end)` RFC3339 live band every sync fetches: the start of last month through the
 /// start of the month 13 months out (≈ a full previous month + a year ahead). Anchored to
-/// `start of month` so paging the Month/Week/Year view back one month lands on fully-mirrored data.
-/// This is the *mirror* band, deliberately wider than the [`AGENDA_DAYS`] focus/chat horizon.
+/// `start of month` so paging the Month/Week/Year view back one month lands on data the last sync
+/// read. Deliberately wider than the [`AGENDA_DAYS`] focus/chat horizon; history before it and the
+/// months after it are kept too ([`crate::calendar_history`]).
 pub fn time_window(conn: &Connection) -> Result<(String, String)> {
     conn.query_row(
         "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now','start of month',?1), \
@@ -1360,13 +1410,20 @@ pub fn time_window(conn: &Connection) -> Result<(String, String)> {
     .map_err(Error::from)
 }
 
+/// [`time_window`] as the [`Band`] the live sync speaks for.
+pub fn live_band(conn: &Connection) -> Result<Band> {
+    let (from, to) = time_window(conn)?;
+    let (from, to) = parse_window(&from, &to)?;
+    Ok(Band::live(from, to))
+}
+
 // --- account + calendar registry (connector_sources service='calendar' + the `calendars` table) ---
 //
 // The clean three-level model: one `connector_sources` row per account/subscription (reused from
 // v14), one `calendars` row per individual calendar within it, and `calendar_events.calendar_id`
 // pointing at a `calendars.id`. Google/Outlook accounts hold many calendars; an ICS subscription is
-// exactly one. Read-only, so no delta cursor — the `cursor` column stays NULL and each sync
-// delete-then-reinserts within the window.
+// exactly one. No delta cursor — the `cursor` column stays NULL, and each sync compares what it
+// holds in a band with what the band's listing returned.
 
 /// The `connector_sources.service` value for every calendar account/subscription row.
 pub const SERVICE: &str = "calendar";
@@ -1557,11 +1614,17 @@ pub fn touch_source_synced_if_ok(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove one account/subscription: delete its calendars' mirrored events, its `calendars` rows, and
-/// the source row. (The FK cascade drops the calendars on its own; we also clear the derived events,
-/// which carry no enforced FK.) The caller forgets the keychain token/feed separately.
+/// Remove one account/subscription: delete its calendars' mirrored events, what PM knew of their
+/// history, its `calendars` rows, and the source row. (The FK cascade drops the calendars on its own;
+/// we also clear the derived events, which carry no enforced FK.) The caller forgets the keychain
+/// token/feed separately.
 pub fn remove_source(conn: &Connection, id: &str) -> Result<()> {
+    let calendars: Vec<String> = list_calendars_for_source(conn, id)?
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
     let tx = conn.unchecked_transaction()?;
+    forget_history(&tx, &calendars)?;
     tx.execute(
         "DELETE FROM calendar_events WHERE calendar_id IN \
          (SELECT id FROM calendars WHERE source_id = ?1)",
@@ -1730,14 +1793,16 @@ pub fn series_rows(
     Ok(rows)
 }
 
-/// Drop calendars under `source_id` that are no longer in `keep` (and their events) — an upstream
-/// calendar that was deleted/unshared. `keep` is the set of `calendars.id` still present this sync.
+/// Drop calendars under `source_id` that are no longer in `keep` (their events and their history
+/// with them) — an upstream calendar that was deleted/unshared. `keep` is the set of `calendars.id`
+/// still present this sync.
 pub fn prune_calendars_not_in(conn: &Connection, source_id: &str, keep: &[String]) -> Result<()> {
     let stale: Vec<String> = list_calendars_for_source(conn, source_id)?
         .into_iter()
         .filter(|c| !keep.contains(&c.id))
         .map(|c| c.id)
         .collect();
+    forget_history(conn, &stale)?;
     for id in stale {
         conn.execute(
             "DELETE FROM calendar_events WHERE calendar_id = ?1",
@@ -1968,104 +2033,15 @@ pub(crate) fn mirrored_location(s: &str) -> String {
     clip(s, MAX_LOCATION_CHARS)
 }
 
-/// The `settings` key prefix for a calendar's last-mirrored event-set hash (F-49).
+/// The `settings` key prefix marking a calendar's live band as last written by a complete fetch
+/// ([`mirror_is_whole`]). It held a hash of the fetched set while a sync skipped an unchanged one
+/// (F-49); comparing row by row ([`replace_band`]) does that job now, and the key's presence is
+/// all anything reads. The name stays, so a store written before keeps its marks.
 const CALENDAR_EVENTS_HASH_PREFIX: &str = "calendar_events_hash:";
 
-/// A stable, order-INDEPENDENT digest of a calendar's mirrored event set (F-49). Every field written to
-/// `calendar_events` is included, so any real change flips the hash; the per-event lines are sorted so a
-/// reordered-but-identical fetch (providers don't guarantee order) still matches. `\u{1f}` (unit
-/// separator) delimits fields so no value can forge a boundary.
-fn events_hash(events: &[CalendarEvent]) -> String {
-    let mut lines: Vec<String> = events
-        .iter()
-        .map(|e| {
-            // Destructured field by field, with no `..`, so a field added to `CalendarEvent` fails to
-            // compile here until it is hashed (or deliberately ignored, like `calendar_id`, which the
-            // per-calendar key already covers). Every stored field is folded in so an edit to any of
-            // them, or the one-time gain of new columns (v40, v57), rewrites the row on the next sync.
-            let CalendarEvent {
-                id,
-                calendar_id: _,
-                summary,
-                description,
-                location,
-                start,
-                end,
-                all_day,
-                html_link,
-                uid,
-                show_as,
-                organizer,
-                attendees,
-                conference_url,
-                recurring,
-                recurrence_summary,
-                status,
-                visibility,
-                created,
-                updated,
-                etag,
-                event_type,
-                organizer_self,
-                locked,
-                guests_can_modify,
-                series_id,
-                original_start,
-                color_id,
-                event_label_id,
-            } = e;
-            let attendees = serde_json::to_string(attendees).unwrap_or_default();
-            let bit = |b: &bool| if *b { "1" } else { "0" };
-            [
-                id.as_str(),
-                summary.as_str(),
-                description.as_deref().unwrap_or(""),
-                location.as_deref().unwrap_or(""),
-                start.as_str(),
-                end.as_deref().unwrap_or(""),
-                bit(all_day),
-                html_link.as_deref().unwrap_or(""),
-                uid.as_deref().unwrap_or(""),
-                show_as.as_deref().unwrap_or(""),
-                organizer.as_deref().unwrap_or(""),
-                attendees.as_str(),
-                conference_url.as_deref().unwrap_or(""),
-                bit(recurring),
-                recurrence_summary.as_deref().unwrap_or(""),
-                status.as_deref().unwrap_or(""),
-                visibility.as_deref().unwrap_or(""),
-                created.as_deref().unwrap_or(""),
-                updated.as_deref().unwrap_or(""),
-                etag.as_deref().unwrap_or(""),
-                event_type.as_deref().unwrap_or(""),
-                bit(organizer_self),
-                bit(locked),
-                bit(guests_can_modify),
-                series_id.as_deref().unwrap_or(""),
-                original_start.as_deref().unwrap_or(""),
-                color_id.as_deref().unwrap_or(""),
-                event_label_id.as_deref().unwrap_or(""),
-            ]
-            .join("\u{1f}")
-        })
-        .collect();
-    lines.sort();
-    let mut text = format!("{MIRROR_FORMAT}\n");
-    text.push_str(&lines.join("\n"));
-    crate::ingest::hex_digest(text.as_bytes())
-}
-
-/// How the mirror stores what it fetches, folded into every [`events_hash`]. The hash is taken over
-/// the fetched events, before they're clipped for storage, so a change to the clipping alone would
-/// otherwise leave every unchanged calendar's rows stored the old way: bumping this makes the next
-/// sync rewrite each calendar once. 2: descriptions keep their line breaks ([`clip_multiline`]), and
-/// titles and places lose U+2028/U+2029 ([`clip`]). 3: descriptions keep up to 8,000 characters
-/// ([`MAX_DESCRIPTION_CHARS`]), so one cut at 2,000 is stored again, longer.
-const MIRROR_FORMAT: &str = "mirror-format:3";
-
-/// Whether `calendar_id`'s rows were last written by a complete fetch, so a row in them is still on
-/// the calendar. An incomplete fetch only upserts and clears the F-49 hash, so a row it didn't see
-/// (a moved iCal event's old start) may be a stale copy; a PM write clears it too, which only means
+/// Whether `calendar_id`'s live band was last written by a complete fetch, so a row in it is still
+/// on the calendar. An incomplete fetch only upserts and clears the mark, so a row it didn't see (a
+/// moved iCal event's old start) may be a stale copy; a PM write clears it too, which only means
 /// waiting for the next complete sync (flags::detect_and_store waits rather than guess).
 pub(crate) fn mirror_is_whole(conn: &Connection, calendar_id: &str) -> Result<bool> {
     Ok(
@@ -2074,72 +2050,168 @@ pub(crate) fn mirror_is_whole(conn: &Connection, calendar_id: &str) -> Result<bo
     )
 }
 
-/// Replace one calendar's mirrored events with a freshly fetched set. Skips the delete+reinsert entirely
-/// when the fetched set already matches what's mirrored (F-49): the provider is re-polled every ~15 min,
-/// and without this every poll rewrites every row — continuous WAL churn — even when nothing changed.
+/// What one write of a band's listing did ([`replace_band`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Replaced {
+    /// Rows added or changed.
+    pub written: usize,
+    /// Rows the band no longer lists, removed.
+    pub removed: usize,
+}
+
+/// Bring one calendar's rows in `band` up to a fresh listing of it (Bobby: "shouldnt it just compare
+/// what we have and update / add the missing ones and remove the deleted ones"): an event that's new
+/// or changed is written, one that's unchanged is left as it is, and — only when the listing is
+/// `complete` — a row the band holds that the listing no longer has is removed. Rows outside the band
+/// are never touched, so the live sync leaves history alone and a history fetch leaves the live band
+/// alone ([`crate::calendar_history`]). A sync that finds nothing changed writes nothing.
 ///
-/// `complete` is the fetch's own verdict on whether it saw the WHOLE calendar (page guard, ICS caps, a
+/// `complete` is the fetch's own verdict on whether it saw the WHOLE band (page guard, ICS caps, a
 /// body cut mid-block). On an INCOMPLETE fetch the delete half is withheld and the events that did
 /// arrive are upserted over the mirror: absence from a partial set is not evidence the user deleted
 /// anything (I-09.3). A genuinely-cancelled event in the unreached tail therefore lingers until the
 /// next complete fetch, which is the deliberate trade — reaping live rows is the worse failure.
+///
+/// An event listed twice is kept as its last copy, as the old delete-and-insert did.
+pub fn replace_band(
+    conn: &Connection,
+    calendar_id: &str,
+    band: &Band,
+    events: &[CalendarEvent],
+    complete: bool,
+) -> Result<Replaced> {
+    // Nothing observed proves nothing: an empty partial set is no evidence at all.
+    if !complete && events.is_empty() {
+        return Ok(Replaced::default());
+    }
+    let now = chrono::Utc::now();
+    let mut fresh: HashMap<&str, CalendarEvent> = HashMap::new();
+    for e in events {
+        fresh.insert(e.id.as_str(), stored_form(e));
+    }
+    let mut out = Replaced::default();
+    let tx = conn.unchecked_transaction()?;
+    let held = rows_near(&tx, calendar_id, band)?;
+    for (id, row) in &fresh {
+        if held.get(*id) != Some(row) {
+            upsert_event(&tx, row, now)?;
+            out.written += 1;
+        }
+    }
+    if complete {
+        for (id, row) in &held {
+            if band.holds(&row.start) && !fresh.contains_key(id.as_str()) {
+                tx.execute(
+                    "DELETE FROM calendar_events WHERE id = ?1 AND calendar_id = ?2",
+                    params![id, calendar_id],
+                )?;
+                out.removed += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    if band.live {
+        let key = format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}");
+        if complete {
+            crate::db::set_setting(conn, &key, "whole")?;
+        } else {
+            crate::db::delete_setting(conn, &key)?;
+        }
+    }
+    Ok(out)
+}
+
+/// [`replace_band`] over every row the calendar has, as if `events` listed the whole calendar: what
+/// a test means by a calendar's set.
+#[cfg(test)]
 pub fn replace_events(
     conn: &Connection,
     calendar_id: &str,
     events: &[CalendarEvent],
     complete: bool,
 ) -> Result<()> {
-    if !complete {
-        // Nothing observed proves nothing: an empty partial set is no evidence at all.
-        if events.is_empty() {
-            return Ok(());
-        }
-        let tx = conn.unchecked_transaction()?;
-        for e in events {
-            insert_event(&tx, e)?;
-        }
-        tx.commit()?;
-        // Never leave a hash describing a set the mirror does not hold. A merge that only refreshed
-        // existing rows leaves the row count unchanged, so a surviving hash could let F-49's
-        // unchanged-skip suppress the very rewrite that would repair the mirror — permanently.
-        crate::db::delete_setting(conn, &format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}"))?;
-        return Ok(());
-    }
-
-    // F-49: skip when unchanged. The stored per-calendar hash tells us the set is identical; the row
-    // count then confirms the rows are actually present, so a stale hash left by an external delete
-    // (e.g. `prune_unselected`) can't wrongly suppress a re-insert — the skip is self-correcting.
-    let hash = events_hash(events);
-    let key = format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}");
-    if crate::db::get_setting(conn, &key)?.as_deref() == Some(hash.as_str()) {
-        let count: i64 = conn.query_row(
-            "SELECT count(*) FROM calendar_events WHERE calendar_id = ?1",
-            params![calendar_id],
-            |r| r.get(0),
-        )?;
-        if count == events.len() as i64 {
-            return Ok(());
-        }
-    }
-
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM calendar_events WHERE calendar_id = ?1",
-        params![calendar_id],
-    )?;
-    for e in events {
-        insert_event(&tx, e)?;
-    }
-    tx.commit()?;
-    crate::db::set_setting(conn, &key, &hash)?;
-    Ok(())
+    let everything = Band {
+        from: None,
+        to: None,
+        live: true,
+    };
+    replace_band(conn, calendar_id, &everything, events, complete).map(|_| ())
 }
 
-/// Write one fetched event into the mirror, clipping every untrusted text field on the way in.
-/// Written once so the complete (delete-then-insert) and incomplete (upsert-only) paths of
-/// [`replace_events`] can never drift in what they store.
-fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
-    // Destructured with no `..`, like `events_hash`, so a new field can't be silently left unstored.
+/// The calendar's rows whose start falls in `band`'s request (or can't be read), by id: every row
+/// the band may remove, and most of the rows its listing would write. A listed event stored outside
+/// them (one that started long before and still runs, or that moved) is simply written again.
+fn rows_near(
+    conn: &Connection,
+    calendar_id: &str,
+    band: &Band,
+) -> Result<HashMap<String, CalendarEvent>> {
+    let (from, to) = band.request();
+    let rows = list_events_where(
+        conn,
+        "WHERE calendar_id = ?1 AND (julianday(start) IS NULL \
+           OR (julianday(start) >= julianday(?2) AND julianday(start) < julianday(?3)))",
+        params![
+            calendar_id,
+            from.as_deref().unwrap_or("0001-01-01T00:00:00Z"),
+            to.as_deref().unwrap_or("9999-12-31T23:59:59Z"),
+        ],
+    )?;
+    Ok(rows.into_iter().map(|r| (r.id.clone(), r)).collect())
+}
+
+/// An event as the mirror stores it: every untrusted text field clipped ([`clip`],
+/// [`clip_multiline`]), so a fresh copy compares like with like against the row it would replace.
+fn stored_form(e: &CalendarEvent) -> CalendarEvent {
+    CalendarEvent {
+        summary: clip(&e.summary, MAX_SUMMARY_CHARS),
+        location: e.location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS)),
+        description: e
+            .description
+            .as_deref()
+            .map(|d| clip_multiline(d, MAX_DESCRIPTION_CHARS)),
+        // Untrusted free-text from the provider — clipped like description/location.
+        organizer: e.organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS)),
+        recurrence_summary: e
+            .recurrence_summary
+            .as_deref()
+            .map(|r| clip(r, MAX_LOCATION_CHARS)),
+        ..e.clone()
+    }
+}
+
+/// A description or guest list as stored: text, or — for an event that ended more than a year ago —
+/// packed ([`calendar_history::pack`]).
+fn stored_text(text: Option<String>, aged: bool) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match text {
+        None => Value::Null,
+        Some(t) if aged => Value::Blob(calendar_history::pack(&t)),
+        Some(t) => Value::Text(t),
+    }
+}
+
+/// A description or guest list column as text, unpacking one [`calendar_history::pack`] stored.
+fn text_at(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<String>> {
+    match r.get_ref(i)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(t) => Ok(Some(String::from_utf8_lossy(t).into_owned())),
+        ValueRef::Blob(b) => Ok(calendar_history::unpack(b)),
+        // Not something the mirror writes: let rusqlite's own conversion name the mismatch.
+        _ => r.get(i),
+    }
+}
+
+/// Write one row the mirror stores ([`stored_form`]), adding it or updating it in place. An update
+/// keeps the columns no fetch carries (the user's own `kind_override`, the `entity_id` link), which
+/// the old delete-and-insert wiped on every sync. An event that ended more than a year before `now`
+/// has its description and guest list packed.
+fn upsert_event(
+    tx: &Connection,
+    e: &CalendarEvent,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    // Destructured with no `..`, so a new field can't be silently left unstored.
     let CalendarEvent {
         id,
         calendar_id,
@@ -2171,27 +2243,35 @@ fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
         color_id,
         event_label_id,
     } = e;
-    let summary = clip(summary, MAX_SUMMARY_CHARS);
-    let location = location.as_deref().map(|l| clip(l, MAX_LOCATION_CHARS));
-    let description = description
-        .as_deref()
-        .map(|d| clip_multiline(d, MAX_DESCRIPTION_CHARS));
-    // Untrusted free-text from the provider — clip like description/location. Attendees are stored
-    // as a JSON array (NULL when none), parsed back on read.
-    let organizer = organizer.as_deref().map(|o| clip(o, MAX_LOCATION_CHARS));
-    let recurrence_summary = recurrence_summary
-        .as_deref()
-        .map(|r| clip(r, MAX_LOCATION_CHARS));
+    let aged = calendar_history::aged(start, end.as_deref(), now);
+    // Attendees are stored as a JSON array (NULL when none), parsed back on read.
     let attendees = (!attendees.is_empty())
         .then(|| serde_json::to_string(attendees).unwrap_or_else(|_| "[]".to_string()));
+    let description = stored_text(description.clone(), aged);
+    let attendees = stored_text(attendees, aged);
     tx.execute(
-        "INSERT OR REPLACE INTO calendar_events \
+        "INSERT INTO calendar_events \
          (id, calendar_id, summary, description, location, start, end, all_day, html_link, uid, \
           show_as, organizer, attendees, conference_url, recurring, recurrence_summary, status, \
           visibility, created, updated, etag, event_type, organizer_self, locked, \
           guests_can_modify, series_id, original_start, color_id, event_label_id) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 ?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+                 ?21,?22,?23,?24,?25,?26,?27,?28,?29) \
+         ON CONFLICT(id) DO UPDATE SET \
+          calendar_id = excluded.calendar_id, summary = excluded.summary, \
+          description = excluded.description, location = excluded.location, \
+          start = excluded.start, end = excluded.end, all_day = excluded.all_day, \
+          html_link = excluded.html_link, uid = excluded.uid, show_as = excluded.show_as, \
+          organizer = excluded.organizer, attendees = excluded.attendees, \
+          conference_url = excluded.conference_url, recurring = excluded.recurring, \
+          recurrence_summary = excluded.recurrence_summary, status = excluded.status, \
+          visibility = excluded.visibility, created = excluded.created, \
+          updated = excluded.updated, etag = excluded.etag, event_type = excluded.event_type, \
+          organizer_self = excluded.organizer_self, locked = excluded.locked, \
+          guests_can_modify = excluded.guests_can_modify, series_id = excluded.series_id, \
+          original_start = excluded.original_start, color_id = excluded.color_id, \
+          event_label_id = excluded.event_label_id, \
+          synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
         params![
             id,
             calendar_id,
@@ -2229,9 +2309,11 @@ fn insert_event(tx: &Connection, e: &CalendarEvent) -> Result<()> {
 
 /// Write what a save to Google produced into the mirror (#884): `upserts` are rows parsed from
 /// Google's own reply or a fresh fetch ([`parse_event`]), never from the draft; `deletes` are row ids
-/// the save removed. One transaction, so the view never shows half a series. The calendar's F-49
-/// hash is dropped, because the mirror no longer matches the last full fetch and the next sync must
-/// rewrite it rather than skip. A calendar the user has unticked mirrors nothing, so it is left alone.
+/// the save removed. One transaction, so the view never shows half a series. The calendar's
+/// [`mirror_is_whole`] mark is dropped, because the mirror no longer matches the last full fetch. A
+/// row lands wherever it falls, history and the months after the live band included: nothing
+/// removes it there but a later listing of its band that no longer has it. A calendar the user has
+/// unticked mirrors nothing, so it is left alone.
 pub(crate) fn apply_write_effect(
     conn: &Connection,
     calendar_id: &str,
@@ -2256,31 +2338,203 @@ pub(crate) fn apply_write_effect(
             params![id, calendar_id],
         )?;
     }
+    let now = chrono::Utc::now();
     for e in upserts.iter().filter(|e| e.calendar_id == calendar_id) {
-        insert_event(&tx, e)?;
+        upsert_event(&tx, &stored_form(e), now)?;
     }
     tx.commit()?;
     crate::db::delete_setting(conn, &format!("{CALENDAR_EVENTS_HASH_PREFIX}{calendar_id}"))?;
     Ok(())
 }
 
-/// Drop mirrored events for calendars the user no longer has selected.
+/// Drop mirrored events for calendars the user no longer has selected, and what PM knew of their
+/// history: ticking one again downloads it whole again.
 pub fn prune_unselected(conn: &Connection, keep: &[String]) -> Result<()> {
     if keep.is_empty() {
-        conn.execute("DELETE FROM calendar_events", [])?;
-        return Ok(());
+        return clear_all_events(conn);
     }
     let placeholders = std::iter::repeat_n("?", keep.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("DELETE FROM calendar_events WHERE calendar_id NOT IN ({placeholders})");
     conn.execute(&sql, rusqlite::params_from_iter(keep))?;
+    let sql = format!(
+        "DELETE FROM settings WHERE substr(key, 1, {len}) = '{HISTORY_PREFIX}' \
+           AND substr(key, {from}) NOT IN ({placeholders})",
+        len = HISTORY_PREFIX.len(),
+        from = HISTORY_PREFIX.len() + 1,
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(keep))?;
     Ok(())
 }
 
 pub fn clear_all_events(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM calendar_events", [])?;
+    conn.execute(
+        &format!(
+            "DELETE FROM settings WHERE substr(key, 1, {}) = '{HISTORY_PREFIX}'",
+            HISTORY_PREFIX.len()
+        ),
+        [],
+    )?;
     Ok(())
+}
+
+// --- history: what PM knows of each calendar's past (crate::calendar_history) ---
+
+/// The `settings` key prefix holding a calendar's [`HistoryState`] as JSON.
+const HISTORY_PREFIX: &str = "calendar_history:";
+
+fn history_key(calendar_id: &str) -> String {
+    format!("{HISTORY_PREFIX}{calendar_id}")
+}
+
+/// Where a calendar's history stands, or `None` when it has never been downloaded (an unreadable
+/// value reads the same, so it's downloaded again rather than trusted).
+pub fn history_state(conn: &Connection, calendar_id: &str) -> Result<Option<HistoryState>> {
+    Ok(db::get_setting(conn, &history_key(calendar_id))?
+        .and_then(|raw| serde_json::from_str(&raw).ok()))
+}
+
+/// History matches the calendar as of `at` (see [`HistoryState::checked_at`]).
+pub fn set_history_checked(
+    conn: &Connection,
+    calendar_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let state = HistoryState {
+        checked_at: at,
+        stale: false,
+    };
+    let raw = serde_json::to_string(&state).map_err(|e| Error::Other(e.to_string()))?;
+    db::set_setting(conn, &history_key(calendar_id), &raw)
+}
+
+/// A save of PM's own reached a calendar's history without landing there: fetch it again at the
+/// next check. One never downloaded is due anyway, so it's left as it is.
+pub fn mark_history_stale(conn: &Connection, calendar_id: &str) -> Result<()> {
+    let Some(mut state) = history_state(conn, calendar_id)? else {
+        return Ok(());
+    };
+    state.stale = true;
+    let raw = serde_json::to_string(&state).map_err(|e| Error::Other(e.to_string()))?;
+    db::set_setting(conn, &history_key(calendar_id), &raw)
+}
+
+/// Forget what PM knew of these calendars' history, beside removing their rows.
+fn forget_history(conn: &Connection, calendar_ids: &[String]) -> Result<()> {
+    for id in calendar_ids {
+        db::delete_setting(conn, &history_key(id))?;
+    }
+    Ok(())
+}
+
+/// What the mirror holds of one changed event in `calendar_id`, for
+/// [`calendar_history::reaches_history`]: its own row (`<calendar>:<event id>`) and, for a series,
+/// its occurrences (`series_id`).
+pub fn held_of(
+    conn: &Connection,
+    calendar_id: &str,
+    live_from: chrono::DateTime<chrono::Utc>,
+    changed: &Changed,
+) -> Result<Held> {
+    let own = format!("{calendar_id}:{}", changed.id);
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, start, updated FROM calendar_events \
+         WHERE calendar_id = ?1 AND (id = ?2 OR series_id = ?3)",
+    )?;
+    let rows = stmt.query_map(params![calendar_id, own, changed.id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut held = Held::default();
+    for row in rows {
+        let (id, start, updated) = row?;
+        held.any = true;
+        if calendar_history::start_instant(&start).is_some_and(|at| at < live_from) {
+            held.before = true;
+        }
+        if id == own && updated.as_deref() == Some(changed.updated.as_str()) {
+            held.current = true;
+        }
+    }
+    Ok(held)
+}
+
+/// Whether any of a calendar's Google series in `series` has a stored occurrence before `live_from`:
+/// a save to such a series reaches history, which the save's own landing (over the live band) can't
+/// bring up to date.
+pub fn series_reach_history(
+    conn: &Connection,
+    calendar_id: &str,
+    series: &[&str],
+    live_from: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT start FROM calendar_events WHERE calendar_id = ?1 AND series_id = ?2",
+    )?;
+    for series_id in series {
+        let starts = stmt.query_map(params![calendar_id, series_id], |r| r.get::<_, String>(0))?;
+        for start in starts {
+            if calendar_history::start_instant(&start?).is_some_and(|at| at < live_from) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Pack the description and guest list of up to `limit` events that ended more than a year before
+/// `now` and are still stored as text ([`calendar_history::pack`]). Events cross that line as time
+/// passes while a sync only rewrites what changed, so each sync packs the next batch. Returns how many
+/// rows it packed.
+pub fn pack_aged(
+    conn: &Connection,
+    now: chrono::DateTime<chrono::Utc>,
+    limit: usize,
+) -> Result<usize> {
+    let cutoff =
+        (now - chrono::TimeDelta::days(365)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let rows: Vec<(String, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, start, end FROM calendar_events \
+             WHERE (typeof(description) = 'text' OR typeof(attendees) = 'text') \
+               AND julianday(COALESCE(end, start)) < julianday(?1) \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    let mut packed = 0;
+    for (id, start, end) in rows {
+        // The SQL and the Rust reading of a time agree on every format the mirror writes; this keeps
+        // the rule in one place for anything they don't.
+        if !calendar_history::aged(&start, end.as_deref(), now) {
+            continue;
+        }
+        let (description, attendees): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT description, attendees FROM calendar_events WHERE id = ?1",
+            params![id],
+            |r| Ok((text_at(r, 0)?, text_at(r, 1)?)),
+        )?;
+        tx.execute(
+            "UPDATE calendar_events SET description = ?2, attendees = ?3 WHERE id = ?1",
+            params![
+                id,
+                stored_text(description, true),
+                stored_text(attendees, true)
+            ],
+        )?;
+        packed += 1;
+    }
+    tx.commit()?;
+    Ok(packed)
 }
 
 /// The shared forward-agenda read. Events starting within `days` and not yet past the day boundary,
@@ -2321,10 +2575,10 @@ fn agenda_query(
         let all_day: i64 = r.get(7)?;
         let ended: i64 = r.get(10)?;
         let recurring: i64 = r.get(11)?;
-        let attendees: Option<String> = r.get(14)?;
+        let attendees = text_at(r, 14)?;
         let calendar: Option<String> = r.get(15)?;
         let reply = own_declined(attendees.as_deref(), calendar.as_deref());
-        let description: Option<String> = r.get(3)?;
+        let description = text_at(r, 3)?;
         let row = AgendaEvent {
             // The v40 detail fields (show_as/attendees/…) are only surfaced by the Calendar tab's
             // event popup via `list_all_events`; the assistant/focus paths this query feeds don't use
@@ -2469,8 +2723,30 @@ pub fn focus_agenda(conn: &Connection, days: i64, zone: chrono_tz::Tz) -> Result
 /// view. Read-only; the client filters to the visible range and by locally-hidden calendars.
 /// Deliberately NOT filtered by `quiet`: a quiet calendar is kept out of the assistant paths
 /// ([`agenda_query`]) but still shown here on the Calendar tab — that's the whole point of quiet.
+#[cfg(test)]
 pub fn list_all_events(conn: &Connection) -> Result<Vec<CalendarEvent>> {
-    list_events_where(conn, "ORDER BY start", [])
+    list_events_between(conn, None, None, None)
+}
+
+/// The mirrored events touching `[from, to)` (RFC 3339; `None` is open on that side) — those that end
+/// after `from` and start before `to` — and only `uid`'s when it's given, ordered by start: the read
+/// behind the calendar view, which asks for the months it shows now that the mirror keeps every
+/// event (#1047). An all-day date reads as UTC midnight, so a caller asking by local days pads a day
+/// each side. Not filtered by `quiet`, as [`list_all_events`] says.
+pub fn list_events_between(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+    uid: Option<&str>,
+) -> Result<Vec<CalendarEvent>> {
+    list_events_where(
+        conn,
+        "WHERE (?1 IS NULL OR julianday(COALESCE(end, start)) > julianday(?1)) \
+           AND (?2 IS NULL OR julianday(start) < julianday(?2)) \
+           AND (?3 IS NULL OR uid = ?3) \
+         ORDER BY start",
+        params![from, to, uid],
+    )
 }
 
 /// Mirrored events, read whole: `tail` follows `FROM calendar_events` (a WHERE and/or ORDER BY).
@@ -2489,7 +2765,7 @@ fn list_events_where(
     let rows = stmt.query_map(params, |r| {
         let all_day: i64 = r.get(7)?;
         let recurring: i64 = r.get(14)?;
-        let attendees_json: Option<String> = r.get(12)?;
+        let attendees_json = text_at(r, 12)?;
         let bit = |i: usize| r.get::<_, i64>(i).map(|v| v != 0);
         Ok(CalendarEvent {
             etag: r.get(20)?,
@@ -2504,7 +2780,7 @@ fn list_events_where(
             id: r.get(0)?,
             calendar_id: r.get(1)?,
             summary: r.get(2)?,
-            description: r.get(3)?,
+            description: text_at(r, 3)?,
             location: r.get(4)?,
             start: r.get(5)?,
             end: r.get(6)?,
@@ -2653,68 +2929,287 @@ mod tests {
         assert_eq!(primary_calendar_id(&serde_json::json!({})), None);
     }
 
-    #[test]
-    fn events_hash_is_order_independent_and_change_sensitive() {
-        // F-49: reordering the same set must NOT change the hash (providers don't guarantee order), but
-        // any real field change must.
-        let set1 = vec![
-            ev("1", "Standup", "2026-07-06T09:00:00Z"),
-            ev("2", "Review", "2026-07-06T14:00:00Z"),
-        ];
-        let reordered = vec![
-            ev("2", "Review", "2026-07-06T14:00:00Z"),
-            ev("1", "Standup", "2026-07-06T09:00:00Z"),
-        ];
-        assert_eq!(events_hash(&set1), events_hash(&reordered));
-
-        let changed = vec![
-            ev("1", "Standup", "2026-07-06T09:00:00Z"),
-            ev("2", "Review (moved)", "2026-07-06T14:00:00Z"),
-        ];
-        assert_ne!(events_hash(&set1), events_hash(&changed));
+    /// A listing of the whole calendar, as tests use one.
+    fn everything() -> Band {
+        Band {
+            from: None,
+            to: None,
+            live: true,
+        }
     }
 
     #[test]
-    fn replace_events_skips_an_unchanged_resync_but_self_heals_a_cleared_mirror() {
+    fn an_unchanged_resync_writes_nothing_and_a_changed_row_is_put_right() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
-        let events = vec![ev("1", "Standup", "2026-07-06T09:00:00Z")];
-        replace_events(&conn, "cal-1", &events, true).unwrap();
+        let events = vec![
+            ev("1", "Standup", "2026-07-06T09:00:00Z"),
+            ev("2", "Review", "2026-07-06T14:00:00Z"),
+        ];
+        let first = replace_band(&conn, "cal-1", &everything(), &events, true).unwrap();
+        assert_eq!(first.written, 2);
 
-        // Tamper with the mirrored row, then re-sync the SAME set. If it skips (F-49) the tamper
-        // survives — proof the delete+reinsert never ran; a rewrite would erase the marker.
+        // The same set, in another order (providers don't guarantee one): nothing to write.
+        let reordered = vec![events[1].clone(), events[0].clone()];
+        let again = replace_band(&conn, "cal-1", &everything(), &reordered, true).unwrap();
+        assert_eq!(
+            again,
+            Replaced::default(),
+            "an unchanged resync writes nothing"
+        );
+
+        // A row that no longer matches the calendar is written again, and only that one.
         conn.execute(
             "UPDATE calendar_events SET summary = 'TAMPERED' WHERE id = '1'",
             [],
         )
         .unwrap();
-        replace_events(&conn, "cal-1", &events, true).unwrap();
-        let summary: String = conn
-            .query_row(
-                "SELECT summary FROM calendar_events WHERE id = '1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let healed = replace_band(&conn, "cal-1", &everything(), &events, true).unwrap();
+        assert_eq!(healed.written, 1);
         assert_eq!(
-            summary, "TAMPERED",
-            "an unchanged re-sync skips the rewrite"
+            mirrored(&conn),
+            vec![
+                ("1".to_string(), "Standup".to_string()),
+                ("2".to_string(), "Review".to_string()),
+            ]
         );
 
-        // A stale hash (rows deleted out-of-band, e.g. prune_unselected) must NOT suppress the re-insert.
+        // Rows removed under it (e.g. prune_unselected) come back.
         conn.execute("DELETE FROM calendar_events", []).unwrap();
-        replace_events(&conn, "cal-1", &events, true).unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM calendar_events WHERE calendar_id = 'cal-1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let back = replace_band(&conn, "cal-1", &everything(), &events, true).unwrap();
+        assert_eq!(back.written, 2);
+
+        // An event the calendar no longer has is removed, and only it.
+        let gone = replace_band(&conn, "cal-1", &everything(), &events[..1], true).unwrap();
         assert_eq!(
-            count, 1,
-            "the count-guard re-inserts when the mirror was cleared"
+            gone,
+            Replaced {
+                written: 0,
+                removed: 1
+            }
         );
+        assert_eq!(
+            mirrored(&conn),
+            vec![("1".to_string(), "Standup".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_bands_listing_leaves_every_row_outside_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let old = ev("old", "Last year", "2025-03-04T09:00:00Z");
+        let edge = ev("edge", "Day before the band", "2026-09-30");
+        let live = ev("live", "Next week", "2026-11-12T09:00:00Z");
+        let later = ev("later", "In two years", "2028-11-12T09:00:00Z");
+        let all = [old.clone(), edge.clone(), live.clone(), later.clone()];
+        replace_events(&conn, "cal-1", &all, true).unwrap();
+        let at = |s: &str| crate::calendar_history::start_instant(s).unwrap();
+        let band = Band::live(at("2026-10-01T00:00:00Z"), at("2027-12-01T00:00:00Z"));
+
+        // The live band's listing has none of them: only the live row goes.
+        let done = replace_band(&conn, "cal-1", &band, &[], true).unwrap();
+        assert_eq!(done.removed, 1);
+        let left: Vec<String> = mirrored(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            left,
+            ["edge", "later", "old"],
+            "history and later months are kept"
+        );
+
+        // History's listing returns the edge row and not the old one: the old one goes, and the
+        // later row (outside history) stays.
+        let history = Band::before(at("2026-10-01T00:00:00Z"));
+        replace_band(&conn, "cal-1", &history, std::slice::from_ref(&edge), true).unwrap();
+        let left: Vec<String> = mirrored(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(left, ["edge", "later"]);
+
+        // An event two days into the live band, listed by history's margin, is written, never
+        // removed by it.
+        let early = ev("early", "Band's first days", "2026-10-02T09:00:00Z");
+        replace_band(&conn, "cal-1", &history, &[edge, early], true).unwrap();
+        replace_band(&conn, "cal-1", &history, &[], true).unwrap();
+        let left: Vec<String> = mirrored(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            left,
+            ["early", "later"],
+            "the margin's row belongs to the live band"
+        );
+    }
+
+    #[test]
+    fn a_resync_keeps_the_users_own_columns() {
+        let (_d, conn) = typing_store();
+        let row = || {
+            let mut e = ev("ev", "standup", "2026-08-01T09:00:00Z");
+            e.calendar_id = "cal".into();
+            e
+        };
+        replace_events(&conn, "cal", &[row()], true).unwrap();
+        conn.execute(
+            "UPDATE calendar_events SET kind_override = 'personal' WHERE id = 'ev'",
+            [],
+        )
+        .unwrap();
+        let mut renamed = row();
+        renamed.summary = "Standup (moved)".into();
+        replace_events(&conn, "cal", &[renamed], true).unwrap();
+        assert_eq!(
+            event_kind(&conn, "ev").unwrap().as_deref(),
+            Some("personal"),
+            "an update in place keeps the event's own typing (the old wipe dropped it)"
+        );
+    }
+
+    #[test]
+    fn an_event_a_year_gone_is_stored_packed_and_reads_back_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let invite = "Join the call\nhttps://meet.example.com/abc-defg-hij\n".repeat(20);
+        let guests: Vec<Attendee> = (0..6)
+            .map(|i| Attendee {
+                email: Some(format!("person{i}@example.com")),
+                response: Some("accepted".into()),
+                ..Default::default()
+            })
+            .collect();
+        let mut old = ev("old", "Kick-off", "2023-05-02T09:00:00Z");
+        old.end = Some("2023-05-02T10:00:00Z".into());
+        old.description = Some(invite.clone());
+        old.attendees = guests.clone();
+        let mut recent = old.clone();
+        recent.id = "recent".into();
+        recent.start = "2099-05-02T09:00:00Z".into();
+        recent.end = Some("2099-05-02T10:00:00Z".into());
+        replace_events(&conn, "cal-1", &[old.clone(), recent.clone()], true).unwrap();
+
+        let kind = |id: &str| -> (String, String) {
+            conn.query_row(
+                "SELECT typeof(description), typeof(attendees) FROM calendar_events WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(kind("old"), ("blob".into(), "blob".into()));
+        assert_eq!(kind("recent"), ("text".into(), "text".into()));
+        let back = list_all_events(&conn).unwrap();
+        assert_eq!(back[0], stored_form(&old), "read back exactly");
+        assert_eq!(back[1], stored_form(&recent));
+        // Nothing changed, nothing written, packed or not.
+        let again = replace_band(&conn, "cal-1", &everything(), &[old, recent], true).unwrap();
+        assert_eq!(again, Replaced::default());
+
+        // A row that has aged since it was written is packed by the next sweep, once.
+        conn.execute(
+            "UPDATE calendar_events SET description = 'plain', attendees = NULL WHERE id = 'old'",
+            [],
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        assert_eq!(pack_aged(&conn, now, 100).unwrap(), 1);
+        assert_eq!(kind("old"), ("blob".into(), "null".into()));
+        assert_eq!(pack_aged(&conn, now, 100).unwrap(), 0, "done once");
+        assert_eq!(
+            list_all_events(&conn).unwrap()[0].description.as_deref(),
+            Some("plain")
+        );
+    }
+
+    #[test]
+    fn the_view_reads_the_events_touching_a_range_and_a_linked_one_by_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let mut spans = ev("spans", "Trip", "2026-10-30");
+        spans.all_day = true;
+        spans.end = Some("2026-11-03".into());
+        let mut inside = ev("inside", "Dentist", "2026-11-10T09:00:00Z");
+        inside.end = Some("2026-11-10T10:00:00Z".into());
+        inside.uid = Some("u-1".into());
+        let mut after = ev("after", "Later", "2026-12-01T09:00:00Z");
+        after.uid = Some("u-2".into());
+        replace_events(&conn, "cal-1", &[spans, inside, after], true).unwrap();
+        let ids =
+            |rows: Vec<CalendarEvent>| -> Vec<String> { rows.into_iter().map(|r| r.id).collect() };
+        let nov = list_events_between(
+            &conn,
+            Some("2026-11-01T00:00:00Z"),
+            Some("2026-12-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ids(nov),
+            ["spans", "inside"],
+            "one running into it counts; one at its end doesn't"
+        );
+        assert_eq!(
+            ids(list_events_between(&conn, None, None, Some("u-2")).unwrap()),
+            ["after"]
+        );
+        assert_eq!(
+            list_events_between(&conn, None, None, None).unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn what_the_mirror_holds_of_a_change_says_whether_it_reaches_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let mut old = ev("cal-1:s_20250101T090000Z", "Weekly", "2025-01-01T09:00:00Z");
+        old.series_id = Some("s".into());
+        old.updated = Some("2025-01-01T00:00:00.000Z".into());
+        let mut now = ev("cal-1:s_20261111T090000Z", "Weekly", "2026-11-11T09:00:00Z");
+        now.series_id = Some("s".into());
+        let mut single = ev("cal-1:one", "Lunch", "2025-06-01T12:00:00Z");
+        single.updated = Some("2025-06-01T00:00:00.000Z".into());
+        replace_events(&conn, "cal-1", &[old, now, single], true).unwrap();
+        let live_from = crate::calendar_history::start_instant("2026-10-01T00:00:00Z").unwrap();
+        let change = |id: &str, updated: &str| Changed {
+            id: id.into(),
+            updated: updated.into(),
+            cancelled: false,
+        };
+        let held = |c: &Changed| held_of(&conn, "cal-1", live_from, c).unwrap();
+        let series = held(&change("s", "2026-11-05T10:00:00.000Z"));
+        assert!(
+            series.before && series.any && !series.current,
+            "a series with an old occurrence"
+        );
+        let same = held(&change("one", "2025-06-01T00:00:00.000Z"));
+        assert!(
+            same.before && same.current,
+            "the old row already shows this change"
+        );
+        assert_eq!(held(&change("new", "x")), Held::default(), "held nowhere");
+        assert!(series_reach_history(&conn, "cal-1", &["s"], live_from).unwrap());
+        assert!(!series_reach_history(&conn, "cal-1", &["other"], live_from).unwrap());
+    }
+
+    #[test]
+    fn history_state_is_kept_marked_stale_and_forgotten_with_the_calendar() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let at = crate::calendar_history::start_instant("2026-11-05T10:00:00Z").unwrap();
+        assert_eq!(history_state(&conn, "a").unwrap(), None);
+        mark_history_stale(&conn, "a").unwrap();
+        assert_eq!(
+            history_state(&conn, "a").unwrap(),
+            None,
+            "never downloaded stays so"
+        );
+        set_history_checked(&conn, "a", at).unwrap();
+        set_history_checked(&conn, "b", at).unwrap();
+        mark_history_stale(&conn, "a").unwrap();
+        let a = history_state(&conn, "a").unwrap().unwrap();
+        assert!(a.stale && a.checked_at == at);
+        // Unticking "a" forgets its history with its rows: ticking it again downloads it again.
+        prune_unselected(&conn, &["b".to_string()]).unwrap();
+        assert_eq!(history_state(&conn, "a").unwrap(), None);
+        assert!(history_state(&conn, "b").unwrap().is_some());
+        clear_all_events(&conn).unwrap();
+        assert_eq!(history_state(&conn, "b").unwrap(), None);
     }
 
     /// The mirrored rows for `cal-1`, id-ordered, as `(id, summary)`.
@@ -2904,7 +3399,8 @@ mod tests {
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(q["updatedMin"], "2026-10-10T09:59:00Z");
         assert_eq!(q["showDeleted"], "true");
-        assert_eq!(q["fields"], "items(id,updated),nextPageToken");
+        // The status says which changes were deletions (#1047: history needn't hear of those).
+        assert_eq!(q["fields"], "items(id,updated,status),nextPageToken");
         for absent in ["timeMin", "timeMax", "orderBy", "singleEvents", "syncToken"] {
             assert!(!q.contains_key(absent), "{absent}");
         }
@@ -2933,9 +3429,9 @@ mod tests {
     }
 
     #[test]
-    fn a_change_listing_reads_as_ids_and_times() {
+    fn a_change_listing_reads_as_ids_times_and_deletions() {
         let body = serde_json::json!({ "items": [
-            { "id": "a", "updated": "2026-10-10T10:00:00.000Z" },
+            { "id": "a", "updated": "2026-10-10T10:00:00.000Z", "status": "confirmed" },
             { "id": "b" },
             { "updated": "2026-10-10T10:00:00.000Z" },
             { "id": "c", "updated": "2026-10-10T10:01:00.000Z", "status": "cancelled" },
@@ -2943,8 +3439,16 @@ mod tests {
         assert_eq!(
             changed_items(&body),
             vec![
-                ("a".to_string(), "2026-10-10T10:00:00.000Z".to_string()),
-                ("c".to_string(), "2026-10-10T10:01:00.000Z".to_string()),
+                Changed {
+                    id: "a".into(),
+                    updated: "2026-10-10T10:00:00.000Z".into(),
+                    cancelled: false,
+                },
+                Changed {
+                    id: "c".into(),
+                    updated: "2026-10-10T10:01:00.000Z".into(),
+                    cancelled: true,
+                },
             ]
         );
         assert!(changed_items(&serde_json::json!({})).is_empty());
@@ -3042,22 +3546,24 @@ mod tests {
         assert_eq!(back[0].location.as_deref(), Some("Room 1 Floor 2"));
     }
 
-    /// The mirror's format is part of every hash: the hash an older build stored for the same events
-    /// (the plain digest of the event lines, which for no events is the digest of nothing) never
-    /// matches, so each calendar is rewritten once in the new format rather than skipped.
+    /// A row stored the old way (a description cut at 2,000 characters before C19, say) differs from
+    /// the fetched event as it would be stored now, so the next sync writes it again: what the
+    /// mirror-format stamp in the old hash was for.
     #[test]
-    fn the_mirror_format_is_folded_into_the_hash() {
-        assert_ne!(events_hash(&[]), crate::ingest::hex_digest(b""));
-        assert_eq!(
-            events_hash(&[]),
-            crate::ingest::hex_digest(format!("{MIRROR_FORMAT}\n").as_bytes())
-        );
-        // Nor does one stored before descriptions kept 8,000 characters (C19), so a description cut
-        // at 2,000 is stored again, longer, on the next sync.
-        assert_ne!(
-            events_hash(&[]),
-            crate::ingest::hex_digest(b"mirror-format:2\n")
-        );
+    fn a_row_stored_the_old_way_is_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let mut e = ev("1", "Standup", "2026-07-06T09:00:00Z");
+        e.description = Some("x".repeat(3_000));
+        replace_events(&conn, "cal-1", std::slice::from_ref(&e), true).unwrap();
+        conn.execute(
+            "UPDATE calendar_events SET description = substr(description, 1, 2000)",
+            [],
+        )
+        .unwrap();
+        replace_events(&conn, "cal-1", std::slice::from_ref(&e), true).unwrap();
+        let back = list_all_events(&conn).unwrap();
+        assert_eq!(back[0].description.as_deref().map(str::len), Some(3_000));
     }
 
     #[test]
@@ -3736,12 +4242,13 @@ mod tests {
         }
     }
 
-    /// F-49: every stored field is in the hash, the v57 ones included, so a change to any of them
-    /// rewrites the row on the next sync instead of being skipped.
+    /// Every stored field is compared, the v57 ones included, so a change to any of them rewrites the
+    /// row on the next sync instead of being skipped as unchanged.
     #[test]
-    fn every_editing_fact_changes_the_hash() {
+    fn every_editing_fact_rewrites_the_row() {
+        let (_d, conn) = store_with_calendar(true);
         let base = parse_event("cal-1", &google_occurrence()).unwrap();
-        let h0 = events_hash(std::slice::from_ref(&base));
+        replace_events(&conn, "cal-1", std::slice::from_ref(&base), true).unwrap();
         type Mutation = fn(&mut CalendarEvent);
         let mutations: [(&str, Mutation); 9] = [
             ("etag", |e| e.etag = Some("\"9\"".into())),
@@ -3757,7 +4264,17 @@ mod tests {
         for (field, mutate) in mutations {
             let mut changed = base.clone();
             mutate(&mut changed);
-            assert_ne!(events_hash(&[changed]), h0, "{field} must change the hash");
+            let wrote = replace_band(
+                &conn,
+                "cal-1",
+                &everything(),
+                std::slice::from_ref(&changed),
+                true,
+            )
+            .unwrap();
+            assert_eq!(wrote.written, 1, "{field} must rewrite the row");
+            assert_eq!(list_all_events(&conn).unwrap(), vec![changed], "{field}");
+            replace_events(&conn, "cal-1", std::slice::from_ref(&base), true).unwrap();
         }
     }
 
@@ -3810,8 +4327,17 @@ mod tests {
         assert_eq!(got.original_start, e.original_start);
         assert_eq!(got.color_id, e.color_id);
         assert_eq!(got.event_label_id, e.event_label_id);
-        // Read back exactly as stored, so a resync of the same set is skipped (F-49).
-        assert_eq!(events_hash(&back), events_hash(std::slice::from_ref(&e)));
+        // Read back exactly as stored, so a resync of the same set writes nothing.
+        assert_eq!(back, vec![stored_form(&e)]);
+        let again = replace_band(
+            &conn,
+            "cal-1",
+            &everything(),
+            std::slice::from_ref(&e),
+            true,
+        )
+        .unwrap();
+        assert_eq!(again, Replaced::default());
     }
 
     #[test]

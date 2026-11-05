@@ -13,8 +13,8 @@
 // with the tab is handed back to open on again, the keyboard comes back into the box even while it's
 // locked, the ghost is told how far the event has got, and the calendar list the keyboard can reach
 // stays inside the box. Repeating (C11): a ready-made rule is sent with the create, one the backend
-// refuses stops every save (a start the clocks skip said once), one from before the months PM syncs
-// is said to show inside them, a rule's own day follows a moved date, the Repeat list stays inside
+// refuses stops every save (a start the clocks skip said once), one from long ago says nothing of
+// where it shows (PM keeps every event), a rule's own day follows a moved date, the Repeat list stays inside
 // the box (Escape there closing only it), and Custom…, clicked or reached by the keyboard, carries
 // on in the full editor with its dialog open, sending nothing.
 
@@ -120,6 +120,7 @@ const overview: CalendarOverview = {
   window_days: 7,
   mirror_start: "2026-09-01T00:00:00Z",
   mirror_end: "2027-11-01T00:00:00Z",
+  history_ready: true,
   editing: { [ME]: "on", [WORK]: "on" },
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
@@ -1361,18 +1362,14 @@ describe("QuickCreatePopover", () => {
     expect(screen.getByRole<HTMLButtonElement>("button", { name: "Save" }).disabled).toBe(true);
   });
 
-  // The backend lists and lands its occurrences inside the months PM syncs, wherever it starts.
-  it("a repeat that starts before the months PM syncs says only its occurrences there show", async () => {
+  // #1047: PM keeps every event, history and the months ahead alike, so a start long ago is shown
+  // like any other, and nothing says otherwise.
+  it("a repeat that starts long ago says nothing of where it shows", async () => {
     open();
     fireEvent.change(title(), { target: { value: "Gym" } });
     typeDate("06-07-2026");
     await pickRepeat("Weekly on Monday");
-    expect(
-      screen.getByText(
-        /^This starts before the months PM syncs \(.+\), so only its occurrences within them will show here\.$/,
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByText(/won't show here/)).toBeNull();
+    expect(screen.queryByText(/months PM syncs|won't show here/)).toBeNull();
   });
 
   it("moving the date moves a one-day weekly rule", async () => {

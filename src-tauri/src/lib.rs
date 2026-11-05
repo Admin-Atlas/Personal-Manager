@@ -15,6 +15,7 @@ mod calendar;
 mod calendar_ask;
 mod calendar_editing;
 mod calendar_fresh;
+mod calendar_history;
 mod calendar_recur;
 mod calendar_write;
 mod chat;
@@ -1837,6 +1838,7 @@ pub fn run() {
             commands::check_google_calendars,
             commands::list_calendar_events,
             commands::list_all_calendar_events,
+            commands::load_calendar_months,
             commands::event_flags,
             commands::connect_drive,
             commands::disconnect_drive,

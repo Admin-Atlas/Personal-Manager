@@ -843,8 +843,6 @@ pub enum WriteWarning {
     MirrorRefreshPending,
     /// Some occurrences changed on their own couldn't be cancelled: `Saved.left_behind` says which.
     LeftOnOldSeries,
-    /// Saved in Google, but it starts outside the months PM mirrors, so PM's calendar won't show it.
-    OutsideMirror,
     /// A "this and following" change landed, and PM couldn't tell which repeating event Google made
     /// of the new part, so it can't offer to move the milestones `Saved.milestone_moves` names: they
     /// stay on the earlier part (C9b-2 critique C2-M1).
@@ -1339,13 +1337,13 @@ mod tests {
             ),
             (
                 WriteOutcome::Saved {
-                    warnings: vec![WriteWarning::OutsideMirror],
+                    warnings: vec![WriteWarning::MilestoneNotOffered],
                     left_behind: Vec::new(),
                     milestone_moves: None,
                     undo: None,
                     calendar: None,
                 },
-                r#"{"outcome":"saved","warnings":["outside_mirror"]}"#,
+                r#"{"outcome":"saved","warnings":["milestone_not_offered"]}"#,
             ),
             (
                 WriteOutcome::Failed {

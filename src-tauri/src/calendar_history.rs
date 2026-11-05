@@ -1,0 +1,470 @@
+// SPDX-FileCopyrightText: 2026 Bobby Yu
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Keeping every calendar event PM has seen (#1047). Bobby: "if im asking the assistant for a event
+//! from last year, it shold still be retrievable", and "first download does absolutely everything".
+//!
+//! The mirror is split by time, the way Google splits its own calendar app (the grid loads what you
+//! look at; search reaches the whole history):
+//!
+//! - the **live band**, from the start of last month to 13 months ahead ([`crate::calendar::
+//!   time_window`]): every full sync and every change check fetch it, as before;
+//! - **history**, everything before the live band: downloaded whole on a calendar's first sync, then
+//!   fetched again only when Google reports a change that reaches it ([`reaches_history`]) or a write
+//!   of PM's own left it behind ([`HistoryState::stale`]); an Outlook calendar, which has no change
+//!   check, is fetched again once a day ([`outlook_due`]);
+//! - **later**, past the live band: loaded when the calendar view scrolls to it.
+//!
+//! Each fetch is a complete listing of one [`Band`], and a band speaks only for the rows whose start
+//! falls inside it: [`crate::calendar::replace_band`] compares what the mirror holds there with what
+//! came back, writes only what changed, and removes only what the band no longer lists. Rows outside
+//! the band are left alone, so a live sync never touches history and a history fetch never touches
+//! the live band. (The mirror used to delete a calendar's rows and write the window back on every
+//! change, which is why it couldn't keep anything older.)
+//!
+//! Events that ended more than a year ago keep their description and guest list compressed
+//! ([`pack`]), as they're rarely read.
+//!
+//! Pure apart from the zstd calls in [`pack`] and [`unpack`]; `calendar` and `commands::calendars`
+//! do the I/O around it.
+
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
+
+/// How far each request reaches past its band on both sides. Google and Outlook list an event when
+/// it overlaps the request, and read an all-day date in the calendar's own zone, which PM doesn't
+/// know when it stores the row (it reads the date as UTC midnight). Two days covers any zone
+/// (UTC−12 to UTC+14) with a day to spare, so every event whose start PM files inside the band is
+/// certainly in the listing, and missing from it means gone.
+fn margin() -> TimeDelta {
+    TimeDelta::days(2)
+}
+
+/// One stretch of time a complete listing speaks for: the rows whose start falls in `[from, to)`.
+/// `None` is open on that side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Band {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    /// The live band also speaks for a row whose start PM can't read, so a complete listing still
+    /// removes one that's gone (the old wipe removed them every sync). Every fetch sees the live band,
+    /// so that's the band that keeps them honest.
+    pub live: bool,
+}
+
+impl Band {
+    /// The live band, `[from, to)` from [`crate::calendar::time_window`].
+    pub fn live(from: DateTime<Utc>, to: DateTime<Utc>) -> Self {
+        Band {
+            from: Some(from),
+            to: Some(to),
+            live: true,
+        }
+    }
+
+    /// History: everything before the live band's start.
+    pub fn before(to: DateTime<Utc>) -> Self {
+        Band {
+            from: None,
+            to: Some(to),
+            live: false,
+        }
+    }
+
+    /// Months loaded on demand, `[from, to)`.
+    pub fn between(from: DateTime<Utc>, to: DateTime<Utc>) -> Self {
+        Band {
+            from: Some(from),
+            to: Some(to),
+            live: false,
+        }
+    }
+
+    /// History and the live band at once, for an iCal feed: it is downloaded whole on every sync, so
+    /// its history comes with the live band at no extra cost.
+    pub fn through_live(to: DateTime<Utc>) -> Self {
+        Band {
+            from: None,
+            to: Some(to),
+            live: true,
+        }
+    }
+
+    /// The request's `[timeMin, timeMax)` (RFC 3339, UTC): the band widened by [`margin`] on each
+    /// bounded side.
+    pub fn request(&self) -> (Option<String>, Option<String>) {
+        let at = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        (
+            self.from.map(|f| at(f - margin())),
+            self.to.map(|t| at(t + margin())),
+        )
+    }
+
+    /// Whether a stored row whose start is `start` is this band's to keep or remove.
+    pub fn holds(&self, start: &str) -> bool {
+        let Some(at) = start_instant(start) else {
+            return self.live;
+        };
+        self.from.is_none_or(|f| at >= f) && self.to.is_none_or(|t| at < t)
+    }
+}
+
+/// A mirrored start or end as an instant: RFC 3339, or an all-day `YYYY-MM-DD` read as UTC midnight,
+/// or a time with no offset read as UTC — the readings SQLite's `julianday` gives the column, so the
+/// SQL that narrows a band's rows and this agree.
+pub fn start_instant(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    if let Ok(at) = DateTime::parse_from_rfc3339(s) {
+        return Some(at.with_timezone(&Utc));
+    }
+    if let Ok(at) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(at.and_utc());
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|t| t.and_utc())
+}
+
+/// One entry of Google's change listing ([`crate::calendar::check_for_changes`]): an event (a
+/// series by its own id, a changed occurrence by its own) and when it changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Changed {
+    pub id: String,
+    pub updated: String,
+    /// Deleted, or cancelled from its series.
+    pub cancelled: bool,
+}
+
+/// What the mirror holds of one changed event ([`crate::calendar::held_of`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// A row of it (its own, or one of its occurrences when it's a series) starts before the live
+    /// band.
+    pub before: bool,
+    /// The mirror has any row of it at all.
+    pub any: bool,
+    /// Its own row already carries this change's `updated`: PM has it (its own save, say).
+    pub current: bool,
+}
+
+/// Whether a change listing reaches history, read after the live band has been fetched again, so
+/// everything it lists inside the live band is already in. History must be fetched again when:
+///
+/// - an event PM holds before the live band changed, and its row doesn't already show the change (a
+///   series counts through any of its occurrences: renaming every occurrence reaches the old ones);
+/// - an event PM holds nowhere changed and wasn't deleted: it's outside the live band, so it was
+///   added to the past, or moved out of the live band into it. (One added more than 13 months ahead
+///   reads the same, and costs one needless fetch.)
+///
+/// A deletion PM holds nowhere needs nothing: the live band's fetch already removed it.
+pub fn reaches_history(changes: &[Changed], held: impl Fn(&Changed) -> Held) -> bool {
+    changes.iter().any(|c| {
+        let h = held(c);
+        (h.before && !h.current) || (!h.any && !c.cancelled)
+    })
+}
+
+/// Where a calendar's history stands, kept in the `settings` table under
+/// [`crate::calendar::history_key`]. No row means it has never been downloaded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryState {
+    /// When history was last known to match the calendar: by Google's clock for a Google calendar
+    /// (the next change check counts from it, as this computer's clock can run hours off), by this
+    /// computer's for an Outlook one (only ever compared with itself).
+    #[serde(with = "rfc3339")]
+    pub checked_at: DateTime<Utc>,
+    /// A save of PM's own reached history without landing there (a change to every occurrence of a
+    /// series that began before the live band, say): fetch it again at the next check.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// [`HistoryState::checked_at`] as RFC 3339 text (chrono is built here without its serde support).
+mod rfc3339 {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(at: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let raw = String::deserialize(d)?;
+        DateTime::parse_from_rfc3339(&raw)
+            .map(|t| t.with_timezone(&Utc))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The next step for a Google calendar's history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Download it whole.
+    Fetch,
+    /// Ask Google what changed since this time, by its clock.
+    Check(DateTime<Utc>),
+}
+
+/// What a Google calendar's history needs: a first download, a fetch PM's own save asked for, or a
+/// change check from when it was last known whole, set back by the change check's own lag.
+pub fn next_step(state: Option<&HistoryState>) -> Next {
+    match state {
+        Some(s) if !s.stale => Next::Check(s.checked_at - crate::calendar_fresh::lag()),
+        _ => Next::Fetch,
+    }
+}
+
+/// Whether an Outlook calendar's history is due: never downloaded, left behind by a save, or a day
+/// old. Outlook has no cheap change check, so once a day is how a change made there to an old event
+/// arrives.
+pub fn outlook_due(state: Option<&HistoryState>, now: DateTime<Utc>) -> bool {
+    match state {
+        None => true,
+        Some(s) => s.stale || now - s.checked_at >= TimeDelta::days(1) || s.checked_at > now,
+    }
+}
+
+/// Events that ended this long ago keep their description and guest list compressed ([`pack`]).
+fn pack_after() -> TimeDelta {
+    TimeDelta::days(365)
+}
+
+/// Whether a row (its `start` and `end`, as stored) ended more than a year before `now`. A row with
+/// no readable end is judged by its start; one with neither stays as it is.
+pub fn aged(start: &str, end: Option<&str>, now: DateTime<Utc>) -> bool {
+    end.and_then(start_instant)
+        .or_else(|| start_instant(start))
+        .is_some_and(|ended| ended < now - pack_after())
+}
+
+/// zstd's level for packed fields: values are small, so a higher level buys almost nothing.
+const PACK_LEVEL: i32 = 9;
+
+/// The first byte of a packed field that compression didn't shrink: the text follows as it is. A
+/// zstd frame starts with its magic number (`28 B5 2F FD`), so the two can't be confused.
+const RAW: u8 = 0;
+
+/// The most a packed field may unpack to. A description is cut at 8,000 characters (at most 32 KB of
+/// UTF-8) and a guest list of a few thousand people fits well inside; anything larger isn't
+/// something PM packed.
+const UNPACK_MAX_BYTES: usize = 1 << 20;
+
+/// `text` as the bytes stored for a field of an event that ended more than a year ago: compressed,
+/// or — when that wouldn't make it smaller, as for a short note — the text behind a [`RAW`] byte.
+/// Measured on a typical video-call invitation, compression saves about 45%; on a guest list, about
+/// 85%. Either way the field is stored as a BLOB, which is how a sync knows it's done.
+pub fn pack(text: &str) -> Vec<u8> {
+    if let Ok(packed) = zstd::bulk::compress(text.as_bytes(), PACK_LEVEL) {
+        if packed.len() < text.len() {
+            return packed;
+        }
+    }
+    let mut raw = Vec::with_capacity(text.len() + 1);
+    raw.push(RAW);
+    raw.extend_from_slice(text.as_bytes());
+    raw
+}
+
+/// A field [`pack`] stored, back as text. `None` when it isn't one (corrupt, or too large).
+pub fn unpack(bytes: &[u8]) -> Option<String> {
+    let raw = match bytes.split_first() {
+        Some((&RAW, text)) => text.to_vec(),
+        _ => zstd::bulk::decompress(bytes, UNPACK_MAX_BYTES).ok()?,
+    };
+    String::from_utf8(raw).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        start_instant(s).unwrap()
+    }
+
+    #[test]
+    fn a_band_holds_starts_inside_it_and_its_requests_reach_two_days_past() {
+        let live = Band::live(at("2026-10-01T00:00:00Z"), at("2027-12-01T00:00:00Z"));
+        assert!(
+            live.holds("2026-10-01T00:00:00Z"),
+            "the first instant is in"
+        );
+        assert!(
+            live.holds("2026-10-01"),
+            "an all-day start reads as UTC midnight"
+        );
+        assert!(!live.holds("2026-09-30T23:59:59Z"));
+        assert!(!live.holds("2027-12-01T00:00:00Z"), "the end is out");
+        assert!(live.holds("2026-10-05T09:00:00+02:00"));
+        assert!(
+            live.holds("not a time"),
+            "the live band takes an unreadable start"
+        );
+        assert_eq!(
+            live.request(),
+            (
+                Some("2026-09-29T00:00:00Z".to_string()),
+                Some("2027-12-03T00:00:00Z".to_string())
+            )
+        );
+
+        let history = Band::before(at("2026-10-01T00:00:00Z"));
+        assert!(history.holds("1998-03-04"));
+        assert!(history.holds("2026-09-30T23:59:59Z"));
+        assert!(!history.holds("2026-10-01"));
+        assert!(!history.holds("not a time"), "only the live band takes it");
+        assert_eq!(
+            history.request(),
+            (None, Some("2026-10-03T00:00:00Z".to_string())),
+            "history has no start: the first download is everything"
+        );
+
+        let feed = Band::through_live(at("2027-12-01T00:00:00Z"));
+        assert!(feed.holds("1990-01-01") && feed.holds("2027-11-30") && feed.holds("?"));
+        assert!(!feed.holds("2027-12-01"));
+    }
+
+    #[test]
+    fn the_bands_meet_without_a_gap_or_an_overlap() {
+        let l0 = at("2026-10-01T00:00:00Z");
+        let l1 = at("2027-12-01T00:00:00Z");
+        let bands = [
+            Band::before(l0),
+            Band::live(l0, l1),
+            Band::between(l1, at("2028-12-01T00:00:00Z")),
+        ];
+        for start in [
+            "2026-09-30T23:59:59Z",
+            "2026-10-01T00:00:00Z",
+            "2026-10-01",
+            "2027-11-30T23:59:59Z",
+            "2027-12-01",
+            "2028-11-30",
+        ] {
+            let holders = bands.iter().filter(|b| b.holds(start)).count();
+            assert_eq!(holders, 1, "{start} belongs to exactly one band");
+        }
+    }
+
+    fn changed(id: &str, cancelled: bool) -> Changed {
+        Changed {
+            id: id.into(),
+            updated: "2026-11-05T10:00:00.000Z".into(),
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn a_change_reaches_history_only_through_an_old_row_or_one_pm_holds_nowhere() {
+        let held = |old: bool, any: bool, current: bool| {
+            move |_: &Changed| Held {
+                before: old,
+                any,
+                current,
+            }
+        };
+        let one = [changed("e", false)];
+        assert!(
+            reaches_history(&one, held(true, true, false)),
+            "an old event or series changed"
+        );
+        assert!(
+            !reaches_history(&one, held(true, true, true)),
+            "its row already shows the change (PM's own save)"
+        );
+        assert!(
+            !reaches_history(&one, held(false, true, false)),
+            "a live event: the live fetch has it"
+        );
+        assert!(
+            reaches_history(&one, held(false, false, false)),
+            "added to the past, or moved there out of the live band"
+        );
+        let gone = [changed("e", true)];
+        assert!(
+            !reaches_history(&gone, held(false, false, false)),
+            "a deletion PM holds nowhere: nothing to remove"
+        );
+        assert!(
+            reaches_history(&gone, held(true, true, false)),
+            "an old event deleted: history must drop it"
+        );
+        assert!(!reaches_history(&[], held(true, false, false)));
+    }
+
+    #[test]
+    fn a_calendar_never_downloaded_or_left_stale_is_fetched_whole() {
+        assert_eq!(next_step(None), Next::Fetch);
+        let t = at("2026-11-05T10:00:00Z");
+        let fresh = HistoryState {
+            checked_at: t,
+            stale: false,
+        };
+        assert_eq!(
+            next_step(Some(&fresh)),
+            Next::Check(t - crate::calendar_fresh::lag())
+        );
+        let stale = HistoryState {
+            stale: true,
+            ..fresh.clone()
+        };
+        assert_eq!(next_step(Some(&stale)), Next::Fetch);
+
+        assert!(outlook_due(None, t));
+        assert!(!outlook_due(Some(&fresh), t + TimeDelta::hours(23)));
+        assert!(outlook_due(Some(&fresh), t + TimeDelta::hours(24)));
+        assert!(outlook_due(Some(&stale), t));
+        assert!(
+            outlook_due(Some(&fresh), t - TimeDelta::hours(1)),
+            "a clock set back can't hold it off for good"
+        );
+    }
+
+    #[test]
+    fn the_state_reads_without_the_stale_flag() {
+        let s: HistoryState =
+            serde_json::from_str(r#"{"checked_at":"2026-11-05T10:00:00Z"}"#).unwrap();
+        assert!(!s.stale);
+        let back: HistoryState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn an_event_ages_a_year_after_it_ends() {
+        let now = at("2026-11-05T10:00:00Z");
+        assert!(aged(
+            "2025-11-01T09:00:00Z",
+            Some("2025-11-01T10:00:00Z"),
+            now
+        ));
+        assert!(
+            !aged("2025-11-01T09:00:00Z", Some("2025-11-06T10:00:00Z"), now),
+            "it ran on"
+        );
+        assert!(aged("2025-10-30", None, now), "no end: judged by its start");
+        assert!(!aged("2026-11-01", Some("2026-11-02"), now));
+        assert!(!aged("?", None, now), "unreadable: left as it is");
+    }
+
+    #[test]
+    fn pack_shrinks_what_it_can_keeps_the_rest_and_unpacks_both_exactly() {
+        let note = "Bring the slides.";
+        let kept = pack(note);
+        assert_eq!(
+            kept.len(),
+            note.len() + 1,
+            "too short to gain: stored behind one byte"
+        );
+        assert_eq!(unpack(&kept).as_deref(), Some(note));
+        assert_eq!(unpack(&pack("")).as_deref(), Some(""));
+
+        let invite =
+            "Join Zoom Meeting\nhttps://example.zoom.us/j/1234567890\n\nMeeting ID: 123 456 7890\n"
+                .repeat(6);
+        let packed = pack(&invite);
+        assert!(packed.len() < invite.len() / 2, "a long invitation shrinks");
+        assert_eq!(unpack(&packed).as_deref(), Some(invite.as_str()));
+        assert_eq!(unpack(b"not zstd at all"), None);
+    }
+}

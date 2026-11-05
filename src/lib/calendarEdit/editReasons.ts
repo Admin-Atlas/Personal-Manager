@@ -481,10 +481,6 @@ export function writeWarningText(
         ? `Some occurrences you changed on their own may still be on the earlier part, or hidden by Google${days}; check them in Google Calendar.`
         : `Some occurrences changed on their own may still show${days}; check them in Google Calendar.`;
     }
-    // A new event comes back with it, a one-off made to repeat, or the one event "Does not repeat"
-    // leaves of a repeating one, for every occurrence or from one on (C11).
-    case "outside_mirror":
-      return "It starts outside the months PM syncs, so PM's calendar won't show it.";
     // A notice per milestone names each one (`milestoneStayedText`); this is the short form.
     case "milestone_not_offered":
       return "PM couldn't find the new part in Google, so a linked milestone stays on the earlier part.";
@@ -1102,9 +1098,9 @@ export function settleText(result: WriteOutcome, title: string): { tone: Tone; t
  *  C11d review 1). `asAll`: the "this and following" row was the first occurrence's, which saves
  *  every occurrence (`RowView.asAll`), so it's worded as All, a stop naming the day of the one event
  *  left, `from` (C11c review); All's own stop names none, since the one it keeps is the first
- *  occurrence still there, which the choices named. One that left the event outside the months PM
- *  syncs says so, and points to Google Calendar, never to editing it again here (C11c review, C11d
- *  review 1). `moved`: the save put it on another calendar (C18d), named `to`, from the one named
+ *  occurrence still there, which the choices named. Wherever the event now falls, PM's calendar shows
+ *  it (it keeps every event, #1047), so editing again here is always the way back. `moved`: the save
+ *  put it on another calendar (C18d), named `to`, from the one named
  *  `from`; it says where it is now and how to put it back, since there's no Undo for it (Q3). A
  *  repeating event goes there whole, from "All events" (C18e), so with a scope it's every
  *  occurrence. */
@@ -1130,9 +1126,6 @@ export function savedNotice(
     ];
     return { tone: said.warn ? "warn" : "ok", text: parts.join(" ") };
   }
-  // A new event or a one-off made to repeat whose occurrences all fall outside the months PM syncs
-  // (C11 §10), or the one event "Does not repeat" leaves there.
-  const outside = outcome.warnings.includes("outside_mirror");
   const pending = outcome.warnings.includes("mirror_refresh_pending");
   const day = from ? formatDateOnly(from) : null;
   const saved: SeriesScope | null = asAll && scope === "following" ? "all" : scope;
@@ -1142,7 +1135,7 @@ export function savedNotice(
   let back: string | null;
   switch (saved) {
     case null:
-      first = pending || outside ? `Saved ${t} to Google.` : `Saved ${t}.`;
+      first = pending ? `Saved ${t} to Google.` : `Saved ${t}.`;
       back = null;
       break;
     case "this":
@@ -1170,13 +1163,6 @@ export function savedNotice(
       break;
     default:
       return unreachable(saved);
-  }
-  // PM's calendar won't show it, so it can't be edited again here: Google Calendar can.
-  if (outside && saved !== null) {
-    back =
-      saved === "following"
-        ? "There's no Undo: to change it, use Google Calendar."
-        : "To change it back, use Google Calendar.";
   }
   const said = savedWarnings(outcome);
   const parts = [first, ...said.words];
@@ -1245,9 +1231,7 @@ export function saveBackText(outcome: WriteOutcome, title: string): { tone: Tone
 }
 
 /** A saved outcome's warnings in words, in one order for every notice that says a save landed
- *  (`savedNotice`, and `settleText` for a Finish): outside the months PM syncs; then PM's calendar
- *  catching up, which beside an event outside is in a delete's words, since the saved event won't
- *  show after a refresh but what it replaced still does until then (C11c review); then occurrences
+ *  (`savedNotice`, and `settleText` for a Finish): PM's calendar catching up; then occurrences
  *  left on the earlier part. Google not keeping all of a save comes first (C13 review round 1), and
  *  the video call asked for last (C18). A milestone that stayed has a notice of its own, naming it.
  *  `warn`: the user should look, and nothing says to edit it again here; a call still being made
@@ -1273,7 +1257,6 @@ function warningWords(
   warn: boolean;
 } {
   const partly = warnings.includes("partly_applied");
-  const outside = warnings.includes("outside_mirror");
   const pending = warnings.includes("mirror_refresh_pending");
   const left = warnings.includes("left_on_old_series");
   const callPending = warnings.includes("call_pending");
@@ -1281,13 +1264,12 @@ function warningWords(
   const links = warnings.includes("links_left_behind");
   const words: string[] = [];
   if (partly) words.push(writeWarningText("partly_applied", "save"));
-  if (outside) words.push(writeWarningText("outside_mirror", "save"));
-  if (pending) words.push(writeWarningText("mirror_refresh_pending", outside ? "delete" : "save"));
+  if (pending) words.push(writeWarningText("mirror_refresh_pending", "save"));
   if (left) words.push(writeWarningText("left_on_old_series", "save", leftBehind));
   if (callPending) words.push(writeWarningText("call_pending", "save"));
   if (callFailed) words.push(writeWarningText("call_failed", "save"));
   if (links) words.push(writeWarningText("links_left_behind", "save", undefined, calendar));
-  return { words, warn: partly || outside || left || callFailed || links };
+  return { words, warn: partly || left || callFailed || links };
 }
 
 // --- moving an event (C16a) ---
@@ -1533,12 +1515,6 @@ function createdWords(
   where: CreatedWhere,
 ): { tone: Tone; text: string } {
   const t = quote(title);
-  if (outcome.warnings.includes("outside_mirror")) {
-    return {
-      tone: "warn",
-      text: `Created ${t} in Google. It starts outside the months PM syncs, so it won't show here.`,
-    };
-  }
   if (where.hidden) {
     return { tone: "warn", text: `Created ${t} in ${where.name}, which is hidden here.` };
   }

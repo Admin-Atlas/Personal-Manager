@@ -37,6 +37,7 @@ import { BOARD_VERSION, PINBOARD_PREF_KEY } from "../../lib/pinboard/types";
 const ipc = vi.hoisted(() => ({
   calendarOverview: vi.fn(),
   listAllCalendarEvents: vi.fn(),
+  loadCalendarMonths: vi.fn(),
   listAllMilestones: vi.fn(),
   getPref: vi.fn(),
   setPref: vi.fn(),
@@ -158,6 +159,7 @@ const overview: CalendarOverview = {
   window_days: 7,
   mirror_start: "2020-01-01T00:00:00Z",
   mirror_end: "2040-01-01T00:00:00Z",
+  history_ready: true,
   editing: { [ME]: "on" },
   default_length: {},
   auto_meet: {},
@@ -239,6 +241,7 @@ beforeEach(() => {
   ipc.listAllCalendarEvents.mockImplementation(() =>
     held ? new Promise<CalendarEvent[]>((r) => reads.push(r)) : Promise.resolve(rows),
   );
+  ipc.loadCalendarMonths.mockResolvedValue(0);
   ipc.listAllMilestones.mockResolvedValue([milestone]);
   ipc.getPref.mockResolvedValue(null);
   ipc.onCalendarSynced.mockResolvedValue(() => {});
@@ -297,6 +300,66 @@ function quickCreate(summary: string) {
   press("C", true);
   fireEvent.change(title(), { target: { value: summary } });
 }
+
+// #1047: PM keeps every event. The view reads the months around the cursor, loads the months after
+// the live band as it reaches them, and says so meanwhile; before the band, it says while a
+// calendar's history is still downloading.
+describe("CalendarView: the whole calendar", () => {
+  const now = new Date();
+  const monthStartUtc = (months: number) =>
+    new Date(Date.UTC(now.getFullYear(), now.getMonth() + months, 1)).toISOString();
+
+  it("reads the months around the cursor, not every event kept", async () => {
+    await mount();
+    const [range] = ipc.listAllCalendarEvents.mock.calls[0] as [{ from: string; to: string }];
+    const from = new Date(range.from);
+    const to = new Date(range.to);
+    // Eighteen months either side, a day of slack each way.
+    expect(to.getTime() - from.getTime()).toBeGreaterThan(36 * 28 * 86_400_000);
+    expect(to.getTime() - from.getTime()).toBeLessThan(38 * 31 * 86_400_000);
+  });
+
+  it("loads the months after the live band as the view reaches them, and says so meanwhile", async () => {
+    // The live band ended at the start of this month, so the day on show is past it.
+    ipc.calendarOverview.mockResolvedValue({ ...overview, mirror_end: monthStartUtc(0) });
+    let answer: (n: number) => void = () => {};
+    ipc.loadCalendarMonths.mockImplementation(() => new Promise<number>((r) => (answer = r)));
+    await mount();
+    expect(ipc.loadCalendarMonths).toHaveBeenCalledTimes(1);
+    const [from, to] = ipc.loadCalendarMonths.mock.calls[0] as [string, string];
+    expect(from).toBe(monthStartUtc(0));
+    expect(new Date(to).getTime()).toBeGreaterThan(new Date(monthStartUtc(2)).getTime());
+    expect(screen.getByText(/Loading these months from your calendars/)).toBeTruthy();
+    await act(async () => answer(3));
+    expect(screen.queryByText(/Loading these months/)).toBeNull();
+    // A save may have put an event there, so it forgets them, and they load again.
+    await act(async () => writeLanded());
+    expect(ipc.loadCalendarMonths).toHaveBeenCalledTimes(2);
+  });
+
+  it("says when the months after the live band couldn't be loaded", async () => {
+    ipc.calendarOverview.mockResolvedValue({ ...overview, mirror_end: monthStartUtc(0) });
+    ipc.loadCalendarMonths.mockRejectedValue(new Error("offline"));
+    await mount();
+    expect(await screen.findByText(/Couldn't load these months/)).toBeTruthy();
+  });
+
+  it("says while older events are still downloading, before the live band", async () => {
+    ipc.calendarOverview.mockResolvedValue({
+      ...overview,
+      mirror_start: monthStartUtc(1),
+      history_ready: false,
+    });
+    await mount();
+    expect(screen.getByText(/older events are still downloading/)).toBeTruthy();
+  });
+
+  it("says nothing of history once it's in", async () => {
+    ipc.calendarOverview.mockResolvedValue({ ...overview, mirror_start: monthStartUtc(1) });
+    await mount();
+    expect(screen.queryByText(/older events are still downloading/)).toBeNull();
+  });
+});
 
 // C16a: the box the drag gesture will hold the pointer in (C16b), which the LD1 probe finds by its
 // attribute: the swipe's own box, holding the event the view draws.

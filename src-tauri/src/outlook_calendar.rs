@@ -20,12 +20,13 @@
 use chrono::NaiveDateTime;
 use serde_json::Value;
 
-use crate::calendar::{Attendee, CalendarEvent, CalendarFacts, RawCalendarInput};
+use crate::calendar::{Attendee, Band, CalendarEvent, CalendarFacts, RawCalendarInput};
 use crate::error::{Error, Result};
 use crate::{microsoft, secrets};
 
-/// How many events to request per page, and the page-follow guard (a backstop, not a coverage cap —
-/// even the wide ~13-month mirror band keeps any real calendar far under 250 × 100 events).
+/// How many events to request per page, and the page-follow guard for the calendar LIST (a backstop,
+/// not a coverage cap). An event fetch takes its own from the caller: [`crate::calendar::MAX_PAGES`]
+/// for the live band, [`crate::calendar::HISTORY_PAGES`] for a calendar's whole history.
 const PAGE_SIZE: usize = 250;
 const MAX_PAGES: usize = 100;
 /// The field projection for one event — only what the mirror needs. Graph returns ONLY the named
@@ -106,19 +107,25 @@ pub async fn list_calendars(token_key: &str) -> Result<(Vec<RawCalendarInput>, b
     Ok((all, !truncated))
 }
 
-/// Fetch one calendar's events within `[time_min, time_max]` (RFC3339), recurrences pre-expanded via
-/// `calendarView`, ordered by start. `mirror_calendar_id` is the owning [`crate::calendar::Calendar::
-/// id`] the events are stored under; `remote_id` is Graph's own calendar id for the path.
+/// Fetch the events of one calendar that a [`Band`]'s request reaches, recurrences pre-expanded via
+/// `calendarView`, ordered by start. `calendarView` needs both ends, so history's open start is
+/// [`crate::calendar::EARLIEST`]. `mirror_calendar_id` is the owning
+/// [`crate::calendar::Calendar::id`] the events are stored under; `remote_id` is Graph's own
+/// calendar id for the path. At most `max_pages` pages.
 ///
 /// Returns `(events, complete)`, matching the Google sibling: a page-run stopped by the runaway guard
-/// is a PARTIAL picture, and [`crate::calendar::replace_events`] must not reap off it.
+/// is a PARTIAL picture, and [`crate::calendar::replace_band`] must not reap off it.
 pub async fn fetch_events(
     token_key: &str,
     mirror_calendar_id: &str,
     remote_id: &str,
-    time_min: &str,
-    time_max: &str,
+    band: &Band,
+    max_pages: usize,
 ) -> Result<(Vec<CalendarEvent>, bool)> {
+    let (time_min, time_max) = band.request();
+    let time_min = time_min.unwrap_or_else(|| crate::calendar::EARLIEST.to_string());
+    let time_max = time_max
+        .ok_or_else(|| Error::Other("an Outlook calendar is only ever read up to a date".into()))?;
     // Build the path via `path_segments_mut` (not string interpolation): a Graph calendar id is an
     // opaque, often base64url token that can contain `/`, which spliced into the path raw would
     // become extra segments and 404 the request — silently dropping a non-default calendar. Mirrors
@@ -129,8 +136,8 @@ pub async fn fetch_events(
         .map_err(|_| Error::Other("invalid Graph API base".into()))?
         .extend(["me", "calendars", remote_id, "calendarView"]);
     url.query_pairs_mut()
-        .append_pair("startDateTime", time_min)
-        .append_pair("endDateTime", time_max)
+        .append_pair("startDateTime", &time_min)
+        .append_pair("endDateTime", &time_max)
         .append_pair("$select", SELECT_EVENT)
         .append_pair("$orderby", "start/dateTime")
         .append_pair("$top", &PAGE_SIZE.to_string());
@@ -139,7 +146,7 @@ pub async fn fetch_events(
     // discarded — dropping it here was the quieter half of the same defect the Google path had, with
     // not even an eprintln to show for it.
     let initial = url.to_string();
-    let (out, truncated) = crate::connector_sync::paginate(MAX_PAGES, |cursor| {
+    let (out, truncated) = crate::connector_sync::paginate(max_pages, |cursor| {
         let initial = initial.as_str();
         async move {
             let u = cursor.unwrap_or_else(|| initial.to_string());
@@ -150,7 +157,7 @@ pub async fn fetch_events(
     .await?;
     if truncated {
         eprintln!(
-            "outlook: '{mirror_calendar_id}' hit the {MAX_PAGES}-page fetch cap with more pages \
+            "outlook: '{mirror_calendar_id}' hit the {max_pages}-page fetch cap with more pages \
              pending; its mirror may be truncated this sync"
         );
     }

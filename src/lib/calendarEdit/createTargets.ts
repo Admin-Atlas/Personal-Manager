@@ -7,15 +7,7 @@
 // calendar uses for Edit and Delete. Hidden calendars stay on offer (hiding is only what the
 // calendar shows); the editor says so before and after the save.
 
-import type {
-  Calendar,
-  CalendarAccount,
-  CalendarOverview,
-  EditingStatus,
-  TimeDraft,
-} from "../types";
-import { formatDateLocal } from "../format";
-import { wallInstant } from "../wallTime";
+import type { Calendar, CalendarAccount, CalendarOverview, EditingStatus } from "../types";
 import { DEFAULT_LENGTH_MS, type GuestDraft, WRITABLE_ROLES } from "./eventDraft";
 import type { CreatedWhere } from "./editReasons";
 import { changeNotice, sameAddress } from "./guests";
@@ -181,37 +173,6 @@ export function meetOnCalendar(
 export const meetOffText = (calendar: string): string =>
   `${calendar} doesn't offer Google Meet, so the video call is off.`;
 
-/** `date` (`YYYY-MM-DD`) at UTC midnight, moved by `days`, as ms. */
-const utcDay = (date: string, days = 0) => Date.parse(`${date}T00:00:00Z`) + days * 86_400_000;
-
-/** Which side of the months PM mirrors a new event's time falls wholly on, so it would be saved in
- *  Google but not shown here, or null when it overlaps them: the backend's own overlap test (start
- *  before the window's end, end after its start; all-day days as UTC midnights, the last one
- *  exclusive). The backend decides; this is the warning before Save. A time that can't be read says
- *  nothing: the problem lines do. */
-export function outsideMirror(
-  time: TimeDraft,
-  overview: CalendarOverview,
-): "before" | "after" | null {
-  const from = Date.parse(overview.mirror_start);
-  const until = Date.parse(overview.mirror_end);
-  if (Number.isNaN(from) || Number.isNaN(until)) return null;
-  let start: number;
-  let end: number;
-  if (time.kind === "all_day") {
-    start = utcDay(time.first_day);
-    end = utcDay(time.last_day, 1);
-  } else {
-    const s = wallInstant(time.start_date, time.start_time, time.start_zone);
-    if (s === null) return null;
-    start = s.getTime();
-    end = wallInstant(time.end_date, time.end_time, time.end_zone)?.getTime() ?? start;
-  }
-  if (Number.isNaN(start) || Number.isNaN(end)) return null;
-  if (start >= until) return "after";
-  return end <= from ? "before" : null;
-}
-
 /** Where a new event on `calendarId` shows (C10 §15): its name, and whether PM's calendar keeps it
  *  out of sight. It does when the calendar is hidden in the list and no copy of the same Google
  *  calendar shows through another account (that copy would show it after the next sync), or when
@@ -235,29 +196,15 @@ export function createdWhere(
   return { name: cal.name, hidden: !cal.selected || (hidden.has(cal.id) && !twinShows) };
 }
 
-/** What a new event's surfaces (the full editor and quick create) say before Save (C10 §15): a start
- *  outside the months PM syncs, and a calendar hidden here with no twin showing it. One that
- *  `repeats` from before those months still shows here wherever it falls inside them, as the backend
- *  lists and lands those (C11); one that starts after them has none there. */
+/** What a new event's surfaces (the full editor and quick create) say before Save (C10 §15): a
+ *  calendar hidden here with no twin showing it. Its date says nothing: PM keeps every event, last
+ *  year's and those years ahead alike (#1047), so wherever it falls it shows here. */
 export function createNotes(
-  time: TimeDraft,
-  repeats: boolean,
   overview: CalendarOverview,
   hidden: ReadonlySet<string>,
   calendarId: string,
 ): string[] {
   const notes: string[] = [];
-  const side = outsideMirror(time, overview);
-  if (side !== null) {
-    const range = `${formatDateLocal(new Date(overview.mirror_start))} – ${formatDateLocal(
-      new Date(overview.mirror_end),
-    )}`;
-    notes.push(
-      side === "before" && repeats
-        ? `This starts before the months PM syncs (${range}), so only its occurrences within them will show here.`
-        : `This starts outside the months PM syncs (${range}), so it'll be saved in Google but won't show here.`,
-    );
-  }
   const where = createdWhere(overview, hidden, calendarId);
   if (hidden.has(calendarId) && where.hidden) {
     notes.push(

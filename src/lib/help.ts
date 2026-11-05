@@ -26,7 +26,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "nav-calendar": {
     title: "Calendar",
-    body: "One place to see everything from the calendars you've connected (Google, Outlook and iCal subscriptions), laid over each other. Switch between Day, Week, Month, Year and Agenda (your tasks on the Runway board, or a dated list of events), jump to today, and choose which calendars show. On a Google account with editing turned on you can do most of what Google Calendar does from here: create events, change, move and delete the ones you can edit, and answer invitations, and every change goes straight to Google. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
+    body: "One place to see everything from the calendars you've connected (Google, Outlook and iCal subscriptions), laid over each other. PM keeps every event they've ever had: the first sync downloads each calendar's whole history, events that ended over a year ago are stored compressed, and months more than a year ahead load as you scroll to them. Switch between Day, Week, Month, Year and Agenda (your tasks on the Runway board, or a dated list of events), jump to today, and choose which calendars show. On a Google account with editing turned on you can do most of what Google Calendar does from here: create events, change, move and delete the ones you can edit, and answer invitations, and every change goes straight to Google. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
   },
   "nav-documents": {
     title: "Documents",

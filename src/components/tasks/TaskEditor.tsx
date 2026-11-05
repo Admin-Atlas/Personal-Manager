@@ -38,6 +38,7 @@ import { runMutation } from "../../lib/runMutation";
 import {
   DEADLINE_FROM_LABEL,
   emptyTaskInput,
+  EVENT_CHOICE_PAST_DAYS,
   eventChoices,
   STACK_HINT,
   STACK_KIND_LABEL,
@@ -210,10 +211,17 @@ function TaskEditorBody({
     listTaskStacks()
       .then((s) => live && setStacks(s))
       .catch(() => {});
-    // The event the task already links to stays a choice however old it is, as the backend still
-    // resolves a deadline that follows it.
-    listAllCalendarEvents()
-      .then((ev) => live && setChoices(eventChoices(ev, today, initial.eventUid)))
+    // The choices: what's to come, and the last month (`eventChoices`), read as just that now the
+    // mirror keeps every event (#1047); a day of slack, as an all-day date reads as UTC midnight. The
+    // event the task already links to stays a choice however old it is, as the backend still
+    // resolves a deadline that follows it, so its occurrences are read too.
+    const from = new Date(today.getTime() - (EVENT_CHOICE_PAST_DAYS + 1) * 86_400_000);
+    const linked = initial.eventUid;
+    Promise.all([
+      listAllCalendarEvents({ from: from.toISOString() }),
+      linked ? listAllCalendarEvents({ uid: linked }) : Promise.resolve([]),
+    ])
+      .then(([recent, old]) => live && setChoices(eventChoices([...old, ...recent], today, linked)))
       .catch(() => live && setChoices([]));
     return () => {
       live = false;
