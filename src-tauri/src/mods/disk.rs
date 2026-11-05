@@ -31,7 +31,7 @@
 //!   once, after its row has committed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -374,7 +374,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn sync_dir(path: &Path) -> io::Result<()> {
     failpoint(Step::SyncDir)?;
     #[cfg(unix)]
-    File::open(path)?.sync_all()?;
+    fs::File::open(path)?.sync_all()?;
     // Windows can't open a folder through std (it needs FILE_FLAG_BACKUP_SEMANTICS), and NTFS
     // journals its metadata itself.
     #[cfg(not(unix))]
