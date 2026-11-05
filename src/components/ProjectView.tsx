@@ -47,7 +47,8 @@ import {
   type MsSort,
   type MsSortKey,
 } from "../lib/milestonePrefs";
-import { useDepth, useTheme } from "../theme";
+import { useDepth } from "../theme";
+import { useLearningToolsVisible } from "../lib/nav";
 
 const PROJECT_LIST_ID = "focus-projects";
 
@@ -95,9 +96,9 @@ export function ProjectView({
   const filesRef = useRef<HTMLUListElement>(null);
   const { atLeast, showMeta, showPower } = useDepth();
   // The focus-panel triage controls are the same learning tool as the Review/Teach tabs, so they
-  // ride the same Settings switch: when the user trusts the AI's filing and hides those tabs, these
-  // hide too (the panel falls back to the read-only display below).
-  const { teachVisible } = useTheme();
+  // follow those tabs: when the user trusts the AI's filing and hides them, these hide too (the
+  // panel falls back to the read-only display below).
+  const teachVisible = useLearningToolsVisible();
   // Existing project names for the power-depth project datalist (re-file autocomplete).
   const [projectNames, setProjectNames] = useState<string[]>([]);
   // Clicking a file opens the shared document reader onto it (mounted at app scope), so a user can

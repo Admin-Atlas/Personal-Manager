@@ -133,7 +133,7 @@ deny:
     cd src-tauri && cargo deny check
 
 # Python dependency CVE audit. Scans the LOCKS — which is every package that actually installs,
-# transitive ones included, on the base venv AND both optional components (L-6). It used to scan
+# transitive ones included, on the base venv AND every optional component (L-6). It used to scan
 # requirements.txt, i.e. the six top-level pins only, so a CVE in (say) pdfminer.six or lxml — both
 # of which parse untrusted input — was never looked at.
 #
@@ -144,7 +144,7 @@ deny:
 # fastembed 0.9.1) is a lock pip's resolver refuses. Like the install it replaces, it reads the lines whose markers
 # match the auditing interpreter (3.12 in CI).
 pip-audit:
-    pip-audit --disable-pip -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock
+    pip-audit --disable-pip -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock -r sidecar/requirements-voice.lock
 
 # JS dependency CVE audit against the npm lockfile. `moderate` (not `high`) so a moderate-rated
 # sanitizer / proto-pollution advisory in the render path can't pass green (L-7).
@@ -275,6 +275,9 @@ model-licences:
 # Regenerate the sidecar dependency locks and refresh the licence evidence behind them. Needs `uv`
 # on PATH; both halves reach the network. Run after any change to sidecar/requirements.txt or the
 # optional pins in sidecar.rs, review anything the second half flags, then commit the result.
+# Every run also takes whatever upstream released since the last one; `PM_LOCK_KEEP=1 just
+# lock-regen` keeps the versions the committed locks hold unless an input forces a move, for a
+# change that only moves packages between locks (scripts/regen-sidecar-locks.mjs says more).
 # `sidecar/licences.json` is one of the few generated files Prettier still owns, and
 # `JSON.stringify(…, null, 2)` never collapses a short array the way Prettier does — so the
 # generator's own output failed `just prettier` every single time it ran. Format it here rather

@@ -30,6 +30,9 @@ vi.mock("../lib/ipc", () => ({
   searchCalendarEvents: (query: string, hidden: string[]) => searchCalendarEvents(query, hidden),
 }));
 
+// The Depth and developer mode the "Go to" list is gated on (lib/nav), set per test.
+const gates = vi.hoisted(() => ({ depth: "standard", devMode: false }));
+
 // The same stub the other component tests use: the palette's primitives reach for `useTheme`, and
 // the real ThemeProvider pulls in IPC.
 vi.mock("../theme/ThemeContext", async (importOriginal) => ({
@@ -40,21 +43,24 @@ vi.mock("../theme/ThemeContext", async (importOriginal) => ({
     modePref: "system",
     modeSource: "system",
     accent: "mono",
-    depth: "standard",
+    depth: gates.depth,
     autoLocation: "",
-    teachVisible: true,
-    mapVisible: true,
     setSystem: () => {},
     setModePref: () => {},
     setAccent: () => {},
     setDepth: () => {},
     setAutoLocation: () => {},
-    setTeachVisible: () => {},
   }),
+}));
+
+vi.mock("../lib/capabilities", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useDevMode: () => ({ devMode: gates.devMode, setDevMode: () => {} }),
 }));
 
 import { CommandPalette } from "./CommandPalette";
 import type { CalendarEvent } from "../lib/types";
+import { writeNavPlacement } from "../lib/nav";
 
 const noop = () => {};
 
@@ -94,6 +100,70 @@ afterEach(() => {
   document.body.innerHTML = "";
   vi.clearAllMocks();
   hiddenCalendars.ids = new Set();
+  localStorage.clear();
+  gates.depth = "standard";
+  gates.devMode = false;
+});
+
+/** The "Go to" rows, in order. */
+async function gotoLabels(): Promise<string[]> {
+  const { findByRole } = renderPalette(noop);
+  await waitFor(() => expect(listDocuments).toHaveBeenCalled());
+  const group = await findByRole("group", { name: "Go to" });
+  return [...group.querySelectorAll('[role="option"]')].map(
+    (o) => o.querySelector("span[title]")?.textContent ?? "",
+  );
+}
+
+// "Go to" reads lib/nav, the list the sidebar draws, so the two can't drift apart again.
+describe("CommandPalette's Go to", () => {
+  it("offers what the sidebar always did, then Settings", async () => {
+    expect(await gotoLabels()).toEqual([
+      "Focus",
+      "Chats",
+      "Calendar",
+      "Documents",
+      "Review",
+      "Teach",
+      "Map",
+      "Pinboard",
+      "Settings",
+    ]);
+  });
+
+  it("leaves out what Minimal leaves out, as it did", async () => {
+    gates.depth = "min";
+    expect(await gotoLabels()).toEqual([
+      "Focus",
+      "Chats",
+      "Calendar",
+      "Documents",
+      "Pinboard",
+      "Settings",
+    ]);
+  });
+
+  it("still offers a tab hidden from the sidebar, after the sidebar's own", async () => {
+    writeNavPlacement({ hidden: ["calendar"], pinned: ["pinboard"] });
+    expect(await gotoLabels()).toEqual([
+      "Pinboard",
+      "Focus",
+      "Chats",
+      "Documents",
+      "Review",
+      "Teach",
+      "Map",
+      "Calendar",
+      "Settings",
+    ]);
+  });
+
+  it("offers Dev only in developer mode", async () => {
+    expect(await gotoLabels()).not.toContain("Dev");
+    cleanup();
+    gates.devMode = true;
+    expect(await gotoLabels()).toContain("Dev");
+  });
 });
 
 function event(id: string, summary: string, calendarId: string): CalendarEvent {

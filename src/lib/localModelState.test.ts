@@ -9,11 +9,12 @@ import { describe, expect, it } from "vitest";
 import {
   ACTIVITY_DETAIL,
   ACTIVITY_LABEL,
+  awaitsLocalModel,
   localModelActivity,
   type LocalModelActivity,
 } from "./localModelState";
 import { INERT_POWER_VIEW } from "./powerRoute";
-import type { LocalLlmStatus } from "./types";
+import type { LocalLlmStatus, PowerRoleView } from "./types";
 
 const status = (over: Partial<LocalLlmStatus>): LocalLlmStatus => ({
   configured: true,
@@ -113,5 +114,44 @@ describe("localModelActivity", () => {
   it("words a release without claiming which setting caused it", () => {
     // The on-battery release and the release policy mark a model released through the same path.
     expect(ACTIVITY_DETAIL.released).toMatch(/Local AI settings/);
+  });
+});
+
+describe("awaitsLocalModel", () => {
+  const role = (over: Partial<PowerRoleView>): PowerRoleView => ({
+    route: "unchanged",
+    blocked: "no_local_model",
+    local_model: null,
+    effective: "nothing",
+    cloud_key: "present",
+    ...over,
+  });
+  const withRoles = (chat: PowerRoleView, background: PowerRoleView) =>
+    status({ power: { ...INERT_POWER_VIEW, chat, background } });
+
+  it("is a local role with nothing to answer it, even with a cloud key there", () => {
+    // Local AI off (the status then reads as not configured, with no local model named), with chat
+    // routed local: the footer must not name the cloud model as if it answered.
+    const off = {
+      ...withRoles(role({}), role({ blocked: "cloud_routing", effective: "cloud" })),
+      configured: false,
+      chat_local_model: null,
+      background_local_model: null,
+    };
+    expect(awaitsLocalModel(off, "chat")).toBe(true);
+    expect(awaitsLocalModel(off, "background")).toBe(false);
+  });
+
+  it("is never a cloud role, a role something answers, or a snapshot that can't say", () => {
+    const noKey = withRoles(
+      role({ blocked: "cloud_routing", cloud_key: "absent" }),
+      role({ blocked: null, effective: "local_then_cloud", local_model: "gemma3:4b" }),
+    );
+    expect(awaitsLocalModel(noKey, "chat")).toBe(false);
+    expect(awaitsLocalModel(noKey, "background")).toBe(false);
+    expect(awaitsLocalModel(withRoles(role({ effective: "unknown" }), role({})), "chat")).toBe(
+      false,
+    );
+    expect(awaitsLocalModel(null, "chat")).toBe(false);
   });
 });

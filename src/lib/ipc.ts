@@ -56,6 +56,7 @@ import type {
   InstallProgressEvent,
   DetectedEndpoint,
   EndpointCheck,
+  LocalAiSwitch,
   LocalBetterFit,
   LocalHardware,
   LocalLlmConfig,
@@ -164,6 +165,7 @@ import type {
   SeriesChoices,
   SeriesScope,
   SplitAction,
+  VoiceSwitch,
   WriteOutcome,
 } from "./types";
 
@@ -644,9 +646,21 @@ export const devApplyChangeEvent = (
 ) => invoke<void>("dev_apply_change_event", { kind, sourceId, title, body, externalRef });
 
 /** Transcribe a recorded voice clip to text, fully on-device via the sidecar's
- *  Whisper model. `audioBase64` is the standard-base64 of the recording bytes. */
+ *  Whisper model. `audioBase64` is the standard-base64 of the recording bytes. Refused while
+ *  voice input is switched off; installs the speech engine first if it has gone (progress on
+ *  `voice://install`). */
 export const transcribeAudio = (audioBase64: string) =>
   invoke<string>("transcribe_audio", { audioBase64 });
+
+/** The voice switch (Mods spec D8), for the Composer's mic. */
+export const getVoiceSwitch = () => invoke<VoiceSwitch>("get_voice_switch");
+
+/** Switch voice input on or off. On installs the speech engine first (progress on
+ *  `voice://install`) and is written only once that worked; off with `removeEngine` also removes
+ *  the engine and the speech model. Answers with the switch as it now stands. Use
+ *  `lib/voiceSwitch.ts`'s `setVoiceEnabled`, which also tells every surface that reads it. */
+export const setVoiceSwitch = (on: boolean, removeEngine: boolean) =>
+  invoke<VoiceSwitch>("set_voice_enabled", { on, removeEngine });
 
 /** Ingest files/folders, streaming progress for each item. `copyPhotosToVault` is the drag-drop
  *  opt-in to save dropped originals into the vault's `photos/` folder (photos only; default off). */
@@ -1649,13 +1663,18 @@ export const onLayoutProgress = (handler: (e: LayoutProgressEvent) => void): Pro
   listen<LayoutProgressEvent>("layout://progress", (e) => handler(e.payload));
 
 /** Subscribe to an optional component's install-download progress on `<component>://install`. One
- *  channel shape for the three optional downloads (t-SNE, OCR, and the macOS Python fetch); the thin
- *  `on*Install` aliases below name each channel for their callers. */
+ *  channel shape for the optional downloads (t-SNE, OCR, the speech engine, and the macOS Python
+ *  fetch); the thin `on*Install` aliases below name each channel for their callers. */
 export const onInstallProgress = (
-  component: "python" | "tsne" | "ocr",
+  component: "python" | "tsne" | "ocr" | "voice",
   handler: (e: InstallProgressEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<InstallProgressEvent>(`${component}://install`, (e) => handler(e.payload));
+
+/** Subscribe to the speech engine's download progress (switching voice on, or a recording that had
+ *  to put it back). */
+export const onVoiceInstall = (handler: (e: InstallProgressEvent) => void): Promise<UnlistenFn> =>
+  onInstallProgress("voice", handler);
 
 /** Subscribe to the optional t-SNE download's progress (fires from whichever view triggered it). */
 export const onTsneInstall = (handler: (e: InstallProgressEvent) => void): Promise<UnlistenFn> =>
@@ -2104,6 +2123,18 @@ export async function resetLocalAiSettings(): Promise<void> {
   // should confirm it the way every other tab's reset is confirmed.
   announceSettingSaved();
 }
+
+/** The Local AI switch (D7) and what it leaves for AI & Models to draw: which roles have nothing to
+ *  answer them while it is off, and whether a server or token is still saved. */
+export const getLocalAiSwitch = () => invoke<LocalAiSwitch>("get_local_ai_switch");
+
+/** Switch Local AI on or off. Off empties the chosen local models, stops a download, a test and
+ *  background work, hands back the graphics card and leaves every local-routed role with no
+ *  provider until a model is picked; the server address and token are kept. Answers with the
+ *  switch as it now stands. Use `lib/localAiSwitch.ts`'s `setLocalAiEnabled`, which also tells
+ *  every surface that reads the switch. */
+export const setLocalAiSwitch = (on: boolean) =>
+  invoke<LocalAiSwitch>("set_local_ai_enabled", { on });
 
 /** The models the configured endpoint currently serves (for the pickers). Rejects if none is
  *  configured or it can't be reached. */

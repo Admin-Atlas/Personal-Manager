@@ -317,7 +317,10 @@ pub async fn retrieval_diagnose(
     explain: crate::commands_dev::DevRetrievalExplain,
 ) -> Result<String> {
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            &app,
+            Role::Background,
+        )));
     };
     retrieval_diag::diagnose(&app, &plan, &symptom, &query, &explain).await
 }
@@ -332,10 +335,11 @@ pub fn sidecar_status(state: State<'_, AppState>) -> SidecarStatus {
 }
 
 /// Progress for an optional-component download, broadcast on `<component>://install` — i.e.
-/// `python://install` (the macOS interpreter fetch), `tsne://install`, and `ocr://install`. None of
-/// these downloads has a file count, so `fraction` (0.0..=1.0, monotonic) renders as a percentage bar.
-/// One shape + one emit helper for all three (X-D6); the per-component structs it replaced were
-/// byte-identical. The python leg only ever fires on macOS when no system Python was found.
+/// `python://install` (the macOS interpreter fetch), `tsne://install`, `ocr://install` and
+/// `voice://install`. None of these downloads has a file count, so `fraction` (0.0..=1.0, monotonic)
+/// renders as a percentage bar. One shape + one emit helper for all of them (X-D6); the per-component
+/// structs it replaced were byte-identical. The python leg only ever fires on macOS when no system
+/// Python was found.
 #[derive(Clone, Serialize)]
 pub struct InstallProgressEvent {
     fraction: f32,
@@ -343,7 +347,8 @@ pub struct InstallProgressEvent {
 
 /// Emit optional-component install progress on the `<component>://install` channel. Fire-and-forget
 /// (a dropped event costs a progress tick, never the install). Shared by `ensure_sidecar` (python),
-/// `install_optional_tsne`, and `install_optional_ocr` so the channel name is built exactly one way.
+/// `install_optional_tsne`, `install_optional_ocr`, and the voice switch and `transcribe_audio`
+/// (voice) so the channel name is built exactly one way.
 pub fn emit_install_progress(app: &AppHandle, component: &str, fraction: f32) {
     let _ = app.emit(
         &format!("{component}://install"),
@@ -983,14 +988,20 @@ pub fn get_document(state: State<'_, AppState>, id: i64) -> Result<Document> {
 /// Transcribe a recorded voice clip to text for the chat box (spec §4 P1 — voice
 /// input). The webview records the clip and sends it base64-encoded; we decode it
 /// to a temp file inside the data dir, transcribe it locally via the sidecar's
-/// Whisper model, and delete the file. An explicit user action, so it ensures the
-/// engine is installed first. Fully on-device — the audio never leaves the
-/// machine. All blocking, so it runs off the async runtime.
+/// Whisper model, and delete the file. Refused while voice input is switched off
+/// (Mods spec §2, D8). An explicit user action, so it ensures the engine is
+/// installed first. Fully on-device — the audio never leaves the machine. All
+/// blocking, so it runs off the async runtime.
 #[tauri::command]
 pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<String> {
     use base64::Engine;
 
     spawn_blocking_result("transcription", move || -> Result<String> {
+        let state = app.state::<AppState>();
+        // The switch is enforced here, not only by the mic being gone: with voice off nothing is
+        // decoded, written or transcribed, however the call arrives.
+        crate::voice_switch::require_on(&state)?;
+
         // Bound the untrusted webview payload before allocating the decode buffer
         // (every other webview input is capped). ~32 MiB of base64 ≈ 24 MiB of
         // audio — far more than a dictation clip, but it stops a hostile/oversized
@@ -1023,8 +1034,23 @@ pub async fn transcribe_audio(app: AppHandle, audio_base64: String) -> Result<St
         clip.write_all(&bytes)?;
         clip.flush()?;
 
-        let state = app.state::<AppState>();
+        // The engine is an optional component (D8): installed when voice was switched on, and here
+        // again if something took it away since (a venv rebuilt while the reinstall failed, a
+        // restore onto another computer). Checked by its marker first, so an ordinary recording
+        // never waits on the install lock behind another component's download. The install refuses
+        // once voice is off: the switch can go off (and remove the engine) while this waited.
         state.sidecar.ensure_installed()?;
+        if !state.sidecar.optional_voice_ready() {
+            let progress_app = app.clone();
+            state
+                .sidecar
+                .install_optional_voice_for_recording(move |fraction| {
+                    emit_install_progress(&progress_app, "voice", fraction);
+                })?;
+        }
+        // Asked again for the same reason, however long the steps above took: nothing is
+        // transcribed while voice is off.
+        crate::voice_switch::require_on(&state)?;
         let text = state.sidecar.transcribe(clip.path());
 
         // `clip` drops at end of scope, deleting the temp file on success or error.

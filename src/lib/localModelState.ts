@@ -38,6 +38,22 @@ export function localModelActivity(
   return (chat ? status.chat_released : status.background_released) ? "released" : "unloaded";
 }
 
+/**
+ * Whether a role routed to a local model has nothing at all to answer it, so a footer row must not
+ * name the cloud model in its place: Local AI switched off, back on before a model is picked for a
+ * role switching off emptied (both D7's "pick a model" state), or "Local only" with no model.
+ *
+ * Read from the status's `effective` route, which the backend works out by the rules routing uses,
+ * never from the routing alone. A cloud-routed role with no key is not this (`blocked` says
+ * "cloud_routing"), and a snapshot without its power half says nothing.
+ */
+export function awaitsLocalModel(status: LocalLlmStatus | null, role: LocalRole): boolean {
+  const power = status?.power;
+  if (!power) return false;
+  const view = role === "chat" ? power.chat : power.background;
+  return view.effective === "nothing" && view.blocked !== "cloud_routing";
+}
+
 /** The word each state gets. One table, so two surfaces cannot word the same fact differently. */
 export const ACTIVITY_LABEL: Record<LocalModelActivity, string> = {
   answering: "answering",

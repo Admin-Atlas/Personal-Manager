@@ -61,11 +61,29 @@ pub enum ProviderPref {
     LocalThenCloud,
 }
 
-/// The per-role routing preferences, read from settings.
+/// The per-role routing preferences, read from settings, with the Local AI switch they answer to.
 #[derive(Clone, Copy, Debug)]
 pub struct RoutingPrefs {
     pub chat: ProviderPref,
     pub background: ProviderPref,
+    /// The Local AI switch (D7, [`crate::local_ai_switch`]). Read with the preferences, on the same
+    /// guard, because it decides what a local preference MEANS: while it is off, a role routed to a
+    /// local model has nothing to answer it.
+    pub local_ai_on: bool,
+    /// The roles whose local model switching Local AI off emptied, with none picked since. Read on
+    /// the same guard for the same reason: it decides what "Local, fall back to cloud" means for
+    /// them once the switch is back on (see [`resolve_provider`]).
+    pub emptied: Emptied,
+}
+
+/// Per role: switching Local AI off deleted this role's chosen local model while the role was routed
+/// to it, and no model has been picked for it since. D7 puts such a role in a "pick a model" state,
+/// and that state has to outlast the switch coming back on: on, the role's routing is still local,
+/// and "Local, fall back to cloud" with no model would otherwise quietly answer from the cloud.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Emptied {
+    pub chat: bool,
+    pub background: bool,
 }
 
 impl RoutingPrefs {
@@ -76,11 +94,32 @@ impl RoutingPrefs {
         }
     }
 
+    /// Whether switching Local AI off emptied this role's model, with none picked since.
+    pub fn emptied(&self, role: Role) -> bool {
+        match role {
+            Role::Chat => self.emptied.chat,
+            Role::Background => self.emptied.background,
+        }
+    }
+
+    /// The preference the role is served by, which is its stored one except in the "pick a model"
+    /// state: an emptied "Local, fall back to cloud" role answers as "Local only" until a model is
+    /// picked, which with no model is nothing. What [`resolve_provider`] decides, for the status's
+    /// readers ([`effective_route`] and [`power_blocked`] take a preference, not the prefs).
+    pub fn served_pref(&self, role: Role) -> ProviderPref {
+        match self.for_role(role) {
+            ProviderPref::LocalThenCloud if self.emptied(role) => ProviderPref::Local,
+            pref => pref,
+        }
+    }
+
     #[cfg(test)]
     fn uniform(pref: ProviderPref) -> Self {
         Self {
             chat: pref,
             background: pref,
+            local_ai_on: true,
+            emptied: Emptied::default(),
         }
     }
 }
@@ -155,12 +194,26 @@ pub enum ProviderChoice {
     LocalThenCloud,
     /// A "Local, fall back to cloud" role the On battery policy (#432) has moved to the cloud.
     CloudForPower,
+    /// Local AI is switched off and this role is routed to a local model (D7): nothing answers it
+    /// until a model is picked in AI & Models. Never the cloud.
+    LocalAiOff,
 }
 
 /// Decide a role's effective provider from its preference and the current runtime context. **Pure**
 /// — no I/O — so it is exhaustively unit-tested and the byte-identical invariant is mechanical, not
 /// argued. `runtime` is read HERE and nowhere else, which is what keeps the power policy a change to
 /// this one function rather than to the call sites.
+///
+/// The Local AI switch comes first. Bobby's rule for switching it off with a local model picked is
+/// "just empty it and stop ai and tell them to pick a model", so both local preferences resolve to
+/// [`ProviderChoice::LocalAiOff`] while it is off — "Local, fall back to cloud" included, which
+/// with no local model would otherwise fall through to the cloud ([`hydrate_local_then_cloud`]) and
+/// start billing someone who never chose that. A cloud-routed role is untouched.
+///
+/// The same fall-through waits for that role when the switch comes back on: the model it was
+/// emptied of is still gone. So until a model is picked for it ([`RoutingPrefs::emptied`]), an
+/// emptied "Local, fall back to cloud" role is served as "Local only", which with no model answers
+/// nothing and says to pick one ([`no_provider_message_with`]).
 pub fn resolve_provider(
     role: Role,
     prefs: &RoutingPrefs,
@@ -168,10 +221,14 @@ pub fn resolve_provider(
 ) -> ProviderChoice {
     match prefs.for_role(role) {
         ProviderPref::Cloud => ProviderChoice::Cloud,
+        ProviderPref::Local | ProviderPref::LocalThenCloud if !prefs.local_ai_on => {
+            ProviderChoice::LocalAiOff
+        }
         // "Local only" never moves: the Roles copy promises it uses the model you picked and fails
         // if that is unreachable, and a one-time consent must not quietly cover a role switched to
         // Local only afterwards (#432 decision 7).
         ProviderPref::Local => ProviderChoice::Local,
+        ProviderPref::LocalThenCloud if prefs.emptied(role) => ProviderChoice::Local,
         ProviderPref::LocalThenCloud if runtime.moves(role) => ProviderChoice::CloudForPower,
         ProviderPref::LocalThenCloud => ProviderChoice::LocalThenCloud,
     }
@@ -204,13 +261,20 @@ pub enum EffectiveRoute {
 ///
 /// `local_ready` is an endpoint AND a model for the role; `moved_for_power` is the status's
 /// `PowerRoute::Cloud`. "Local only" never reads a key, so an unreadable store cannot make it
-/// `Unknown` — exactly as `resolve` never asks.
+/// `Unknown` — exactly as `resolve` never asks. With Local AI off, a local preference is `Nothing`
+/// whatever else holds, as [`resolve_provider`] decides it. `pref` is the one the role is served by
+/// ([`RoutingPrefs::served_pref`]), so a role the switch emptied reads as the "Local only" it is
+/// served as until a model is picked.
 pub fn effective_route(
     pref: ProviderPref,
+    local_ai_on: bool,
     local_ready: bool,
     key: KeyPresence,
     moved_for_power: bool,
 ) -> EffectiveRoute {
+    if !local_ai_on && pref != ProviderPref::Cloud {
+        return EffectiveRoute::Nothing;
+    }
     match pref {
         ProviderPref::Cloud => match key {
             KeyPresence::Present => EffectiveRoute::Cloud,
@@ -641,6 +705,28 @@ impl RoutePlan {
     pub fn is_power_routed(&self) -> bool {
         matches!(self, RoutePlan::CloudForPower { .. })
     }
+
+    /// Whether this plan exists only because Local AI was on when it was resolved: it has a local
+    /// arm, or it is the cloud arm the On battery policy put in place of one. Such a plan must not
+    /// run once the switch is off (D7), and the long background jobs hold their plan across batches
+    /// ([`refresh_plan`] keeps it when a re-resolve finds nothing), so the executor asks this.
+    pub fn needs_local_ai(&self) -> bool {
+        !matches!(self, RoutePlan::Cloud(_))
+    }
+}
+
+/// The executor's half of the Local AI switch (D7), asked where [`resolve`]'s half cannot reach: a
+/// plan resolved before the switch went off, and every cloud fallback from a local arm, which would
+/// otherwise turn "Local AI is off" into a silent bill. Reads the runtime copy of the switch, so it
+/// holds while the store is shut too.
+fn local_ai_gate(rt: &crate::local_slot::LocalRuntime) -> Result<()> {
+    if rt.local_ai_on() {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            crate::local_ai_switch::LOCAL_AI_OFF_MESSAGE.into(),
+        ))
+    }
 }
 
 /// Settings keys for the per-role routing preference. Absent → `Cloud`, which is what makes the seam
@@ -653,6 +739,21 @@ pub(crate) const BACKGROUND_ROUTING_KEY: &str = "local_llm_background_routing";
 pub(crate) const LOCAL_BASE_URL_KEY: &str = "local_llm_base_url";
 pub(crate) const LOCAL_CHAT_MODEL_KEY: &str = "local_llm_chat_model";
 pub(crate) const LOCAL_BACKGROUND_MODEL_KEY: &str = "local_llm_background_model";
+
+/// Settings keys for [`Emptied`], `"true"` or absent. Written by `local_ai_switch::write_off`;
+/// deleted when a model or a routing is chosen for the role (`local_ai::set_local_llm_role_model`,
+/// `set_local_llm_routing`), when the server is forgotten while Local AI is on
+/// (`clear_local_llm_endpoint`), and by the Local AI tab's reset.
+pub(crate) const CHAT_MODEL_EMPTIED_KEY: &str = "local_llm_chat_model_emptied";
+pub(crate) const BACKGROUND_MODEL_EMPTIED_KEY: &str = "local_llm_background_model_emptied";
+
+/// The local model key for a role, and its [`Emptied`] key.
+pub(crate) fn local_model_keys(role: Role) -> (&'static str, &'static str) {
+    match role {
+        Role::Chat => (LOCAL_CHAT_MODEL_KEY, CHAT_MODEL_EMPTIED_KEY),
+        Role::Background => (LOCAL_BACKGROUND_MODEL_KEY, BACKGROUND_MODEL_EMPTIED_KEY),
+    }
+}
 
 /// Parse a stored routing preference. Absent (every install today), `"cloud"`, or an unrecognised
 /// value all resolve to `Cloud` — the strictly-additive default.
@@ -668,6 +769,11 @@ pub(crate) fn routing_prefs(conn: &rusqlite::Connection) -> Result<RoutingPrefs>
     Ok(RoutingPrefs {
         chat: parse_pref(crate::db::get_setting(conn, CHAT_ROUTING_KEY)?),
         background: parse_pref(crate::db::get_setting(conn, BACKGROUND_ROUTING_KEY)?),
+        local_ai_on: crate::local_ai_switch::read(conn)?,
+        emptied: Emptied {
+            chat: crate::db::get_bool(conn, CHAT_MODEL_EMPTIED_KEY, false)?,
+            background: crate::db::get_bool(conn, BACKGROUND_MODEL_EMPTIED_KEY, false)?,
+        },
     })
 }
 
@@ -704,6 +810,9 @@ pub fn resolve(app: &AppHandle, role: Role) -> Result<Option<RoutePlan>> {
             local_arm(app, role)?,
             cloud_arm(app, role)?,
         ),
+        // No arm is hydrated at all, so not even a key is read: the role has nothing to answer it,
+        // and the caller says so ([`no_provider_message_for`]) or skips.
+        ProviderChoice::LocalAiOff => None,
     };
     Ok(plan)
 }
@@ -813,7 +922,13 @@ fn local_arm(app: &AppHandle, role: Role) -> Result<Option<LocalArm>> {
 /// onboarding gate (#295) can ask "is this user AI-ready via a local model?" and so it is unit-
 /// testable. The routing preference is deliberately ignored: leniency errs toward the honest
 /// `no_provider_message()` guard rather than re-showing a local-only user the onboarding wizard.
+///
+/// Local AI switched off is never ready: switching off deletes the chat model anyway, and a store
+/// that somehow still holds one while off has nothing that would answer with it.
 pub(crate) fn local_chat_configured(conn: &Connection) -> Result<bool> {
+    if !crate::local_ai_switch::read(conn)? {
+        return Ok(false);
+    }
     let base_url = db::get_setting(conn, LOCAL_BASE_URL_KEY)?;
     let model = db::get_setting(conn, LOCAL_CHAT_MODEL_KEY)?;
     Ok(match (base_url, model) {
@@ -830,6 +945,9 @@ pub async fn complete(
     messages: &[ChatMessage],
     cache_prefix: bool,
 ) -> Result<LlmOutcome> {
+    if plan.needs_local_ai() {
+        local_ai_gate(&app.state::<AppState>().local_ai)?;
+    }
     match plan {
         RoutePlan::Cloud(arm) => {
             let start = Instant::now();
@@ -896,6 +1014,7 @@ async fn run_local_complete(
         return match cloud {
             Some(cloud) => {
                 cloud_complete(
+                    rt,
                     cloud,
                     messages,
                     FallbackReason::Cooldown,
@@ -915,6 +1034,7 @@ async fn run_local_complete(
         return match cloud {
             Some(cloud) => {
                 cloud_complete(
+                    rt,
                     cloud,
                     messages,
                     FallbackReason::EndpointRefused,
@@ -941,6 +1061,7 @@ async fn run_local_complete(
             // all but certainly fits there.
             Some(cloud) => {
                 cloud_complete(
+                    rt,
                     cloud,
                     messages,
                     FallbackReason::HardFailure(failure.kind),
@@ -955,6 +1076,10 @@ async fn run_local_complete(
     let loop_start = Instant::now();
     let mut loading_recheck: u32 = 0;
     loop {
+        // Switching Local AI off stops background work (D7: "stop ai"). Asked here, before the
+        // marker below, so a retry after the switch went off never reaches the wire and never
+        // claims a load it didn't cause; then raced against the call itself.
+        local_ai_gate(rt)?;
         let start = Instant::now();
         let token = local.token.as_ref().map(Secret::expose);
         // Mark BEFORE the wire, not on success: a cold load that then times out has still left the
@@ -962,11 +1087,16 @@ async fn run_local_complete(
         // memory its own failed call reserved.
         rt.mark_pm_loaded(&local.base_url, &local.model);
         let attempt = openai_compat::complete(&local.base_url, &local.model, token, messages);
-        match rt
-            .slot
-            .run_background(crate::local_slot::Lane::Background, attempt)
-            .await
-        {
+        // The switch going off mid-call drops the slot future, which aborts the request exactly as
+        // a chat preemption does; the load it may have caused stays marked, like a preempted one,
+        // for the switch's release pass to hand back.
+        let ran = tokio::select! {
+            ran = rt.slot.run_background(crate::local_slot::Lane::Background, attempt) => ran,
+            _ = rt.wait_local_ai_off() => {
+                return Err(Error::Other(crate::local_ai_switch::LOCAL_AI_OFF_MESSAGE.into()));
+            }
+        };
+        match ran {
             SlotOutcome::Ran(Ok(completion)) => {
                 // A reply nothing can use is not a clean success. `Ok` clears the strike streak,
                 // the cooldown AND the ejection count, so a server that truncates every reply (an
@@ -1026,6 +1156,7 @@ async fn run_local_complete(
                 return match cloud {
                     Some(cloud) => {
                         cloud_complete(
+                            rt,
                             cloud,
                             messages,
                             FallbackReason::HardFailure(failure.kind),
@@ -1041,12 +1172,18 @@ async fn run_local_complete(
 }
 
 /// A cloud completion tagged as a FALLBACK (records the reason + the local model it displaced).
+///
+/// Every fallback from a local arm comes through here, so this is where the Local AI switch is
+/// asked once more: a local call that failed because the switch went off under it (its model
+/// handed back, its server forgotten) must surface, never be quietly retried on a paid model.
 async fn cloud_complete(
+    rt: &crate::local_slot::LocalRuntime,
     cloud: &CloudArm,
     messages: &[ChatMessage],
     reason: FallbackReason,
     displaced: String,
 ) -> Result<LlmOutcome> {
+    local_ai_gate(rt)?;
     let start = Instant::now();
     let completion =
         openrouter::complete(cloud.key.expose(), &cloud.models, messages, false).await?;
@@ -1074,6 +1211,9 @@ pub async fn stream_chat<F>(
 where
     F: FnMut(ChatDelta<'_>),
 {
+    if plan.needs_local_ai() {
+        local_ai_gate(&app.state::<AppState>().local_ai)?;
+    }
     match plan {
         RoutePlan::Cloud(arm) => {
             let start = Instant::now();
@@ -1162,6 +1302,7 @@ where
         return match cloud {
             Some(cloud) => {
                 cloud_stream(
+                    rt,
                     cloud,
                     messages,
                     cache_through,
@@ -1181,6 +1322,7 @@ where
         return match cloud {
             Some(cloud) => {
                 cloud_stream(
+                    rt,
                     cloud,
                     messages,
                     cache_through,
@@ -1213,6 +1355,7 @@ where
         return match cloud {
             Some(cloud) => {
                 cloud_stream(
+                    rt,
                     cloud,
                     messages,
                     cache_through,
@@ -1258,7 +1401,16 @@ where
             want_thinking,
             |delta| leg.forward(delta, on_delta),
         );
-        rt.slot.run_foreground(attempt).await
+        // Switching Local AI off stops a chat reply too (D7: "stop ai"), whether it is still
+        // waiting for the slot or already streaming. The turn ends with the switch's message and
+        // is not kept, as with any reply that fails mid-stream; never a cloud retry, because the
+        // switch said no more local work, not "try the cloud instead".
+        tokio::select! {
+            out = rt.slot.run_foreground(attempt) => out,
+            _ = rt.wait_local_ai_off() => {
+                return Err(Error::Other(crate::local_ai_switch::LOCAL_AI_OFF_MESSAGE.into()));
+            }
+        }
     };
     match local_result {
         Ok(completion) => {
@@ -1288,10 +1440,14 @@ where
             ) {
                 // No answer shown yet — a fallback to cloud is safe, once any shown thinking is gone.
                 (AfterLocalFailure::FallBack { drop_thinking }, Some(cloud)) => {
+                    // Asked before the note too: a fallback the switch refuses must not first tell
+                    // the chat it is falling back.
+                    local_ai_gate(rt)?;
                     if drop_thinking {
                         on_delta(ChatDelta::Note(ThinkingNote::FellBack));
                     }
                     cloud_stream(
+                        rt,
                         cloud,
                         messages,
                         cache_through,
@@ -1309,8 +1465,10 @@ where
 }
 
 /// A cloud stream tagged as a FALLBACK (records the reason + the local model it displaced). Answers
-/// only: the cloud arm shows no thinking.
+/// only: the cloud arm shows no thinking. Asks the Local AI switch first, as [`cloud_complete`]
+/// does and for its reason.
 async fn cloud_stream<F>(
+    rt: &crate::local_slot::LocalRuntime,
     cloud: &CloudArm,
     messages: &[ChatMessage],
     cache_through: Option<usize>,
@@ -1321,6 +1479,7 @@ async fn cloud_stream<F>(
 where
     F: FnMut(ChatDelta<'_>),
 {
+    local_ai_gate(rt)?;
     let start = Instant::now();
     let completion = openrouter::stream_chat(
         cloud.key.expose(),
@@ -1342,6 +1501,35 @@ where
 pub fn no_provider_message() -> String {
     "No AI provider is set up yet — add an OpenRouter key, or set up a local model in Settings → AI."
         .to_string()
+}
+
+/// The message for a role [`resolve`] found nothing for. A role routed to a local model while Local
+/// AI is off has a provider set up, just switched off, so it is told what to do about that (D7:
+/// "tell them to pick a model") instead of being told none exists. So is a local role the switch
+/// emptied, once it is back on: the server is there, the model isn't. Pure, so the rule is tested.
+pub(crate) fn no_provider_message_with(prefs: &RoutingPrefs, role: Role) -> String {
+    if resolve_provider(role, prefs, &RuntimeContext::default()) == ProviderChoice::LocalAiOff {
+        crate::local_ai_switch::LOCAL_AI_OFF_MESSAGE.to_string()
+    } else if prefs.emptied(role) && prefs.for_role(role) != ProviderPref::Cloud {
+        crate::local_ai_switch::PICK_A_MODEL_MESSAGE.to_string()
+    } else {
+        no_provider_message()
+    }
+}
+
+/// [`no_provider_message_with`] for the open store. Takes the DB guard for one read and lets it go,
+/// so a caller must not be holding it (the mutex is not reentrant). A store that cannot be read
+/// gets the general message.
+pub fn no_provider_message_for(app: &AppHandle, role: Role) -> String {
+    let prefs = app
+        .state::<AppState>()
+        .conn()
+        .ok()
+        .and_then(|conn| routing_prefs(&conn).ok());
+    match prefs {
+        Some(prefs) => no_provider_message_with(&prefs, role),
+        None => no_provider_message(),
+    }
 }
 
 /// The window PM should SIZE a prompt against, and whether that number is proven.
@@ -1998,9 +2186,211 @@ mod tests {
         let prefs = RoutingPrefs {
             chat: ProviderPref::Local,
             background: ProviderPref::Cloud,
+            local_ai_on: true,
+            emptied: Emptied {
+                chat: false,
+                background: true,
+            },
         };
         assert_eq!(prefs.for_role(Role::Chat), ProviderPref::Local);
         assert_eq!(prefs.for_role(Role::Background), ProviderPref::Cloud);
+        assert!(!prefs.emptied(Role::Chat));
+        assert!(prefs.emptied(Role::Background));
+    }
+
+    /// D7's "pick a model" state outlasts the switch: back on, a "Local, fall back to cloud" role
+    /// whose model switching off emptied still has no model, and the cloud must not quietly take it
+    /// over (the fall-through in `hydrate_local_then_cloud`). It is served as "Local only" until a
+    /// model is picked: nothing answers, the status says so, and the message says to pick one. With
+    /// a cloud key present and the battery moving roles, which are the cases a silent fallback
+    /// would bill.
+    #[test]
+    fn back_on_a_role_the_switch_emptied_waits_for_a_model_and_never_takes_the_cloud() {
+        use KeyPresence::*;
+        let moved = RuntimeContext {
+            battery_low: true,
+            scope: PowerScope::Both,
+            consent: Consent::ALL,
+            keep_local: false,
+        };
+        let compose =
+            |role, prefs: &RoutingPrefs, ctx: &RuntimeContext, local: Option<LocalArm>| {
+                match resolve_provider(role, prefs, ctx) {
+                    ProviderChoice::Cloud => Some(RoutePlan::Cloud(cloud(&["a"]))),
+                    ProviderChoice::Local => local.map(RoutePlan::LocalOnly),
+                    c @ (ProviderChoice::LocalThenCloud | ProviderChoice::CloudForPower) => {
+                        hydrate_local_then_cloud(
+                            c == ProviderChoice::CloudForPower,
+                            local,
+                            Some(cloud(&["a"])),
+                        )
+                    }
+                    ProviderChoice::LocalAiOff => None,
+                }
+            };
+        for role in [Role::Chat, Role::Background] {
+            let emptied = RoutingPrefs {
+                emptied: Emptied {
+                    chat: true,
+                    background: true,
+                },
+                ..RoutingPrefs::uniform(ProviderPref::LocalThenCloud)
+            };
+            for ctx in [RuntimeContext::default(), moved] {
+                assert_eq!(
+                    resolve_provider(role, &emptied, &ctx),
+                    ProviderChoice::Local
+                );
+                assert!(
+                    compose(role, &emptied, &ctx, None).is_none(),
+                    "{role:?}: no model, so nothing answers, never the cloud"
+                );
+            }
+            assert_eq!(emptied.served_pref(role), ProviderPref::Local);
+            for key in [Present, Absent, Unreadable] {
+                assert_eq!(
+                    effective_route(emptied.served_pref(role), true, false, key, false),
+                    EffectiveRoute::Nothing,
+                    "the status says nothing answers {role:?}, without asking after the key"
+                );
+            }
+            assert_eq!(
+                no_provider_message_with(&emptied, role),
+                crate::local_ai_switch::PICK_A_MODEL_MESSAGE
+            );
+            // "Local only" emptied is told the same; it never had a cloud arm to fall to.
+            let local_only = RoutingPrefs {
+                emptied: emptied.emptied,
+                ..RoutingPrefs::uniform(ProviderPref::Local)
+            };
+            assert_eq!(
+                no_provider_message_with(&local_only, role),
+                crate::local_ai_switch::PICK_A_MODEL_MESSAGE
+            );
+
+            // A model picked clears the state, and the route is the real one again.
+            let picked = RoutingPrefs::uniform(ProviderPref::LocalThenCloud);
+            assert!(matches!(
+                compose(role, &picked, &RuntimeContext::default(), Some(arm())),
+                Some(RoutePlan::LocalThenCloud { .. })
+            ));
+            // Never emptied (a role routed this way before it had a model, as on main): the cloud
+            // answers, which the Roles section says beside the choice.
+            assert!(matches!(
+                compose(role, &picked, &RuntimeContext::default(), None),
+                Some(RoutePlan::Cloud(_))
+            ));
+            assert_eq!(
+                no_provider_message_with(&picked, role),
+                no_provider_message()
+            );
+            // A cloud role is not the switch's, emptied flag or not.
+            let cloud_role = RoutingPrefs {
+                emptied: emptied.emptied,
+                ..RoutingPrefs::uniform(ProviderPref::Cloud)
+            };
+            assert_eq!(cloud_role.served_pref(role), ProviderPref::Cloud);
+            assert_eq!(
+                no_provider_message_with(&cloud_role, role),
+                no_provider_message()
+            );
+        }
+    }
+
+    /// D7, Bobby's rule for switching Local AI off with a local model picked: "just empty it and
+    /// stop ai and tell them to pick a model". Off, every role routed to a local model resolves to
+    /// nothing — whatever the keys, the endpoint, the battery or the consent say — and never to the
+    /// cloud; a cloud-routed role is untouched. Checked through the whole of `resolve`'s composition
+    /// (the pure decision, then the hydration a real arm pair would get), with a local model
+    /// selected AND a cloud key present, which is the case a silent fallback would bill.
+    #[test]
+    fn local_ai_off_with_a_local_model_selected_resolves_every_local_role_to_nothing() {
+        use KeyPresence::*;
+        let moved = RuntimeContext {
+            battery_low: true,
+            scope: PowerScope::Both,
+            consent: Consent::ALL,
+            keep_local: false,
+        };
+        for role in [Role::Chat, Role::Background] {
+            for pref in [ProviderPref::Local, ProviderPref::LocalThenCloud] {
+                for ctx in [RuntimeContext::default(), moved] {
+                    let prefs = RoutingPrefs {
+                        local_ai_on: false,
+                        ..RoutingPrefs::uniform(pref)
+                    };
+                    let choice = resolve_provider(role, &prefs, &ctx);
+                    assert_eq!(choice, ProviderChoice::LocalAiOff, "{role:?} {pref:?}");
+                    // What `resolve` builds for that choice: no arm at all, so no key is even read.
+                    let plan: Option<RoutePlan> = match choice {
+                        ProviderChoice::LocalAiOff => None,
+                        other => panic!("{other:?} would hydrate an arm"),
+                    };
+                    assert!(plan.is_none());
+                    for local_ready in [true, false] {
+                        for key in [Present, Absent, Unreadable] {
+                            assert_eq!(
+                                effective_route(pref, false, local_ready, key, false),
+                                EffectiveRoute::Nothing,
+                                "the status must say nothing answers {role:?} {pref:?}"
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        no_provider_message_with(&prefs, role),
+                        crate::local_ai_switch::LOCAL_AI_OFF_MESSAGE,
+                        "and tell them to pick a model"
+                    );
+                }
+            }
+            // A cloud-routed role is not Local AI's to stop.
+            let cloud = RoutingPrefs {
+                local_ai_on: false,
+                ..RoutingPrefs::uniform(ProviderPref::Cloud)
+            };
+            assert_eq!(
+                resolve_provider(role, &cloud, &moved),
+                ProviderChoice::Cloud
+            );
+            assert_eq!(
+                effective_route(ProviderPref::Cloud, false, true, Present, false),
+                EffectiveRoute::Cloud
+            );
+            assert_eq!(
+                no_provider_message_with(&cloud, role),
+                no_provider_message(),
+                "a cloud role without a key is told to add one, not that Local AI is off"
+            );
+        }
+    }
+
+    /// The executor's half: every plan that exists only because Local AI was on is refused once it
+    /// is off — the two local arms and the battery's stand-in for one — and a plain cloud plan never.
+    #[test]
+    fn only_a_plain_cloud_plan_runs_with_local_ai_off() {
+        assert!(!RoutePlan::Cloud(cloud(&["a"])).needs_local_ai());
+        assert!(RoutePlan::LocalOnly(arm()).needs_local_ai());
+        assert!(RoutePlan::LocalThenCloud {
+            local: arm(),
+            cloud: cloud(&["a"]),
+        }
+        .needs_local_ai());
+        assert!(RoutePlan::CloudForPower {
+            cloud: cloud(&["a"]),
+            displaced_local_model: "m".into(),
+        }
+        .needs_local_ai());
+
+        let rt = crate::local_slot::LocalRuntime::default();
+        assert!(local_ai_gate(&rt).is_err(), "a fresh runtime is off");
+        rt.set_local_ai_on(true);
+        assert!(local_ai_gate(&rt).is_ok());
+        rt.set_local_ai_on(false);
+        let refused = local_ai_gate(&rt).unwrap_err().to_string();
+        assert!(
+            refused.contains(crate::local_ai_switch::LOCAL_AI_OFF_MESSAGE),
+            "{refused}"
+        );
     }
 
     fn mem_conn() -> Connection {
@@ -2023,6 +2413,10 @@ mod tests {
         assert!(!local_chat_configured(&conn).unwrap()); // model present but blank
         db::set_setting(&conn, LOCAL_CHAT_MODEL_KEY, "llama3").unwrap();
         assert!(local_chat_configured(&conn).unwrap()); // both present and non-blank
+
+        // Local AI switched off is never ready, whatever is stored.
+        db::set_bool(&conn, crate::local_ai_switch::LOCAL_AI_ENABLED_KEY, false).unwrap();
+        assert!(!local_chat_configured(&conn).unwrap());
     }
 
     #[test]
@@ -2366,45 +2760,64 @@ mod tests {
                 ProviderPref::Local,
                 ProviderPref::LocalThenCloud,
             ] {
-                for local_ready in [true, false] {
-                    for key in [Present, Absent] {
-                        for moved in [true, false] {
-                            let ctx = if moved {
-                                moved_ctx
-                            } else {
-                                RuntimeContext::default()
-                            };
-                            assert_eq!(ctx.moves(role), moved);
-                            let local = local_ready.then(arm);
-                            let cloud_arm = (key == Present).then(|| cloud(&["a"]));
-                            let choice = resolve_provider(role, &RoutingPrefs::uniform(pref), &ctx);
-                            let plan = match choice {
-                                ProviderChoice::Cloud => cloud_arm.map(RoutePlan::Cloud),
-                                ProviderChoice::Local => local.map(RoutePlan::LocalOnly),
-                                ProviderChoice::LocalThenCloud | ProviderChoice::CloudForPower => {
-                                    hydrate_local_then_cloud(
+                // `emptied`: a role switching Local AI off emptied, whose status reads it by the
+                // preference it is served by.
+                for (on, emptied) in [(true, false), (true, true), (false, false), (false, true)] {
+                    for local_ready in [true, false] {
+                        for key in [Present, Absent] {
+                            for moved in [true, false] {
+                                let ctx = if moved {
+                                    moved_ctx
+                                } else {
+                                    RuntimeContext::default()
+                                };
+                                assert_eq!(ctx.moves(role), moved);
+                                let local = local_ready.then(arm);
+                                let cloud_arm = (key == Present).then(|| cloud(&["a"]));
+                                let prefs = RoutingPrefs {
+                                    local_ai_on: on,
+                                    emptied: Emptied {
+                                        chat: emptied,
+                                        background: emptied,
+                                    },
+                                    ..RoutingPrefs::uniform(pref)
+                                };
+                                let choice = resolve_provider(role, &prefs, &ctx);
+                                let plan = match choice {
+                                    ProviderChoice::Cloud => cloud_arm.map(RoutePlan::Cloud),
+                                    ProviderChoice::Local => local.map(RoutePlan::LocalOnly),
+                                    ProviderChoice::LocalThenCloud
+                                    | ProviderChoice::CloudForPower => hydrate_local_then_cloud(
                                         choice == ProviderChoice::CloudForPower,
                                         local,
                                         cloud_arm,
-                                    )
-                                }
-                            };
-                            let built = match plan {
-                                None => EffectiveRoute::Nothing,
-                                Some(RoutePlan::Cloud(_)) => EffectiveRoute::Cloud,
-                                Some(RoutePlan::LocalOnly(_)) => EffectiveRoute::LocalOnly,
-                                Some(RoutePlan::LocalThenCloud { .. }) => {
-                                    EffectiveRoute::LocalThenCloud
-                                }
-                                Some(RoutePlan::CloudForPower { .. }) => {
-                                    EffectiveRoute::CloudForPower
-                                }
-                            };
-                            assert_eq!(
-                                effective_route(pref, local_ready, key, moved),
-                                built,
-                                "{role:?} {pref:?} ready={local_ready} {key:?} moved={moved}"
-                            );
+                                    ),
+                                    ProviderChoice::LocalAiOff => None,
+                                };
+                                let built = match plan {
+                                    None => EffectiveRoute::Nothing,
+                                    Some(RoutePlan::Cloud(_)) => EffectiveRoute::Cloud,
+                                    Some(RoutePlan::LocalOnly(_)) => EffectiveRoute::LocalOnly,
+                                    Some(RoutePlan::LocalThenCloud { .. }) => {
+                                        EffectiveRoute::LocalThenCloud
+                                    }
+                                    Some(RoutePlan::CloudForPower { .. }) => {
+                                        EffectiveRoute::CloudForPower
+                                    }
+                                };
+                                assert_eq!(
+                                    effective_route(
+                                        prefs.served_pref(role),
+                                        on,
+                                        local_ready,
+                                        key,
+                                        moved
+                                    ),
+                                    built,
+                                    "{role:?} {pref:?} on={on} emptied={emptied} \
+                                     ready={local_ready} {key:?} moved={moved}"
+                                );
+                            }
                         }
                     }
                 }
@@ -2412,25 +2825,42 @@ mod tests {
         }
 
         // An unreadable store: `resolve` errors hydrating the cloud arm, so the status cannot say
-        // where the role goes — except "Local only", which never reads a key.
+        // where the role goes — except "Local only", which never reads a key, and any local role
+        // while Local AI is off, which reads nothing at all.
         for local_ready in [true, false] {
             for moved in [true, false] {
                 assert_eq!(
-                    effective_route(ProviderPref::Cloud, local_ready, Unreadable, moved),
+                    effective_route(ProviderPref::Cloud, true, local_ready, Unreadable, moved),
                     EffectiveRoute::Unknown
                 );
                 assert_eq!(
-                    effective_route(ProviderPref::LocalThenCloud, local_ready, Unreadable, moved),
+                    effective_route(
+                        ProviderPref::LocalThenCloud,
+                        true,
+                        local_ready,
+                        Unreadable,
+                        moved
+                    ),
                     EffectiveRoute::Unknown
                 );
                 assert_eq!(
-                    effective_route(ProviderPref::Local, local_ready, Unreadable, moved),
+                    effective_route(ProviderPref::Local, true, local_ready, Unreadable, moved),
                     if local_ready {
                         EffectiveRoute::LocalOnly
                     } else {
                         EffectiveRoute::Nothing
                     }
                 );
+                assert_eq!(
+                    effective_route(ProviderPref::Cloud, false, local_ready, Unreadable, moved),
+                    EffectiveRoute::Unknown
+                );
+                for pref in [ProviderPref::Local, ProviderPref::LocalThenCloud] {
+                    assert_eq!(
+                        effective_route(pref, false, local_ready, Unreadable, moved),
+                        EffectiveRoute::Nothing
+                    );
+                }
             }
         }
     }

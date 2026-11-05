@@ -11,6 +11,7 @@ import { localEndpointState, LOCAL_STATE_LABEL, LOCAL_STATE_TOKEN } from "../lib
 import {
   ACTIVITY_DETAIL,
   ACTIVITY_LABEL,
+  awaitsLocalModel,
   localModelActivity,
   type LocalModelActivity,
 } from "../lib/localModelState";
@@ -22,7 +23,7 @@ import {
   powerTag,
   type PowerTag,
 } from "../lib/powerRoute";
-import { useDevMode } from "../lib/capabilities";
+import type { View } from "../lib/nav";
 import {
   useDepth,
   useTheme,
@@ -43,18 +44,7 @@ import { globalChats, projectChats } from "../lib/chatNav";
 import { Briefing } from "./Briefing";
 import { readBriefingInSidebar, subscribeBriefingPrefs } from "../lib/briefingPrefs";
 import { readChatSectionOpen, writeChatSectionOpen, type ChatSectionId } from "../lib/chatPrefs";
-
-export type View =
-  | "focus"
-  | "project"
-  | "chat"
-  | "calendar"
-  | "documents"
-  | "review"
-  | "teach"
-  | "graph"
-  | "pinboard"
-  | "dev";
+import { SidebarNav } from "./SidebarNav";
 
 /** The command-palette shortcut hint shown in the sidebar (⌘ on macOS). */
 const SHORTCUT_HINT =
@@ -227,12 +217,9 @@ export function Sidebar({
   resizing,
 }: Props) {
   const { minimal } = useDepth();
-  // The Teach tab is a Depth-keyed feature reveal (hidden for the minimalist preset), overridable
-  // in Settings. Hiding it hides only the editor — deterministic alias resolution keeps running.
-  const { teachVisible, mapVisible, modelsVisible, system, accent, colorblind } = useTheme();
-  // The Dev tab is an orthogonal capability reveal (issue #78) — independent of Depth, shown only
-  // when the user turns Developer mode on in Settings.
-  const { devMode } = useDevMode();
+  // Which tabs show, and in what order, is lib/nav's (drawn by SidebarNav): Depth's reveals, the
+  // Dev tab's developer mode, and what the user pinned or hid.
+  const { modelsVisible, system, accent, colorblind } = useTheme();
   // The conversation awaiting a delete confirmation (null = no dialog open). Held here so the row's
   // hover trash and the confirm modal stay a local concern; the actual purge is `onDelete` (App owns
   // the mutation + list refresh + reselecting after the active chat is deleted).
@@ -385,98 +372,7 @@ export function Sidebar({
           this shrink below its content so the scrollbar appears; the app-wide axis normaliser
           (installed once in App) covers wheel behaviour, so nothing is wired per-surface here. */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-        <nav className="flex flex-col gap-1 px-2 pb-2">
-          <NavItem
-            active={view === "focus" || view === "project"}
-            onClick={() => onNavigate("focus")}
-            helpId="nav-focus"
-          >
-            Focus
-          </NavItem>
-          {/* New sits on the Chats row because that is what it makes — not in the chrome above,
-              where it had no subject and cost the whole sidebar a line. A SIBLING of NavItem, never
-              its `trailing` slot: NavItem is itself a <button>, so a button inside it would be
-              invalid markup and every New click would also fire the navigate underneath.
-
-              It makes a GLOBAL chat from every tab, including while a project is open. A button on
-              the Chats row reads as "new chat in Chats" no matter what is on screen behind it, so
-              scoping it to the open project silently — as its predecessor did — meant the same
-              control made two different things with nothing to tell them apart. A project's own
-              New sits over that project's conversation list below. */}
-          <div className="flex items-center gap-1">
-            <NavItem
-              active={view === "chat"}
-              onClick={() => onNavigate("chat")}
-              helpId="nav-chat"
-              className="min-w-0 flex-1"
-            >
-              Chats
-            </NavItem>
-            <button
-              onClick={onNew}
-              title="New conversation"
-              aria-label="New conversation"
-              className="shrink-0 rounded-[var(--radius-sm)] px-1.5 py-1.5 text-xs text-ink4 transition hover:bg-surface hover:text-ink"
-            >
-              + New
-            </button>
-          </div>
-          <NavItem
-            active={view === "calendar"}
-            onClick={() => onNavigate("calendar")}
-            helpId="nav-calendar"
-          >
-            Calendar
-          </NavItem>
-          <NavItem
-            active={view === "documents"}
-            onClick={() => onNavigate("documents")}
-            helpId="nav-documents"
-          >
-            Documents
-          </NavItem>
-          {/* Review + Teach are the "learning tools" — shown/hidden together by `teachVisible`. */}
-          {teachVisible && (
-            <NavItem
-              active={view === "review"}
-              onClick={() => onNavigate("review")}
-              helpId="nav-review"
-              trailing={<CountBadge count={reviewCount} />}
-            >
-              Review
-            </NavItem>
-          )}
-          {teachVisible && (
-            <NavItem
-              active={view === "teach"}
-              onClick={() => onNavigate("teach")}
-              helpId="nav-teach"
-            >
-              Teach
-            </NavItem>
-          )}
-          {mapVisible && (
-            <NavItem
-              active={view === "graph"}
-              onClick={() => onNavigate("graph")}
-              helpId="nav-graph"
-            >
-              Map
-            </NavItem>
-          )}
-          <NavItem
-            active={view === "pinboard"}
-            onClick={() => onNavigate("pinboard")}
-            helpId="nav-pinboard"
-          >
-            Pinboard
-          </NavItem>
-          {devMode && (
-            <NavItem active={view === "dev"} onClick={() => onNavigate("dev")} helpId="nav-dev">
-              Dev
-            </NavItem>
-          )}
-        </nav>
+        <SidebarNav view={view} onNavigate={onNavigate} reviewCount={reviewCount} onNew={onNew} />
 
         <div className="px-2">
           {/* The Chats tab shows two sections — your projects, and the chats that belong to no
@@ -674,6 +570,7 @@ export function Sidebar({
               role="Chat"
               id={chatModel}
               local={localAi?.chat_local_model ?? null}
+              awaitingModel={awaitsLocalModel(localAi, "chat")}
               activity={localModelActivity(localAi, "chat")}
               power={powerTag(localAi, "chat")}
               parked={localAi ? powerOf(localAi).chat.local_model : null}
@@ -683,6 +580,7 @@ export function Sidebar({
               role="Tasks"
               id={backgroundModel}
               local={localAi?.background_local_model ?? null}
+              awaitingModel={awaitsLocalModel(localAi, "background")}
               activity={localModelActivity(localAi, "background")}
               power={powerTag(localAi, "background")}
               parked={localAi ? powerOf(localAi).background.local_model : null}
@@ -720,6 +618,7 @@ function ModelRow({
   role,
   id,
   local,
+  awaitingModel,
   activity,
   power,
   parked,
@@ -729,6 +628,8 @@ function ModelRow({
   id: string | null;
   /** The local model this role will really reach for, when routing sends it there. */
   local: string | null;
+  /** The role is routed to a local model and nothing answers it until one is picked (D7). */
+  awaitingModel: boolean;
   /** What that model is doing right now, or `null` when there is nothing PM can honestly say. */
   activity: LocalModelActivity | null;
   /** What the On battery policy is doing to this role, or `null` when nothing (#432). */
@@ -740,8 +641,9 @@ function ModelRow({
   // On battery the backend already reports no local model for a moved role, so `shown` is the cloud
   // model answering and `activity` is null — only the title and the chip need to say why.
   const shown = local ?? id;
-  const title =
-    power === "on_battery"
+  const title = awaitingModel
+    ? "Nothing answers this until you pick a model. Click to choose one."
+    : power === "on_battery"
       ? onBatteryRowTitle(id, parked)
       : local
         ? `${local} — running on this machine${id ? `; ${id} is the cloud fallback` : ""}`
@@ -749,8 +651,13 @@ function ModelRow({
   return (
     <div className="flex items-center gap-1.5 text-xs leading-5">
       <span className="w-9 shrink-0 font-mono text-ink4">{role}</span>
-      <span className="min-w-0 flex-1 truncate text-ink3" title={title}>
-        {shown ? shortModel(shown) : "default"}
+      {/* A role with nothing to answer it never shows the cloud model's name: that would read as
+          the cloud answering, which is the one thing the Local AI switch promises it won't do. */}
+      <span
+        className={`min-w-0 flex-1 truncate ${awaitingModel ? "text-ink4" : "text-ink3"}`}
+        title={title}
+      >
+        {awaitingModel ? "pick a model" : shown ? shortModel(shown) : "default"}
       </span>
       {/* The live half. It renders NOTHING at all when PM cannot honestly answer — a role using
           cloud, an endpoint with no `/api/ps`, or nothing observed recently enough to repeat — so a
@@ -781,7 +688,8 @@ function ModelRow({
           kept local
         </span>
       )}
-      {fallbacks > 0 && (
+      {/* The fallbacks are cloud models, and none of them answers a role waiting for a pick. */}
+      {!awaitingModel && fallbacks > 0 && (
         <span
           className="shrink-0 rounded-[var(--radius-sm)] bg-accent-soft px-1 font-mono text-[0.625rem] text-accent-text"
           title={`${fallbacks} auto-switch fallback${fallbacks === 1 ? "" : "s"}`}
@@ -904,15 +812,5 @@ export function AttentionDot({ label }: { label: string }) {
       title={label}
       className="ml-2 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
     />
-  );
-}
-
-/** The pill count shown on a nav row (e.g. pending reviews); renders nothing at zero. */
-function CountBadge({ count }: { count?: number }) {
-  if (count == null || count <= 0) return null;
-  return (
-    <span className="ml-2 rounded-[var(--radius-sm)] bg-accent-soft px-2 py-0.5 font-mono text-xs font-medium text-accent-text">
-      {count}
-    </span>
   );
 }

@@ -18,7 +18,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Sidebar / navigation
   "nav-focus": {
     title: "Focus",
-    body: "Your home screen: every active project on one page, each with a single status that answers 'should I look at this now?' — Due soon, Quick win, Take a look, Blocked, or On track. Click a project to narrow everything to just it.",
+    body: "Your home screen: every active project on one page, each with a single status that answers 'should I look at this now?' — Due soon, Quick win, Take a look, Blocked, or On track. Click a project to narrow everything to just it. Right-click any tab in this list to pin it to the top or hide it.",
   },
   "nav-chat": {
     title: "Chats",
@@ -38,7 +38,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "nav-teach": {
     title: "Teach",
-    body: "Where you teach PM how your projects are named. Merge a name variant into the real project so it stops reappearing, rename a project everywhere at once, or add a name you know means the same thing — the same thing correcting a project in Review does, just directly. On for the Standard and Power presets; toggle it under Settings → Appearance.",
+    body: "Where you teach PM how your projects are named. Merge a name variant into the real project so it stops reappearing, rename a project everywhere at once, or add a name you know means the same thing — the same thing correcting a project in Review does, just directly. On for the Standard and Power presets; right-click it in the sidebar to hide it (Review goes with it) or pin it to the top.",
   },
   "nav-graph": {
     title: "Map",
@@ -58,7 +58,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "sidebar-models": {
     title: "Models in use",
-    body: "The models PM is currently using — 'Chat' for your conversations and 'Tasks' for background work (sorting and learning). Each row names whatever will actually answer: if you have pointed that role at a model on your own machine, that is the name you see, and the cloud model behind it becomes the fallback. A '+N' badge means auto-switch is on with N fallback models behind it. 'Local' below them is your own model server's connection. Click to change any of it in Settings. On battery, a row can say 'on battery': PM has moved that role to your cloud model under your On battery setting, and the row names the cloud model answering. 'kept local' means you asked PM to stay on this machine anyway.",
+    body: "The models PM is currently using — 'Chat' for your conversations and 'Tasks' for background work (sorting and learning). Each row names whatever will actually answer: if you have pointed that role at a model on your own machine, that is the name you see, and the cloud model behind it becomes the fallback. A row that says 'pick a model' is set to use a model on your own machine and has none right now (Local AI is off, or its model was cleared when you switched it off), so nothing answers it until you pick one. A '+N' badge means auto-switch is on with N fallback models behind it. 'Local' below them is your own model server's connection. Click to change any of it in Settings. On battery, a row can say 'on battery': PM has moved that role to your cloud model under your On battery setting, and the row names the cloud model answering. 'kept local' means you asked PM to stay on this machine anyway.",
   },
   "sidebar-search": {
     title: "Search",
@@ -98,9 +98,9 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Confirm before deleting a pinboard card",
     body: "Ask before a note or timeline is deleted from the Pinboard, so an important one can't go with a stray click. The pop-up tells you what actually goes with it — entries that would leave your calendar, or a document already saved to your vault that would stay behind. If you ticked 'Don't ask again' in that pop-up, this is where you turn it back on. It's per-device, and it doesn't apply to a folder's ✕, which only ungroups it and spills the cards back onto the board. Either way, Ctrl+Z (⌘Z on a Mac) undoes a deletion.",
   },
-  "settings-teach-tab": {
-    title: "Review & Teach tabs",
-    body: "Show or hide the two 'learning tools' — Review (approve the assistant's filing of new items) and Teach (correct its naming rules and preferences) — together in the sidebar. They're on for the Standard and Power presets and off for Minimal, but you can override that here. Turn them off once the assistant files things well enough on its own that you no longer want to curate; nothing is lost — new items still index and auto-file, and PM keeps applying what you've already taught it. Turn them back on any time.",
+  "settings-sidebar-placement": {
+    title: "Sidebar tabs",
+    body: "Right-click a tab in the sidebar to arrange it. 'Pin to the top' moves it above the rest, in the order you pin them; 'Hide' takes it out of the sidebar, and it's still a search away: press Ctrl K (⌘K on a Mac) and type its name. To bring one back, right-click any tab and choose 'Show'. Review and Teach move together, and hiding them also hides the filing controls in Documents and in a project's files; nothing is lost: new items still index and file themselves, and PM keeps applying what you've taught it. On the Minimal preset Review, Teach and the Map start out of the sidebar, and 'Show' brings them back pinned to the top. Focus always stays, and Dev comes and goes with Developer mode. It's remembered on this device; 'Reset sidebar placement' puts every tab back where it started.",
   },
   "focus-panels": {
     title: "Panels",
@@ -121,10 +121,6 @@ export const HELP: Record<string, HelpEntry> = {
   "settings-focus": {
     title: "Focus",
     body: "What this section covers is where today's briefing shows up outside the Focus tab — pinned in the sidebar, floating inside PM, or in its own always-on-top window — plus the tray icon. The Focus tab's own controls (Split/Stacked, the Upcoming list-or-days toggle and its hours, and which panels the tab shows) live on that tab, in its header, beside the thing they change; there is nothing to mirror here. 'Reset Focus' still puts all of it back, the tab's controls included.",
-  },
-  "settings-map-tab": {
-    title: "Map tab",
-    body: "Show or hide the Map — the semantic picture of everything you've filed, laid out so related things sit near each other. Like the learning tools above, it follows your preset by default: on for Standard and Power, off for Minimal, since a pared-back setup rarely wants an exploratory view. Overriding here wins either way. Hiding it changes nothing about your data or the search behind it; the Map is still there the moment you switch it back on.",
   },
   "settings-calendar-open-on": {
     title: "Calendar opens where you left it",
@@ -347,6 +343,20 @@ export const HELP: Record<string, HelpEntry> = {
     title: "Appearance",
     body: "Switch the visual System (Editorial / Slate / Terminal), the light/dark Mode (including System, which follows your device, and Auto, which follows sunrise and sunset), Depth (how much detail is shown — it reveals and hides, never rearranges), the accent colour, and the text size. Changes apply instantly and are remembered on this device.",
   },
+  // The Local AI switch (D7): at the top of its tab while on, and in AI & Models while off, where
+  // the "pick a model" prompt also lives.
+  "settings-localai-switch": {
+    title: "Local AI",
+    body: "Turns PM's use of a model on your own computer on or off. Off, this tab goes away, PM stops using your local models and hands back your graphics card, and anything set to use a local model waits until you pick a model in AI & Models. Nothing moves to the cloud on its own. Models you downloaded into Ollama stay there, and PM keeps your server's address and token, so turning it back on is one click.",
+  },
+  "settings-localai-switch-row": {
+    title: "Local AI",
+    body: "Local AI is off. Turn it on to run AI on your own computer with Ollama, LM Studio or llama-server, and the Local AI tab comes back. If PM still has your server's address and token, it reconnects at once; you choose your models again. Forget server and token removes both, so you would connect afresh.",
+  },
+  "settings-localai-pick": {
+    title: "Pick a model",
+    body: "These jobs were set to use a model on your own computer, and Local AI is off, so nothing does them right now. PM never moves them to the cloud on its own. Use the cloud model to hand them to the model listed below, or turn Local AI back on to keep using your own.",
+  },
   // The Local AI tab's sections, in the tab's order, each titled with its rail label (sections.ts).
   "settings-localai-start": {
     title: "Your local model",
@@ -382,7 +392,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "settings-storage": {
     title: "On-device components",
-    body: "Everything PM has downloaded to this device, with sizes. The document engine and the active search model are always needed. The enhanced map layout (t-SNE), photo text recognition and the speech model can be removed to free space — they re-download when you need them again, and photo text recognition installs from here too. Some rows are shared libraries a feature above them depends on: scikit-learn and scipy under the enhanced layout, OpenCV, shapely and pyclipper under photo text recognition. Those read 'Installed — in use' with a greyed Remove button and a pill pointing at what to remove first — they're already on your device, just still needed by something. numpy is never offered because the search model shares it.",
+    body: "Everything PM has downloaded to this device, with sizes. The document engine and the active search model are always needed. The enhanced map layout (t-SNE), photo text recognition and the speech model can be removed to free space — they re-download when you need them again, and photo text recognition installs from here too. Voice input is switched on and off here: turning it on downloads its speech engine and puts a mic in the chat box, and turning it off takes the mic away and offers to remove the engine and the speech model. Some rows are shared libraries a feature above them depends on: scikit-learn and scipy under the enhanced layout, OpenCV, shapely and pyclipper under photo text recognition. Those read 'Installed — in use' with a greyed Remove button and a pill pointing at what to remove first — they're already on your device, just still needed by something. numpy is never offered because the search model shares it.",
   },
   "settings-memory-map": {
     title: "Memory map",

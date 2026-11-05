@@ -103,7 +103,10 @@ pub async fn propose_metadata(
     on_event: Channel<ReviewEvent>,
 ) -> Result<()> {
     let Some(mut plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            &app,
+            Role::Background,
+        )));
     };
 
     // Bound the (untrusted webview) id list: it expands to one SQL placeholder
@@ -559,7 +562,10 @@ pub async fn propose_retag_vocabulary(app: AppHandle) -> Result<Vec<String>> {
 
 async fn propose_vocabulary_inner(app: &AppHandle, sink: &retag::RetagSink) -> Result<Vec<String>> {
     let Some(plan) = llm_gateway::resolve(app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            app,
+            Role::Background,
+        )));
     };
     let docs = retag_documents(app)?;
     if docs.is_empty() {
@@ -638,7 +644,10 @@ async fn apply_vocabulary_inner(
     vocabulary: Vec<String>,
 ) -> Result<()> {
     let Some(mut plan) = llm_gateway::resolve(app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            app,
+            Role::Background,
+        )));
     };
 
     let mut vocabulary: Vec<String> = {

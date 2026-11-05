@@ -60,20 +60,14 @@ export interface ThemeState {
   setAccent: (a: string) => void;
   setDepth: (d: Depth) => void;
   setAutoLocation: (v: string) => void;
-  /** Whether the **learning tools** — the Review and Teach tabs — are shown. A Depth-keyed reveal
-   *  the user can override, e.g. hide both once the assistant files things well on its own. */
-  teachVisible: boolean;
-  setTeachVisible: (v: boolean) => void;
-  /** Whether the **Map** tab is shown. A Depth-keyed reveal the user can override, on the same
-   *  footing as the learning tools above. */
-  mapVisible: boolean;
-  setMapVisible: (v: boolean) => void;
-  /** Whether the sidebar footer's **"Models in use"** block is shown. Same Depth-keyed reveal with a
+  // Which sidebar TABS show (the learning tools, the Map) is lib/nav's: a Depth default plus the
+  // user's pin and hide, set by right-clicking the tab itself.
+  /** Whether the sidebar footer's **"Models in use"** block is shown. A Depth-keyed reveal with a
    *  user override; hiding it changes nothing about which model actually runs. */
   modelsVisible: boolean;
   setModelsVisible: (v: boolean) => void;
-  /** True when every appearance axis (System, Mode, Accent, Depth, Location, Teach) is at its
-   *  out-of-the-box default — drives whether Settings offers an appearance "Reset". */
+  /** True when every appearance axis (System, Mode, Accent, Depth, Location, the models footer) is
+   *  at its out-of-the-box default — drives whether Settings offers an appearance "Reset". */
   appearanceIsDefault: boolean;
   /** Restore every appearance axis to its default and forget the per-System accent memory (#445). */
   resetAppearance: () => void;
@@ -149,24 +143,13 @@ export function storedContrast(stored: string | null): Contrast {
   return oneOf(stored, CONTRASTS, DEFAULT_CONTRAST);
 }
 
-// The Teach-tab visibility override: "auto" follows the Depth preset (hidden for minimalist,
-// shown for standard/power); "show"/"hide" are explicit choices made from Settings.
-type TeachPref = "auto" | "show" | "hide";
-const TEACH_PREFS: readonly TeachPref[] = ["auto", "show", "hide"];
-const DEFAULT_TEACH: TeachPref = "auto";
-
-// The Map-tab visibility override, the same shape as Teach above: "auto" follows the Depth preset
-// (hidden for minimalist, shown for standard/power), "show"/"hide" are explicit Settings choices.
-// The semantic map is an exploratory surface rather than a daily one, so a minimalist preset has no
-// use for it -- but someone on `min` who does want it can say so and keep it.
-type MapPref = "auto" | "show" | "hide";
-const MAP_PREFS: readonly MapPref[] = ["auto", "show", "hide"];
-const DEFAULT_MAP: MapPref = "auto";
-
-// The sidebar "Models in use" block, same shape again. It was governed by the Depth preset alone,
-// with no way to say otherwise: hidden on `min` even if you specifically want to see which model is
-// answering, and always on at standard/power even if you find it noise. "auto" keeps today's
-// behaviour, so nothing moves for anyone who doesn't touch it.
+// The sidebar "Models in use" block: "auto" follows the Depth preset, "show"/"hide" are explicit
+// Settings choices. (The Teach and Map tabs had overrides of this shape too. Tabs are lib/nav's now,
+// pinned and hidden from a right-click on the tab, and it adopted those two stored values once.)
+//
+// It was governed by the Depth preset alone, with no way to say otherwise: hidden on `min` even if
+// you specifically want to see which model is answering, and always on at standard/power even if you
+// find it noise. "auto" keeps today's behaviour, so nothing moves for anyone who doesn't touch it.
 //
 // A tri-state, NOT a boolean: a plain on/off cannot express "keep following the preset", which is
 // what the default has to be. And once a value is in this list it can never be REMOVED — `oneOf`
@@ -184,8 +167,7 @@ const KEY = {
   accent: "pm:theme:accent",
   depth: "pm:theme:depth",
   accentBySystem: "pm:theme:accentBySystem",
-  teach: "pm:theme:teach",
-  map: "pm:theme:map",
+  // "pm:theme:teach" and "pm:theme:map" were here; lib/nav adopts and removes them.
   models: "pm:theme:models",
   fontScale: "pm:a11y:fontScale",
   reduceMotion: "pm:a11y:reduceMotion",
@@ -259,12 +241,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       ? stored
       : defaultAccentFor(initialSystem);
   });
-  const [teachPref, setTeachPrefState] = useState<TeachPref>(() =>
-    oneOf(read(KEY.teach), TEACH_PREFS, DEFAULT_TEACH),
-  );
-  const [mapPref, setMapPrefState] = useState<MapPref>(() =>
-    oneOf(read(KEY.map), MAP_PREFS, DEFAULT_MAP),
-  );
   const [modelsPref, setModelsPrefState] = useState<ModelsPref>(() =>
     oneOf(read(KEY.models), MODELS_PREFS, DEFAULT_MODELS),
   );
@@ -417,25 +393,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     write(KEY.accentBySystem, JSON.stringify(map));
   }
 
-  // The learning tools (Review + Teach) are a Depth-keyed feature reveal — hidden for minimalist,
-  // shown for standard/power — until the user makes an explicit choice in Settings, which then wins.
-  // Lets a user who's happy with the assistant's filing hide both once they no longer want to curate.
-  const teachVisible = teachPref === "auto" ? depth !== "min" : teachPref === "show";
-  function setTeachVisible(visible: boolean): void {
-    const pref: TeachPref = visible ? "show" : "hide";
-    setTeachPrefState(pref);
-    write(KEY.teach, pref);
-  }
-
-  // The Map tab, on the same footing (see MapPref above).
-  const mapVisible = mapPref === "auto" ? depth !== "min" : mapPref === "show";
-  function setMapVisible(visible: boolean): void {
-    const pref: MapPref = visible ? "show" : "hide";
-    setMapPrefState(pref);
-    write(KEY.map, pref);
-  }
-
-  // The sidebar's "Models in use" block, likewise (see ModelsPref above).
+  // The sidebar's "Models in use" block: a Depth-keyed reveal until the user chooses (see ModelsPref).
   const modelsVisible = modelsPref === "auto" ? depth !== "min" : modelsPref === "show";
   function setModelsVisible(visible: boolean): void {
     const pref: ModelsPref = visible ? "show" : "hide";
@@ -451,8 +409,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     depth === DEFAULT_DEPTH &&
     accent === defaultAccentFor(DEFAULT_SYSTEM) &&
     autoLocation === "" &&
-    teachPref === DEFAULT_TEACH &&
-    mapPref === DEFAULT_MAP &&
     modelsPref === DEFAULT_MODELS;
 
   const accessibilityIsDefault =
@@ -473,21 +429,17 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }
 
   // Restore every axis to its default in one go. The persist effect below mirrors the axis changes to
-  // localStorage + the stored `appearance` blob; teach and the per-System accent memory aren't in that
-  // effect, so they're written here directly. `setSystemState` (not the public `setSystem`) avoids
-  // re-recording a per-System accent while we're clearing that memory.
+  // localStorage + the stored `appearance` blob; the models footer and the per-System accent memory
+  // aren't in that effect, so they're written here directly. `setSystemState` (not the public
+  // `setSystem`) avoids re-recording a per-System accent while we're clearing that memory.
   function resetAppearance(): void {
     write(KEY.accentBySystem, "{}");
-    write(KEY.teach, DEFAULT_TEACH);
-    write(KEY.map, DEFAULT_MAP);
     write(KEY.models, DEFAULT_MODELS);
     setSystemState(DEFAULT_SYSTEM);
     setModePrefState(DEFAULT_MODE_PREF);
     setDepthState(DEFAULT_DEPTH);
     setAccentState(defaultAccentFor(DEFAULT_SYSTEM));
     setAutoLocationState("");
-    setTeachPrefState(DEFAULT_TEACH);
-    setMapPrefState(DEFAULT_MAP);
     setModelsPrefState(DEFAULT_MODELS);
   }
 
@@ -564,10 +516,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setAccent,
     setDepth: setDepthState,
     setAutoLocation: setAutoLocationState,
-    teachVisible,
-    setTeachVisible,
-    mapVisible,
-    setMapVisible,
     modelsVisible,
     setModelsVisible,
     appearanceIsDefault,

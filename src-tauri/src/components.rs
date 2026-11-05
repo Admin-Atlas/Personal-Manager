@@ -3,11 +3,13 @@
 
 //! On-device storage inventory + a reference-counted, guarded teardown of the large, regenerable
 //! components PM downloads: the optional t-SNE stack (`openTSNE` → `scikit-learn`/`scipy`), the
-//! optional photo-OCR stack (`rapidocr`+`pi-heif` → OpenCV/`shapely`/`pyclipper`), the
-//! Whisper speech model, and a **read-only** view of the active embedder.
+//! optional photo-OCR stack (`rapidocr`+`pi-heif` → OpenCV/`shapely`/`pyclipper`), voice input's
+//! speech engine, the Whisper speech model, and a **read-only** view of the active embedder.
 //!
 //! The photo-OCR stack is also **installable** from this inventory (the one place it's enabled or
 //! disabled): when absent it shows an Install action, when present it's removable with its cascade.
+//! Voice input is the same, with its switch on the row (Mods spec D8): turning it on installs the
+//! engine, turning it off offers to remove it.
 //!
 //! The teardown is a cascade: a heavy shared library can only be removed once nothing still needs it
 //! (`scikit-learn` after `openTSNE`; `scipy` after both; the OCR image libs after `rapidocr`). `numpy`
@@ -23,6 +25,10 @@ use tauri::{AppHandle, Manager};
 
 use crate::error::{Error, Result};
 use crate::registry::ModelEntry;
+// The Speech-model row measures and removes the Whisper model's own folders only, never
+// `runtime/models` itself, which also holds the embedder, reranker and OCR weights (#1046). The
+// helpers live in `sidecar`, which also reads the folder as D8's evidence that voice was used.
+use crate::sidecar::{remove_whisper, whisper_paths};
 use crate::{db, paths, AppState};
 
 #[derive(Serialize, Clone, Copy)]
@@ -52,6 +58,32 @@ enum Status {
 /// yet). The ~31 MB of OCR models download separately, on the first photo.
 const OCR_INSTALL_ESTIMATE_BYTES: u64 = 205 * 1024 * 1024;
 
+/// Rough on-disk footprint of voice input's speech engine once installed: measured at 243 MiB on
+/// Linux with faster-whisper 1.2.1, CTranslate2 4.8.1 and PyAV 18.1.0 (the two native libraries are
+/// nearly all of it). Shown, like the OCR estimate, on a row whose engine isn't on disk. The speech
+/// model (~145 MB) downloads separately, on the first recording.
+const VOICE_INSTALL_ESTIMATE_BYTES: u64 = 245 * 1024 * 1024;
+
+/// Every site-packages entry the speech engine installs: the voice lock's own packages
+/// (`OPTIONAL_VOICE_COMPONENT.uninstall` in sidecar.rs), each import dir with its dist-info and
+/// bundled-library folder. setuptools brings `_distutils_hack` and its `.pth`, and older releases
+/// `pkg_resources`.
+const VOICE_GLOBS: &[&str] = &[
+    "faster_whisper",
+    "faster_whisper-*",
+    "ctranslate2",
+    "ctranslate2-*",
+    "ctranslate2.libs",
+    "av",
+    "av-*",
+    "av.libs",
+    "setuptools",
+    "setuptools-*",
+    "_distutils_hack",
+    "distutils-precedence.pth",
+    "pkg_resources",
+];
+
 /// A dependent that must be removed first; `anchor` is the component id to scroll to in this tab.
 #[derive(Serialize)]
 struct Blocker {
@@ -80,6 +112,17 @@ struct Component {
     blockers: Vec<Blocker>,
     manage: Option<Manage>,
     note: Option<String>,
+    /// A feature switch that lives on this row, and where it stands: voice input's. `None` for
+    /// every other row. With it, `status` describes the engine on disk, and the switch decides
+    /// whether the row offers Turn on or Turn off beside it.
+    switch: Option<bool>,
+}
+
+/// The voice switch and whether its engine is ready, read before the walk (a DB row and a marker).
+#[derive(Clone, Copy, Default)]
+struct VoiceState {
+    on: bool,
+    ready: bool,
 }
 
 #[derive(Serialize)]
@@ -144,34 +187,6 @@ fn dir_nonempty(path: &Path) -> bool {
     std::fs::read_dir(path)
         .map(|mut rd| rd.next().is_some())
         .unwrap_or(false)
-}
-
-/// The Whisper model's own folder inside `runtime/models`. The sidecar loads
-/// `WhisperModel(WHISPER_MODEL, download_root=<runtime/models>)` (`pm_sidecar.py`, `get_whisper`), and
-/// faster-whisper passes that root to huggingface_hub as its `cache_dir`, which lays the repo out as
-/// `models--<org>--<name>`. The same root also holds the embedder and reranker (`fastembed/`), the
-/// hf and xet caches (`hf/`) and the photo-OCR weights (`rapidocr/`), so the Speech-model row must
-/// measure and remove this folder only, never the root: removing the root used to delete the search
-/// models with it, and the total counted the embedder twice.
-const WHISPER_REPO_DIR: &str = "models--Systran--faster-whisper-base.en";
-
-/// Every path the Whisper download leaves under `models`: the repo folder and huggingface_hub's lock
-/// folder for it.
-fn whisper_paths(models: &Path) -> [PathBuf; 2] {
-    [
-        models.join(WHISPER_REPO_DIR),
-        models.join(".locks").join(WHISPER_REPO_DIR),
-    ]
-}
-
-/// Remove the Whisper model's folders and nothing else under `models`.
-fn remove_whisper(models: &Path) -> std::io::Result<()> {
-    for p in whisper_paths(models) {
-        if p.exists() {
-            std::fs::remove_dir_all(&p)?;
-        }
-    }
-    Ok(())
 }
 
 /// The venv's `site-packages` (per-OS layout), if it exists.
@@ -252,6 +267,20 @@ fn pkg_dist(site: Option<&PathBuf>, dist_prefix: &str, patterns: &[&str]) -> (bo
     (present, size)
 }
 
+/// The import dirs of the speech engine's three packages. Any one of them is an engine on disk: pip
+/// removes packages one at a time and stops at the first it can't, so a removal that failed
+/// part-way can leave CTranslate2 or PyAV (nearly all of the ~240 MB) without faster-whisper.
+const VOICE_IMPORT_DIRS: &[&str] = &["faster_whisper", "ctranslate2", "av"];
+
+/// Whether voice input's speech engine, or any part of it, is in the venv. The Storage row and the
+/// sidecar's one-off clean-up of an older PM's engine (`sidecar::legacy_voice_action`) both ask
+/// this, so they can never disagree about what is installed, and what a failed removal left is
+/// still shown (with its Remove) and still cleaned up.
+pub(crate) fn voice_engine_on_disk(venv: &Path) -> bool {
+    site_packages_dir(venv)
+        .is_some_and(|site| VOICE_IMPORT_DIRS.iter().any(|d| site.join(d).is_dir()))
+}
+
 /// Approximate on-disk size of an embedder's weights (its shared fastembed/HF cache is outside the
 /// data dir and unmanaged, so we estimate rather than scan).
 fn embedder_estimate_bytes(id: &str) -> u64 {
@@ -292,6 +321,7 @@ fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
                  You can reinstall it any time."
                     .into(),
             ),
+            switch: None,
         },
         (true, false) => Component {
             id: "ocr",
@@ -306,6 +336,7 @@ fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
             blockers: Vec::new(),
             manage: None,
             note: Some("Until then, photos are indexed by their date and location only.".into()),
+            switch: None,
         },
         (false, _) => Component {
             id: "ocr",
@@ -320,11 +351,84 @@ fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
             blockers: Vec::new(),
             manage: None,
             note: Some("Without it, photos are indexed by their date and location only.".into()),
+            switch: None,
         },
     }
 }
 
-fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageReport {
+/// The voice-input row (Mods spec D8): the switch and its speech engine in one place, the way
+/// photo OCR's row holds that whole feature, so voice is turned on, turned off and removed here.
+/// `status` describes the engine on disk, by the same rules as OCR's (a marker a moved lock left
+/// stale is `Stale`), and `switch` says which of Turn on / Turn off goes beside it. Pure, so the
+/// six cases are tested. The speech model's weights keep their own row.
+fn voice_row(on: bool, present: bool, ready: bool, size: u64) -> Component {
+    const WHAT: &str = "Dictate into the chat box with the mic. PM turns your speech into text on \
+                        this computer; the recording never leaves it.";
+    let (detail, note, status, installed) = match (on, present, ready) {
+        (true, true, true) => (
+            WHAT.to_string(),
+            "Turning it off offers to remove the engine and the speech model too.",
+            Status::Removable,
+            true,
+        ),
+        (true, true, false) => (
+            format!("{WHAT} It is on, but its engine needs installing again after an update."),
+            "Until then, the mic installs it the first time you record.",
+            Status::Stale,
+            true,
+        ),
+        (true, false, _) => (
+            format!("{WHAT} It is on, but its engine isn't on this computer."),
+            "Install it here, or the mic installs it the first time you record.",
+            Status::Installable,
+            false,
+        ),
+        (false, true, true) => (
+            format!("{WHAT} Off. Its engine is still on this computer, so turning it on is quick."),
+            "Remove it to free the space; turning voice on again downloads it.",
+            Status::Removable,
+            true,
+        ),
+        (false, true, false) => (
+            format!("{WHAT} Off. Its engine is still on this computer, from before an update."),
+            "Remove it to free the space; turning voice on installs it again.",
+            Status::Stale,
+            true,
+        ),
+        (false, false, _) => (
+            format!("{WHAT} Off: turning it on downloads the engine once."),
+            "The speech model (about 145 MB) downloads the first time you record.",
+            Status::Installable,
+            false,
+        ),
+    };
+    Component {
+        id: "voice",
+        label: "Voice input (speech engine)".into(),
+        detail,
+        // What is on disk once installed; before then, what installing it will use.
+        size_bytes: if installed {
+            size
+        } else {
+            VOICE_INSTALL_ESTIMATE_BYTES
+        },
+        approximate: !installed,
+        child: false,
+        status,
+        blockers: Vec::new(),
+        manage: None,
+        note: Some(note.into()),
+        switch: Some(on),
+    }
+}
+
+fn build_report(
+    venv: &Path,
+    data: &Path,
+    embedder: &ModelEntry,
+    ocr_ready: bool,
+    voice: VoiceState,
+) -> StorageReport {
     let site = site_packages_dir(venv);
     let (tsne_present, tsne_size) = pkg(site.as_ref(), "openTSNE", &["openTSNE", "openTSNE-*"]);
     let (sklearn_present, sklearn_size) = pkg(
@@ -369,14 +473,30 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
     );
     let (pyclipper_present, pyclipper_size) =
         pkg_dist(site.as_ref(), "pyclipper-", &["pyclipper*"]);
+    // Voice input's speech engine. Counted only with one of its own packages there: setuptools is
+    // in its set, and a venv built on Python 3.11 has its own copy from `venv` whether or not voice
+    // is installed, which then belongs to the document engine.
+    let (_, voice_size) = pkg(site.as_ref(), "faster_whisper", VOICE_GLOBS);
+    let voice_present = voice_engine_on_disk(venv);
+    let voice_size = if voice_present { voice_size } else { 0 };
 
     let venv_total = dir_size(venv);
     // The base engine is the venv minus every optional library (each listed separately below), so the
     // total never double-counts them.
-    let optional_size =
-        tsne_size + sklearn_size + scipy_size + ocr_size + cv2_size + shapely_size + pyclipper_size;
+    let optional_size = tsne_size
+        + sklearn_size
+        + scipy_size
+        + ocr_size
+        + cv2_size
+        + shapely_size
+        + pyclipper_size
+        + voice_size;
     let base = venv_total.saturating_sub(optional_size);
 
+    // The Whisper model's own folders, never the whole of `runtime/models`: the embedder, the
+    // reranker, the hf and xet caches and the photo-OCR weights live there too. Measured that way,
+    // the row appeared for someone who never dictated, the total counted the embedder twice, and the
+    // voice-off dialog offered to free all of it.
     let models = data.join("runtime").join("models");
     let [whisper_dir, whisper_locks] = whisper_paths(&models);
     let whisper_present = dir_nonempty(&whisper_dir);
@@ -401,6 +521,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
         blockers: Vec::new(),
         manage: None,
         note: None,
+        switch: None,
     });
 
     if tsne_present {
@@ -418,6 +539,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
                 tab: "general",
             }),
             note: Some("Removing it returns the Map to the basic (PCA) layout.".into()),
+            switch: None,
         });
     }
 
@@ -451,6 +573,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
                 .unwrap_or_default(),
             manage: None,
             note: None,
+            switch: None,
         });
     };
     if sklearn_present {
@@ -501,6 +624,8 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
         );
     }
 
+    components.push(voice_row(voice.on, voice_present, voice.ready, voice_size));
+
     if whisper_present {
         components.push(Component {
             id: "whisper",
@@ -513,6 +638,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
             blockers: Vec::new(),
             manage: None,
             note: Some("Re-downloads automatically the next time you record.".into()),
+            switch: None,
         });
     }
 
@@ -530,6 +656,7 @@ fn build_report(venv: &Path, data: &Path, embedder: &ModelEntry, ocr_ready: bool
             tab: "search",
         }),
         note: Some("Stored in a shared model cache; can't be removed here.".into()),
+        switch: None,
     });
 
     let total = base + optional_size + whisper_size + embedder_size;
@@ -561,6 +688,18 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
         "scikit-learn" => sidecar.pip_uninstall(&["scikit-learn", "joblib", "threadpoolctl"])?,
         "scipy" => sidecar.pip_uninstall(&["scipy"])?,
         "ocr" => sidecar.uninstall_optional_ocr()?,
+        // Only while voice is off: the row offers Remove only then (Turn off is how an engine in
+        // use goes, and it offers this removal), and with voice on the next recording would just
+        // download it again.
+        "voice" => {
+            if crate::voice_switch::is_on(&state)? {
+                return Err(Error::Other(
+                    "Voice input is on. Turn it off first; that offers to remove its engine."
+                        .into(),
+                ));
+            }
+            sidecar.uninstall_optional_voice()?
+        }
         // The row keeps its old id (the frontend keys on it), but what is installed changed name:
         // rapidocr 3.10 depends on `opencv-python-headless`, and a venv that had OCR before still
         // holds `opencv-python`. Both own the same `cv2/` folder, so removing only one leaves either
@@ -569,6 +708,8 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path, data: &Path) -> Result<()> 
         "opencv-python" => sidecar.pip_uninstall(&["opencv-python-headless", "opencv-python"])?,
         "shapely" => sidecar.pip_uninstall(&["shapely"])?,
         "pyclipper" => sidecar.pip_uninstall(&["pyclipper"])?,
+        // The Whisper model's folders only: removing all of `runtime/models` took the search and
+        // photo-OCR models with it.
         "whisper" => remove_whisper(&data.join("runtime").join("models"))?,
         other => {
             return Err(Error::Other(format!("'{other}' can't be removed here.")));
@@ -590,11 +731,20 @@ pub async fn list_storage_components(app: AppHandle) -> Result<StorageReport> {
     };
     let venv = paths::venv_dir(&app)?;
     let data = paths::data_dir(&app)?;
-    // A marker read and a hash of the small OCR lock: cheap enough to take before the walk.
-    let ocr_ready = app.state::<AppState>().sidecar.optional_ocr_ready();
-    tauri::async_runtime::spawn_blocking(move || build_report(&venv, &data, &embedder, ocr_ready))
-        .await
-        .map_err(|e| Error::Other(format!("storage scan task panicked: {e}")))
+    // Marker reads and hashes of the small optional locks: cheap enough to take before the walk.
+    let (ocr_ready, voice) = {
+        let state = app.state::<AppState>();
+        let voice = VoiceState {
+            on: crate::voice_switch::is_on(&state)?,
+            ready: state.sidecar.optional_voice_ready(),
+        };
+        (state.sidecar.optional_ocr_ready(), voice)
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        build_report(&venv, &data, &embedder, ocr_ready, voice)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("storage scan task panicked: {e}")))
 }
 
 /// Remove a component, enforcing the dependency cascade. For `openTSNE` it also recomputes the
@@ -622,6 +772,7 @@ pub async fn remove_storage_component(app: AppHandle, id: String) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidecar::WHISPER_REPO_DIR;
 
     #[test]
     fn cascade_blocks_then_unblocks_in_order() {
@@ -722,7 +873,7 @@ mod tests {
         seeded_models(dir.path());
         let venv = dir.path().join("runtime").join("venv");
         let embedder = crate::registry::active_embedder();
-        let report = build_report(&venv, dir.path(), &embedder, false);
+        let report = build_report(&venv, dir.path(), &embedder, false, VoiceState::default());
         let whisper = report
             .components
             .iter()
@@ -742,23 +893,132 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let models = seeded_models(dir.path());
         remove_whisper(&models).unwrap();
+        assert!(models.join("fastembed").is_dir());
         let venv = dir.path().join("runtime").join("venv");
         let report = build_report(
             &venv,
             dir.path(),
             &crate::registry::active_embedder(),
             false,
+            VoiceState::default(),
         );
         assert!(report.components.iter().all(|c| c.id != "whisper"));
     }
 
+    // That `WHISPER_REPO_DIR` matches the sidecar's model name is tested where it lives
+    // (`sidecar::tests::whisper_folder_name_matches_the_sidecar_model`).
+
+    /// The voice row's six cases: the switch always rides on it, and the engine's state is told by
+    /// OCR's rules, so the frontend can offer Turn on / Turn off beside Install and Remove.
     #[test]
-    fn whisper_folder_name_matches_the_sidecar_model() {
-        // `WHISPER_REPO_DIR` is derived from the sidecar's model name; if that changes, the Storage
-        // row would silently stop finding the download.
-        let sidecar = include_str!("../../sidecar/pm_sidecar.py");
-        assert!(sidecar.contains("WHISPER_MODEL = \"base.en\""));
-        assert_eq!(WHISPER_REPO_DIR, "models--Systran--faster-whisper-base.en");
+    fn the_voice_row_carries_the_switch_and_the_engine_state() {
+        let row = |on, present, ready| voice_row(on, present, ready, 9);
+        let shape = |c: &Component| {
+            (
+                c.id,
+                c.switch,
+                matches!(c.status, Status::Removable),
+                matches!(c.status, Status::Stale),
+                matches!(c.status, Status::Installable),
+                c.size_bytes,
+                c.approximate,
+            )
+        };
+        let est = VOICE_INSTALL_ESTIMATE_BYTES;
+        // On.
+        assert_eq!(
+            shape(&row(true, true, true)),
+            ("voice", Some(true), true, false, false, 9, false)
+        );
+        assert_eq!(
+            shape(&row(true, true, false)),
+            ("voice", Some(true), false, true, false, 9, false)
+        );
+        assert_eq!(
+            shape(&row(true, false, false)),
+            ("voice", Some(true), false, false, true, est, true)
+        );
+        // Off: the engine left behind is Remove-able, and an absent one shows what Turn on costs.
+        assert_eq!(
+            shape(&row(false, true, true)),
+            ("voice", Some(false), true, false, false, 9, false)
+        );
+        assert_eq!(
+            shape(&row(false, true, false)),
+            ("voice", Some(false), false, true, false, 9, false)
+        );
+        assert_eq!(
+            shape(&row(false, false, false)),
+            ("voice", Some(false), false, false, true, est, true)
+        );
+        // No other row carries a switch.
+        assert_eq!(ocr_row(true, true, 1).switch, None);
+    }
+
+    /// A venv laid out with the speech engine in it (as an older PM's base install, or the switch,
+    /// leaves it): the voice row measures the engine's globs, and the document engine no longer
+    /// counts them, so the total adds them once.
+    #[test]
+    fn the_voice_engine_is_measured_on_its_own_row_and_out_of_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let venv = dir.path().join("runtime").join("venv");
+        let site = if cfg!(windows) {
+            venv.join("Lib").join("site-packages")
+        } else {
+            venv.join("lib").join("python3.12").join("site-packages")
+        };
+        let put = |rel: &str, bytes: usize| {
+            let p = site.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; bytes]).unwrap();
+        };
+        put("faster_whisper/__init__.py", 10);
+        put("faster_whisper-1.2.1.dist-info/RECORD", 1);
+        put("ctranslate2/__init__.py", 20);
+        put("ctranslate2.libs/libct2.so", 200);
+        put("av/__init__.py", 30);
+        put("av.libs/libavcodec.so", 300);
+        put("setuptools/__init__.py", 4);
+        put("fastembed/__init__.py", 1000);
+
+        assert!(voice_engine_on_disk(&venv));
+        let embedder = crate::registry::active_embedder();
+        let on = VoiceState {
+            on: true,
+            ready: true,
+        };
+        let report = build_report(&venv, dir.path(), &embedder, false, on);
+        let row = |id: &str| report.components.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(row("voice").size_bytes, 565);
+        assert_eq!(row("voice").switch, Some(true));
+        assert_eq!(row("venv").size_bytes, 1000, "the base excludes the engine");
+        assert_eq!(
+            report.total_bytes,
+            1565 + embedder_estimate_bytes(embedder.id)
+        );
+
+        // A removal pip stopped part-way: faster-whisper gone, CTranslate2 and PyAV left. Still the
+        // engine, on its own row with a Remove (voice is off), never folded into the base.
+        std::fs::remove_dir_all(site.join("faster_whisper")).unwrap();
+        assert!(voice_engine_on_disk(&venv));
+        let report = build_report(&venv, dir.path(), &embedder, false, VoiceState::default());
+        let row = |id: &str| report.components.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(row("voice").size_bytes, 1 + 20 + 200 + 30 + 300 + 4);
+        assert!(matches!(row("voice").status, Status::Stale));
+        assert_eq!(row("venv").size_bytes, 1000);
+
+        // With none of its packages left there is no engine: an off row with the install estimate,
+        // and what is left (here setuptools, as a 3.11 venv has from `venv` itself) is the base's.
+        for d in ["ctranslate2", "ctranslate2.libs", "av", "av.libs"] {
+            std::fs::remove_dir_all(site.join(d)).unwrap();
+        }
+        assert!(!voice_engine_on_disk(&venv));
+        let report = build_report(&venv, dir.path(), &embedder, false, VoiceState::default());
+        let voice = report.components.iter().find(|c| c.id == "voice").unwrap();
+        assert!(matches!(voice.status, Status::Installable));
+        assert_eq!(voice.switch, Some(false));
+        let base = report.components.iter().find(|c| c.id == "venv").unwrap();
+        assert_eq!(base.size_bytes, 1000 + 1 + 4);
     }
 
     #[test]

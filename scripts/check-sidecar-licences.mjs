@@ -36,6 +36,7 @@ export const LOCKS = [
   "sidecar/requirements.lock",
   "sidecar/requirements-ocr.lock",
   "sidecar/requirements-tsne.lock",
+  "sidecar/requirements-voice.lock",
 ];
 
 /**

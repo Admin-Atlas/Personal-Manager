@@ -355,6 +355,12 @@ jobs:
   # shipped resolution untested. `--no-deps` because an override can resolve the
   # lock past a dependency's bound (sidecar.rs `provision` says why); it also means pip no longer reports a
   # dependency the markers failed to select, so the import line is what catches one.
+  #
+  # Voice input's speech engine left the base lock for its own optional lock (Mods spec D8), so it is
+  # installed second, on top of the base, exactly as switching voice on installs it: the smoke still
+  # proves faster-whisper, CTranslate2 and PyAV import on every shipped OS, as it did when they were
+  # base packages. markitdown and fastembed are imported before the voice lock goes in, so neither
+  # can lean on a package only voice brings.
   python-smoke:
     needs: guards
     strategy:
@@ -383,7 +389,9 @@ jobs:
           fi
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r sidecar/requirements.lock
-          python -c "import markitdown, fastembed, faster_whisper; print('sidecar deps import OK')"
+          python -c "import markitdown, fastembed; print('sidecar deps import OK')"
+          pip install --require-hashes --no-deps -r sidecar/requirements-voice.lock
+          python -c "import faster_whisper, ctranslate2, av; print('voice engine import OK')"
 
   publish:
     needs: [guards, build, python-smoke]

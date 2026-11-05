@@ -589,7 +589,10 @@ pub async fn send_message(
     state.mark_user_activity();
 
     let Some(plan) = llm_gateway::resolve(&app, Role::Chat)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            &app,
+            Role::Chat,
+        )));
     };
     // Decided once, here: a reply finishes where it started, whatever the battery does meanwhile.
     let power_routed = plan.is_power_routed();

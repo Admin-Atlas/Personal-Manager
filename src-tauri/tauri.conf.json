@@ -47,7 +47,8 @@
       "../sidecar/requirements.txt": "sidecar/requirements.txt",
       "../sidecar/requirements.lock": "sidecar/requirements.lock",
       "../sidecar/requirements-ocr.lock": "sidecar/requirements-ocr.lock",
-      "../sidecar/requirements-tsne.lock": "sidecar/requirements-tsne.lock"
+      "../sidecar/requirements-tsne.lock": "sidecar/requirements-tsne.lock",
+      "../sidecar/requirements-voice.lock": "sidecar/requirements-voice.lock"
     },
     "icon": [
       "icons/32x32.png",

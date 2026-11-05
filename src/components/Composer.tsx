@@ -10,10 +10,11 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useRecorder } from "../lib/useRecorder";
+import { useRecorder, type RecorderState } from "../lib/useRecorder";
 import { listTags } from "../lib/ipc";
 import { completeMention, matchTags, mentionAtCaret } from "../lib/mentions";
 import type { TagSummary } from "../lib/types";
+import { useVoiceSwitch, voiceShown } from "../lib/voiceSwitch";
 import { MentionSuggest } from "./MentionSuggest";
 import { Button, Textarea } from "./ui";
 
@@ -124,11 +125,15 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
   }
 
   // Voice input (spec §4 P1): a dictated clip is transcribed on-device and
-  // appended to the box for the user to review/edit — never auto-sent.
-  const recorder = useRecorder((spoken) => {
+  // appended to the box for the user to review/edit — never auto-sent. It is a
+  // switch (Mods spec D8): while it is off, or not known yet, there is no mic and
+  // no recorder at all, and the backend refuses a transcription anyway.
+  const voiceOn = voiceShown(useVoiceSwitch());
+  const [voice, setVoice] = useState<VoiceStatus>(VOICE_IDLE);
+  const onTranscript = useCallback((spoken: string) => {
     setText((current) => (current.trim() ? `${current.trim()} ${spoken}` : spoken));
     textareaRef.current?.focus();
-  });
+  }, []);
 
   // Grow the textarea to fit its content, capped at `cap`px; past that it scrolls inside. Reset to
   // auto first so it can also shrink as the draft gets shorter (and back to one row on send).
@@ -170,18 +175,9 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
     setMentionQuery(null);
   }
 
-  function toggleMic() {
-    if (recorder.state === "recording") recorder.stop();
-    else if (recorder.state === "idle") void recorder.start();
-  }
-
-  const recording = recorder.state === "recording";
-  const transcribing = recorder.state === "transcribing";
-  const micTitle = recording
-    ? "Stop and transcribe"
-    : transcribing
-      ? "Transcribing…"
-      : "Record voice (transcribed on your device)";
+  const recording = voiceOn && voice.state === "recording";
+  const transcribing = voiceOn && voice.state === "transcribing";
+  const voiceError = voiceOn ? voice.error : null;
 
   return (
     <div ref={rootRef} className="border-t border-border p-4">
@@ -202,27 +198,7 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
             onPick={pick}
             onHover={setActive}
           />
-          <button
-            type="button"
-            onClick={toggleMic}
-            disabled={transcribing}
-            title={micTitle}
-            aria-label={micTitle}
-            data-help="composer-mic"
-            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-              recording ? "animate-pulse" : "border-border2 text-ink3 hover:text-ink2"
-            }`}
-            style={
-              recording
-                ? {
-                    color: "var(--st-due)",
-                    background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-                  }
-                : undefined
-            }
-          >
-            {transcribing ? <SpinnerIcon /> : recording ? <StopIcon /> : <MicIcon />}
-          </button>
+          {voiceOn && <VoiceMic onTranscript={onTranscript} onStatus={setVoice} />}
 
           <Textarea
             ref={textareaRef}
@@ -298,7 +274,7 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
         <div className="flex min-w-0 items-center justify-start">{rightTools}</div>
       </div>
 
-      {(recording || transcribing || recorder.error) && (
+      {(recording || transcribing || voiceError) && (
         <div className={`mt-2 ${COMPOSER_GRID}`}>
           <div />
           <div role="status" aria-live="polite">
@@ -312,9 +288,9 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
                 Transcribing on your device… the first time also downloads the voice model.
               </p>
             )}
-            {recorder.error && (
+            {voiceError && (
               <p className="text-xs" style={{ color: "var(--st-due)" }}>
-                {recorder.error}
+                {voiceError}
               </p>
             )}
           </div>
@@ -322,6 +298,71 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
         </div>
       )}
     </div>
+  );
+}
+
+/** What the composer's status line shows about the mic. */
+interface VoiceStatus {
+  state: RecorderState;
+  error: string | null;
+}
+
+const VOICE_IDLE: VoiceStatus = { state: "idle", error: null };
+
+/**
+ * The mic button. Its own component so the recorder exists only while voice is on: switching voice
+ * off unmounts it, which stops a recording and releases the microphone (`useRecorder`'s cleanup),
+ * and its status goes back to idle so no stale line is left under the box.
+ */
+function VoiceMic({
+  onTranscript,
+  onStatus,
+}: {
+  onTranscript: (text: string) => void;
+  onStatus: (status: VoiceStatus) => void;
+}) {
+  const recorder = useRecorder(onTranscript);
+  const { state, error } = recorder;
+  useEffect(() => {
+    onStatus({ state, error });
+  }, [state, error, onStatus]);
+  useEffect(() => () => onStatus(VOICE_IDLE), [onStatus]);
+
+  function toggleMic() {
+    if (recorder.state === "recording") recorder.stop();
+    else if (recorder.state === "idle") void recorder.start();
+  }
+
+  const recording = state === "recording";
+  const transcribing = state === "transcribing";
+  const micTitle = recording
+    ? "Stop and transcribe"
+    : transcribing
+      ? "Transcribing…"
+      : "Record voice (transcribed on your device)";
+
+  return (
+    <button
+      type="button"
+      onClick={toggleMic}
+      disabled={transcribing}
+      title={micTitle}
+      aria-label={micTitle}
+      data-help="composer-mic"
+      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+        recording ? "animate-pulse" : "border-border2 text-ink3 hover:text-ink2"
+      }`}
+      style={
+        recording
+          ? {
+              color: "var(--st-due)",
+              background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
+            }
+          : undefined
+      }
+    >
+      {transcribing ? <SpinnerIcon /> : recording ? <StopIcon /> : <MicIcon />}
+    </button>
   );
 }
 
