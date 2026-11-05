@@ -461,6 +461,27 @@ describe("CalendarView: the whole calendar", () => {
     const details = await screen.findByRole("dialog", { name: "Dentist" });
     await escapeLandsOn(details, pieceOf(kept));
   });
+
+  it("lands a hit on its piece in the Terminal look too", async () => {
+    // The Terminal System draws its own lists and tables, which marked no pieces at first.
+    env.system = "terminal";
+    localStorage.setItem("pm.calendar.view", "week");
+    const year = now.getFullYear() - 2;
+    const old = row({
+      id: "old",
+      summary: "Dentist",
+      start: `${year}-03-04T09:00:00`,
+      end: `${year}-03-04T09:30:00`,
+    });
+    rows = [standup, old];
+    const { CalendarView } = await import("./CalendarView");
+    const view = render(<CalendarView />);
+    await waitFor(() => expect(pieceOf(standup.id)).toBeDefined());
+    await act(async () => {});
+    view.rerender(<CalendarView reveal={{ event: old, nonce: 1 }} />);
+    const details = await screen.findByRole("dialog", { name: "Dentist" });
+    await escapeLandsOn(details, pieceOf("old"));
+  });
 });
 
 // C16a: the box the drag gesture will hold the pointer in (C16b), which the LD1 probe finds by its

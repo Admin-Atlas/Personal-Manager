@@ -454,8 +454,33 @@ fn open_keyed(path: &Path, key: &str) -> Result<Connection> {
     // journal_mode returns a row, so consume it via query rather than execute.
     conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    register_functions(&conn)?;
 
     Ok(conn)
+}
+
+/// PM's own SQL functions, registered once per connection as it opens: registering again later
+/// would expire every prepared statement on the shared connection, and fail while one is stepping.
+///
+/// - `pm_fold(text)`: lower case in every script, for the calendar search
+///   (`calendar::search_events`). SQLite's own `lower` and `LIKE` fold only A to Z, so "élodie"
+///   never found "Élodie". Anything not text (NULL, or a packed BLOB) folds to NULL, which matches
+///   nothing.
+fn register_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::types::ValueRef;
+    conn.create_scalar_function(
+        "pm_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(match ctx.get_raw(0) {
+                ValueRef::Text(t) => Some(String::from_utf8_lossy(t).to_lowercase()),
+                _ => None,
+            })
+        },
+    )?;
+    Ok(())
 }
 
 /// Re-key the open store in place (SQLCipher `PRAGMA rekey`). The same connection

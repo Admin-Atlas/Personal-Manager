@@ -133,6 +133,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                               background: eventFill(own, colorOf(ev.calendar_id), null),
                             }}
                             title={ev.summary}
+                            data-piece-of={ev.id}
                             role={clickable ? "button" : undefined}
                             tabIndex={clickable ? 0 : undefined}
                             onClick={
@@ -213,6 +214,7 @@ export function TerminalMonthTable({ cursor, events, colorOf, now, onEventClick 
                       borderBottomRightRadius: b.continuesRight ? 0 : "var(--radius-sm)",
                     }}
                     title={b.ev.summary}
+                    data-piece-of={b.ev.id}
                     role={onEventClick ? "button" : undefined}
                     tabIndex={onEventClick ? 0 : undefined}
                     onClick={

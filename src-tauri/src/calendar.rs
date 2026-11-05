@@ -2837,29 +2837,10 @@ pub fn list_events_between(
 /// a query language).
 const SEARCH_MAX_WORDS: usize = 8;
 
-/// Lower case in every script, as SQL `pm_fold(text)`, for [`search_events`]: SQLite's own `lower`
-/// and `LIKE` fold only A to Z, so "élodie" never found "Élodie". Not text (NULL, or a packed BLOB)
-/// folds to NULL, which matches nothing.
-fn register_fold(conn: &Connection) -> Result<()> {
-    use rusqlite::functions::FunctionFlags;
-    use rusqlite::types::ValueRef;
-    conn.create_scalar_function(
-        "pm_fold",
-        1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            Ok(match ctx.get_raw(0) {
-                ValueRef::Text(t) => Some(String::from_utf8_lossy(t).to_lowercase()),
-                _ => None,
-            })
-        },
-    )?;
-    Ok(())
-}
-
 /// The mirrored events whose title or location holds every word of `query`, case aside in any
-/// script, for the search palette: Google's search reaches the whole calendar, and since #1047 so
-/// does the mirror.
+/// script (SQL `pm_fold`, which `db::open` registers: SQLite's own `LIKE` folds only A to Z), for
+/// the search palette: Google's search reaches the whole calendar, and since #1047 so does the
+/// mirror.
 ///
 /// - **One hit per repeating event**, as its next occurrence, or its latest once it's over. Every
 ///   occurrence is a row of its own (`singleEvents`), so a weekly meeting would otherwise fill the
@@ -2894,7 +2875,6 @@ pub fn search_events(
     if words.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    register_fold(conn)?;
     // ?1 now, ?2 the limit, ?3 today, then the words, then the hidden calendars.
     let first_word = 4;
     let matches = (0..words.len())
