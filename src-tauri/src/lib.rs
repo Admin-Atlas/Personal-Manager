@@ -1020,6 +1020,15 @@ impl AppState {
         Ok(())
     }
 
+    /// The open vault's id (`VaultMeta.vault_id`), or `None` while no vault is open. The mods
+    /// ledger binds each of its DB steps to it, so a change begun in one vault never commits into
+    /// another. Safe to call while holding [`Self::conn`]'s guard: DB then vault is the order
+    /// [`Self::open_session`] takes them in.
+    pub fn active_vault_id(&self) -> Option<String> {
+        let guard = self.vault.lock().ok()?;
+        guard.as_ref().map(|rt| rt.cipher.vault_id().to_owned())
+    }
+
     /// Snapshot the active vault's Markdown dir + cipher, or a friendly error if the
     /// vault is locked. Cloned so the caller can do file IO without holding the lock —
     /// the single way ingest reaches the Markdown layer.

@@ -107,7 +107,8 @@ release remain the open post-v1 work.
     named `commands::<name>`), `error.rs`, `paths.rs`, `clock.rs`.
   - **Store** — `db/` (`open()` = SQLCipher key + sqlite-vec + FTS5 + migrations;
     `migrations.rs` additive + `user_version`-based, the version pinned to the migration
-    count by a test in that file); `vault/` (the Markdown vault
+    count by a test in that file, and a store past that count refused untouched, INVARIANTS.md
+    I-28); `vault/` (the Markdown vault
     + its crypto / KDF / ACL / pointer / migration).
   - **Ingestion & retrieval** — `ingest.rs` (convert → hash → chunk → embed → vault + index;
     the `write_document_truth` truth-writer seam; `rebuild`), `splitter.rs` (structure-aware
@@ -146,8 +147,12 @@ release remain the open post-v1 work.
     the navigation guard, the init scripts and the per-engine switches, with no `crate::` path so
     the sealed-frame regression app can include it. `mod.rs` builds every window through
     `build_window` (INVARIANTS.md I-26), the main one included (`"create": false` in
-    `tauri.conf.json`). `ids.rs` is the mod id grammar and the trust tiers; `package.rs` the
-    `.pmmod` verifier (signature, file set, caps, manifest); `runtime.rs` the `pmmod` scheme's
+    `tauri.conf.json`). `ids.rs` is the mod id grammar and the trust tiers; `store.rs` the closed
+    value sets of the v60 mod tables (INVARIANTS.md I-12, I-29); `package.rs` the
+    `.pmmod` verifier (signature, file set, caps, manifest); `ledger.rs` install, update,
+    repair, uninstall and the writer's startup load and sweep, with `policy.rs` (its pure
+    decisions and `MOD_API_VERSION`) and `disk.rs` (the only code under `data_dir/mods`,
+    INVARIANTS.md I-30); `runtime.rs` the `pmmod` scheme's
     registry, one-time entry URLs and frame sessions, with `headers.rs` (crate-free, like
     `engine.rs`) building every response header (INVARIANTS.md I-27). In the page,
     `src/components/mods/ModFrame.tsx` draws the only iframe in `src/` (I-24), and `modBridge.ts`

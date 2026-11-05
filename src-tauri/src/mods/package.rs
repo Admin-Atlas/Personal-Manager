@@ -1357,7 +1357,7 @@ fn check_data(data: &DataDecl, granted: &BTreeSet<&str>) -> Result<(), PackageEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use blake2::Blake2b512;
@@ -1612,6 +1612,16 @@ mod tests {
         let mut f = Fixture::new();
         change(&mut f.manifest);
         f
+    }
+
+    /// A signed `.pmmod` for other modules' tests (the ledger's): this file's fixture with its
+    /// manifest and files changed, and the public half of the key made for this run that signed it.
+    pub(crate) fn signed_package(
+        change: impl FnOnce(&mut Value, &mut BTreeMap<String, Vec<u8>>),
+    ) -> (Vec<u8>, PublicKey) {
+        let mut f = Fixture::new();
+        change(&mut f.manifest, &mut f.files);
+        (f.bytes(), f.key.public())
     }
 
     /// Rewrite a field in an entry's local and central headers alike (so they still agree).

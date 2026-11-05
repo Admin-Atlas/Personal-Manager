@@ -72,8 +72,29 @@ pub fn pack(
     inputs: PackInputs,
     dest: &Path,
     passphrase: &str,
+    report: impl FnMut(BackupPhase, f32),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    pack_as(
+        inputs,
+        dest,
+        passphrase,
+        report,
+        cancel,
+        format::FORMAT_VERSION,
+    )
+}
+
+/// [`pack`], writing container version `format_version` (one this build can read back). Only
+/// `pack`, with the current version, and the restore tests, with format 1 to prove a pre-mods
+/// archive still restores, call it.
+pub(super) fn pack_as(
+    inputs: PackInputs,
+    dest: &Path,
+    passphrase: &str,
     mut report: impl FnMut(BackupPhase, f32),
     cancel: &AtomicBool,
+    format_version: u16,
 ) -> Result<()> {
     let sources = enumerate_sources(&inputs)?;
     let total: u64 = sources.iter().map(Source::len).sum();
@@ -85,7 +106,7 @@ pub fn pack(
     let nonce_prefix: [u8; format::NONCE_PREFIX_LEN] = vault::random_array()?;
 
     let header = format::Header {
-        format_version: format::FORMAT_VERSION,
+        format_version,
         cipher: format::CIPHER_ID.to_string(),
         kdf: format::KdfBlock {
             params,
@@ -111,7 +132,7 @@ pub fn pack(
     {
         let mut file = tmp.as_file().try_clone()?;
         let header_json = format::write_header(&mut file, flags, &header)?;
-        let aad = format::aad(flags, &header_json);
+        let aad = format::aad(header.format_version, flags, &header_json);
         let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
         let aead_w =
             format::ChunkedAeadWriter::new(file, cipher, &nonce_prefix, aad, header.chunk_size)?;

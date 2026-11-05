@@ -958,9 +958,11 @@ pub fn adopt_shared_vault(
 pub fn detach_from_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result<()> {
     let data_dir = paths::data_dir(&app)?;
     vault::pointer::retire(&data_dir)?;
-    // Close whatever is open (possibly the shared store) before reopening locally.
+    // Close whatever is open (possibly the shared store) before reopening locally. Its mods stop
+    // now, not at the next engage: a step below can fail and return before it.
     let _ = state.take_conn();
     let _ = state.clear_vault_runtime();
+    crate::mods::ledger::on_store_closed(&app);
     // The unreachable-shared-vault story no longer applies — this profile walked away.
     state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
@@ -986,18 +988,39 @@ pub fn acknowledge_deleted_shared_vault(app: AppHandle, state: State<'_, AppStat
     let data_dir = paths::data_dir(&app)?;
     // Drop this profile's cached key for the deleted vault before we forget which vault it
     // was (the pointer names the folder; the meta named the id — read it while we still can).
+    // The mods folder needs the id too, and once the folder is gone only the tombstone names it.
+    let mut deleted = None;
     if let Some(pointer) = vault::pointer::load(&data_dir)? {
-        if let Ok(Some(meta)) = vault::load_meta(&pointer.vault_root) {
-            let _ = secrets::clear_cached_vault_key(&meta.vault_id);
-        }
+        let from_meta = match vault::load_meta(&pointer.vault_root) {
+            Ok(Some(meta)) => {
+                let _ = secrets::clear_cached_vault_key(&meta.vault_id);
+                Some(meta.vault_id)
+            }
+            _ => None,
+        };
+        let ads = vault::advert::ads_dir()
+            .map(|d| vault::advert::list(&d))
+            .unwrap_or_default();
+        let tombstone = vault::advert::deletion_tombstone_for(&ads, &pointer.vault_root)
+            .map(|ad| ad.vault_id.clone());
+        let live: Vec<String> = ads
+            .into_iter()
+            .filter(|ad| ad.deleted_at.is_none())
+            .map(|ad| ad.vault_id)
+            .collect();
+        deleted = Some((from_meta.or(tombstone), live));
     }
     vault::pointer::clear(&data_dir)?;
     vault::pointer::clear_retired(&data_dir)?;
     let _ = state.take_conn();
     let _ = state.clear_vault_runtime();
+    crate::mods::ledger::on_store_closed(&app);
     state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
     let meta = vault::ensure_device_meta(&resolved.vault_root)?;
+    if let Some(id) = deleted.and_then(|(id, live)| acknowledged_mods(id, &meta.vault_id, &live)) {
+        crate::mods::ledger::remove_deleted_vault(&app, &data_dir, &id, &meta.vault_id);
+    }
     // A different vault from here on, so anything the old one was warning about no longer applies.
     state.clear_meta_warning();
     if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &meta)? {
@@ -1006,6 +1029,15 @@ pub fn acknowledge_deleted_shared_vault(app: AppHandle, state: State<'_, AppStat
     }
     lock_session::engage(&app)?;
     Ok(())
+}
+
+/// Whose mods a joiner's acknowledgement of a deleted shared vault removes (spec §6): the vault its
+/// pointer named, by that folder's metadata while it still answers, else by the tombstone the notice
+/// came from. Both sit in folders other accounts can write, so the id is never taken to name the
+/// vault this profile goes back to (`resident`) or one still advertised as live (`live`, which a
+/// rejoin could reach): at worst it names a folder nothing here reaches any more. Pure.
+fn acknowledged_mods(id: Option<String>, resident: &str, live: &[String]) -> Option<String> {
+    id.filter(|id| id != resident && !live.contains(id))
 }
 
 /// Owner-side deletion of a shared vault: remove the DB + artifacts from the shared folder,
@@ -1054,6 +1086,7 @@ pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result
     // was ours alone (leaving any unrelated files the user kept there).
     let _ = state.take_conn();
     let _ = state.clear_vault_runtime();
+    crate::mods::ledger::on_store_closed(&app);
     // Release OUR writer lock before the sweep: `vault.lock` sits in the folder we are about to
     // empty, and delete_vault_artifacts deliberately spares it (it can't tell our lock from
     // another instance's). Held, it guaranteed the empty check below never passed — so the
@@ -1090,6 +1123,13 @@ pub fn delete_shared_vault(app: AppHandle, state: State<'_, AppState>) -> Result
     state.set_vault_fault(None);
     let resolved = vault::resolve(&app)?;
     let local_meta = vault::ensure_device_meta(&resolved.vault_root)?;
+    // Its mods on this machine go with it (spec §6): the ledger that named them was in its store.
+    crate::mods::ledger::remove_deleted_vault(
+        &app,
+        &data_dir,
+        &meta.vault_id,
+        &local_meta.vault_id,
+    );
     // A different vault from here on, so anything the old one was warning about no longer applies.
     state.clear_meta_warning();
     if let Some((conn, master, report)) = vault::open_at_boot(&resolved, &local_meta)? {
@@ -1370,5 +1410,26 @@ mod vault_command_tests {
         // A vault already at (or under) the profile data dir stays put.
         assert!(!needs_move_home(data_dir, data_dir));
         assert!(!needs_move_home(&data_dir.join("vault"), data_dir));
+    }
+
+    /// A joiner's acknowledgement removes the deleted vault's mods, named by its metadata or its
+    /// tombstone, but an id from those shared folders never takes this profile's own vault's mods or
+    /// those of a vault still advertised.
+    #[test]
+    fn an_acknowledged_deletion_removes_only_a_vault_nothing_here_reaches() {
+        let live = vec!["live-vault".to_owned()];
+        assert_eq!(
+            super::acknowledged_mods(Some("gone".into()), "home", &live).as_deref(),
+            Some("gone")
+        );
+        assert_eq!(super::acknowledged_mods(None, "home", &live), None);
+        assert_eq!(
+            super::acknowledged_mods(Some("home".into()), "home", &live),
+            None
+        );
+        assert_eq!(
+            super::acknowledged_mods(Some("live-vault".into()), "home", &live),
+            None
+        );
     }
 }

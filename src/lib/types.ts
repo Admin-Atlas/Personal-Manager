@@ -162,9 +162,17 @@ export type SmartAppControlState = "off" | "enforced" | "evaluation" | "unknown"
  *  instead of string-matching: `denied` gets Repair access, `no-vault`/`not-found` the
  *  honest gone-folder story, `store-missing` the create-don't-delete recovery (the vault
  *  survived, only pm.sqlite is gone), `wrong-passphrase` its own message, `corrupt` the
- *  damaged-store guidance, `other` the generic Retry surface. */
+ *  damaged-store guidance, `newer-store` "update PM" and never a destructive recovery (a newer
+ *  PM wrote this healthy store; INVARIANTS.md I-28), `other` the generic Retry surface. */
 export type VaultFaultCode =
-  "denied" | "not-found" | "no-vault" | "store-missing" | "wrong-passphrase" | "corrupt" | "other";
+  | "denied"
+  | "not-found"
+  | "no-vault"
+  | "store-missing"
+  | "wrong-passphrase"
+  | "corrupt"
+  | "newer-store"
+  | "other";
 
 /** A vault failure the UI can branch on AND display verbatim — mirrors Rust `VaultFault`.
  *  `message` is a ready-to-show sentence; `op`/`path` say what was being done where. */

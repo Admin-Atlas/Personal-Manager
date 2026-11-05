@@ -389,13 +389,36 @@ fn register_sqlite_vec() {
 /// failure (or disarm it for a real brick).
 pub const WRONG_KEY_OR_CORRUPT_MSG: &str = "could not open database (wrong key or corrupt file)";
 
+/// What [`open`] says, as a [`crate::error::VaultFaultCode::NewerStore`] fault, for a store whose
+/// `user_version` is past this build's migrations (INVARIANTS.md I-28). Deliberately shares no words
+/// with [`WRONG_KEY_OR_CORRUPT_MSG`]: the "Start fresh" gate keys on that literal, and a newer store
+/// is healthy data that must never reach it.
+pub const NEWER_STORE_MSG: &str =
+    "This data was written by a newer version of PM. Update PM to open it.";
+
 /// Open the encrypted store, unlock it with the raw 256-bit key, and bring the
 /// schema up to date. Returns an error if the key is wrong or the file is
-/// corrupt.
+/// corrupt, and refuses, writing nothing, a store a newer PM wrote.
 pub fn open(path: &Path, key: &str) -> Result<Connection> {
     let conn = open_keyed(path, key)?;
     migrations::run(&conn)?;
     Ok(conn)
+}
+
+/// Test-only: a keyed store with NO migrations run, at whatever `user_version` the file carries, for
+/// tests outside this module that must build or inspect an old (or newer) store without migrating it.
+#[cfg(test)]
+pub(crate) fn open_unmigrated(path: &Path, key: &str) -> Result<Connection> {
+    open_keyed(path, key)
+}
+
+/// Test-only: an authentic store at exactly version `n`, built from the first `n` real migrations
+/// (not a teardown of the current schema), reopened so its schema is freshly parsed after any
+/// `writable_schema` patch among them.
+#[cfg(test)]
+pub(crate) fn open_at_version(path: &Path, key: &str, n: usize) -> Result<Connection> {
+    migrations::apply_through(&open_keyed(path, key)?, n)?;
+    open_keyed(path, key)
 }
 
 /// Open + unlock the encrypted store WITHOUT running migrations: the returned
@@ -1042,7 +1065,19 @@ mod tests {
             // rule the `preferences`/`entities` pair below follows).
             // v59: `tasks` references `project_milestones`, `projects` and `task_stacks`, so it drops
             // first, then its stacks.
-            "DROP TABLE tasks; \
+            // v60: the mod tables go first of all: `mod_ledger` points at `tasks` and
+            // `project_milestones`, and every other one at `mods`, which drops after its children.
+            "DROP TABLE mod_ledger; \
+             DROP TABLE mod_grants; \
+             DROP TABLE mod_kv; \
+             DROP TABLE mod_doc_data; \
+             DROP TABLE mod_secrets; \
+             DROP TABLE mod_overlay; \
+             DROP TABLE ai_reservations; \
+             DROP TABLE mods; \
+             DROP TABLE mcp_clients; \
+             ALTER TABLE usage_log DROP COLUMN mod_id; \
+             DROP TABLE tasks; \
              DROP TABLE task_stacks; \
              DROP TABLE document_tags; \
              DROP TABLE tags; \
@@ -1243,7 +1278,19 @@ mod tests {
             // rule the `preferences`/`entities` pair below follows).
             // v59: `tasks` references `project_milestones`, `projects` and `task_stacks`, so it drops
             // first, then its stacks.
-            "DROP TABLE tasks; \
+            // v60: the mod tables go first of all: `mod_ledger` points at `tasks` and
+            // `project_milestones`, and every other one at `mods`, which drops after its children.
+            "DROP TABLE mod_ledger; \
+             DROP TABLE mod_grants; \
+             DROP TABLE mod_kv; \
+             DROP TABLE mod_doc_data; \
+             DROP TABLE mod_secrets; \
+             DROP TABLE mod_overlay; \
+             DROP TABLE ai_reservations; \
+             DROP TABLE mods; \
+             DROP TABLE mcp_clients; \
+             ALTER TABLE usage_log DROP COLUMN mod_id; \
+             DROP TABLE tasks; \
              DROP TABLE task_stacks; \
              DROP TABLE document_tags; \
              DROP TABLE tags; \
@@ -1431,5 +1478,96 @@ mod tests {
             gentle <= fast,
             "gentle ({gentle}) must never ask for more than fast ({fast})"
         );
+    }
+
+    /// The current build's schema version, read off a freshly migrated store.
+    fn latest_version() -> i64 {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("probe.sqlite"), KEY).unwrap();
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// I-28: a store a newer PM wrote is refused with the typed fault, and the refusal writes
+    /// nothing: the file is byte-for-byte what the newer PM left, at its own version, data intact.
+    #[test]
+    fn a_store_newer_than_this_build_is_refused_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pm.sqlite");
+        let newer = latest_version() + 1;
+        {
+            let conn = open(&path, KEY).unwrap();
+            conn.execute("INSERT INTO projects(name) VALUES ('Atlas')", [])
+                .unwrap();
+            // What a newer PM's next migration would leave behind: its own version, and schema this
+            // build has never seen.
+            conn.execute_batch(&format!(
+                "CREATE TABLE from_the_future(x); PRAGMA user_version = {newer};"
+            ))
+            .unwrap();
+            // Fold the WAL in, so the main file alone is the whole store being compared.
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let err = open(&path, KEY).expect_err("a newer store must not open");
+        match &err {
+            Error::Vault(fault) => {
+                assert_eq!(fault.code, crate::error::VaultFaultCode::NewerStore);
+                assert_eq!(fault.message, NEWER_STORE_MSG);
+            }
+            other => panic!("expected the typed newer-store fault, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            NEWER_STORE_MSG,
+            "the message the user reads"
+        );
+        assert!(
+            !err.to_string().contains(WRONG_KEY_OR_CORRUPT_MSG),
+            "nothing about it may read as a brick"
+        );
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the refused open wrote nothing"
+        );
+        let conn = open_keyed(&path, KEY).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "its version is the newer PM's, not rewound");
+        let kept: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM projects WHERE name = 'Atlas'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+    }
+
+    /// The boundary: a store at exactly this build's version opens as it always has, and migrates
+    /// nothing (its schema cookie doesn't move).
+    #[test]
+    fn a_store_at_this_builds_version_opens_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pm.sqlite");
+        let cookie = {
+            let conn = open(&path, KEY).unwrap();
+            conn.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let conn = open(&path, KEY).expect("a current store opens");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, latest_version());
+        let after: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, cookie, "nothing ran");
     }
 }

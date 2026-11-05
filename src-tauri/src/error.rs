@@ -30,6 +30,10 @@ pub enum VaultFaultCode {
     WrongPassphrase,
     /// The verifier accepted the key but the store itself won't open — damaged files.
     Corrupt,
+    /// The store opened, but a newer PM wrote it: its schema is past this build's migrations
+    /// (`db::NEWER_STORE_MSG`). Healthy data, so like [`Self::Denied`] and [`Self::StoreMissing`]
+    /// it never arms a destructive recovery; the only way forward is a newer PM (INVARIANTS.md I-28).
+    NewerStore,
     /// Everything else (transient file locks, disk I/O, parse errors).
     Other,
 }
@@ -259,6 +263,11 @@ mod tests {
         // Every other variant keeps the historical bare-string rejection shape.
         let s = serde_json::to_value(Error::Other("plain".into())).unwrap();
         assert_eq!(s, serde_json::json!("plain"));
+        // The wire name the open-error screen branches on to withhold "Start fresh" (types.ts).
+        assert_eq!(
+            serde_json::to_value(VaultFaultCode::NewerStore).unwrap(),
+            "newer-store"
+        );
     }
 
     #[test]

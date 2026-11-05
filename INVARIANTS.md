@@ -486,6 +486,92 @@ the checks the verifier can't (index, blacklist, newer version, publisher pin, A
 `ids::check_tier`; storage, the dispatcher and the MCP server take a `ModId`, never a bare string; and
 nothing else registers a scheme, protocol or URL that serves mod files.
 
+### I-28 · A store a newer PM wrote is refused untouched, and the refusal never reaches a destructive path — **Held**
+
+`migrations::run` refuses a store whose `user_version` is past this build's migrations (or negative)
+before it writes anything, with `Error::Vault` coded `VaultFaultCode::NewerStore` and
+`db::NEWER_STORE_MSG`. Every open goes through `db::open`, so boot, retry, unlock, join, restore,
+switch-to-vault, the lock session's reopen and a vault move all get the same refusal. The recovery
+paths that delete, replace or re-key key on a code or on `WRONG_KEY_OR_CORRUPT_MSG`, which the newer
+message shares no words with: "Start fresh" refuses it by code (`wipe::reset_refusal`), "Start a new
+empty store" accepts only `StoreMissing`, the boot open's stale-key branch clears a cached key only on
+the brick message, a restore promotes nothing, re-homing a restore reads it as not pristine, and the
+open-error screen offers only "Try again" (`VaultOpenError.tsx`). Tests pin the refusal itself, the
+reset gate, restore, re-homing, unlock and the screen; the stale-key branch and "Start a new empty
+store" are held by their code-or-literal gates, which need a keychain or a live app to exercise.
+
+**Why.** Before this, `run` simply skipped a newer store and opened it as if current, which was safe
+only while every migration was additive. Mods v60 is the first that isn't safe to ignore (its later
+drop, the Pinboard move), and from here on a newer store is the user's whole library at a schema this
+build can't name. Opening it would misread it; any recovery that treats it as damaged deletes it.
+
+**Co-signers.** A new open path goes through `db::open`, never `open_keyed` plus its own migrate. A new
+recovery that deletes, resets, re-keys or overwrites a store after an open failure branches on the
+fault's code and refuses `NewerStore`, and never matches error text to decide. A migration that an
+older build must not survive also bumps the backup `FORMAT_VERSION` (`backup/format.rs`).
+
+### I-29 · Everything keyed to a mod cascades from `mods`, and attribution never does — **Held**
+
+Uninstall is one `DELETE FROM mods` (Mods spec §1.3): grants, private storage, per-document rows,
+secrets, overlay entries and AI reservations all `REFERENCES mods(id) ON DELETE CASCADE` (v60), and
+`foreign_keys` is on for every connection `db::open` returns. Two things are deliberately outside it:
+`mod_ledger` (which mod made a task or milestone) names the mod as plain text with who it was (its
+publisher pin, whether it was signed, and its install id) and cascades only from its target, and
+`usage_log.mod_id` is plain text. A gift is a mod's "own" (`mods::policy::made_it`) when its
+`mod_ledger` row has the installed row's id and signedness, and then, for a signed maker, the same
+pin (a reinstall edits its gifts again), or, for an unsigned maker, whose pin is only what its own
+manifest claimed, the same install id, which only an update or a repair keeps. So neither another
+publisher's signed mod nor any unsigned file that reuses a removed mod's id and copies its pin can
+edit what that mod made.
+
+**Why.** A per-mod table without the cascade is residue every uninstall leaves behind, invisibly,
+secrets included. Attribution with the cascade would erase "made by X" on uninstall and lose a
+reinstall's claim to edit its own gifts; spend history with it would make an uninstall rewrite the
+Usage & cost totals.
+
+**Co-signers.** A later table holding a mod's data references `mods(id) ON DELETE CASCADE` and gets its
+row in SYNC-SET.md; a later record of what a mod made follows `mod_ledger` (text id, FK to the target
+only). The cascade tests in `db/migrations.rs` gain the new table.
+
+### I-30 · Mod files are written, moved and deleted only by the ledger, from the `mods` rows, by the writer — **Held**
+
+Everything under `data_dir/mods` goes through `mods/disk.rs`, named by a `ModId`, a `VersionName`, a
+checked vault id and a checked store id, and every change holds the runtime's ledger lock
+(`mods/ledger.rs`). Each store has its own folder, `mods/<vault_id>/<store_id>/`: the store id is
+random, kept in that store's `settings` (`mods_store_id`), and cleared by a restore, so a restored
+copy (which keeps the vault id) never shares a folder with the store it came from. A `mods` row never
+names files that aren't there: an install writes and fsyncs its files and renames them into place
+before the row commits, and rolls them back if it doesn't. The boot sweep runs only after this
+instance opens a store as its writer (`lock_session::holds_writer`), only from a positive listing of
+the `mods` table, and not at all when that listing can't be read; a mod folder no row names, and a
+version folder its row doesn't name, are moved to `.quarantine/` for 30 days, never deleted on sight
+(only an update's own prune deletes, after its commit), a quarantined copy whose files exactly match a
+row that names it again is put back, an exact copy in another store of the vault is copied in (never
+moved, and on a blocking thread after the load, never inline in an open path), and a row whose files
+are missing is parked, never deleted. Only the open store's folder is
+ever changed, except to remove a store PM has just deleted, and then only once every row of the open
+store was looked for there (a row this PM can't read back, or whose files differ, keeps those
+folders); another store's is only read. Tests pin the
+failure points, the read-error skip, the writer rule, the sweep, the recovery and two stores of one
+vault side by side.
+
+**Why.** A sweep that read "no rows" from a closed or curtained store would remove every mod, and an
+unsigned one can't be re-fetched. A sweep made from another store's ledger, or an older copy of its
+own, would do the same to the files that ledger doesn't name. A row that names missing files serves
+nothing and can only be repaired; a folder no row names is residue that survives every uninstall.
+
+**Co-signers.** A new writer of mod files (the Storage tab's "remove all mods", slice 7's auto-install)
+goes through the ledger and its lock, never `std::fs` on its own. A new open path calls
+`lock_session::engage` after the store opens, which is where the writer's mods load (or, when it isn't
+the writer of an open store, where the registry is emptied); a path that takes the connection itself
+calls `ledger::on_store_closed` before it can return, or, like `vault::migrate::relocate`, whenever it
+returns with no store open. A new way to copy a store into a new one (restore is the only one
+today) clears its store id with `ledger::forget_store_id`. A new "remove this vault's data" path
+removes `mods/<vault_id>/` as `wipe::remove_vault_artifacts` does (spec §6) or, outside the wipe,
+through `ledger::remove_deleted_vault` (the shared-vault delete and its acknowledgement), and a path
+that deletes one store and keeps the vault (the re-homed restore's pristine home) removes that store's
+folder through `ledger::remove_vacated_store`.
+
 ---
 
 ## 6. Build tooling and dependencies
