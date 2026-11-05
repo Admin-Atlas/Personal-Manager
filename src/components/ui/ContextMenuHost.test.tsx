@@ -5,7 +5,10 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextMenuHost } from "./ContextMenuHost";
+import { LinkNotice } from "../LinkNotice";
 import { closeContextMenu, openContextMenu } from "../../lib/contextMenu";
+import { openUrl } from "../../lib/ipc";
+import { dismissLinkFailure } from "../../lib/linkFailure";
 
 vi.mock("../../lib/ipc", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
 
@@ -84,6 +87,26 @@ describe("ContextMenuHost", () => {
     // Nothing to offer on plain text with nothing selected, and still no system menu.
     expect(fireEvent.contextMenu(screen.getByText("plain"))).toBe(false);
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  // It was silent: a left-click on the same link said so, its Open link didn't.
+  it("says in the link notice when its Open link didn't open", async () => {
+    vi.mocked(openUrl).mockClear();
+    vi.mocked(openUrl).mockRejectedValueOnce("Couldn't open the link (NotFound).");
+    render(
+      <>
+        <a href="https://example.com/">site</a>
+        <ContextMenuHost />
+        <LinkNotice />
+      </>,
+    );
+    fireEvent.contextMenu(screen.getByText("site"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("menuitem", { name: "Open link" }));
+    });
+    expect(openUrl).toHaveBeenCalledExactlyOnceWith("https://example.com/");
+    expect(screen.getByRole("status").textContent).toContain("Couldn't open the link (NotFound).");
+    act(() => dismissLinkFailure());
   });
 
   it("leaves text fields and Shift+right-click to the system menu", () => {

@@ -22,11 +22,59 @@
 // Two dialogs open side by side (neither inside the other) are both topmost, which is exactly
 // today's behaviour — this rule fixes nesting and deliberately regresses nothing else.
 
-import { useCallback, useEffect, type RefObject } from "react";
+import { useCallback, useEffect, useSyncExternalStore, type RefObject } from "react";
 
 /** Every open dialog's container element. Module-level: the question "is anything deeper than me
  *  open?" is about the whole app, not about one React subtree. */
 const openDialogs = new Set<HTMLElement>();
+
+// ---- The topmost modal dialog, for an app-wide layer that has to be inside it ------------------
+//
+// An `aria-modal` dialog confines the keyboard (Modal's focus trap) and a screen reader (both
+// engines leave the rest of the page out of the accessibility tree while it is up) to itself. A
+// layer mounted once for the whole window, the link notice, has to sit inside that dialog to be
+// reached or heard, so it asks here which one that is and portals into it.
+
+let topmostModal: HTMLElement | null = null;
+const topmostListeners = new Set<() => void>();
+
+/** The open modal dialog no other open modal dialog is nested in. Two side by side (neither inside
+ *  the other) shouldn't happen, as the command palette won't open over a dialog; if it does, the
+ *  later in the page is taken, the one painted on top. */
+function findTopmostModal(): HTMLElement | null {
+  const modal = [...openDialogs].filter((d) => d.getAttribute("aria-modal") === "true");
+  let top: HTMLElement | null = null;
+  for (const d of modal) {
+    if (modal.some((other) => other !== d && d.contains(other))) continue;
+    if (!top || top.compareDocumentPosition(d) & Node.DOCUMENT_POSITION_FOLLOWING) top = d;
+  }
+  return top;
+}
+
+function dialogsChanged(): void {
+  const next = findTopmostModal();
+  if (next === topmostModal) return;
+  topmostModal = next;
+  topmostListeners.forEach((l) => l());
+}
+
+function subscribeTopmost(listener: () => void): () => void {
+  topmostListeners.add(listener);
+  return () => topmostListeners.delete(listener);
+}
+
+/**
+ * The topmost open modal dialog's element (see above), or null with none open; re-renders when it
+ * changes. A dialog counts from the effect that registers it, so this answers a commit after the
+ * dialog first paints.
+ */
+export function useTopmostModalDialog(): HTMLElement | null {
+  return useSyncExternalStore(
+    subscribeTopmost,
+    () => topmostModal,
+    () => null,
+  );
+}
 
 /**
  * Whether any dialog is open anywhere. For a page-level listener (a view's keyboard shortcuts, a
@@ -97,8 +145,10 @@ export function useDialogLayer(
     const el = containerRef.current;
     if (!el) return;
     openDialogs.add(el);
+    dialogsChanged();
     return () => {
       openDialogs.delete(el);
+      dialogsChanged();
     };
   }, [active, containerRef]);
 

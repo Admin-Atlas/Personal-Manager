@@ -142,6 +142,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 futures-util = "0.3"
 tauri-plugin-single-instance = "2"
 
+# Mods (spec §1.2): the `.pmmod` verifier checks a package's minisign signature (prehashed only) and
+# its manifest's semver (src/mods/package.rs). Both were already in Cargo.lock, minisign-verify through
+# tauri-plugin-updater and semver through it and tauri-utils, under licences already allow-listed
+# (MIT; MIT OR Apache-2.0), so no new package.
+minisign-verify = "0.3"
+semver = "1"
+
 # OS keychain for all secrets (API key, DB key). Per-platform native backends;
 # Linux uses the freedesktop Secret Service over the session D-Bus (KWallet on KDE,
 # GNOME Keyring elsewhere) — the one persistent store the desktop actually provides.
@@ -192,6 +199,15 @@ libc = "0.2"
 # (no new package, licences already allow-listed); objc2 encodes the Create/Get ownership rules.
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "ps"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
+# Mods (spec §1.4): the WKWebView switches that keep a mod frame off the network, which are SPI
+# (`-[WKPreferences _setEnabled:forFeature:]`, `_setPeerConnectionEnabled:`) reached through
+# `msg_send!`, each behind `respondsToSelector:` (src/mods/engine.rs). Already in Cargo.lock through
+# wry and tao (MIT, already allow-listed), so no new package or licence.
+objc2 = "0.6"
+# Mods (spec §1.4): the completion handler WebKit's content rule list store calls back with, for the
+# list that blocks every web load in PM's webviews (src/mods/engine.rs). Already in Cargo.lock through
+# wry (MIT, already allow-listed), so no new package or licence.
+block2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
@@ -201,4 +217,18 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 # transitively already, so this adds no new licences (MIT/Apache-2.0, already allow-listed).
 landlock = "0.4"
 libc = "0.2"
+# Mods (spec §1.4): the WebKitGTK webview's proxy (pointed at PM's sinkhole) and its WebRTC and DNS
+# prefetch settings, through `with_webview` (src/mods/engine.rs). Already in Cargo.lock through tauri and
+# wry, which enable the same `v2_40` API level (MIT, already allow-listed), so no new package.
+webkit2gtk = { version = "2", features = ["v2_40"] }
 
+[dev-dependencies]
+# Mods (spec §1.2): the verifier's tests sign packages in minisign's format with a key made for each
+# run (Ed25519 over BLAKE2b-512), so no signing key, not even a test one, is ever committed. Both are
+# already in Cargo.lock (ring through rustls, blake2 through argon2), so no new package.
+ring = "0.17"
+blake2 = "0.11"
+# Mods (spec §1.4): runs macOS's content rule list against URLs the way WebKit does, so a filter
+# that exempts more than Vite's host fails a test. Already in Cargo.lock (through rrule, tauri-utils
+# and zxcvbn; MIT OR Apache-2.0), so no new package.
+regex = "1"

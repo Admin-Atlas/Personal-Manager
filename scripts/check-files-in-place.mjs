@@ -106,6 +106,7 @@ const ALLOWED_ROOT = new Set([
   "sidecar",
   "src",
   "src-tauri",
+  "tests", // apps that test PM from outside and never ship (tests/sealed-frame, Mods spec §1.4)
   "tsconfig.json",
   "tsconfig.node.json",
   "vite.config.ts",

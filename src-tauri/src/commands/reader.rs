@@ -13,9 +13,9 @@ use crate::error::{Error, Result};
 use crate::ingest;
 use crate::{pathguard, vault, AppState};
 
-/// What a mail link the mail app didn't open is refused with. The webview's mail links match these
-/// words exactly to add the address they were for (`src/components/calendar/parts/useMailLink.ts`),
-/// so the two change together.
+/// What a mail link the mail app didn't open is refused with. The webview matches these words
+/// exactly to add the address they were for (`src/lib/linkFailure.ts`, shown under an event's
+/// description and in the link notice), so the two change together.
 const MAIL_APP_FAILED: &str = "PM couldn't open your mail app.";
 
 /// What PM opens for a link: a web address as it is, or a new message to an email address. A mail
@@ -88,9 +88,11 @@ fn open_external_url(url: &str) -> Result<()> {
 /// Open a web or email link: a web address in the system browser, an email address as a new message
 /// in the mail app. The webview can't open `target="_blank"` links itself (no shell/opener plugin),
 /// so the frontend's app-wide link handler routes them here, and an event description's mail links
-/// come here too (C19). Every caller: `useExternalLinks` (web only), an event's Join the call, Open in
-/// Google Calendar and its Meet link (addresses Google sent), a sign-in page and Proton Drive's
-/// install page (PM's own), and a description's links; `open_source` reaches only web addresses.
+/// come here too (C19). Every caller: `useExternalLinks` (`target="_blank"` web links, and mail links
+/// in rendered Markdown: chat, the reader, the briefing), an event's Join the call, Open in Google
+/// Calendar and its Meet link (addresses Google sent), a sign-in page and Proton Drive's install page
+/// (PM's own), a description's links, the right-click menu's Open link and a note's Ctrl+click on a
+/// web link; `open_source` reaches only web addresses.
 /// On the blocking pool, not the main thread: a launcher can wait until the browser it started quits
 /// (xdg-open does on a desktop it doesn't know), and PM would be frozen until then.
 #[tauri::command]

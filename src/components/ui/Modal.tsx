@@ -15,6 +15,11 @@
 //
 // NOT a scroll lock, and deliberately so: `index.css` makes html/body `overflow: hidden` app-wide,
 // so the document behind a dialog has nothing to scroll. Do not claim one in a changelog.
+//
+// Pass it elements, never a bare string: a Popover with `withinDialog` and the link notice
+// (LinkNotice) portal into the dialog element, and React writes a string child as the element's
+// whole text, which would wipe what they put there. Nor may the scrim or dialog gain a transform:
+// it would become their `fixed` panels' containing block.
 
 import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import { cn } from "./cn";

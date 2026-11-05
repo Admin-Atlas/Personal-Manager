@@ -12,6 +12,9 @@
 set shell := ["bash", "-c"]
 
 manifest := "src-tauri/Cargo.toml"
+# The sealed-frame regression app (Mods spec §1.4): its own crate and lock, never built into PM. Only
+# formatting is gated here; .github/workflows/sealed-frame.yml builds and runs it on three OSes.
+sealed_frame := "tests/sealed-frame/src-tauri/Cargo.toml"
 
 # Default: show the recipe list.
 default:
@@ -33,6 +36,7 @@ fmt:
     npx prettier --write .
     npx eslint . --fix || true
     cargo fmt --manifest-path {{manifest}}
+    cargo fmt --manifest-path {{sealed_frame}}
     ruff check --fix sidecar
     ruff format sidecar
 
@@ -97,6 +101,7 @@ generate-local-catalog:
 
 cargo-fmt:
     cargo fmt --check --manifest-path {{manifest}}
+    cargo fmt --check --manifest-path {{sealed_frame}}
 
 clippy: fetch-python
     cargo clippy --all-targets --all-features --manifest-path {{manifest}} -- -D warnings

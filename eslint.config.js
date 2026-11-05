@@ -19,11 +19,20 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import prettier from "eslint-config-prettier";
 
 // The backend boundary: see the frontend block below. The package root re-exports `core` too, so
-// `import { core } from "@tauri-apps/api"` is the same door and is shut with it.
+// `import { core } from "@tauri-apps/api"` (or from its `/index` subpath, the same file) is the same
+// door and is shut with it. no-restricted-imports sees static imports only; IPC_DYNAMIC shuts a
+// dynamic `import()` of the same modules, which would hand over `invoke` just the same.
 const IPC_MESSAGE = "Call backend commands only through src/lib/ipc.ts (the typed IPC boundary).";
 const IPC_BOUNDARY = [
   { name: "@tauri-apps/api/core", message: IPC_MESSAGE },
   { name: "@tauri-apps/api", importNames: ["core"], message: IPC_MESSAGE },
+  { name: "@tauri-apps/api/index", importNames: ["core"], message: IPC_MESSAGE },
+];
+const IPC_DYNAMIC = [
+  {
+    selector: "ImportExpression[source.value=/^@tauri-apps\\/api(\\/(core|index)(\\.js)?)?$/]",
+    message: IPC_MESSAGE,
+  },
 ];
 
 // Calendar editing (#884) changes the user's Google Calendar with their own sign-in, so its
@@ -108,6 +117,79 @@ const HTML_SINKS = [
   },
 ];
 
+// Mod frames (Mods spec §1.4; INVARIANTS.md I-24). PM's commands have no per-window ACL and Tauri counts
+// the `pmmod` scheme as local, so the frame's sandbox is the wall: on WebView2 a mod frame that lost it
+// sends a local Origin and reaches every command. So an <iframe> exists only in ModFrame.tsx, written as
+// `sandbox="allow-scripts" allow=""` with literal values, no spread and only the attributes listed below;
+// nothing anywhere makes a frame another way, names "iframe" as a string (`const Tag = "iframe"; <Tag />`
+// is an iframe too), or touches a frame's sandbox or permissions once it is drawn.
+const FRAME = "Mod frames live only in src/components/mods/ModFrame.tsx (INVARIANTS.md I-24).";
+const FRAME_TAGS = "/^(iframe|frame|frameset|object|embed|portal|fencedframe)$/i";
+const FRAME_PROPS = "/^(sandbox|allow|allowfullscreen|credentialless)$/i";
+const FRAME_SINKS = [
+  {
+    selector: `CallExpression[callee.property.name='createElement'][arguments.0.value=${FRAME_TAGS}]`,
+    message: FRAME,
+  },
+  {
+    selector: `CallExpression[callee.name=/^(createElement|jsx|jsxs|jsxDEV)$/][arguments.0.value=${FRAME_TAGS}]`,
+    message: FRAME,
+  },
+  {
+    selector: "JSXOpeningElement[name.name=/^(frame|frameset|object|embed|portal|fencedframe)$/]",
+    message: FRAME,
+  },
+  { selector: `MemberExpression[property.name=${FRAME_PROPS}]`, message: FRAME },
+  { selector: `MemberExpression[property.value=${FRAME_PROPS}]`, message: FRAME },
+  // `Object.assign(frame, { sandbox })`, and `const { sandbox } = frame`.
+  { selector: `Property[key.name=${FRAME_PROPS}]`, message: FRAME },
+  { selector: `Property[key.value=${FRAME_PROPS}]`, message: FRAME },
+  {
+    selector: `CallExpression[callee.property.name=/^(setAttribute|removeAttribute|toggleAttribute|getAttributeNode)$/][arguments.0.value=${FRAME_PROPS}]`,
+    message: FRAME,
+  },
+  {
+    selector: `CallExpression[callee.property.name=/^(setAttributeNS|removeAttributeNS)$/][arguments.1.value=${FRAME_PROPS}]`,
+    message: FRAME,
+  },
+];
+const NO_IFRAME_ELEMENT = [{ selector: "JSXOpeningElement[name.name='iframe']", message: FRAME }];
+const NO_IFRAME_NAME = [
+  { selector: "Literal[value=/^iframe$/i]", message: FRAME },
+  { selector: "TemplateElement[value.raw=/^iframe$/i]", message: FRAME },
+];
+// ModFrame.tsx's one frame, attribute by attribute.
+const IFRAME = "JSXOpeningElement[name.name='iframe']";
+const MOD_FRAME_SANDBOX = 'A mod frame is sandbox="allow-scripts", written literally (I-24).';
+const MOD_FRAME_ALLOW = 'A mod frame is allow="", written literally (I-24).';
+const MOD_FRAME_SHAPE = [
+  {
+    selector: `${IFRAME}:not(:has(> JSXAttribute[name.name='sandbox'][value.type='Literal'][value.value='allow-scripts']))`,
+    message: MOD_FRAME_SANDBOX,
+  },
+  {
+    selector: `${IFRAME} > JSXAttribute[name.name='sandbox']:not([value.type='Literal'][value.value='allow-scripts'])`,
+    message: MOD_FRAME_SANDBOX,
+  },
+  {
+    selector: `${IFRAME}:not(:has(> JSXAttribute[name.name='allow'][value.type='Literal'][value.value='']))`,
+    message: MOD_FRAME_ALLOW,
+  },
+  {
+    selector: `${IFRAME} > JSXAttribute[name.name='allow']:not([value.type='Literal'][value.value=''])`,
+    message: MOD_FRAME_ALLOW,
+  },
+  {
+    selector: `${IFRAME} > JSXSpreadAttribute`,
+    message: "A mod frame takes no spread props (I-24).",
+  },
+  {
+    selector: `${IFRAME} > JSXAttribute:not([name.name=/^(key|ref|src|title|sandbox|allow|className|style|onLoad)$/])`,
+    message:
+      "A mod frame takes only key, ref, src, title, sandbox, allow, className, style and onLoad (I-24).",
+  },
+];
+
 export default tseslint.config(
   // src-tauri/python is the fetched standalone interpreter (a build artifact, like
   // src-tauri/target) — present only on Windows checkouts and full of vendored JS.
@@ -117,6 +199,9 @@ export default tseslint.config(
       "dist-ssr",
       "src-tauri/target",
       "src-tauri/python",
+      // The sealed-frame regression app's build output (its own crate, tests/sealed-frame).
+      "tests/sealed-frame/src-tauri/target",
+      "tests/sealed-frame/src-tauri/gen",
       "design-system-docs",
       // The spec + decision log + scratch notes (git-ignored, local-only — not first-party
       // source). Lint shouldn't reach into it (e.g. a stray docs/calendar-view/*.js prototype).
@@ -184,8 +269,64 @@ export default tseslint.config(
       // builtin plugin APIs (api/event, api/app, api/window, api/webview, plugin-*) legitimately
       // cross from ~15 components and must not be caught. ipc.ts itself is exempted below.
       "no-restricted-imports": ["error", { paths: IPC_BOUNDARY, patterns: [CALENDAR_WRITES] }],
-      // The HTML sinks (HTML_SINKS above): nothing in the page parses HTML or writes it in.
-      "no-restricted-syntax": ["error", ...HTML_SINKS],
+      // The HTML sinks (HTML_SINKS above): nothing in the page parses HTML or writes it in. And no
+      // frame outside ModFrame.tsx (FRAME_SINKS and the two NO_IFRAME lists above).
+      "no-restricted-syntax": [
+        "error",
+        ...HTML_SINKS,
+        ...FRAME_SINKS,
+        ...NO_IFRAME_ELEMENT,
+        ...NO_IFRAME_NAME,
+        ...IPC_DYNAMIC,
+      ],
+    },
+  },
+  // The one home of a mod frame: an <iframe> here, in exactly the shape MOD_FRAME_SHAPE allows. A
+  // rule's options replace rather than merge, so the other fences are restated.
+  {
+    files: ["src/components/mods/ModFrame.tsx"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...HTML_SINKS,
+        ...FRAME_SINKS,
+        ...NO_IFRAME_NAME,
+        ...MOD_FRAME_SHAPE,
+        ...IPC_DYNAMIC,
+      ],
+    },
+  },
+  // The description tokenizer names "iframe" as data (an element whose content it skips); it makes no
+  // element, and every other fence still holds there.
+  {
+    files: ["src/lib/calendarEdit/descriptionTokens.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...HTML_SINKS,
+        ...FRAME_SINKS,
+        ...NO_IFRAME_ELEMENT,
+        ...IPC_DYNAMIC,
+      ],
+    },
+  },
+  // A plain JavaScript file in src/ (none exists) would ship just the same, so the page's fences hold
+  // there too rather than stopping at the TypeScript block's glob.
+  {
+    files: ["src/**/*.{js,jsx,mjs,cjs}"],
+    languageOptions: {
+      globals: globals.browser,
+    },
+    rules: {
+      "no-restricted-imports": ["error", { paths: IPC_BOUNDARY, patterns: [CALENDAR_WRITES] }],
+      "no-restricted-syntax": [
+        "error",
+        ...HTML_SINKS,
+        ...FRAME_SINKS,
+        ...NO_IFRAME_ELEMENT,
+        ...NO_IFRAME_NAME,
+        ...IPC_DYNAMIC,
+      ],
     },
   },
   // Tests may drive the sinks (a spy on an innerHTML setter, a fixture's markup): they ship nowhere.
@@ -218,6 +359,24 @@ export default tseslint.config(
     files: ["scripts/**/*.mjs", "*.{js,mjs,ts}"],
     languageOptions: {
       globals: globals.node,
+    },
+  },
+  // The webview engine's init scripts (src-tauri/src/mods/*.js): plain browser scripts Rust injects
+  // into PM's windows ahead of every page, not modules.
+  {
+    files: ["src-tauri/src/**/*.js"],
+    languageOptions: {
+      sourceType: "script",
+      globals: globals.browser,
+    },
+  },
+  // The sealed-frame regression app's pages (tests/sealed-frame): plain browser scripts. The hostile
+  // probe does on purpose what the page's fences forbid, and none of it ships.
+  {
+    files: ["tests/sealed-frame/**/*.js"],
+    languageOptions: {
+      sourceType: "script",
+      globals: globals.browser,
     },
   },
   prettier,

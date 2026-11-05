@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: 2026 Bobby Yu
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Sealed frame: the regression test for the walls around a mod's frame (Mods spec §1.4, "What PR-1
+# ships from this", item 4). It builds tests/sealed-frame, a small Tauri app on PM's exact engine
+# crates that includes PM's own src-tauri/src/mods/engine.rs and headers.rs, and runs a hostile probe
+# in a sealed frame on all three engines with every mitigation on. The app exits non-zero on any call
+# that reaches Tauri's IPC, any TCP or UDP that reaches its loopback listeners, an engine switch that
+# didn't take, or a frame that doesn't look sealed; this job fails with it. The app is never shipped:
+# nothing in release.yml or the bundle builds it. What it doesn't run is PM's serve decision
+# (src-tauri/src/mods/runtime.rs: which file goes out, and which as a document): its scheme mirrors
+# that, and runtime.rs's unit tests in pr.yml are what hold it.
+#
+# WebView2 updates itself on users' machines and macOS ships WebKit with the OS, so an engine change
+# has to show up here as a red job, not as a leak: hence the weekly run on the latest runners, as well
+# as PRs that touch the mod runtime (spec §1.4 item 4). PM's tauri.conf.json and Cargo.lock aren't in
+# the paths, since every PR bumps the version in both; a Tauri or engine-crate bump, or a CSP change,
+# still turns the next run red, because the app's build.rs refuses to build until its lock and CSP
+# match PM's again.
+#
+# SECURITY: `pull_request`, never `pull_request_target`; the token is read-only and no step reads a
+# secret. Actions are SHA-pinned, with the version Dependabot reads in the trailing comment.
+name: Sealed frame
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1" # Mondays, 04:23 UTC
+  pull_request:
+    paths:
+      - "src-tauri/src/mods/**"
+      - "src/components/mods/**"
+      - "tests/sealed-frame/**"
+      - ".github/workflows/sealed-frame.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sealed-frame-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sealed-frame:
+    name: sealed frame (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: tests/sealed-frame/src-tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        # Pinned to the stable tip pr.yml pins; see the note there on the impostor-commit audit.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust) # zizmor: ignore[impostor-commit]
+        with:
+          toolchain: stable
+      - name: Install Linux WebKit and a virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev xvfb
+      - name: Build (refuses any engine crate, CSP or frame shape that isn't PM's)
+        run: cargo build --locked
+      - name: Map the probe's IDNA host to loopback
+        # The probe's idna-host target: a host Rust's URL parser refuses, so where the engine
+        # accepts it (WebView2, Fedora's WebKitGTK 2.54) Tauri's runtime lets the navigation past
+        # PM's guard; the relaxed frame's open loads go there too. The WebKitGTK on ubuntu-latest
+        # and the WebKit on macos-latest refuse it as an invalid URL, so there neither reaches the
+        # network. Mapped here, a load of it is a hit on the app's loopback listener. Keep the name
+        # in step with main.rs's IDNA_HOST.
+        run: |
+          host=xn--1ug.pm-probe.test
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "127.0.0.1 $host" >> /c/Windows/System32/drivers/etc/hosts
+            ipconfig //flushdns
+          else
+            echo "127.0.0.1 $host" | sudo tee -a /etc/hosts >/dev/null
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              sudo dscacheutil -flushcache
+              sudo killall -HUP mDNSResponder || true
+            fi
+          fi
+          # It must resolve, or the target proves nothing. curl's exit 6 is "couldn't resolve";
+          # anything else (7: refused on 127.0.0.1:9) means the name reached loopback.
+          status=0
+          curl --noproxy '*' -s -o /dev/null --max-time 5 "http://$host:9/" || status=$?
+          echo "curl exited $status"
+          [ "$status" -ne 6 ]
+      - name: Run the probe (fails on any IPC escape or network leak)
+        env:
+          # WebKitGTK's DMA-BUF renderer has no GPU to use under Xvfb.
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+        run: |
+          mkdir -p ../../../sealed-frame-out
+          bin=target/debug/pm-sealed-frame
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          run_probe() {
+            local report="$1" status=0
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              PM_SEALED_FRAME_OUT="$report" xvfb-run -a "$bin" || status=$?
+            else
+              PM_SEALED_FRAME_OUT="$report" "$bin" || status=$?
+            fi
+            echo "the app exited with $status"
+            # Both must say so: the exit code, and the verdict the app wrote.
+            [ "$status" -eq 0 ] && grep -q '"verdict": "pass"' "$report"
+          }
+          run_probe "../../../sealed-frame-out/report-$RUNNER_OS.json"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Again at once, as when PM relaunches itself: the first run's WebView2 may still be up
+            # with its browser args, and the window must open all the same (engine.rs
+            # `build_retrying`, `Sinkhole::bind_preferring`).
+            run_probe "../../../sealed-frame-out/report-$RUNNER_OS-relaunch.json"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sealed-frame-${{ matrix.os }}
+          path: sealed-frame-out/
+          if-no-files-found: warn

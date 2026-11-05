@@ -12,7 +12,7 @@
 import type { ReactNode } from "react";
 
 import type { BackupPhase } from "../../lib/types";
-import { openUrl } from "../../lib/ipc";
+import { openLink } from "../../lib/linkFailure";
 import { Button, CopyLinkButton, SectionInfo, SectionLabel } from "../ui";
 import { CloudDestinationPanel } from "./CloudDestinationPanel";
 import type { UseProtonBackup } from "./useProtonBackup";
@@ -76,10 +76,7 @@ export function ProtonDriveSection({
             just <span className="text-ink3">Check again</span>; otherwise point PM straight at it.
           </p>
           <div className="flex flex-wrap gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => void openUrl(proton.install_url).catch(() => {})}
-            >
+            <Button variant="secondary" onClick={() => openLink(proton.install_url)}>
               Get the Proton Drive CLI&hellip;
             </Button>
             <CopyLinkButton url={proton.install_url} to="the Proton Drive CLI" size="md" />

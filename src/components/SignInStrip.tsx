@@ -4,6 +4,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 
 import { openUrl } from "../lib/ipc";
+import { dismissLinkFailure } from "../lib/linkFailure";
 import { useSignInPages } from "../lib/signInPages";
 import type { SignInPage } from "../lib/types";
 import { Button, Callout, CopyLinkButton } from "./ui";
@@ -57,9 +58,23 @@ export function SignInStrip() {
 
 /** One sign-in waiting. Keyed by its id, so nothing (a "Copied ✓") carries over to another. */
 function SignInRow({ page }: { page: SignInPage }) {
-  // A browser that wouldn't open, then did from here, has the page open after all.
+  // A browser that wouldn't open, then did from here, has the page open after all. A press here
+  // that didn't open it is said as the backend's own failed try is, until a press does: in the
+  // strip's own words, never an error's, which could hold the link. An earlier link's notice goes
+  // first (lib/linkFailure.ts), so it never shows beside this.
   const [reopened, setReopened] = useState(false);
-  const opened = page.opened || reopened;
+  const [failed, setFailed] = useState(false);
+  const opened = (page.opened || reopened) && !failed;
+  const open = () => {
+    dismissLinkFailure();
+    void openUrl(page.url).then(
+      () => {
+        setFailed(false);
+        setReopened(true);
+      },
+      () => setFailed(true),
+    );
+  };
   return (
     <Callout
       tone="info"
@@ -85,12 +100,7 @@ function SignInRow({ page }: { page: SignInPage }) {
           variant="tertiary"
           size="sm"
           aria-label={`${opened ? "Open again" : "Try opening it"}: the ${page.label} sign-in`}
-          onClick={() =>
-            void openUrl(page.url).then(
-              () => setReopened(true),
-              () => {},
-            )
-          }
+          onClick={open}
         >
           {opened ? "Open again" : "Try opening it"}
         </Button>

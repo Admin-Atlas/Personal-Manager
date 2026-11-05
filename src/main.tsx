@@ -6,6 +6,7 @@ import ReactDOM from "react-dom/client";
 import { ThemeProvider, UserTimeProvider } from "./theme";
 import { CapabilityProvider } from "./lib/capabilities";
 import { ContextMenuHost, ErrorBoundary, TitleBar } from "./components/ui";
+import { LinkNotice } from "./components/LinkNotice";
 import { PopoverRoot } from "./PopoverRoot";
 import "./theme/fonts";
 import "./index.css";
@@ -27,6 +28,9 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     {/* PM's right-click menu, in every window: the browser's own page menu (Back, Reload) would
         reset the app. */}
     <ContextMenuHost />
+    {/* What PM says when a link it handed to the OS didn't open (lib/linkFailure.ts), in every
+        window and on every one of App's screens. */}
+    <LinkNotice />
     {isBriefingWindow ? (
       <PopoverRoot />
     ) : (

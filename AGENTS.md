@@ -140,7 +140,20 @@ release remain the open post-v1 work.
     tokens + feed URLs), `openrouter.rs` (streaming SSE + non-streaming `complete()`; the key
     stays in Rust), `cost.rs`, `applock.rs` / `lock_session.rs`, `components.rs` (the Storage
     manager), `sidecar.rs` / `python_fetch.rs`, `wipe.rs` (Remove-PM-data), `local_ai_switch.rs`
-    and `voice_switch.rs` (the two feature switches, enforced in Rust).
+    and `voice_switch.rs` (the two feature switches, enforced in Rust), `tray.rs` / `popout.rs`
+    (the briefing panel and the pop-out Calendar windows).
+  - **Mods** — `mods/` (the Mods spec). `engine.rs` seals the webview engine: the sinkhole proxy,
+    the navigation guard, the init scripts and the per-engine switches, with no `crate::` path so
+    the sealed-frame regression app can include it. `mod.rs` builds every window through
+    `build_window` (INVARIANTS.md I-26), the main one included (`"create": false` in
+    `tauri.conf.json`). `ids.rs` is the mod id grammar and the trust tiers; `package.rs` the
+    `.pmmod` verifier (signature, file set, caps, manifest); `runtime.rs` the `pmmod` scheme's
+    registry, one-time entry URLs and frame sessions, with `headers.rs` (crate-free, like
+    `engine.rs`) building every response header (INVARIANTS.md I-27). In the page,
+    `src/components/mods/ModFrame.tsx` draws the only iframe in `src/` (I-24), and `modBridge.ts`
+    is its bridge. `tests/sealed-frame/` is a regression app that never ships: it includes
+    `engine.rs` and `headers.rs` and runs a hostile probe on all three engines
+    (`.github/workflows/sealed-frame.yml`).
 - **Sidecar** — `sidecar/pm_sidecar.py` + `requirements.txt` (committed code). A managed venv
   (provisioned on first run) speaks newline-JSON over stdio: `convert` (MarkItDown),
   `embed` / `count_tokens` / `rerank` (fastembed ONNX, model-parameterised — English

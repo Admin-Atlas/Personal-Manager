@@ -32,7 +32,7 @@ import {
 import { minimalChange as diff, previewMarks, type PreviewMark } from "../lib/pinboard/livePreview";
 import { tableCellOffset, unescapeCell } from "../lib/pinboard/noteTables";
 import { toggleTaskAt, type TextEdit } from "../lib/pinboard/notesMarkdown";
-import { openUrl } from "../lib/ipc";
+import { openLink } from "../lib/linkFailure";
 
 /** A transaction that brings the editor in line with `value` from outside, so it isn't echoed back. */
 const external = Annotation.define<boolean>();
@@ -251,13 +251,14 @@ export const NoteEditor = memo(
             return true;
           },
           // A link opens with Ctrl/Cmd+click, or with a plain click while the note isn't being edited
-          // (a plain click while typing just puts the cursor there). Web addresses only.
+          // (a plain click while typing just puts the cursor there). Web addresses only. One that
+          // didn't open says so in the link notice.
           mousedown(e, view) {
             const href = (e.target as Element).closest?.("[data-href]")?.getAttribute("data-href");
             if (!href || !/^https?:\/\//i.test(href)) return false;
             if (!(e.metaKey || e.ctrlKey) && view.hasFocus) return false;
             e.preventDefault();
-            void openUrl(href).catch(() => {});
+            openLink(href);
             return true;
           },
         }),

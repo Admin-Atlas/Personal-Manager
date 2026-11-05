@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "The regression app's window gets what PM's main window starts from: core:default. Its own commands (the canary among them) are app commands, which Tauri allows from any local origin without a capability, exactly as PM's are, so a frame that reached IPC would reach them.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

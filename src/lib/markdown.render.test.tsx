@@ -103,8 +103,8 @@ describe("the sanitizing boundary, end to end", () => {
     // effective value so this does not become a test of React's rendering choice.
     expect(img?.getAttribute("src") ?? "").toBe("");
     expect(container.innerHTML).not.toContain("evil.example");
-    // The tripwire for the single most likely way this becomes live: today `img-src 'self' asset:
-    // data: blob:` blocks the request anyway, so widening the CSP to render remote images would turn
+    // The tripwire for the single most likely way this becomes live: today `img-src 'self' data:
+    // blob:` blocks the request anyway, so widening the CSP to render remote images would turn
     // an `![](//attacker/px.png)` in any ingested document into a per-open read receipt and IP
     // beacon. This assertion fails first if the URL guard is loosened alongside the CSP.
   });
