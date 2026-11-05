@@ -1727,19 +1727,24 @@ pub fn list_all_calendar_events(
 /// The most hits one [`search_calendar_events`] call returns.
 const SEARCH_MAX_HITS: u32 = 50;
 
-/// The search palette's calendar hits: [`calendar::search_events`] over every kept event, at most
-/// `limit` (20 by default), each with its editing rights as [`list_all_calendar_events`] gives them,
-/// so the event popover a hit opens can edit it.
+/// The search palette's calendar hits: [`calendar::search_events`] over every kept event but the
+/// `hidden` calendars' (the Calendar tab's hidden set, a per-device view pref the client holds), at
+/// most `limit` (20 by default), each with its editing rights as [`list_all_calendar_events`] gives
+/// them, so the event popover a hit opens can edit it. All-day events are judged by the user's own
+/// date, in their chosen zone.
 #[tauri::command]
 pub fn search_calendar_events(
     state: State<'_, AppState>,
     query: String,
+    hidden: Option<Vec<String>>,
     limit: Option<u32>,
 ) -> Result<Vec<ListedEvent>> {
     let limit = limit.unwrap_or(20).clamp(1, SEARCH_MAX_HITS) as usize;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let conn = state.conn()?;
-    let rows = calendar::search_events(&conn, &query, &now, limit)?;
+    let today = crate::clock::today_sql_in(super::shared::resolve_zone(&conn));
+    let hidden = hidden.unwrap_or_default();
+    let rows = calendar::search_events(&conn, &query, &now, &today, &hidden, limit)?;
     let rights = super::calendar_edit::list_rights(&conn, &rows)?;
     Ok(rows
         .into_iter()

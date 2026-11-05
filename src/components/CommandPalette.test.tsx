@@ -27,7 +27,7 @@ vi.mock("../lib/ipc", () => ({
   listConversations: () => listConversations(),
   listDocuments: () => listDocuments(),
   listProjectOverviews: () => listProjectOverviews(),
-  searchCalendarEvents: (query: string) => searchCalendarEvents(query),
+  searchCalendarEvents: (query: string, hidden: string[]) => searchCalendarEvents(query, hidden),
 }));
 
 // The same stub the other component tests use: the palette's primitives reach for `useTheme`, and
@@ -186,28 +186,77 @@ describe("CommandPalette", () => {
     expect(getByRole("listbox").closest("[data-help]")).toBe(getByRole("dialog"));
   });
 
-  it("finds calendar events, leaves out hidden calendars, and opens one", async () => {
+  it("finds calendar events, leaving hidden calendars to Rust, and opens one", async () => {
     // The Search button found nothing in the calendar (#1047): events are searched in Rust as you
-    // type, and a hit opens the Calendar on it.
+    // type, the Calendar tab's hidden calendars left out there (before the limit), and a hit opens
+    // the Calendar on it.
     hiddenCalendars.ids = new Set(["cal-hidden"]);
     const standup = event("standup-09", "Team standup", "cal-work");
-    searchCalendarEvents.mockResolvedValue([standup, event("secret", "Team secret", "cal-hidden")]);
+    searchCalendarEvents.mockResolvedValue([standup]);
     const onClose = vi.fn();
     const onOpenEvent = vi.fn();
-    const { getByRole, findByRole, queryByRole } = renderPalette(onClose, onOpenEvent);
+    const { getByRole, findByRole } = renderPalette(onClose, onOpenEvent);
     await waitFor(() => expect(listDocuments).toHaveBeenCalled());
 
     fireEvent.change(getByRole("combobox"), { target: { value: "  Team " } });
     const hit = await findByRole("option", { name: /Team standup/ });
     expect(searchCalendarEvents).toHaveBeenCalledTimes(1);
-    expect(searchCalendarEvents).toHaveBeenCalledWith("team");
+    expect(searchCalendarEvents).toHaveBeenCalledWith("team", ["cal-hidden"]);
     expect(getByRole("group", { name: "Events" })).toBeTruthy();
     expect(hit.textContent).toContain("repeats");
-    expect(queryByRole("option", { name: /Team secret/ })).toBeNull();
 
     fireEvent.click(hit);
     expect(onOpenEvent).toHaveBeenCalledWith(standup);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("never shows an older search's answer under a newer query", async () => {
+    const answers = new Map<string, (events: CalendarEvent[]) => void>();
+    searchCalendarEvents.mockImplementation(
+      (query: string) => new Promise<CalendarEvent[]>((resolve) => answers.set(query, resolve)),
+    );
+    const { getByRole, findByRole, queryByRole } = renderPalette(noop);
+    await waitFor(() => expect(listDocuments).toHaveBeenCalled());
+    const box = getByRole("combobox");
+
+    fireEvent.change(box, { target: { value: "te" } });
+    await waitFor(() => expect(answers.has("te")).toBe(true));
+    fireEvent.change(box, { target: { value: "team" } });
+    await waitFor(() => expect(answers.has("team")).toBe(true));
+    answers.get("team")?.([event("standup", "Team standup", "cal-work")]);
+    await findByRole("option", { name: /Team standup/ });
+    answers.get("te")?.([event("tea", "Tea with Mats", "cal-work")]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(queryByRole("option", { name: /Tea with Mats/ })).toBeNull();
+  });
+
+  it("keeps the arrowed row highlighted when the calendar's hits land, and keeps hits meanwhile", async () => {
+    // An index used to snap back to the top when the hits landed, under a row already picked; and
+    // the Events group blinked out on every keystroke until the next answer.
+    listDocuments.mockResolvedValue([
+      { id: 1, title: "Team notes", project: "Atlas", linked_projects: [], tags: [] },
+      { id: 2, title: "Team plan", project: "Atlas", linked_projects: [], tags: [] },
+    ]);
+    const answers = new Map<string, (events: CalendarEvent[]) => void>();
+    searchCalendarEvents.mockImplementation(
+      (query: string) => new Promise<CalendarEvent[]>((resolve) => answers.set(query, resolve)),
+    );
+    const { getByRole, findByRole } = renderPalette(noop);
+    await findByRole("option", { name: /Team notes/ });
+    const box = getByRole("combobox");
+
+    fireEvent.change(box, { target: { value: "team" } });
+    fireEvent.keyDown(box, { key: "ArrowDown" });
+    const plan = getByRole("option", { name: /Team plan/ });
+    expect(plan.getAttribute("aria-selected")).toBe("true");
+    await waitFor(() => expect(answers.has("team")).toBe(true));
+    answers.get("team")?.([event("standup", "Team standup", "cal-work")]);
+    await findByRole("option", { name: /Team standup/ });
+    expect(getByRole("option", { name: /Team plan/ }).getAttribute("aria-selected")).toBe("true");
+
+    // A longer query: the hit that still holds every word stays while its own search is on the way.
+    fireEvent.change(box, { target: { value: "team stand" } });
+    expect(getByRole("option", { name: /Team standup/ })).toBeTruthy();
   });
 
   it("doesn't search the calendar for a single letter", async () => {

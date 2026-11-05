@@ -388,6 +388,7 @@ export function MonthView({
                               isPast={isEventPast(ev, nowDate)}
                               ghost={draftNote(ev)}
                               declined={isDeclined(ev)}
+                              pieceOf={ev.id}
                               onClick={onEventClick ? (rect) => onEventClick(ev, rect) : undefined}
                               drag={
                                 interaction
@@ -468,6 +469,7 @@ export function MonthView({
                               )
                             : undefined
                         }
+                        data-piece-of={b.ev.id}
                         role={onEventClick ? "button" : undefined}
                         tabIndex={onEventClick ? 0 : undefined}
                         onClick={

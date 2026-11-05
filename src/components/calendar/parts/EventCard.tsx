@@ -74,6 +74,8 @@ interface Props {
     /** A move of it is being asked about or saved: drawn where it was dropped, dashed. */
     pending: boolean;
   };
+  /** The event's id, whether or not it drags: what a jump from Search finds the card by. */
+  pieceOf?: string;
 }
 
 // Height thresholds below which a line has no room — keep them out of the render so a squeezed card
@@ -101,6 +103,7 @@ export function EventCard({
   tabStop = true,
   onSelect,
   drag,
+  pieceOf,
 }: Props) {
   const style: CSSProperties = {
     top: `${topPx}px`,
@@ -147,6 +150,7 @@ export function EventCard({
       )}
       data-draft-event={ghost !== null ? "" : undefined}
       data-event-id={drag?.eventId}
+      data-piece-of={pieceOf}
       data-day={drag?.day}
       style={style}
       title={summary}

@@ -115,7 +115,10 @@ export function CommandPalette({
   // The Teach destination is only offered when the tab is visible (same Depth/Settings gate).
   const { teachVisible, mapVisible } = useTheme();
   const [query, setQuery] = useState("");
-  const [active, setActive] = useState(0);
+  // The highlighted row, by its id: rows that land later (the lists, the calendar's hits) never
+  // move the highlight off what was arrowed to, so Enter opens what's highlighted. `null` (a new
+  // query, or nothing arrowed yet) is the top row.
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectOverview[]>([]);
   const [docs, setDocs] = useState<Document[]>([]);
   const [convs, setConvs] = useState<Conversation[]>([]);
@@ -148,19 +151,18 @@ export function CommandPalette({
   };
   const q = normalizeQuery(query);
 
-  // Search the calendar once typing pauses. Only the latest query's answer lands (`eventHits.q`
-  // must match), and a failed search just shows no events: the rest of the palette still works.
+  // Search the calendar once typing pauses. Only the latest query's answer lands (an older one is
+  // cancelled), and a failed search just shows no events: the rest of the palette still works. A
+  // calendar the Calendar tab hides has nothing to jump to, so it's left out, in Rust, before the
+  // limit.
   useEffect(() => {
     if (q.length < EVENT_QUERY_MIN) return;
     let cancelled = false;
     const timer = window.setTimeout(() => {
-      void searchCalendarEvents(q)
+      void searchCalendarEvents(q, [...readHidden()])
         .catch(() => [] as CalendarEvent[])
         .then((events) => {
-          if (cancelled) return;
-          // What the Calendar tab shows: a calendar hidden there has nothing to jump to.
-          const hidden = readHidden();
-          setEventHits({ q, events: events.filter((e) => !hidden.has(e.calendar_id)) });
+          if (!cancelled) setEventHits({ q, events });
         });
     }, EVENT_SEARCH_DELAY_MS);
     return () => {
@@ -266,10 +268,20 @@ export function CommandPalette({
 
   // The calendar's hits for this query, in the order Rust ranked them (upcoming soonest first, then
   // past latest first): already matched word by word, so they skip the fuzzy scorer. Only with a
-  // query: an empty palette browses everything else, but not every event ever kept.
+  // query: an empty palette browses everything else, but not every event ever kept. While this
+  // query's search is on its way, the last answer's hits that still hold every word stay, so the
+  // group doesn't blink out and back under the rows being read.
   const eventItems = useMemo<PaletteItem[]>(() => {
-    if (q.length < EVENT_QUERY_MIN || eventHits.q !== q) return [];
-    return eventHits.events.map((ev) => ({
+    if (q.length < EVENT_QUERY_MIN) return [];
+    const words = q.split(/\s+/).filter(Boolean);
+    const events =
+      eventHits.q === q
+        ? eventHits.events
+        : eventHits.events.filter((ev) => {
+            const text = `${ev.summary} ${ev.location ?? ""}`.toLowerCase();
+            return words.every((w) => text.includes(w));
+          });
+    return events.map((ev) => ({
       id: `event:${ev.calendar_id}:${ev.id}`,
       kind: "event",
       label: ev.summary || "(No title)",
@@ -302,13 +314,12 @@ export function CommandPalette({
     return { groups, flat: groups.flatMap((g) => g.items) };
   }, [items, eventItems, q]);
 
-  // Reset the highlight to the top whenever the result set changes — a new query,
-  // or the async project/file/conversation lists landing — so Enter can't fire a
-  // row that silently shifted under the cursor. Arrowing changes `active`, not
-  // `flat`, so an explicit selection is preserved.
-  useEffect(() => {
-    setActive(0);
-  }, [flat]);
+  // The highlight follows the row it's on, not a position: when the lists or the calendar's hits land
+  // and rows move, the arrowed row stays highlighted (an index used to snap back to the top, under a
+  // row the user had picked), so Enter can't fire a row that shifted under the cursor. Nothing
+  // arrowed yet, or the row gone, is the top row.
+  const found = activeId === null ? -1 : flat.findIndex((item) => item.id === activeId);
+  const active = found < 0 ? 0 : found;
 
   useEffect(() => {
     listRef.current
@@ -319,10 +330,10 @@ export function CommandPalette({
   function onKeyDown(e: React.KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActive((a) => Math.min(a + 1, flat.length - 1));
+      setActiveId(flat[Math.min(active + 1, flat.length - 1)]?.id ?? null);
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActive((a) => Math.max(a - 1, 0));
+      setActiveId(flat[Math.max(active - 1, 0)]?.id ?? null);
     } else if (e.key === "Enter") {
       e.preventDefault();
       flat[active]?.activate();
@@ -360,7 +371,7 @@ export function CommandPalette({
         value={query}
         onChange={(e) => {
           setQuery(e.target.value);
-          setActive(0);
+          setActiveId(null);
         }}
         onKeyDown={onKeyDown}
         role="combobox"
@@ -401,7 +412,7 @@ export function CommandPalette({
                     // Arrow keys drive selection from the input via aria-activedescendant, so the
                     // options aren't separate tab stops; mouse click still activates.
                     tabIndex={-1}
-                    onMouseMove={() => setActive(idx)}
+                    onMouseMove={() => setActiveId(item.id)}
                     onClick={item.activate}
                     className={`flex w-full items-center gap-3 px-3 py-2 text-left ${
                       idx === active ? "bg-accent-soft" : "hover:bg-surface"

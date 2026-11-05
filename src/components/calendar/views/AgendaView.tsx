@@ -123,6 +123,7 @@ export function AgendaView({ events, fromDay, colorOf, now, onEventClick }: Prop
                       // text colour; the rule stays its calendar's.
                       background: eventFill(own, colorOf(ev.calendar_id), null),
                     }}
+                    data-piece-of={ev.id}
                     role={clickable ? "button" : undefined}
                     tabIndex={clickable ? 0 : undefined}
                     onClick={

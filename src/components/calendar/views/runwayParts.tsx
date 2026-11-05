@@ -75,6 +75,7 @@ export function EventsStrip({
               <button
                 type="button"
                 title={ev.summary}
+                data-piece-of={ev.id}
                 onClick={(e) => onEventClick?.(ev, e.currentTarget.getBoundingClientRect())}
                 className={cn(
                   "flex w-full min-w-0 items-baseline gap-1.5 text-left text-xs text-ink2 hover:text-ink",

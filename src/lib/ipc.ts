@@ -1206,12 +1206,13 @@ export const listAllCalendarEvents = (range: { from?: string; to?: string; uid?:
 export const loadCalendarMonths = (from: string, to: string) =>
   invoke<number>("load_calendar_months", { from, to });
 
-/** Kept events whose title or location holds every word of `query`, for the search palette: one per
- *  repeating event (its next occurrence, or its last once over), upcoming soonest first, then past
- *  latest first; at most `limit` (default 20, at most 50). Every kept event is searched, however old;
- *  descriptions and guests aren't. The client leaves out locally hidden calendars. */
-export const searchCalendarEvents = (query: string, limit?: number) =>
-  invoke<CalendarEvent[]>("search_calendar_events", { query, limit: limit ?? null });
+/** Kept events whose title or location holds every word of `query` (case aside, in any script), for
+ *  the search palette: one per repeating event (its next occurrence, or its last once over) and one
+ *  per occurrence on several calendars, upcoming soonest first, then past latest first; at most
+ *  `limit` (default 20, at most 50). Every kept event is searched, however old; descriptions and
+ *  guests aren't. `hidden` (the Calendar tab's hidden calendars) are left out before the limit. */
+export const searchCalendarEvents = (query: string, hidden: string[] = [], limit?: number) =>
+  invoke<CalendarEvent[]>("search_calendar_events", { query, hidden, limit: limit ?? null });
 
 /** The active PM flags anchored on a calendar event's iCal UID — for the event detail popup. */
 export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid });

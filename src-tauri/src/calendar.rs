@@ -2837,72 +2837,117 @@ pub fn list_events_between(
 /// a query language).
 const SEARCH_MAX_WORDS: usize = 8;
 
-/// The mirrored events whose title or location holds every word of `query`, for the search palette:
-/// Google's search reaches the whole calendar, and since #1047 so does the mirror. Case-insensitive
-/// for ASCII letters, as SQLite's `LIKE` is.
+/// Lower case in every script, as SQL `pm_fold(text)`, for [`search_events`]: SQLite's own `lower`
+/// and `LIKE` fold only A to Z, so "élodie" never found "Élodie". Not text (NULL, or a packed BLOB)
+/// folds to NULL, which matches nothing.
+fn register_fold(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::types::ValueRef;
+    conn.create_scalar_function(
+        "pm_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(match ctx.get_raw(0) {
+                ValueRef::Text(t) => Some(String::from_utf8_lossy(t).to_lowercase()),
+                _ => None,
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// The mirrored events whose title or location holds every word of `query`, case aside in any
+/// script, for the search palette: Google's search reaches the whole calendar, and since #1047 so
+/// does the mirror.
 ///
 /// - **One hit per repeating event**, as its next occurrence, or its latest once it's over. Every
 ///   occurrence is a row of its own (`singleEvents`), so a weekly meeting would otherwise fill the
-///   list with the same title.
+///   list with the same title. A series is its Google `recurringEventId`, else (iCal, Outlook) its
+///   UID when the row repeats; a one-off is itself.
+/// - **One hit per occurrence**: the same event on two of the user's calendars (an invitation seen
+///   through two accounts) comes once, as the Calendar tab draws it once.
 /// - **Upcoming first**, soonest first (one under way counts as upcoming), then past ones, latest
-///   first; at most `limit`. `now` is RFC 3339.
+///   first; at most `limit`. A timed event is to come while it ends after `now` (RFC 3339); an
+///   all-day one while its end date (exclusive) is after `today`, the user's own date, since a date
+///   has no instant to compare.
 /// - **Not the description or the guests.** An event over a year old keeps them packed
 ///   ([`calendar_history::pack`]), where SQL can't see, and a search that found a note only while
 ///   it was recent would be worse than one that says what it reads.
 ///
-/// Like [`list_events_between`], not filtered by `quiet` (the palette is the Calendar tab's, not
-/// the assistant's); the client leaves out locally hidden calendars.
+/// `hidden` calendars (the ones the Calendar tab hides) are left out before the limit, so they
+/// can't fill it. Like [`list_events_between`], not filtered by `quiet` (the palette is the Calendar
+/// tab's, not the assistant's).
 pub fn search_events(
     conn: &Connection,
     query: &str,
     now: &str,
+    today: &str,
+    hidden: &[String],
     limit: usize,
 ) -> Result<Vec<CalendarEvent>> {
     let words: Vec<String> = query
         .split_whitespace()
         .take(SEARCH_MAX_WORDS)
-        .map(|w| {
-            let escaped = w
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            format!("%{escaped}%")
-        })
+        .map(str::to_lowercase)
         .collect();
     if words.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
+    register_fold(conn)?;
+    // ?1 now, ?2 the limit, ?3 today, then the words, then the hidden calendars.
+    let first_word = 4;
     let matches = (0..words.len())
         .map(|i| {
-            let n = i + 3;
-            format!("(summary LIKE ?{n} ESCAPE '\\' OR location LIKE ?{n} ESCAPE '\\')")
+            let n = first_word + i;
+            format!("(instr(pm_fold(summary), ?{n}) > 0 OR instr(pm_fold(location), ?{n}) > 0)")
         })
         .collect::<Vec<_>>()
         .join(" AND ");
-    // A series is its Google `recurringEventId`, else (iCal, Outlook) its UID when the row repeats;
-    // a one-off is itself. Within one calendar: the same invitation on two calendars is two hits.
+    let first_hidden = first_word + words.len();
+    let unhidden = if hidden.is_empty() {
+        String::new()
+    } else {
+        let marks = (0..hidden.len())
+            .map(|i| format!("?{}", first_hidden + i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" AND calendar_id NOT IN ({marks})")
+    };
     let sql = format!(
         "WITH hits AS ( \
-           SELECT id, calendar_id, \
+           SELECT id, calendar_id, uid, start, \
                   calendar_id || char(31) || \
                     COALESCE(series_id, CASE WHEN recurring = 1 THEN uid END, id) AS grp, \
-                  julianday(COALESCE(end, start)) > julianday(?1) AS upcoming, \
+                  CASE WHEN all_day = 1 \
+                    THEN substr(COALESCE(end, date(start, '+1 day')), 1, 10) > ?3 \
+                    ELSE julianday(COALESCE(end, start)) > julianday(?1) END AS upcoming, \
                   julianday(start) AS at \
-           FROM calendar_events WHERE {matches} \
+           FROM calendar_events WHERE {matches}{unhidden} \
          ), ranked AS ( \
-           SELECT id, calendar_id, upcoming, at, \
-                  ROW_NUMBER() OVER ( \
+           SELECT *, ROW_NUMBER() OVER ( \
                     PARTITION BY grp \
                     ORDER BY upcoming DESC, CASE WHEN upcoming THEN at END, at DESC, id \
                   ) AS n \
            FROM hits \
+         ), single AS ( \
+           SELECT *, ROW_NUMBER() OVER ( \
+                    PARTITION BY CASE WHEN uid IS NULL THEN grp ELSE uid || char(0) || start END \
+                    ORDER BY calendar_id, id \
+                  ) AS m \
+           FROM ranked WHERE n = 1 \
          ) \
-         SELECT id, calendar_id FROM ranked WHERE n = 1 \
+         SELECT id, calendar_id FROM single WHERE m = 1 \
          ORDER BY upcoming DESC, CASE WHEN upcoming THEN at END, at DESC, id \
          LIMIT ?2"
     );
-    let mut args: Vec<rusqlite::types::Value> = vec![now.to_string().into(), (limit as i64).into()];
+    let mut args: Vec<rusqlite::types::Value> = vec![
+        now.to_string().into(),
+        (limit as i64).into(),
+        today.to_string().into(),
+    ];
     args.extend(words.into_iter().map(rusqlite::types::Value::from));
+    args.extend(hidden.iter().cloned().map(rusqlite::types::Value::from));
     let picked: Vec<(String, String)> = conn
         .prepare(&sql)?
         .query_map(rusqlite::params_from_iter(args), |r| {
@@ -3291,7 +3336,7 @@ mod tests {
         .unwrap();
         let now = "2026-11-05T12:00:00Z";
         let ids = |query: &str, now: &str| -> Vec<String> {
-            search_events(&conn, query, now, 20)
+            search_events(&conn, query, now, &now[..10], &[], 20)
                 .unwrap()
                 .into_iter()
                 .map(|e| e.id)
@@ -3313,10 +3358,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(packed, "blob");
-        let found = search_events(&conn, "ramit", now, 20).unwrap();
+        let found = search_events(&conn, "ramit", now, "2026-11-05", &[], 20).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].description.as_deref(), Some(notes.as_str()));
-        assert_eq!(search_events(&conn, "e", now, 2).unwrap().len(), 2);
+        assert_eq!(
+            search_events(&conn, "e", now, "2026-11-05", &[], 2)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// Review of the search (#1047): case in any script; an iCal series (no Google series id) once by
+    /// its UID; an event under way counts as to come; the same event on two calendars once; a hidden
+    /// calendar left out before the limit; an all-day event judged by the user's own date, not UTC
+    /// midnight.
+    #[test]
+    fn a_search_folds_case_groups_by_uid_and_judges_days_by_the_users_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let on = |calendar: &str, mut e: CalendarEvent| {
+            e.calendar_id = calendar.into();
+            e
+        };
+        let choir = |id: &str, start: &str| {
+            let mut e = ev(id, "Choir", start);
+            e.recurring = true;
+            e.uid = Some("choir@feed".into());
+            e
+        };
+        let mut board = ev("board", "Board meeting", "2026-11-12T10:00:00Z");
+        board.uid = Some("board@example.com".into());
+        let mut running = ev("running", "Board offsite", "2026-11-04T23:00:00Z");
+        running.end = Some("2026-11-05T02:00:00Z".into());
+        let day = |id: &str, start: &str, end: &str| {
+            let mut e = ev(id, "Élodie's birthday", start);
+            e.all_day = true;
+            e.end = Some(end.into());
+            e
+        };
+        replace_events(
+            &conn,
+            "cal-1",
+            &[
+                choir("choir-1", "2026-11-03T18:00:00Z"),
+                choir("choir-2", "2026-11-10T18:00:00Z"),
+                choir("choir-3", "2026-11-17T18:00:00Z"),
+                board.clone(),
+                running,
+                day("elodie-2025", "2025-11-04", "2025-11-05"),
+                day("elodie-2026", "2026-11-04", "2026-11-05"),
+                ev("mum", "Mum's birthday", "2026-11-20"),
+            ],
+            true,
+        )
+        .unwrap();
+        let mut board_copy = on("cal-2", board);
+        board_copy.id = "board-copy".into();
+        replace_events(
+            &conn,
+            "cal-2",
+            &[
+                board_copy,
+                on(
+                    "cal-2",
+                    ev("holiday", "Board games night", "2026-11-06T19:00:00Z"),
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        // 23:30 UTC on the 4th is the 5th in Singapore: the birthday on the 4th is over there.
+        let now = "2026-11-04T23:30:00Z";
+        let ids = |query: &str, today: &str, hidden: &[String], limit: usize| -> Vec<String> {
+            search_events(&conn, query, now, today, hidden, limit)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        assert_eq!(ids("choir", "2026-11-05", &[], 20), ["choir-2"]);
+        assert_eq!(
+            ids("ÉLODIE", "2026-11-05", &[], 20),
+            ["elodie-2026", "elodie-2025"]
+        );
+        assert_eq!(ids("élodie", "2026-11-05", &[], 1), ["elodie-2026"]);
+        // In Singapore the birthday on the 4th is over; in London it's still the 4th, so to come.
+        assert_eq!(
+            ids("birthday", "2026-11-05", &[], 20),
+            ["mum", "elodie-2026", "elodie-2025"]
+        );
+        assert_eq!(
+            ids("birthday", "2026-11-04", &[], 20),
+            ["elodie-2026", "mum", "elodie-2025"]
+        );
+        assert_eq!(
+            ids("board", "2026-11-05", &[], 20),
+            ["running", "holiday", "board"],
+            "under way first, and the meeting on both calendars once"
+        );
+        // Left out before the limit: the one hit allowed is cal-2's, not a hidden one filtered away.
+        assert_eq!(
+            ids("board", "2026-11-05", &["cal-1".to_string()], 1),
+            ["holiday"]
+        );
+        assert_eq!(
+            ids("games", "2026-11-05", &["cal-2".to_string()], 20),
+            Vec::<String>::new()
+        );
     }
 
     /// Verify pass of #1047: a feed that lists only what's to come moved this morning's 09:00 review

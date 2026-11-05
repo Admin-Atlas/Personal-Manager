@@ -1369,9 +1369,11 @@ export function CalendarView({
   }, []);
 
   // A search hit (#1047): move to its day, in whatever view is on, then open its details on its
-  // first piece once that's drawn. The hit came from the store, so the ranged read around the new
-  // cursor brings it in. A view that draws no piece of it (Agenda, Year, the Runway) opens them over
-  // the grid once it's read; one it never shows (filtered out meanwhile) after REVEAL_WAIT_MS.
+  // first piece once that's drawn (`data-piece-of`, on every piece whether or not it drags), focused
+  // so Escape hands focus back to it. The hit came from the store, so the ranged read around the new
+  // cursor brings it in. The same occurrence on two calendars is drawn once (`visibleEvents`), so the
+  // hit lands on the copy the view kept. A view that draws no piece of it (Year) opens them over the
+  // grid once it's read; one it never shows (filtered out meanwhile) after REVEAL_WAIT_MS.
   const [revealing, setRevealing] = useState<CalendarEvent | null>(null);
   const revealNonce = reveal?.nonce;
   const revealTakenRef = useRef(onRevealTaken);
@@ -1389,23 +1391,27 @@ export function CalendarView({
   }, [revealNonce]);
   useEffect(() => {
     if (!revealing) return;
+    const key = occurrenceKey(revealing);
+    const shown =
+      shownEvents.find((e) => e.id === revealing.id) ??
+      (key !== null ? shownEvents.find((e) => occurrenceKey(e) === key) : undefined);
+    const target = shown ?? revealing;
     const pieceOf = () => {
-      const pieces = gridWrapperRef.current?.querySelectorAll<HTMLElement>("[data-event-id]") ?? [];
-      for (const el of pieces) {
-        if (el.dataset.eventId === revealing.id && el.tabIndex === 0) return el;
-      }
-      return null;
+      const pieces = [...document.querySelectorAll<HTMLElement>("[data-piece-of]")].filter(
+        (el) => el.dataset.pieceOf === target.id,
+      );
+      return pieces.find((el) => el.tabIndex === 0) ?? pieces[0] ?? null;
     };
     const open = (anchor: DOMRect) => {
       setRevealing(null);
-      setEventPopup({ ev: revealing, anchor });
+      setEventPopup({ ev: target, anchor });
     };
     const overGrid = () => {
       const grid = gridWrapperRef.current?.getBoundingClientRect();
       const left = grid ? grid.left + grid.width / 2 : window.innerWidth / 2;
       return new DOMRect(left, (grid?.top ?? 0) + 48, 0, 0);
     };
-    const read = shownEvents.some((e) => e.id === revealing.id);
+    const read = shown !== undefined;
     const frame = requestAnimationFrame(() => {
       const el = pieceOf();
       if (el) {
