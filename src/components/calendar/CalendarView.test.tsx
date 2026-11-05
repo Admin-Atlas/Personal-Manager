@@ -359,6 +359,66 @@ describe("CalendarView: the whole calendar", () => {
     await mount();
     expect(screen.queryByText(/older events are still downloading/)).toBeNull();
   });
+
+  it("shows a search hit: reads around its day and opens its details, once", async () => {
+    // The palette's hit, two years back: the view moves there, so its read reaches the event, and
+    // the event's details open. The owner then drops the reveal, and nothing jumps again.
+    const year = now.getFullYear() - 2;
+    const old = row({
+      id: "old",
+      summary: "Dentist",
+      start: `${year}-03-04T09:00:00`,
+      end: `${year}-03-04T09:30:00`,
+    });
+    rows = [standup, old];
+    const onRevealTaken = vi.fn();
+    const { CalendarView } = await import("./CalendarView");
+    const view = render(
+      <CalendarView reveal={{ event: old, nonce: 1 }} onRevealTaken={onRevealTaken} />,
+    );
+    // Within the default second: the Agenda draws no piece to anchor on, so the details open over
+    // the grid as soon as the event is read, not after the wait for one that never comes.
+    expect(await screen.findByRole("dialog", { name: "Dentist" })).toBeTruthy();
+    expect(onRevealTaken).toHaveBeenCalledTimes(1);
+    const calls = ipc.listAllCalendarEvents.mock.calls;
+    const [range] = calls[calls.length - 1] as [{ from: string; to: string }];
+    expect(new Date(range.from).getTime()).toBeLessThan(new Date(old.start).getTime());
+    expect(new Date(range.to).getTime()).toBeGreaterThan(new Date(old.start).getTime());
+    view.rerender(<CalendarView reveal={null} onRevealTaken={onRevealTaken} />);
+    await act(async () => {});
+    expect(onRevealTaken).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a search hit's details on its own piece in Week, focused", async () => {
+    // A piece the view marks (one that drags, here): the details open on it, and it takes focus.
+    // Week, since jsdom has no layout for Month to lay its days out by.
+    localStorage.setItem("pm.calendar.view", "week");
+    const year = now.getFullYear() - 2;
+    const old = row({
+      id: "old",
+      summary: "Dentist",
+      start: `${year}-03-04T09:00:00`,
+      end: `${year}-03-04T09:30:00`,
+      can_retime: true,
+    });
+    rows = [standup, old];
+    // Already on the Calendar tab, its first reads in, when the palette jumps.
+    const { CalendarView } = await import("./CalendarView");
+    const view = render(<CalendarView />);
+    await screen.findByRole("button", { name: "+ New event" });
+    await act(async () => {});
+    view.rerender(<CalendarView reveal={{ event: old, nonce: 1 }} />);
+    const details = await screen.findByRole("dialog", { name: "Dentist" });
+    const piece = [...document.querySelectorAll<HTMLElement>('[data-event-id="old"]')].find(
+      (el) => el.tabIndex === 0,
+    );
+    expect(piece).toBeDefined();
+    // The details take focus, as a click's do, and Escape hands it to the event, not the sidebar.
+    await waitFor(() => expect(details.contains(document.activeElement)).toBe(true));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Dentist" })).toBeNull();
+    expect(document.activeElement).toBe(piece);
+  });
 });
 
 // C16a: the box the drag gesture will hold the pointer in (C16b), which the LD1 probe finds by its

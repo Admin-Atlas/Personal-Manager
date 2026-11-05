@@ -2,8 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { listConversations, listDocuments, listProjectOverviews } from "../lib/ipc";
-import type { Conversation, Document, ProjectOverview } from "../lib/types";
+import {
+  listConversations,
+  listDocuments,
+  listProjectOverviews,
+  searchCalendarEvents,
+} from "../lib/ipc";
+import { readHidden } from "../lib/calendarPrefs";
+import { formatEventWhen } from "../lib/format";
+import type { CalendarEvent, Conversation, Document, ProjectOverview } from "../lib/types";
 import type { View } from "./Sidebar";
 import { Modal, STATUS_LABEL } from "./ui";
 import { useDepth, useTheme } from "../theme";
@@ -13,11 +20,13 @@ interface Props {
   /** Open a project's scoped view; `focusDocId` highlights a file within it. */
   onOpenProject: (project: string, focusDocId?: number) => void;
   onOpenConversation: (id: number) => void;
+  /** Show a calendar event: the Calendar tab, moved to its day, with its details open. */
+  onOpenEvent: (event: CalendarEvent) => void;
   onNavigate: (view: View) => void;
   onOpenSettings: () => void;
 }
 
-type ItemKind = "project" | "file" | "conversation" | "goto";
+type ItemKind = "project" | "file" | "conversation" | "event" | "goto";
 
 interface PaletteItem {
   id: string;
@@ -33,6 +42,7 @@ const KIND_HEADING: Record<ItemKind, string> = {
   project: "Projects",
   file: "Files",
   conversation: "Conversations",
+  event: "Events",
   goto: "Go to",
 };
 
@@ -40,11 +50,41 @@ const KIND_BADGE: Record<ItemKind, string> = {
   project: "Project",
   file: "File",
   conversation: "Chat",
+  event: "Event",
   goto: "Go to",
 };
 
 /** Display/grouping order — entities first (spec §4), navigation last. */
-const KIND_ORDER: ItemKind[] = ["project", "file", "conversation", "goto"];
+const KIND_ORDER: ItemKind[] = ["project", "file", "conversation", "event", "goto"];
+
+/** The shortest query that searches the calendar: one letter would match most of it. */
+const EVENT_QUERY_MIN = 2;
+/** How long typing must pause before the calendar is searched (a query per keystroke otherwise). */
+const EVENT_SEARCH_DELAY_MS = 150;
+
+/**
+ * The query as the palette matches it. The chat's pin syntax, typed here: there is no pinning in
+ * the palette — this is a text search over titles, projects and tags, not a retrieval scope — but
+ * every form the chat TEACHES has to come back with something, and two of them came back empty
+ * (#276):
+ *
+ *   `@"Atlas, Inc."` — what the chat's own @ menu inserts for a name with a space in it. The
+ *   quotes belong to the syntax, not to the name, so left on they searched for a string no
+ *   title contains.
+ *   `@marketing @sales` — only the FIRST @ was stripped, so the second one had to appear
+ *   literally in a title to match.
+ *
+ * Both now normalise to the words themselves. The sigil is dropped rather than honoured because
+ * pinning a tag as a filter here is a feature, not a parse — it is carded separately.
+ */
+function normalizeQuery(query: string): string {
+  return query
+    .trim()
+    .replace(/@"([^"]*)"?/g, "$1")
+    .replace(/@/g, "")
+    .trim()
+    .toLowerCase();
+}
 
 const NAV_DESTS: { label: string; view: View }[] = [
   { label: "Focus", view: "focus" },
@@ -59,13 +99,15 @@ const NAV_DESTS: { label: string; view: View }[] = [
 
 /**
  * Global quick-jump (spec §4): one keystroke opens it, type to filter to any
- * project, file, past conversation, or navigation destination, Enter jumps there.
- * Frontend-only — composes the existing list commands (mirrors GraphView's reuse).
+ * project, file, past conversation, calendar event, or navigation destination, Enter jumps there.
+ * Composes the existing list commands (mirrors GraphView's reuse); the calendar is searched in Rust
+ * as you type, since PM keeps every event (#1047) and they don't all belong in memory.
  */
 export function CommandPalette({
   onClose,
   onOpenProject,
   onOpenConversation,
+  onOpenEvent,
   onNavigate,
   onOpenSettings,
 }: Props) {
@@ -77,13 +119,55 @@ export function CommandPalette({
   const [projects, setProjects] = useState<ProjectOverview[]>([]);
   const [docs, setDocs] = useState<Document[]>([]);
   const [convs, setConvs] = useState<Conversation[]>([]);
+  // The calendar's hits, and the (normalised) query they answer: a hit list for an older query is
+  // never shown under a newer one.
+  const [eventHits, setEventHits] = useState<{ q: string; events: CalendarEvent[] }>({
+    q: "",
+    events: [],
+  });
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the latest navigation callbacks in a ref so the searchable index isn't
   // rebuilt on every parent re-render (App passes fresh closures each render, e.g.
   // on every streamed chat token while the palette is open).
-  const cbRef = useRef({ onClose, onOpenProject, onOpenConversation, onNavigate, onOpenSettings });
-  cbRef.current = { onClose, onOpenProject, onOpenConversation, onNavigate, onOpenSettings };
+  const cbRef = useRef({
+    onClose,
+    onOpenProject,
+    onOpenConversation,
+    onOpenEvent,
+    onNavigate,
+    onOpenSettings,
+  });
+  cbRef.current = {
+    onClose,
+    onOpenProject,
+    onOpenConversation,
+    onOpenEvent,
+    onNavigate,
+    onOpenSettings,
+  };
+  const q = normalizeQuery(query);
+
+  // Search the calendar once typing pauses. Only the latest query's answer lands (`eventHits.q`
+  // must match), and a failed search just shows no events: the rest of the palette still works.
+  useEffect(() => {
+    if (q.length < EVENT_QUERY_MIN) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void searchCalendarEvents(q)
+        .catch(() => [] as CalendarEvent[])
+        .then((events) => {
+          if (cancelled) return;
+          // What the Calendar tab shows: a calendar hidden there has nothing to jump to.
+          const hidden = readHidden();
+          setEventHits({ q, events: events.filter((e) => !hidden.has(e.calendar_id)) });
+        });
+    }, EVENT_SEARCH_DELAY_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [q]);
 
   // Fetch the three lists once on open — fast local reads. If any fails, the
   // "Go to" destinations below are still built, so navigation always works.
@@ -180,28 +264,28 @@ export function CommandPalette({
     return [...projectItems, ...fileItems, ...convItems, ...gotoItems];
   }, [projects, docs, convs, teachVisible, mapVisible]);
 
+  // The calendar's hits for this query, in the order Rust ranked them (upcoming soonest first, then
+  // past latest first): already matched word by word, so they skip the fuzzy scorer. Only with a
+  // query: an empty palette browses everything else, but not every event ever kept.
+  const eventItems = useMemo<PaletteItem[]>(() => {
+    if (q.length < EVENT_QUERY_MIN || eventHits.q !== q) return [];
+    return eventHits.events.map((ev) => ({
+      id: `event:${ev.calendar_id}:${ev.id}`,
+      kind: "event",
+      label: ev.summary || "(No title)",
+      sublabel: `${formatEventWhen(ev.start, ev.all_day)}${ev.recurring ? " · repeats" : ""}`,
+      search: "",
+      activate: () => {
+        cbRef.current.onOpenEvent(ev);
+        cbRef.current.onClose();
+      },
+    }));
+  }, [eventHits, q]);
+
   // Filter + rank against the query, then regroup in display order. With a query,
   // each group is ordered by match score (best first); empty query keeps the
   // natural order so the palette doubles as a browse-everything list.
   const { groups, flat } = useMemo(() => {
-    // The chat's pin syntax, typed here. There is no pinning in the palette — this is a text search
-    // over titles, projects and tags, not a retrieval scope — but every form the chat TEACHES has to
-    // come back with something, and two of them came back empty (#276):
-    //
-    //   `@"Atlas, Inc."` — what the chat's own @ menu inserts for a name with a space in it. The
-    //   quotes belong to the syntax, not to the name, so left on they searched for a string no
-    //   title contains.
-    //   `@marketing @sales` — only the FIRST @ was stripped, so the second one had to appear
-    //   literally in a title to match.
-    //
-    // Both now normalise to the words themselves. The sigil is dropped rather than honoured because
-    // pinning a tag as a filter here is a feature, not a parse — it is carded separately.
-    const q = query
-      .trim()
-      .replace(/@"([^"]*)"?/g, "$1")
-      .replace(/@/g, "")
-      .trim()
-      .toLowerCase();
     const scored = items
       .map((item) => ({ item, score: q ? fuzzyScore(q, item.search) : 0 }))
       .filter((s): s is { item: PaletteItem; score: number } => s.score !== null);
@@ -209,11 +293,14 @@ export function CommandPalette({
 
     const groups = KIND_ORDER.map((kind) => ({
       kind,
-      items: scored.filter((s) => s.item.kind === kind).map((s) => s.item),
+      items:
+        kind === "event"
+          ? eventItems
+          : scored.filter((s) => s.item.kind === kind).map((s) => s.item),
     })).filter((g) => g.items.length > 0);
 
     return { groups, flat: groups.flatMap((g) => g.items) };
-  }, [items, query]);
+  }, [items, eventItems, q]);
 
   // Reset the highlight to the top whenever the result set changes — a new query,
   // or the async project/file/conversation lists landing — so Enter can't fire a
@@ -277,12 +364,12 @@ export function CommandPalette({
         }}
         onKeyDown={onKeyDown}
         role="combobox"
-        aria-label="Search projects, files and conversations"
+        aria-label="Search projects, files, conversations and events"
         aria-expanded={flat.length > 0}
         aria-controls="pm-cmdk-listbox"
         aria-autocomplete="list"
         aria-activedescendant={flat.length > 0 ? `pm-cmdk-opt-${active}` : undefined}
-        placeholder="Jump to a project, file, conversation…"
+        placeholder="Jump to a project, file, conversation, event…"
         className="w-full border-b border-border bg-transparent px-4 py-3 text-sm text-ink placeholder:text-ink4 focus:outline-none"
       />
 

@@ -2833,6 +2833,93 @@ pub fn list_events_between(
     )
 }
 
+/// The most words of a search [`search_events`] matches on; the rest are dropped (a search box, not
+/// a query language).
+const SEARCH_MAX_WORDS: usize = 8;
+
+/// The mirrored events whose title or location holds every word of `query`, for the search palette:
+/// Google's search reaches the whole calendar, and since #1047 so does the mirror. Case-insensitive
+/// for ASCII letters, as SQLite's `LIKE` is.
+///
+/// - **One hit per repeating event**, as its next occurrence, or its latest once it's over. Every
+///   occurrence is a row of its own (`singleEvents`), so a weekly meeting would otherwise fill the
+///   list with the same title.
+/// - **Upcoming first**, soonest first (one under way counts as upcoming), then past ones, latest
+///   first; at most `limit`. `now` is RFC 3339.
+/// - **Not the description or the guests.** An event over a year old keeps them packed
+///   ([`calendar_history::pack`]), where SQL can't see, and a search that found a note only while
+///   it was recent would be worse than one that says what it reads.
+///
+/// Like [`list_events_between`], not filtered by `quiet` (the palette is the Calendar tab's, not
+/// the assistant's); the client leaves out locally hidden calendars.
+pub fn search_events(
+    conn: &Connection,
+    query: &str,
+    now: &str,
+    limit: usize,
+) -> Result<Vec<CalendarEvent>> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .take(SEARCH_MAX_WORDS)
+        .map(|w| {
+            let escaped = w
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{escaped}%")
+        })
+        .collect();
+    if words.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let matches = (0..words.len())
+        .map(|i| {
+            let n = i + 3;
+            format!("(summary LIKE ?{n} ESCAPE '\\' OR location LIKE ?{n} ESCAPE '\\')")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    // A series is its Google `recurringEventId`, else (iCal, Outlook) its UID when the row repeats;
+    // a one-off is itself. Within one calendar: the same invitation on two calendars is two hits.
+    let sql = format!(
+        "WITH hits AS ( \
+           SELECT id, calendar_id, \
+                  calendar_id || char(31) || \
+                    COALESCE(series_id, CASE WHEN recurring = 1 THEN uid END, id) AS grp, \
+                  julianday(COALESCE(end, start)) > julianday(?1) AS upcoming, \
+                  julianday(start) AS at \
+           FROM calendar_events WHERE {matches} \
+         ), ranked AS ( \
+           SELECT id, calendar_id, upcoming, at, \
+                  ROW_NUMBER() OVER ( \
+                    PARTITION BY grp \
+                    ORDER BY upcoming DESC, CASE WHEN upcoming THEN at END, at DESC, id \
+                  ) AS n \
+           FROM hits \
+         ) \
+         SELECT id, calendar_id FROM ranked WHERE n = 1 \
+         ORDER BY upcoming DESC, CASE WHEN upcoming THEN at END, at DESC, id \
+         LIMIT ?2"
+    );
+    let mut args: Vec<rusqlite::types::Value> = vec![now.to_string().into(), (limit as i64).into()];
+    args.extend(words.into_iter().map(rusqlite::types::Value::from));
+    let picked: Vec<(String, String)> = conn
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(args), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut found = Vec::with_capacity(picked.len());
+    for (id, calendar_id) in picked {
+        found.extend(list_events_where(
+            conn,
+            "WHERE id = ?1 AND calendar_id = ?2",
+            params![id, calendar_id],
+        )?);
+    }
+    Ok(found)
+}
+
 /// Mirrored events, read whole: `tail` follows `FROM calendar_events` (a WHERE and/or ORDER BY).
 fn list_events_where(
     conn: &Connection,
@@ -3164,6 +3251,72 @@ mod tests {
                 "fair-2024"
             ]
         );
+    }
+
+    /// The search palette (#1047): every word, in the title or the place, case aside; a weekly
+    /// meeting comes once, as its next occurrence (its last once it's over); upcoming soonest first,
+    /// then past latest first; an old event comes back whole from its packed columns; `LIKE`'s
+    /// wildcards are only themselves.
+    #[test]
+    fn a_search_finds_events_by_title_or_place_once_per_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let standup = |id: &str, start: &str| {
+            let mut e = ev(id, "Team standup", start);
+            e.recurring = true;
+            e.series_id = Some("standup".into());
+            e.uid = Some("standup@example.com".into());
+            e
+        };
+        let mut lunch = ev("lunch-2024", "Lunch with Ramit", "2024-03-01T12:00:00Z");
+        let notes = "Bring the Q1 numbers. ".repeat(20);
+        lunch.description = Some(notes.clone());
+        let mut offsite = ev("offsite", "Planning day", "2026-12-01");
+        offsite.all_day = true;
+        offsite.location = Some("Team room 3".into());
+        replace_events(
+            &conn,
+            "cal-1",
+            &[
+                standup("standup-02", "2026-11-02T09:00:00Z"),
+                standup("standup-09", "2026-11-09T09:00:00Z"),
+                standup("standup-16", "2026-11-16T09:00:00Z"),
+                lunch,
+                offsite,
+                ev("half", "50% review", "2026-11-20T10:00:00Z"),
+                ev("dentist", "Dentist", "2026-11-10T08:00:00Z"),
+            ],
+            true,
+        )
+        .unwrap();
+        let now = "2026-11-05T12:00:00Z";
+        let ids = |query: &str, now: &str| -> Vec<String> {
+            search_events(&conn, query, now, 20)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        assert_eq!(ids("team", now), ["standup-09", "offsite"]);
+        assert_eq!(ids("  STANDUP   team ", now), ["standup-09"]);
+        assert_eq!(ids("standup", "2027-01-01T00:00:00Z"), ["standup-16"]);
+        assert_eq!(ids("%", now), ["half"]);
+        assert_eq!(ids("_", now), Vec::<String>::new());
+        assert_eq!(ids("   ", now), Vec::<String>::new());
+        assert_eq!(ids("e", now), ["standup-09", "dentist", "half", "offsite"]);
+        assert_eq!(ids("a", now), ["standup-09", "offsite", "lunch-2024"]);
+        let packed: String = conn
+            .query_row(
+                "SELECT typeof(description) FROM calendar_events WHERE id = 'lunch-2024'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(packed, "blob");
+        let found = search_events(&conn, "ramit", now, 20).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description.as_deref(), Some(notes.as_str()));
+        assert_eq!(search_events(&conn, "e", now, 2).unwrap().len(), 2);
     }
 
     /// Verify pass of #1047: a feed that lists only what's to come moved this morning's 09:00 review

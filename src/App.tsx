@@ -105,6 +105,7 @@ import {
   vaultStatus,
 } from "./lib/ipc";
 import type {
+  CalendarEvent,
   Conversation,
   Settings,
   SharedVaultAd,
@@ -192,6 +193,12 @@ export default function App() {
   const [betterFit, setBetterFit] = useState(false);
   const [sheetsNudge, setSheetsNudge] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
+  /** A calendar event the search palette jumped to, for the Calendar tab to show once (#1047);
+   *  cleared as it's taken, so coming back to the tab later doesn't jump again. */
+  const [calendarReveal, setCalendarReveal] = useState<{
+    event: CalendarEvent;
+    nonce: number;
+  } | null>(null);
 
   function openProject(project: string, focusDocId?: number) {
     setSelectedProject(project);
@@ -1242,6 +1249,8 @@ export default function App() {
                       onOpenProject={openProject}
                       onOpenPinboard={() => setView("pinboard")}
                       onPopOut={() => void openCalendarWindow().catch(() => {})}
+                      reveal={calendarReveal}
+                      onRevealTaken={() => setCalendarReveal(null)}
                     />
                   </main>
                 ) : view === "documents" ? (
@@ -1396,6 +1405,10 @@ export default function App() {
                   onOpenConversation={(id) => {
                     setView("chat");
                     void selectConversation(id);
+                  }}
+                  onOpenEvent={(event) => {
+                    setCalendarReveal({ event, nonce: Date.now() });
+                    setView("calendar");
                   }}
                   onNavigate={setView}
                   onOpenSettings={() => setShowSettings(true)}

@@ -18,11 +18,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const listConversations = vi.fn();
 const listDocuments = vi.fn();
 const listProjectOverviews = vi.fn();
+const searchCalendarEvents = vi.fn();
+// The Calendar tab's hidden calendars live in the encrypted store, which no test hydrates.
+const hiddenCalendars = vi.hoisted(() => ({ ids: new Set<string>() }));
+vi.mock("../lib/calendarPrefs", () => ({ readHidden: () => hiddenCalendars.ids }));
 
 vi.mock("../lib/ipc", () => ({
   listConversations: () => listConversations(),
   listDocuments: () => listDocuments(),
   listProjectOverviews: () => listProjectOverviews(),
+  searchCalendarEvents: (query: string) => searchCalendarEvents(query),
 }));
 
 // The same stub the other component tests use: the palette's primitives reach for `useTheme`, and
@@ -49,15 +54,17 @@ vi.mock("../theme/ThemeContext", async (importOriginal) => ({
 }));
 
 import { CommandPalette } from "./CommandPalette";
+import type { CalendarEvent } from "../lib/types";
 
 const noop = () => {};
 
-function renderPalette(onClose: () => void) {
+function renderPalette(onClose: () => void, onOpenEvent: (event: CalendarEvent) => void = noop) {
   return render(
     <CommandPalette
       onClose={onClose}
       onOpenProject={noop}
       onOpenConversation={noop}
+      onOpenEvent={onOpenEvent}
       onNavigate={noop}
       onOpenSettings={noop}
     />,
@@ -76,6 +83,7 @@ beforeEach(() => {
   listConversations.mockResolvedValue([]);
   listDocuments.mockResolvedValue([]);
   listProjectOverviews.mockResolvedValue([]);
+  searchCalendarEvents.mockResolvedValue([]);
   // jsdom implements no layout, so it has no `scrollIntoView` at all; the palette keeps the
   // highlighted row in view on every arrow press. Same stub as ChatView.test.tsx.
   Element.prototype.scrollIntoView = vi.fn();
@@ -85,7 +93,19 @@ afterEach(() => {
   cleanup();
   document.body.innerHTML = "";
   vi.clearAllMocks();
+  hiddenCalendars.ids = new Set();
 });
+
+function event(id: string, summary: string, calendarId: string): CalendarEvent {
+  return {
+    id,
+    calendar_id: calendarId,
+    summary,
+    start: "2026-11-09T09:00:00Z",
+    all_day: false,
+    recurring: true,
+  } as CalendarEvent;
+}
 
 describe("CommandPalette", () => {
   it("closes on Escape from a focus position that is NOT the input", async () => {
@@ -136,7 +156,7 @@ describe("CommandPalette", () => {
 
     expect(getByRole("dialog", { name: "Command palette" })).toBeTruthy();
     expect(
-      getByRole("combobox", { name: "Search projects, files and conversations" }),
+      getByRole("combobox", { name: "Search projects, files, conversations and events" }),
     ).toBeTruthy();
   });
 
@@ -164,5 +184,37 @@ describe("CommandPalette", () => {
     expect(getByRole("dialog").getAttribute("data-help")).toBe("command-palette");
     expect(getByRole("combobox").closest("[data-help]")).toBe(getByRole("dialog"));
     expect(getByRole("listbox").closest("[data-help]")).toBe(getByRole("dialog"));
+  });
+
+  it("finds calendar events, leaves out hidden calendars, and opens one", async () => {
+    // The Search button found nothing in the calendar (#1047): events are searched in Rust as you
+    // type, and a hit opens the Calendar on it.
+    hiddenCalendars.ids = new Set(["cal-hidden"]);
+    const standup = event("standup-09", "Team standup", "cal-work");
+    searchCalendarEvents.mockResolvedValue([standup, event("secret", "Team secret", "cal-hidden")]);
+    const onClose = vi.fn();
+    const onOpenEvent = vi.fn();
+    const { getByRole, findByRole, queryByRole } = renderPalette(onClose, onOpenEvent);
+    await waitFor(() => expect(listDocuments).toHaveBeenCalled());
+
+    fireEvent.change(getByRole("combobox"), { target: { value: "  Team " } });
+    const hit = await findByRole("option", { name: /Team standup/ });
+    expect(searchCalendarEvents).toHaveBeenCalledTimes(1);
+    expect(searchCalendarEvents).toHaveBeenCalledWith("team");
+    expect(getByRole("group", { name: "Events" })).toBeTruthy();
+    expect(hit.textContent).toContain("repeats");
+    expect(queryByRole("option", { name: /Team secret/ })).toBeNull();
+
+    fireEvent.click(hit);
+    expect(onOpenEvent).toHaveBeenCalledWith(standup);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("doesn't search the calendar for a single letter", async () => {
+    const { getByRole } = renderPalette(noop);
+    await waitFor(() => expect(listDocuments).toHaveBeenCalled());
+    fireEvent.change(getByRole("combobox"), { target: { value: "t" } });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(searchCalendarEvents).not.toHaveBeenCalled();
   });
 });

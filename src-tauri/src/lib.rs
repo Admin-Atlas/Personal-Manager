@@ -1839,6 +1839,7 @@ pub fn run() {
             commands::list_calendar_events,
             commands::list_all_calendar_events,
             commands::load_calendar_months,
+            commands::search_calendar_events,
             commands::event_flags,
             commands::connect_drive,
             commands::disconnect_drive,

@@ -1724,6 +1724,30 @@ pub fn list_all_calendar_events(
         .collect())
 }
 
+/// The most hits one [`search_calendar_events`] call returns.
+const SEARCH_MAX_HITS: u32 = 50;
+
+/// The search palette's calendar hits: [`calendar::search_events`] over every kept event, at most
+/// `limit` (20 by default), each with its editing rights as [`list_all_calendar_events`] gives them,
+/// so the event popover a hit opens can edit it.
+#[tauri::command]
+pub fn search_calendar_events(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<ListedEvent>> {
+    let limit = limit.unwrap_or(20).clamp(1, SEARCH_MAX_HITS) as usize;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let conn = state.conn()?;
+    let rows = calendar::search_events(&conn, &query, &now, limit)?;
+    let rights = super::calendar_edit::list_rights(&conn, &rows)?;
+    Ok(rows
+        .into_iter()
+        .zip(rights)
+        .map(|(event, rights)| ListedEvent::new(event, rights))
+        .collect())
+}
+
 /// The longest stretch one [`load_calendar_months`] call fetches: four years, inside what one
 /// Outlook `calendarView` may take with its margins. The view asks for a few months at a time; this
 /// just bounds a bad request.

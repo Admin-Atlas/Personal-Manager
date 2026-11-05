@@ -29,6 +29,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     highlights: [
       "Your calendar now keeps everything. The first sync downloads every event your Google and Outlook calendars have ever had, so you can scroll back to last year, or ten years ago, and see what happened then. Old events can be changed just like new ones, as Google lets you. The first download can take a few minutes for a busy calendar; until it's done, the calendar says older events are still on their way.",
       "Months more than a year ahead now load as you scroll to them, so the calendar no longer stops 13 months out, and an event you make far ahead shows up where you put it.",
+      "Search finds your calendar events. Press Search (Ctrl+K) and type part of an event's title or where it is: upcoming events come first, then past ones, however long ago, and a repeating meeting shows once. Pick one to open the Calendar on its day with its details showing.",
       "A milestone or task linked to an event keeps its date after the event is over, instead of losing it a month later.",
       "Syncing does less work: PM now compares what it has with your calendar and writes only what changed, instead of rewriting a calendar each time something in it moved. Events that ended more than a year ago are stored compressed, so years of history take little room.",
     ],

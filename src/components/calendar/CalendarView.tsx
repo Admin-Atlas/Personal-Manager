@@ -300,9 +300,24 @@ interface CalendarViewProps {
   onOpenPinboard?: () => void;
   /** Open the Calendar in a window of its own (#1039). Absent in that window itself. */
   onPopOut?: () => void;
+  /** An event to show, from the search palette (#1047): the view moves to its day and opens its
+   *  details. A new `nonce` shows it again. */
+  reveal?: { event: CalendarEvent; nonce: number } | null;
+  /** Called once `reveal` is taken, so the owner can drop it and a later visit doesn't jump. */
+  onRevealTaken?: () => void;
 }
 
-export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: CalendarViewProps) {
+/** How long a revealed event may take to be drawn before its details open over the grid instead
+ *  (its months still loading, or a view that draws no piece of it, like the Year view). */
+const REVEAL_WAIT_MS = 1500;
+
+export function CalendarView({
+  onOpenProject,
+  onOpenPinboard,
+  onPopOut,
+  reveal,
+  onRevealTaken,
+}: CalendarViewProps) {
   const { system, accent, colorblind } = useTheme();
   const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
@@ -1352,6 +1367,64 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
       }
     });
   }, []);
+
+  // A search hit (#1047): move to its day, in whatever view is on, then open its details on its
+  // first piece once that's drawn. The hit came from the store, so the ranged read around the new
+  // cursor brings it in. A view that draws no piece of it (Agenda, Year, the Runway) opens them over
+  // the grid once it's read; one it never shows (filtered out meanwhile) after REVEAL_WAIT_MS.
+  const [revealing, setRevealing] = useState<CalendarEvent | null>(null);
+  const revealNonce = reveal?.nonce;
+  const revealTakenRef = useRef(onRevealTaken);
+  revealTakenRef.current = onRevealTaken;
+  useEffect(() => {
+    if (!reveal) return;
+    const ev = reveal.event;
+    const day = parseLocal(ev.start, ev.all_day);
+    if (day) setCursor(view === "week" ? startOfWeek(day) : day);
+    setEventPopup(null);
+    setRevealing(ev);
+    revealTakenRef.current?.();
+    // Only a new reveal moves the view: switching views afterwards mustn't jump back to it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealNonce]);
+  useEffect(() => {
+    if (!revealing) return;
+    const pieceOf = () => {
+      const pieces = gridWrapperRef.current?.querySelectorAll<HTMLElement>("[data-event-id]") ?? [];
+      for (const el of pieces) {
+        if (el.dataset.eventId === revealing.id && el.tabIndex === 0) return el;
+      }
+      return null;
+    };
+    const open = (anchor: DOMRect) => {
+      setRevealing(null);
+      setEventPopup({ ev: revealing, anchor });
+    };
+    const overGrid = () => {
+      const grid = gridWrapperRef.current?.getBoundingClientRect();
+      const left = grid ? grid.left + grid.width / 2 : window.innerWidth / 2;
+      return new DOMRect(left, (grid?.top ?? 0) + 48, 0, 0);
+    };
+    const read = shownEvents.some((e) => e.id === revealing.id);
+    const frame = requestAnimationFrame(() => {
+      const el = pieceOf();
+      if (el) {
+        el.scrollIntoView?.({ block: "center", inline: "nearest" });
+        el.focus({ preventScroll: true });
+        open(el.getBoundingClientRect());
+      } else if (read) {
+        open(overGrid());
+      }
+    });
+    const fallback = window.setTimeout(
+      () => open(pieceOf()?.getBoundingClientRect() ?? overGrid()),
+      REVEAL_WAIT_MS,
+    );
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(fallback);
+    };
+  }, [revealing, shownEvents]);
 
   // A drop: shown at once where it went, sent at once when it asks nothing, else asked about in
   // `MoveFlow`, one at a time.

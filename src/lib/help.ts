@@ -62,7 +62,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "sidebar-search": {
     title: "Search",
-    body: "Opens the command palette — a quick-jump to any project, file, or past conversation. You can also open it anytime with Ctrl+K (⌘K on a Mac).",
+    body: "Opens the command palette — a quick-jump to any project, file, past conversation, or calendar event. You can also open it anytime with Ctrl+K (⌘K on a Mac).",
   },
 
   // Teach (entity resolution)
@@ -169,7 +169,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Command palette (Step 5b)
   "command-palette": {
     title: "Command palette",
-    body: "Type to jump anywhere: a project opens its focus view, a file opens its project with the file highlighted, a conversation reopens it, and 'Go to' jumps to a section. Use ↑↓ to move, Enter to open, Esc to close.",
+    body: "Type to jump anywhere: a project opens its focus view, a file opens its project with the file highlighted, a conversation reopens it, an event opens the Calendar on its day with its details, and 'Go to' jumps to a section. Events are found by title or place, however old, with one entry per repeating event. Use ↑↓ to move, Enter to open, Esc to close.",
   },
 
   // Documents view
