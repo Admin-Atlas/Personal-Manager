@@ -2091,7 +2091,7 @@ pub fn replace_band(
     }
     let mut out = Replaced::default();
     let tx = conn.unchecked_transaction()?;
-    let held = rows_near(&tx, calendar_id, band)?;
+    let held = rows_near(&tx, calendar_id, band, &fresh)?;
     for (id, row) in &fresh {
         if held.get(*id) != Some(row) {
             upsert_event(&tx, row, now)?;
@@ -2138,23 +2138,39 @@ pub fn replace_events(
     replace_band(conn, calendar_id, &everything, events, complete).map(|_| ())
 }
 
-/// The calendar's rows whose start falls in `band`'s request (or can't be read), by id: every row
-/// the band may remove, and most of the rows its listing would write. A listed event stored outside
-/// them (one that started long before and still runs, or that moved) is simply written again.
+/// The calendar's rows whose start falls in `band`'s request or among the `listed` events' starts
+/// (or can't be read), by id: every row the band may remove, and the stored copy of nearly every
+/// event its listing would write, so an unchanged one is left alone. The listing can reach past the
+/// band — an iCal feed's band starts at what it keeps, while its repeating events are expanded from
+/// their own first day — and those rows must be compared too, or they'd be written on every sync. A
+/// listed event stored elsewhere (one that moved) is simply written again.
 fn rows_near(
     conn: &Connection,
     calendar_id: &str,
     band: &Band,
+    listed: &HashMap<&str, CalendarEvent>,
 ) -> Result<HashMap<String, CalendarEvent>> {
     let (from, to) = band.request();
+    let at = |s: &str| calendar_history::start_instant(s);
+    let mut from = from.as_deref().and_then(at);
+    let mut to = to.as_deref().and_then(at);
+    for start in listed.values().filter_map(|e| at(&e.start)) {
+        from = from.map(|f| f.min(start));
+        to = to.map(|t| t.max(start + chrono::TimeDelta::seconds(1)));
+    }
+    let bound = |t: Option<chrono::DateTime<chrono::Utc>>, open: &str| {
+        t.map_or(open.to_string(), |t| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+    };
     let rows = list_events_where(
         conn,
         "WHERE calendar_id = ?1 AND (julianday(start) IS NULL \
            OR (julianday(start) >= julianday(?2) AND julianday(start) < julianday(?3)))",
         params![
             calendar_id,
-            from.as_deref().unwrap_or("0001-01-01T00:00:00Z"),
-            to.as_deref().unwrap_or("9999-12-31T23:59:59Z"),
+            bound(from, "0001-01-01T00:00:00Z"),
+            bound(to, "9999-12-31T23:59:59Z"),
         ],
     )?;
     Ok(rows.into_iter().map(|r| (r.id.clone(), r)).collect())
@@ -3041,6 +3057,37 @@ mod tests {
             left,
             ["early", "later"],
             "the margin's row belongs to the live band"
+        );
+    }
+
+    /// Verify pass of #1047: an iCal feed's band starts at what it keeps, while its repeats are
+    /// listed from their own first day. Those rows are compared like the band's, so an unchanged
+    /// feed writes nothing, and they're never removed by it.
+    #[test]
+    fn a_listing_that_reaches_past_its_band_compares_those_rows_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        let at = |s: &str| crate::calendar_history::start_instant(s).unwrap();
+        let band = Band {
+            from: Some(at("2026-11-05T00:00:00Z")),
+            to: Some(at("2027-12-01T00:00:00Z")),
+            live: true,
+        };
+        let old = ev("weekly-2019", "Class", "2019-01-07T09:00:00Z");
+        let next = ev("weekly-next", "Class", "2026-11-09T09:00:00Z");
+        let listing = [old.clone(), next.clone()];
+        let first = replace_band(&conn, "cal-1", &band, &listing, true).unwrap();
+        assert_eq!(first.written, 2);
+        let again = replace_band(&conn, "cal-1", &band, &listing, true).unwrap();
+        assert_eq!(
+            again,
+            Replaced::default(),
+            "nothing changed, nothing written"
+        );
+        let without_old = replace_band(&conn, "cal-1", &band, &[next], true).unwrap();
+        assert_eq!(
+            without_old.removed, 0,
+            "before the band: not the listing's to remove"
         );
     }
 

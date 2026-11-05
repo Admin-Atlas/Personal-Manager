@@ -692,12 +692,7 @@ pub async fn add_ics_feed(
     };
     let band = feed_band(&live);
     let (events, complete) = calendar::sync_feed(&feed, &band, tz).await?;
-    let band = match live.from {
-        Some(from) => {
-            band.of_feed_listing(events.iter().map(|e| (e.start.as_str(), e.recurring)), from)
-        }
-        None => band,
-    };
+    let band = band.of_feed_listing(feed_listing(&events), chrono::Utc::now());
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::save_new_feed(&feed)?;
@@ -874,6 +869,13 @@ fn is_feed(cal: &calendar::Calendar) -> bool {
     !matches!(cal.provider.as_str(), "google" | "microsoft")
 }
 
+/// A feed download's events as [`calendar::Band::of_feed_listing`] reads them.
+fn feed_listing(events: &[CalendarEvent]) -> impl Iterator<Item = (&str, Option<&str>, bool)> {
+    events
+        .iter()
+        .map(|e| (e.start.as_str(), e.end.as_deref(), e.recurring))
+}
+
 /// Pull one band of a single selected calendar's events (provider-dispatched) and write them to the
 /// mirror, comparing them with what it holds there ([`calendar::replace_band`]). At most `max_pages`
 /// pages for Google and Outlook ([`calendar::MAX_PAGES`], [`calendar::HISTORY_PAGES`]). Never holds
@@ -934,16 +936,11 @@ async fn sync_one_calendar(
     let count = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    // A feed asked for its whole history speaks only from its first one-off event
-    // (`Band::of_feed_listing`): one that publishes only a window mustn't take history with it.
-    let band = if is_feed(cal) && band.from.is_none() {
-        let live_from = calendar::live_band(&conn)?.from;
-        match live_from {
-            Some(from) => {
-                band.of_feed_listing(events.iter().map(|e| (e.start.as_str(), e.recurring)), from)
-            }
-            None => *band,
-        }
+    // A feed asked for its whole history speaks for what's to come, and back only as far as it
+    // shows it keeps (`Band::of_feed_listing`): one that publishes a window mustn't take history
+    // with it.
+    let band = if is_feed(cal) {
+        band.of_feed_listing(feed_listing(&events), chrono::Utc::now())
     } else {
         *band
     };
