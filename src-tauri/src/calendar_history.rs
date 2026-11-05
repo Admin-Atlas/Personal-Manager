@@ -107,6 +107,28 @@ impl Band {
         };
         self.from.is_none_or(|f| at >= f) && self.to.is_none_or(|t| at < t)
     }
+
+    /// What one download of an iCal feed, asked for with [`Band::through_live`], speaks for. A feed
+    /// lists what its publisher keeps, and many keep only a window (the last few weeks and the year
+    /// ahead, say), so an event older than everything the feed lists — and older than the live band
+    /// — has rolled out of the feed rather than been deleted, and history keeps it. So the band
+    /// starts at the earlier of the listing's first start and `live_from`; an empty listing starts it
+    /// at `live_from`. The live band itself is always the feed's to clear, as before. Any other band
+    /// is returned as it is.
+    pub fn of_feed_listing<'a>(
+        self,
+        starts: impl IntoIterator<Item = &'a str>,
+        live_from: DateTime<Utc>,
+    ) -> Band {
+        if self.from.is_some() {
+            return self;
+        }
+        let first = starts.into_iter().filter_map(start_instant).min();
+        Band {
+            from: Some(first.map_or(live_from, |f| f.min(live_from))),
+            ..self
+        }
+    }
 }
 
 /// A mirrored start or end as an instant: RFC 3339, or an all-day `YYYY-MM-DD` read as UTC midnight,
@@ -165,8 +187,8 @@ pub fn reaches_history(changes: &[Changed], held: impl Fn(&Changed) -> Held) -> 
     })
 }
 
-/// Where a calendar's history stands, kept in the `settings` table under
-/// [`crate::calendar::history_key`]. No row means it has never been downloaded.
+/// Where a calendar's history stands, kept in the `settings` table under a `calendar_history:` key.
+/// No row means it has never been downloaded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryState {
     /// When history was last known to match the calendar: by Google's clock for a Google calendar
@@ -178,6 +200,11 @@ pub struct HistoryState {
     /// series that began before the live band, say): fetch it again at the next check.
     #[serde(default)]
     pub stale: bool,
+    /// How many times a save has marked it stale. A fetch notes the count when it starts, and
+    /// clears `stale` only if no mark came in while it ran: saves don't wait for the sync lock, so a
+    /// mark can land mid-fetch, about a change that fetch may not have seen.
+    #[serde(default)]
+    pub marks: u64,
 }
 
 /// [`HistoryState::checked_at`] as RFC 3339 text (chrono is built here without its serde support).
@@ -223,6 +250,29 @@ pub fn outlook_due(state: Option<&HistoryState>, now: DateTime<Utc>) -> bool {
         None => true,
         Some(s) => s.stale || now - s.checked_at >= TimeDelta::days(1) || s.checked_at > now,
     }
+}
+
+/// How long one slice of an Outlook calendar's history is: four years, so with its margins a request
+/// stays well inside the 1,825 days Graph may take for one `calendarView` (unverified: no Outlook
+/// account to probe, so the safe width is used).
+fn outlook_slice() -> TimeDelta {
+    TimeDelta::days(4 * 365)
+}
+
+/// An Outlook calendar's history as slices that meet with no gap, newest first: four-year bands back
+/// from the live band's start, then one band open at the start for everything before (its request
+/// starts at [`crate::calendar::EARLIEST`], so it too is at most a slice wide). Each is a complete
+/// listing of its own stretch, so a slice that fails leaves the others' rows alone.
+pub fn outlook_slices(live_from: DateTime<Utc>) -> Vec<Band> {
+    let floor = start_instant(crate::calendar::EARLIEST).unwrap_or(live_from);
+    let mut bands = Vec::new();
+    let mut to = live_from;
+    while to - outlook_slice() > floor {
+        bands.push(Band::between(to - outlook_slice(), to));
+        to -= outlook_slice();
+    }
+    bands.push(Band::before(to));
+    bands
 }
 
 /// Events that ended this long ago keep their description and guest list compressed ([`pack`]).
@@ -326,6 +376,56 @@ mod tests {
     }
 
     #[test]
+    fn outlook_history_comes_in_slices_that_meet_and_stay_narrow() {
+        let l0 = at("2026-10-01T00:00:00Z");
+        let slices = outlook_slices(l0);
+        assert_eq!(slices[0].to, Some(l0), "newest first, up to the live band");
+        for pair in slices.windows(2) {
+            assert_eq!(pair[1].to, pair[0].from, "no gap, no overlap");
+        }
+        let last = slices.last().unwrap();
+        assert_eq!(last.from, None, "everything before is the last slice's");
+        // Every request, margins and the open slice's 1900 start included, stays under 1,825 days.
+        let earliest = start_instant(crate::calendar::EARLIEST).unwrap();
+        for band in &slices {
+            let (from, to) = band.request();
+            let from = from.map_or(earliest, |f| start_instant(&f).unwrap());
+            let to = start_instant(&to.unwrap()).unwrap();
+            assert!((to - from).num_days() < 1825, "{band:?}");
+        }
+        assert!(slices.iter().all(|b| !b.live));
+    }
+
+    /// Review of #1047: a feed that publishes only a window must not take history with it as the
+    /// window moves on; one that lists everything still clears what it no longer lists.
+    #[test]
+    fn a_feed_listing_speaks_only_from_its_first_event() {
+        let l0 = at("2026-10-01T00:00:00Z");
+        let feed = Band::through_live(at("2027-12-01T00:00:00Z"));
+        let windowed = feed.of_feed_listing(["2026-09-20T09:00:00Z", "2027-01-05"], l0);
+        assert_eq!(windowed.from, Some(at("2026-09-20T09:00:00Z")));
+        assert!(
+            !windowed.holds("2025-06-01"),
+            "rolled out of the feed: kept"
+        );
+        assert!(
+            windowed.holds("2026-09-25"),
+            "inside what the feed lists: its to clear"
+        );
+        let only_ahead = feed.of_feed_listing(["2026-12-01"], l0);
+        assert_eq!(
+            only_ahead.from,
+            Some(l0),
+            "the live band is always the feed's"
+        );
+        assert_eq!(feed.of_feed_listing([], l0).from, Some(l0));
+        let whole = feed.of_feed_listing(["1999-01-01", "?"], l0);
+        assert!(whole.holds("2003-04-05") && whole.live);
+        let later = Band::between(l0, at("2027-01-01T00:00:00Z"));
+        assert_eq!(later.of_feed_listing(["1999-01-01"], l0), later);
+    }
+
+    #[test]
     fn the_bands_meet_without_a_gap_or_an_overlap() {
         let l0 = at("2026-10-01T00:00:00Z");
         let l1 = at("2027-12-01T00:00:00Z");
@@ -400,6 +500,7 @@ mod tests {
         let fresh = HistoryState {
             checked_at: t,
             stale: false,
+            marks: 0,
         };
         assert_eq!(
             next_step(Some(&fresh)),

@@ -24,17 +24,32 @@ describe("windowAround and nextWindow", () => {
     expect(w.end).toEqual(local(2027, 3));
   });
 
-  it("keeps the window while the day stays inside its margin, and moves it near an edge", () => {
+  it("keeps the window while what's on show stays inside its margin, and moves it near an edge", () => {
     const w = windowAround(local(2026, 11, 5), 18, 18);
-    expect(nextWindow(w, local(2027, 6, 30), 18, 18, 6)).toBe(w);
-    expect(nextWindow(w, local(2026, 1, 1), 18, 18, 6)).toBe(w);
-    const later = nextWindow(w, local(2027, 12, 1), 18, 18, 6);
+    const day = (y: number, m: number, d: number) => ({
+      start: local(y, m, d),
+      end: local(y, m, d + 1),
+    });
+    expect(nextWindow(w, day(2027, 6, 30), local(2027, 6, 30), 18, 18, 6)).toBe(w);
+    expect(nextWindow(w, day(2026, 1, 1), local(2026, 1, 1), 18, 18, 6)).toBe(w);
+    const later = nextWindow(w, day(2027, 12, 1), local(2027, 12, 1), 18, 18, 6);
     expect(later).not.toBe(w);
     expect(later.start).toEqual(local(2026, 6));
     // The window runs May 2025 to May 2028: November 2025 is still six months in; October isn't.
-    expect(nextWindow(w, local(2025, 11, 30), 18, 18, 6)).toBe(w);
-    const earlier = nextWindow(w, local(2025, 10, 15), 18, 18, 6);
+    expect(nextWindow(w, day(2025, 11, 30), local(2025, 11, 30), 18, 18, 6)).toBe(w);
+    const earlier = nextWindow(w, day(2025, 10, 15), local(2025, 10, 15), 18, 18, 6);
     expect(earlier.end).toEqual(local(2027, 5));
+  });
+
+  // Review of #1047: a Year view shows months up to eleven away from its cursor, so the window is
+  // measured against the whole year on show; the cursor alone left January to April out.
+  it("moves for a year on show whose cursor is still inside the margin", () => {
+    const w = windowAround(local(2026, 11, 5), 18, 18);
+    const year2025 = { start: local(2025, 1), end: local(2026, 1) };
+    const moved = nextWindow(w, year2025, local(2025, 11, 1), 18, 18, 6);
+    expect(moved).not.toBe(w);
+    expect(moved.start.getTime()).toBeLessThanOrEqual(year2025.start.getTime());
+    expect(moved.end.getTime()).toBeGreaterThanOrEqual(year2025.end.getTime());
   });
 
   it("reads a day of slack either side", () => {

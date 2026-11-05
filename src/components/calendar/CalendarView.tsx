@@ -404,10 +404,12 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
   // by a read that knows how it ended. A delete that settles reads again.
   const loadEvents = useMirrorReads(readEvents, applyEvents, eventsReadFailed);
 
-  // The cursor nearing an edge of the months read moves them, and reads the new stretch.
+  // What's on show nearing an edge of the months read moves them, and reads the new stretch. The
+  // visible range, not the cursor: a Year view shows months up to eleven away from it.
   useEffect(() => {
-    setLoadWindow((w) => nextWindow(w, cursor, WINDOW_BACK, WINDOW_AHEAD, WINDOW_MARGIN));
-  }, [cursor]);
+    const visible = visibleRange(view, cursor, dayCount);
+    setLoadWindow((w) => nextWindow(w, visible, cursor, WINDOW_BACK, WINDOW_AHEAD, WINDOW_MARGIN));
+  }, [view, cursor, dayCount]);
   useEffect(() => {
     if (windowRef.current === loadWindow) return;
     windowRef.current = loadWindow;

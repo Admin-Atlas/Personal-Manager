@@ -140,8 +140,9 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
     windowAround(anchor, WINDOW_BACK, WINDOW_AHEAD),
   );
   useEffect(() => {
-    setReadWindow((w) => nextWindow(w, anchor, WINDOW_BACK, WINDOW_AHEAD, WINDOW_MARGIN));
-  }, [anchor]);
+    const visible = { start: anchor, end: addDays(anchor, days) };
+    setReadWindow((w) => nextWindow(w, visible, anchor, WINDOW_BACK, WINDOW_AHEAD, WINDOW_MARGIN));
+  }, [anchor, days]);
 
   // Lazily load the mirror only while the grid is on (List mode needs nothing extra). Refresh on
   // window focus so an edit made elsewhere shows on return, and when a sync or the ~30 s change check

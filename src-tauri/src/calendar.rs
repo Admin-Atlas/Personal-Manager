@@ -2396,15 +2396,21 @@ pub fn history_state(conn: &Connection, calendar_id: &str) -> Result<Option<Hist
         .and_then(|raw| serde_json::from_str(&raw).ok()))
 }
 
-/// History matches the calendar as of `at` (see [`HistoryState::checked_at`]).
+/// History matches the calendar as of `at` (see [`HistoryState::checked_at`]), by a check or fetch
+/// that began when the state had `seen_marks` marks: it stays stale if a save marked it since, as
+/// that save's change may not be in what was fetched ([`HistoryState::marks`]).
 pub fn set_history_checked(
     conn: &Connection,
     calendar_id: &str,
     at: chrono::DateTime<chrono::Utc>,
+    seen_marks: u64,
 ) -> Result<()> {
+    let now = history_state(conn, calendar_id)?;
+    let marks = now.as_ref().map_or(0, |s| s.marks);
     let state = HistoryState {
         checked_at: at,
-        stale: false,
+        stale: marks != seen_marks,
+        marks,
     };
     let raw = serde_json::to_string(&state).map_err(|e| Error::Other(e.to_string()))?;
     db::set_setting(conn, &history_key(calendar_id), &raw)
@@ -2417,6 +2423,7 @@ pub fn mark_history_stale(conn: &Connection, calendar_id: &str) -> Result<()> {
         return Ok(());
     };
     state.stale = true;
+    state.marks += 1;
     let raw = serde_json::to_string(&state).map_err(|e| Error::Other(e.to_string()))?;
     db::set_setting(conn, &history_key(calendar_id), &raw)
 }
@@ -3199,11 +3206,20 @@ mod tests {
             None,
             "never downloaded stays so"
         );
-        set_history_checked(&conn, "a", at).unwrap();
-        set_history_checked(&conn, "b", at).unwrap();
+        set_history_checked(&conn, "a", at, 0).unwrap();
+        set_history_checked(&conn, "b", at, 0).unwrap();
         mark_history_stale(&conn, "a").unwrap();
         let a = history_state(&conn, "a").unwrap().unwrap();
-        assert!(a.stale && a.checked_at == at);
+        assert!(a.stale && a.checked_at == at && a.marks == 1);
+        // A fetch that began before that mark (it saw none) leaves it stale; one that saw it clears it.
+        set_history_checked(&conn, "a", at, 0).unwrap();
+        assert!(
+            history_state(&conn, "a").unwrap().unwrap().stale,
+            "marked mid-fetch"
+        );
+        set_history_checked(&conn, "a", at, 1).unwrap();
+        assert!(!history_state(&conn, "a").unwrap().unwrap().stale);
+        mark_history_stale(&conn, "a").unwrap();
         // Unticking "a" forgets its history with its rows: ticking it again downloads it again.
         prune_unselected(&conn, &["b".to_string()]).unwrap();
         assert_eq!(history_state(&conn, "a").unwrap(), None);
@@ -3553,7 +3569,9 @@ mod tests {
     fn a_row_stored_the_old_way_is_written_again() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
-        let mut e = ev("1", "Standup", "2026-07-06T09:00:00Z");
+        // Far ahead, so the row is stored as text and the cut below reaches it (a year after it ends
+        // it would be packed, and the cut would do nothing).
+        let mut e = ev("1", "Standup", "2099-07-06T09:00:00Z");
         e.description = Some("x".repeat(3_000));
         replace_events(&conn, "cal-1", std::slice::from_ref(&e), true).unwrap();
         conn.execute(

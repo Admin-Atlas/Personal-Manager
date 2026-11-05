@@ -3482,7 +3482,12 @@ async fn land_new_series<W: Wire, H: Host>(
     if series_in_window(&master, window) == Some(false) {
         // Nothing of it in the live band to list. A row PM couldn't remove stays until the next
         // sync, which the notice says (C11d review 3).
-        if !gone.is_empty() && land_on(host, cal.calendar_id, Vec::new(), &[], gone).is_err() {
+        // The view hears of it either way (`land_on` tells it): one showing the months after the
+        // live band loads them again, which is where a series that starts there shows (review of
+        // #1047).
+        if gone.is_empty() {
+            host.landed(cal.calendar_id);
+        } else if land_on(host, cal.calendar_id, Vec::new(), &[], gone).is_err() {
             return series_pending(host, cal.calendar_id, Vec::new());
         }
         return WriteOutcome::Saved {
@@ -23783,7 +23788,8 @@ mod tests {
             assert!(outcome == outside, "saved in Google: {outcome:?}");
             assert_eq!(script.sent().len(), 1, "nothing listed");
             assert!(new_rows(&host).is_empty() && host.nothing_recorded());
-            assert!(host.told().is_empty());
+            // The view is told all the same, so the months it shows past the live band load again.
+            assert_eq!(host.told(), ["cal"]);
         }
         // From Monday 03-08-2026, ten times: its last five fall in the window, so it is listed (the
         // listing's own occurrences are what land, three here).
@@ -24083,7 +24089,7 @@ mod tests {
             None,
             "never downloaded: the first download is due anyway"
         );
-        host.with_conn(|conn| calendar::set_history_checked(conn, "cal", checked))
+        host.with_conn(|conn| calendar::set_history_checked(conn, "cal", checked, 0))
             .unwrap();
         history_behind(&*host, "cal", &["abc"], None);
         assert_eq!(
@@ -24094,7 +24100,8 @@ mod tests {
         let started_long_ago = json!({ "start": { "dateTime": "2019-03-04T09:00:00Z" } });
         history_behind(&*host, "cal", &[], Some(&started_long_ago));
         assert_eq!(stale(&host), Some(true));
-        host.with_conn(|conn| calendar::set_history_checked(conn, "cal", checked))
+        // A fetch that saw that one mark brings it up to date.
+        host.with_conn(|conn| calendar::set_history_checked(conn, "cal", checked, 1))
             .unwrap();
         let mut old = october()[0].clone();
         old["id"] = json!("abc_20190304T090000Z");

@@ -1199,7 +1199,7 @@ export const listAllCalendarEvents = (range: { from?: string; to?: string; uid?:
     uid: range.uid ?? null,
   });
 
-/** Fetch every selected calendar's events in `[from, to)` (ISO instants, at most five years) and keep
+/** Fetch every selected calendar's events in `[from, to)` (ISO instants, at most four years) and keep
  *  them: how the calendar view loads the months after the live band as it scrolls to them. Waits
  *  behind a running sync; the views re-read on `calendar://synced`. Rejects when no calendar could
  *  be reached. */

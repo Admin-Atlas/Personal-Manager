@@ -25,19 +25,21 @@ export function windowAround(at: Date, back: number, ahead: number): MonthWindow
   return { start: monthStart(at, -back), end: monthStart(at, ahead + 1) };
 }
 
-/** `current`, while `at` stays at least `margin` months inside it; otherwise a new window around
- *  `at`, so paging a little never re-reads and paging far reads the stretch ahead before it shows. */
+/** `current`, while everything on show (`visible`, local, `end` exclusive) stays at least `margin`
+ *  months inside it; otherwise a new window around `at` (the cursor), so paging a little never
+ *  re-reads and paging far reads the stretch ahead before it shows. It's what's on show that's
+ *  measured, not the cursor: a Year view shows months up to eleven away from it. */
 export function nextWindow(
   current: MonthWindow,
+  visible: { start: Date; end: Date },
   at: Date,
   back: number,
   ahead: number,
   margin: number,
 ): MonthWindow {
-  const t = at.getTime();
   if (
-    t >= monthStart(current.start, margin).getTime() &&
-    t < monthStart(current.end, -margin).getTime()
+    visible.start.getTime() >= monthStart(current.start, margin).getTime() &&
+    visible.end.getTime() <= monthStart(current.end, -margin).getTime()
   ) {
     return current;
   }
