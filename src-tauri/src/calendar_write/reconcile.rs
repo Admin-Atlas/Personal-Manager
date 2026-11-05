@@ -145,9 +145,9 @@ impl RecentWrites {
         self.entries.is_empty()
     }
 
-    /// Lay this calendar's recent saves over a fresh fetch of it, dropping each entry the fetch
-    /// settles. `complete` is the fetch's own verdict on whether it saw the whole calendar;
-    /// `fetch_started` is when it began, which decides whether it may settle anything.
+    /// Lay this calendar's recent saves over a fresh fetch of the whole of it ([`Self::merge_band`]
+    /// for a listing that holds every row).
+    #[cfg(test)]
     pub fn merge(
         &mut self,
         calendar_id: &str,
@@ -155,6 +155,24 @@ impl RecentWrites {
         complete: bool,
         fetch_started: Instant,
         now: Stamp,
+    ) -> Merged {
+        self.merge_band(calendar_id, fetched, complete, fetch_started, now, |_| true)
+    }
+
+    /// Lay this calendar's recent saves over a fresh fetch of it, dropping each entry the fetch
+    /// settles. `complete` is the fetch's own verdict on whether it saw the whole of what it asked
+    /// for; `fetch_started` is when it began, which decides whether it may settle anything. `holds`
+    /// says whether the fetch's listing speaks for a row that starts at `start` (#1047: a fetch now
+    /// lists one band of the calendar, and a row missing from it proves nothing unless the band
+    /// holds it); `None` asks about a deleted row, whose start the entry doesn't keep.
+    pub fn merge_band(
+        &mut self,
+        calendar_id: &str,
+        fetched: Vec<CalendarEvent>,
+        complete: bool,
+        fetch_started: Instant,
+        now: Stamp,
+        holds: impl Fn(Option<&str>) -> bool,
     ) -> Merged {
         self.entries.retain(|_, (_, at)| !at.expired_at(now));
         let mut rows = fetched;
@@ -188,10 +206,15 @@ impl RecentWrites {
                     }
                     may_settle && (landed || upstream_won)
                 }
-                // Missing from a complete fetch that began after the save: deleted in Google since
-                // (or moved out of the window), and upstream wins. Not for a row PM created: a list
-                // can lag behind a new event, so it stays on screen until a fetch shows it or the
-                // entry expires. An incomplete or older fetch proves nothing, so it shows the save.
+                // A fetch of another band says nothing of the save, and writes nothing over its row:
+                // the row stays as the mirror holds it (which may be newer than the save, from a fetch
+                // that couldn't settle it), and the entry waits for its own band's fetch.
+                (Entry::Upsert { row: saved, .. }, None) if !holds(Some(&saved.start)) => false,
+                // Missing from a complete fetch that began after the save, of a band that holds it:
+                // deleted in Google since (or moved out of the band), and upstream wins. Not for a
+                // row PM created: a list can lag behind a new event, so it stays on screen until a
+                // fetch shows it or the entry expires. An incomplete or older fetch proves nothing,
+                // so it shows the save.
                 (
                     Entry::Upsert {
                         row: saved,
@@ -223,14 +246,16 @@ impl RecentWrites {
                         false
                     }
                 }
-                // Gone from a complete fetch that began after the delete: it landed. An incomplete
-                // or older fetch proves nothing, so the entry stays (and an incomplete one deletes the
+                // Gone from a complete fetch that began after the delete, of a listing that surely
+                // holds it: it landed. An incomplete or older fetch, or a band that may not hold the
+                // deleted row's start, proves nothing, so the entry stays until it expires, hiding
+                // the row from any listing that still shows it (and an incomplete one deletes the
                 // row explicitly).
                 (Entry::Delete { .. }, None) => {
                     if !complete {
                         deletes.push(row_id.to_string());
                     }
-                    complete && may_settle
+                    complete && may_settle && holds(None)
                 }
             };
             if settled {
@@ -283,6 +308,35 @@ mod tests {
             wall: saved.wall + Duration::from_secs(5),
         };
         (saved, after)
+    }
+
+    /// #1047: a fetch lists one band. A save the band doesn't hold, missing from its complete listing,
+    /// proves nothing, so the save keeps its protection for its own band's fetch, which may lag; and
+    /// a delete, whose start isn't kept, settles only by a listing that holds everything.
+    #[test]
+    fn a_listing_of_another_band_settles_nothing_by_absence() {
+        let (saved, after) = clocks();
+        let mut w = RecentWrites::default();
+        w.record_upsert(row("a", "Old event, renamed", "\"2\"", T1), saved);
+        w.record_delete("cal", "cal:b", Some("\"1\"".into()), Some(T0.into()), saved);
+        let elsewhere = |_: Option<&str>| false;
+        let merged = w.merge_band("cal", vec![], true, after.mono, after, elsewhere);
+        // Nothing written over the row either: the mirror's copy may be newer than the save.
+        assert!(merged.rows.is_empty() && merged.deletes.is_empty());
+        assert_eq!(w.entries.len(), 2, "neither is settled");
+        // Its own band's listing, lagging, shows the old version: the save still wins.
+        let merged = w.merge_band(
+            "cal",
+            vec![row("a", "Old event", "\"1\"", T0)],
+            true,
+            after.mono,
+            after,
+            |start| start.is_some(),
+        );
+        assert_eq!(summaries(&merged), vec!["Old event, renamed"]);
+        // A listing of everything settles the delete by its absence.
+        w.merge_band("cal", vec![], true, after.mono, after, |_| true);
+        assert!(w.is_empty());
     }
 
     #[test]

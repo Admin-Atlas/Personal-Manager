@@ -203,6 +203,7 @@ export function AllDayBand({
               }}
               title={b.ev.summary}
               aria-label={declinedName(spokenName(ghost, b.ev.summary), isDeclined(b.ev))}
+              data-piece-of={b.ev.id}
               role={clickable ? "button" : undefined}
               tabIndex={clickable ? 0 : undefined}
               onClick={

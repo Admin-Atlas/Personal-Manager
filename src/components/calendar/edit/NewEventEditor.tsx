@@ -794,7 +794,7 @@ export function NewEventEditor({
   const account = target?.account.email ?? null;
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...createNotes(draft.time, draft.recurrence.kind === "rule", overview, hidden, calendarId),
+    ...createNotes(overview, hidden, calendarId),
     ...(noPrivate ? [PRIVATE_OFF] : []),
   ];
 

@@ -3451,14 +3451,15 @@ impl<'a> CalIds<'a> {
 }
 
 /// A repeating event Google now holds, from its copy `copy` (its master): its occurrences in the
-/// months PM mirrors, listed and landed as CREATED rows, so a list that lags can't take them off the
-/// screen (A28). One with no occurrence in those months (it starts after them, or a COUNT or UNTIL
-/// ended it before them) is saved and said to be outside, with nothing listed (C10 §6.2, C11
-/// critique 1 L8). Looks up to three times (now, 1 s, 3 s) while the listing is empty or
-/// incomplete; then "saved, the calendar will catch up" rather than a guess. `replaces`: the row
-/// this event was before it repeated (a one-off given a repeat, C11 §10), removed in the same mirror
-/// write, and removed on every other path too, so it never shows beside its own occurrences. No lock
-/// is held across a listing; the landing takes the DB, then `recent`.
+/// live band, listed and landed as CREATED rows, so a list that lags can't take them off the screen
+/// (A28). Its occurrences before the live band are history's to fetch ([`history_behind`]), and those
+/// after it load as the view reaches them; one with no occurrence in the live band (it starts after
+/// it, or a COUNT or UNTIL ended it before it) is saved with nothing listed (C11 critique 1 L8).
+/// Looks up to three times (now, 1 s, 3 s) while the listing is empty or incomplete; then "saved,
+/// the calendar will catch up" rather than a guess. `replaces`: the row this event was before it
+/// repeated (a one-off given a repeat, C11 §10), removed in the same mirror write, and removed on
+/// every other path too, so it never shows beside its own occurrences. No lock is held across a
+/// listing; the landing takes the DB, then `recent`.
 async fn land_new_series<W: Wire, H: Host>(
     wire: &W,
     host: &H,
@@ -3467,6 +3468,7 @@ async fn land_new_series<W: Wire, H: Host>(
     replaces: Option<GoneRow>,
 ) -> WriteOutcome {
     let gone: Vec<GoneRow> = replaces.into_iter().collect();
+    history_behind(host, cal.calendar_id, &[], Some(copy));
     // Its id one path segment, its start and rule readable (never a guessed zone).
     let Ok(master) = Master::read(&FreshEvent::from_google(copy.clone())) else {
         return series_pending(host, cal.calendar_id, gone);
@@ -3478,13 +3480,18 @@ async fn land_new_series<W: Wire, H: Host>(
         return series_pending(host, cal.calendar_id, gone);
     };
     if series_in_window(&master, window) == Some(false) {
-        // A row PM couldn't remove stays until the next sync, which the notice says, beside the
-        // event being outside (C11d review 3).
-        if !gone.is_empty() && land_on(host, cal.calendar_id, Vec::new(), &[], gone).is_err() {
-            return said_outside(series_pending(host, cal.calendar_id, Vec::new()), true);
+        // Nothing of it in the live band to list. A row PM couldn't remove stays until the next
+        // sync, which the notice says (C11d review 3).
+        // The view hears of it either way (`land_on` tells it): one showing the months after the
+        // live band loads them again, which is where a series that starts there shows (review of
+        // #1047).
+        if gone.is_empty() {
+            host.landed(cal.calendar_id);
+        } else if land_on(host, cal.calendar_id, Vec::new(), &[], gone).is_err() {
+            return series_pending(host, cal.calendar_id, Vec::new());
         }
         return WriteOutcome::Saved {
-            warnings: vec![WriteWarning::OutsideMirror],
+            warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
@@ -3542,10 +3549,10 @@ fn series_pending(host: &impl Host, calendar_id: &str, gone: Vec<GoneRow>) -> Wr
     }
 }
 
-/// Whether a repeating event has an occurrence in the window PM mirrors (`[from, until)`): its
-/// first at or after `from` comes before `until`. `None` when PM can't walk its rule, which lists it
-/// anyway. An occurrence begun before `from` that runs into the window doesn't count: at worst the
-/// next sync shows it.
+/// Whether a repeating event has an occurrence in the live band (`[from, until)`), so listing it there
+/// is worth the wait: its first at or after `from` comes before `until`. `None` when PM can't walk its
+/// rule, which lists it anyway. An occurrence begun before `from` that runs into the window doesn't
+/// count: at worst the next sync shows it.
 fn series_in_window(
     master: &Master,
     (from, until): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
@@ -3568,24 +3575,12 @@ fn series_in_window(
 }
 
 /// A new event Google holds: its copy into the mirror as a CREATED row (a list that lags can't take
-/// it off the screen, A28), unless it starts outside the months PM mirrors ([`in_mirror`]).
+/// it off the screen, A28), wherever it falls — last year or three years ahead, the mirror keeps it
+/// (#1047).
 fn land_created(host: &impl Host, target: &CalendarTarget, copy: &Value) -> WriteOutcome {
     let Some(row) = calendar::parse_event(&target.calendar_id, copy) else {
         return created_pending(host, target);
     };
-    let window = host
-        .mirror(&target.calendar_id)
-        .ok()
-        .and_then(|m| m.instants());
-    if in_mirror(&row, window) == Some(false) {
-        return WriteOutcome::Saved {
-            warnings: vec![WriteWarning::OutsideMirror],
-            left_behind: Vec::new(),
-            milestone_moves: None,
-            undo: None,
-            calendar: None,
-        };
-    }
     let id = row.id.clone();
     match land_on(host, &target.calendar_id, vec![row], &[id], Vec::new()) {
         Ok(()) => WriteOutcome::Saved {
@@ -3609,35 +3604,6 @@ fn created_pending(host: &impl Host, target: &CalendarTarget) -> WriteOutcome {
         undo: None,
         calendar: None,
     }
-}
-
-/// Whether a mirror row overlaps the window PM syncs (`[start, end)`, as instants): what the next
-/// sync will fetch. Landing one outside it would show it until the created entry's ten minutes ran
-/// out, then the next complete sync would drop it, so it isn't landed (C10 §6.2). `None` when the
-/// row's times or the window can't be read, which lands it. All-day dates read as UTC midnight,
-/// while Google bounds them in the calendar's zone: at the window's very edges a day can read a few
-/// hours off, which at worst skips one that the next sync shows, or lands one it then drops. Never
-/// a wrong write (C10 critique 1 L9).
-fn in_mirror(
-    row: &CalendarEvent,
-    window: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
-) -> Option<bool> {
-    let (from, until) = window?;
-    let instant = |s: &str| -> Option<chrono::DateTime<chrono::Utc>> {
-        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(s.trim()) {
-            return Some(at.with_timezone(&chrono::Utc));
-        }
-        chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|t| t.and_utc())
-    };
-    let start = instant(&row.start)?;
-    let end = match row.end.as_deref() {
-        Some(end) => instant(end)?,
-        None => start,
-    };
-    Some(start < until && end > from)
 }
 
 /// A wire that counts the POSTs it passes on: the new event's copies, for [`MAX_POSTS`].
@@ -4830,6 +4796,13 @@ async fn land_every_reply<W: Wire, H: Host>(
     now: &Value,
 ) -> WriteOutcome {
     let cal = target.remote_calendar.as_str();
+    // The reply reaches every occurrence, history's too, which only a fetch of history shows.
+    history_behind(
+        host,
+        &target.calendar_id,
+        &[sent.copy_id.as_str()],
+        Some(now),
+    );
     let Ok(mirror) = host.mirror(&target.calendar_id) else {
         return saved_pending(host, target);
     };
@@ -6593,6 +6566,7 @@ async fn land_series<W: Wire, H: Host>(
     let (host, target) = (ctx.host, ctx.target);
     let cal = target.calendar_id.as_str();
     let master = planning.series.master.id.as_str();
+    history_behind(host, cal, &[master], None);
     let zone = planning.series.master.start.zone();
     let skipped = ran.skipped();
     let ends = match ran {
@@ -6697,7 +6671,7 @@ async fn land_series<W: Wire, H: Host>(
     }
     // "Does not repeat" for every occurrence: Google's answer is the one event it now is (C11 §9.7).
     if stops_repeating(plan) {
-        return land_one_event(ctx, mirror, planning, reply, date, snapshot).await;
+        return land_one_event(ctx, planning, reply, date, snapshot).await;
     }
     let left_behind: Vec<String> = plan
         .left_behind(&skipped)
@@ -6822,13 +6796,13 @@ async fn land_series<W: Wire, H: Host>(
 
 /// "Does not repeat" for every occurrence, landed (C11 §9.7; critiques 1 M2, 2 M1): Google's `copy`
 /// (its answer) is the one event the series now is, recorded as created so a list that lags can't
-/// take it off the screen, unless it's outside the months PM mirrors. No instances listing: the old
-/// series' rows go, but those Google still holds live under its iCal UID (what it does with
-/// occurrences changed on their own is probe P-R2's to show); a listing that didn't run to its end
-/// removes none, and the next sync settles them. Floored at the answer's own time.
+/// take it off the screen, wherever it falls (the mirror keeps every event now, #1047). No instances
+/// listing: the old series' rows go, history's included, but those Google still holds live under its
+/// iCal UID (what it does with occurrences changed on their own is probe P-R2's to show); a listing
+/// that didn't run to its end removes none, and the next sync settles them. Floored at the answer's
+/// own time.
 async fn land_one_event<W: Wire, H: Host>(
     ctx: &SeriesWrite<'_, W, H>,
-    mirror: &MirrorFacts,
     planning: &Planning,
     copy: Option<Value>,
     date: Option<chrono::DateTime<chrono::Utc>>,
@@ -6876,7 +6850,6 @@ async fn land_one_event<W: Wire, H: Host>(
             .flatten()
             .map(String::as_str),
     );
-    let outside = in_mirror(&row, mirror.instants()) == Some(false);
     let landed = host.with_conn(|conn| {
         let before = rows_union(&snapshot, calendar::series_rows(conn, cal, &[master])?);
         let gone: Vec<GoneRow> = match &still {
@@ -6889,21 +6862,14 @@ async fn land_one_event<W: Wire, H: Host>(
             .collect(),
             None => Vec::new(),
         };
-        let (upserts, created) = if outside {
-            (Vec::new(), Vec::new())
-        } else {
-            (vec![row.clone()], vec![row.id.clone()])
-        };
-        record(conn, host.edit(), cal, upserts, &created, gone)
+        let created = [row.id.clone()];
+        record(conn, host.edit(), cal, vec![row.clone()], &created, gone)
     });
     if retire_landed(host, landed).is_err() {
-        return said_outside(pending(), outside);
+        return pending();
     }
     host.landed(cal);
     let mut warnings = Vec::new();
-    if outside {
-        warnings.push(WriteWarning::OutsideMirror);
-    }
     if still.is_none() {
         drop_hash(host, cal);
         warnings.push(WriteWarning::MirrorRefreshPending);
@@ -8076,7 +8042,9 @@ async fn look_and_hold<W: Wire, H: Host>(
     }
 }
 
-/// A split that ran to its end: both series re-fetched, then landed in one mirror write.
+/// A split that ran to its end: both series re-fetched over the live band, then landed in one mirror
+/// write. Either part's occurrences before the live band are history's to fetch again
+/// ([`history_behind`]).
 async fn land_split_done<W: Wire, H: Host>(
     ctx: &SeriesWrite<'_, W, H>,
     mirror: &MirrorFacts,
@@ -8086,6 +8054,12 @@ async fn land_split_done<W: Wire, H: Host>(
     snapshot: Vec<CalendarEvent>,
 ) -> WriteOutcome {
     let (host, cal) = (ctx.host, ctx.target.calendar_id.as_str());
+    history_behind(
+        host,
+        cal,
+        &[facts.master.as_str(), facts.tail.as_str()],
+        None,
+    );
     let remote = ctx.target.remote_calendar.as_str();
     let skipped = ran.skipped();
     // The cut's answer, never the insert's: the new part's `updated` would floor the original's rows.
@@ -8111,7 +8085,7 @@ async fn land_split_done<W: Wire, H: Host>(
     };
     // A split that stops repeating made one event in place of a new part: it lands from its insert's
     // own answer, never a listing, since what Google lists for a one-off's occurrences is unproven
-    // (C11 §9.7). One outside the months PM mirrors isn't landed (C10 §6.2).
+    // (C11 §9.7). It lands wherever it falls: the mirror keeps every event now (#1047).
     let one_event = plan
         .expect
         .iter()
@@ -8124,9 +8098,6 @@ async fn land_split_done<W: Wire, H: Host>(
     } else {
         None
     };
-    let outside = event_row
-        .as_ref()
-        .is_some_and(|row| in_mirror(row, Some(window)) == Some(false));
     let (mut original, mut tail) = (Listing::default(), Listing::default());
     let mut stale = true;
     for pause in [None, Some(REFETCH_AGAIN[0]), Some(REFETCH_AGAIN[1])] {
@@ -8155,7 +8126,7 @@ async fn land_split_done<W: Wire, H: Host>(
         }
     }
     if stale {
-        return said_outside(stale_saved(host, cal, removal, left_behind), outside);
+        return stale_saved(host, cal, removal, left_behind);
     }
     let landed = host.with_conn(|conn| {
         let now = calendar::series_rows(conn, cal, &[facts.master.as_str(), facts.tail.as_str()])?;
@@ -8182,14 +8153,14 @@ async fn land_split_done<W: Wire, H: Host>(
             }
         }
         let mut upserts = diff.upserts;
-        if let Some(row) = event_row.clone().filter(|_| !outside) {
+        if let Some(row) = event_row.clone() {
             created.push(row.id.clone());
             upserts.push(row);
         }
         deletes.retain(|d| !upserts.iter().any(|u| u.id == d.row_id));
         record(conn, host.edit(), cal, upserts, &created, deletes)
     });
-    let saved = match retire_landed(host, landed) {
+    match retire_landed(host, landed) {
         Ok(()) => {
             host.landed(cal);
             series_saved(Vec::new(), left_behind)
@@ -8198,19 +8169,31 @@ async fn land_split_done<W: Wire, H: Host>(
             drop_hash(host, cal);
             series_saved(vec![WriteWarning::MirrorRefreshPending], left_behind)
         }
-    };
-    said_outside(saved, outside)
+    }
 }
 
-/// `outcome`, saying first that the one event a save made is `outside` the months PM mirrors: known
-/// before the mirror is written, it stands whatever the writing came to (C11c review).
-fn said_outside(mut outcome: WriteOutcome, outside: bool) -> WriteOutcome {
-    if let (true, WriteOutcome::Saved { warnings, .. }) = (outside, &mut outcome) {
-        let rest = std::mem::take(warnings);
-        warnings.push(WriteWarning::OutsideMirror);
-        warnings.extend(rest);
-    }
-    outcome
+/// A save that reached every occurrence of a series (or split one) lands over the live band only:
+/// its re-fetch, like everything editing reads, covers those months (#1047). When any of `series` has
+/// occurrences stored before them — or the event `starts`, by Google's copy of its master, before
+/// them — history is marked to be fetched again, which the next change check does, so the old
+/// occurrences catch up within the half minute (`calendar::mark_history_stale`). Best effort: a
+/// failure to mark leaves history to the next change Google reports.
+fn history_behind(host: &impl Host, calendar_id: &str, series: &[&str], starts: Option<&Value>) {
+    let Some((from, _)) = host.mirror(calendar_id).ok().and_then(|m| m.instants()) else {
+        return;
+    };
+    let _ = host.with_conn(|conn| {
+        let starts_before = starts
+            .and_then(|copy| copy.get("start"))
+            .and_then(|s| s.get("dateTime").or_else(|| s.get("date")))
+            .and_then(Value::as_str)
+            .and_then(crate::calendar_history::start_instant)
+            .is_some_and(|at| at < from);
+        if starts_before || calendar::series_reach_history(conn, calendar_id, series, from)? {
+            calendar::mark_history_stale(conn, calendar_id)?;
+        }
+        Ok(())
+    });
 }
 
 /// The series a landed split re-fetched: the original, and the new part unless it's one event
@@ -15937,10 +15920,11 @@ mod tests {
         }
     }
 
-    /// The one event outside the months PM mirrors isn't landed, and the old rows still go; a
-    /// listing that didn't run to its end removes none and leaves the rest to the next sync.
+    /// The one event before the live band lands all the same (the mirror keeps every event, #1047),
+    /// and the old rows go; a listing that didn't run to its end removes none and leaves the rest to
+    /// the next sync.
     #[tokio::test]
-    async fn does_not_repeat_on_all_outside_the_mirror_or_unlisted() {
+    async fn does_not_repeat_on_all_lands_before_the_live_band_or_waits_when_unlisted() {
         let (series, instance) = (weekly(), monday_19());
         let mut long_ago = written(&series, &[], "\"m2\"");
         long_ago.as_object_mut().unwrap().remove("recurrence");
@@ -15967,15 +15951,11 @@ mod tests {
         .await;
         script.asked_all();
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, .. }
-                if *warnings == [WriteWarning::OutsideMirror]),
-            "saved, outside the mirror"
+            matches!(&outcome, WriteOutcome::Saved { warnings, .. } if warnings.is_empty()),
+            "saved and landed: {outcome:?}"
         );
-        assert!(host.ids().is_empty());
-        assert!(host
-            .with_conn(|conn| calendar::event_by_id(conn, "cal:abc"))
-            .unwrap()
-            .is_none());
+        assert!(host.ids().is_empty(), "the series' rows went");
+        assert_eq!(host.row("abc").start, "2026-08-03T08:00:00Z");
         // The listing cut short: nothing removed, the calendar to catch up.
         let host = TestHost::holding(&october());
         let mut one_event = written(&series, &[], "\"m2\"");
@@ -16001,8 +15981,7 @@ mod tests {
         assert!(outcome == pending(), "saved, the calendar to catch up");
         assert_eq!(host.ids().len(), 3);
         assert_eq!(host.row("abc").start, "2026-10-05T08:00:00Z");
-        // Outside the mirror and a mirror that can't be written: said to be outside all the same,
-        // beside the calendar catching up (C11c review).
+        // A mirror that can't be written: the calendar catches up.
         let host = TestHost::holding(&october());
         let refusing = Arc::clone(&host);
         let mut steps = october_reads();
@@ -16026,9 +16005,8 @@ mod tests {
         .await;
         script.asked_all();
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, .. }
-                if *warnings == [WriteWarning::OutsideMirror, WriteWarning::MirrorRefreshPending]),
-            "outside, the calendar to catch up"
+            outcome == pending(),
+            "the calendar to catch up: {outcome:?}"
         );
         assert_eq!(host.ids().len(), 3);
     }
@@ -16081,10 +16059,10 @@ mod tests {
         }
     }
 
-    /// The one event put past the months PM mirrors isn't landed, and says so; the original is cut
-    /// as ever.
+    /// The one event put past the live band lands all the same (the mirror keeps every event, #1047);
+    /// the original is cut as ever.
     #[tokio::test]
-    async fn does_not_repeat_on_following_outside_the_mirror_says_so() {
+    async fn does_not_repeat_on_following_past_the_live_band_lands() {
         let host = TestHost::holding(&october());
         let far = EventPatchDraft {
             recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
@@ -16111,14 +16089,10 @@ mod tests {
         .await;
         script.asked_all();
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, .. }
-                if *warnings == [WriteWarning::OutsideMirror]),
-            "saved, outside the mirror"
+            matches!(&outcome, WriteOutcome::Saved { warnings, .. } if warnings.is_empty()),
+            "saved and landed: {outcome:?}"
         );
-        assert!(host
-            .with_conn(|conn| calendar::event_by_id(conn, &format!("cal:{TAIL}")))
-            .unwrap()
-            .is_none());
+        assert_eq!(host.row(TAIL).start, "2027-12-06T09:00:00Z");
         assert_eq!(split_rows(&host).0, ["cal:abc_20261012T080000Z"]);
     }
 
@@ -16134,11 +16108,10 @@ mod tests {
         .unwrap();
     }
 
-    /// C11c review: the one event put past the months PM mirrors is said to be outside whatever the
-    /// landing came to, a re-fetch that never shows the cut or a mirror that can't be written, beside
-    /// the calendar catching up.
+    /// C11c review: a re-fetch that never shows the cut, or a mirror that can't be written, leaves the
+    /// calendar to catch up, wherever the one event the save made falls.
     #[tokio::test]
-    async fn does_not_repeat_on_following_outside_the_mirror_says_so_when_pending() {
+    async fn does_not_repeat_on_following_past_the_live_band_waits_when_pending() {
         let far = EventPatchDraft {
             recurrence: Some(crate::calendar_write::dto::RepeatDraft::Once),
             ..at("09:00", "2027-12-06")
@@ -16146,9 +16119,9 @@ mod tests {
         let plan = Case::new(weekly(), monday_19())
             .edit(Scope::Following, far.clone())
             .unwrap();
-        let outside_pending = |outcome: &WriteOutcome| {
+        let catches_up = |outcome: &WriteOutcome| {
             matches!(outcome, WriteOutcome::Saved { warnings, .. }
-                if *warnings == [WriteWarning::OutsideMirror, WriteWarning::MirrorRefreshPending])
+                if *warnings == [WriteWarning::MirrorRefreshPending])
         };
         // The re-fetch never shows the cut.
         let host = TestHost::holding(&october());
@@ -16171,7 +16144,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(outside_pending(&outcome), "never shown: outside, pending");
+        assert!(catches_up(&outcome), "never shown: pending");
         // The mirror can't be written.
         let host = TestHost::holding(&october());
         let refusing = Arc::clone(&host);
@@ -16193,7 +16166,7 @@ mod tests {
         )
         .await;
         script.asked_all();
-        assert!(outside_pending(&outcome), "not written: outside, pending");
+        assert!(catches_up(&outcome), "not written: pending");
         assert!(host.hash_dropped());
     }
 
@@ -20583,8 +20556,9 @@ mod tests {
         assert_eq!(host.told(), vec!["cal".to_string()]);
     }
 
-    /// C11 critique 1 L8: outside the months PM shows, nothing is listed, and the one-off's row goes
-    /// all the same; a listing that never shows the occurrences takes it off too.
+    /// C11 critique 1 L8: with no occurrence in the live band, nothing is listed (the months after it
+    /// load as the view reaches them), and the one-off's row goes all the same; a listing that never
+    /// shows the occurrences takes it off too.
     #[tokio::test]
     async fn a_one_off_made_to_repeat_drops_its_row_on_every_path() {
         let far = written(
@@ -20621,19 +20595,19 @@ mod tests {
         )
         .await;
         script.asked_all();
-        let outside = WriteOutcome::Saved {
-            warnings: vec![WriteWarning::OutsideMirror],
+        let saved = WriteOutcome::Saved {
+            warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
             calendar: None,
         };
-        assert!(outcome == outside, "saved, and said to be outside");
+        assert!(outcome == saved, "saved: {outcome:?}");
         let row = host
             .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
             .unwrap();
         assert!(row.is_none());
-        // A mirror that can't remove the row: outside, and the calendar to catch up (C11d review 3).
+        // A mirror that can't remove the row: the calendar to catch up (C11d review 3).
         let host = TestHost::holding(std::slice::from_ref(&far));
         let refusing = Arc::clone(&host);
         let (outcome, script, _) = save_one_off(
@@ -20656,9 +20630,8 @@ mod tests {
         .await;
         script.asked_all();
         assert!(
-            matches!(&outcome, WriteOutcome::Saved { warnings, .. }
-                if *warnings == [WriteWarning::OutsideMirror, WriteWarning::MirrorRefreshPending]),
-            "outside, the calendar to catch up"
+            outcome == pending(),
+            "the calendar to catch up: {outcome:?}"
         );
         let row = host
             .with_conn(|conn| calendar::event_by_id(conn, "cal:solo"))
@@ -23170,8 +23143,10 @@ mod tests {
         assert!(new_row(&host).is_none());
     }
 
+    /// A new event past the live band (or before it) lands like any other: the mirror keeps every
+    /// event now (#1047), so nothing drops it at the next sync.
     #[tokio::test]
-    async fn a_create_outside_the_mirror_is_saved_but_not_landed() {
+    async fn a_create_past_the_live_band_is_saved_and_landed() {
         let host = TestHost::holding(&[]);
         let draft = on_day("2028-01-10");
         let copy = google_copy(&draft, "\"n1\"");
@@ -23187,17 +23162,17 @@ mod tests {
         assert!(
             outcome
                 == WriteOutcome::Saved {
-                    warnings: vec![WriteWarning::OutsideMirror],
+                    warnings: Vec::new(),
                     left_behind: Vec::new(),
                     milestone_moves: None,
                     undo: None,
                     calendar: None,
                 },
-            "saved in Google, and said to be outside"
+            "saved in Google, and landed: {outcome:?}"
         );
-        assert!(new_row(&host).is_none());
-        assert!(host.nothing_recorded());
-        assert!(host.told().is_empty());
+        assert!(new_row(&host).is_some());
+        assert!(!host.nothing_recorded());
+        assert_eq!(host.told(), ["cal"]);
     }
 
     /// R5: the webview gets PM's own token, never the id PM chose for Google.
@@ -23781,13 +23756,14 @@ mod tests {
         }
     }
 
-    /// C10 §6.2, C11 critique 1 L8: a new repeating event with no occurrence in the months PM
-    /// mirrors, after them or ended before them, is saved and said to be outside, with no listing
-    /// at all. One begun before them that runs into them is listed.
+    /// C11 critique 1 L8: a new repeating event with no occurrence in the live band, after it or
+    /// ended before it, is saved with no listing at all: history's fetch lands the one before it, and
+    /// the view loads the months after as it reaches them (#1047). One begun before them that runs
+    /// into them is listed.
     #[tokio::test]
-    async fn a_created_series_after_the_window_is_saved_not_landed() {
+    async fn a_created_series_outside_the_live_band_is_saved_without_a_listing() {
         let outside = WriteOutcome::Saved {
-            warnings: vec![WriteWarning::OutsideMirror],
+            warnings: Vec::new(),
             left_behind: Vec::new(),
             milestone_moves: None,
             undo: None,
@@ -23809,13 +23785,11 @@ mod tests {
                 None,
             )
             .await;
-            assert!(
-                outcome == outside,
-                "saved in Google, and said to be outside"
-            );
+            assert!(outcome == outside, "saved in Google: {outcome:?}");
             assert_eq!(script.sent().len(), 1, "nothing listed");
             assert!(new_rows(&host).is_empty() && host.nothing_recorded());
-            assert!(host.told().is_empty());
+            // The view is told all the same, so the months it shows past the live band load again.
+            assert_eq!(host.told(), ["cal"]);
         }
         // From Monday 03-08-2026, ten times: its last five fall in the window, so it is listed (the
         // listing's own occurrences are what land, three here).
@@ -24097,31 +24071,47 @@ mod tests {
         ));
     }
 
+    /// #1047: a save that reaches every occurrence of a series with occurrences kept from before the
+    /// live band, or a new series that starts before it, marks that calendar's history to be fetched
+    /// again; a series wholly inside it, or a calendar whose history was never downloaded, doesn't.
     #[test]
-    fn in_mirror_reads_overlap_at_both_edges() {
-        let window = mirror(&[]).instants();
-        let row = |start: &str, end: Option<&str>, all_day: bool| CalendarEvent {
-            start: start.into(),
-            end: end.map(str::to_string),
-            all_day,
-            ..Default::default()
+    fn a_save_reaching_history_marks_it_to_be_fetched_again() {
+        let host = TestHost::holding(&october());
+        let checked = crate::calendar_history::start_instant("2026-11-05T10:00:00Z").unwrap();
+        let stale = |host: &TestHost| {
+            host.with_conn(|conn| calendar::history_state(conn, "cal"))
+                .unwrap()
+                .map(|s| s.stale)
         };
-        // Ends exactly where the window starts: out.
-        let edge = row("2026-08-31T23:00:00Z", Some("2026-09-01T00:00:00Z"), false);
-        assert_eq!(in_mirror(&edge, window), Some(false));
-        let across = row("2026-08-31T23:00:00Z", Some("2026-09-01T00:30:00Z"), false);
-        assert_eq!(in_mirror(&across, window), Some(true));
-        // The last day before the window ends: in. The day the window ends on: out.
-        let last = row("2027-10-31", Some("2027-11-01"), true);
-        assert_eq!(in_mirror(&last, window), Some(true));
-        let after = row("2027-11-01", Some("2027-11-02"), true);
-        assert_eq!(in_mirror(&after, window), Some(false));
-        // No end: its start alone.
-        let point = row("2026-10-26T10:00:00Z", None, false);
-        assert_eq!(in_mirror(&point, window), Some(true));
-        // What can't be read lands.
-        assert_eq!(in_mirror(&row("soon", None, false), window), None);
-        assert_eq!(in_mirror(&point, None), None);
+        history_behind(&*host, "cal", &["abc"], None);
+        assert_eq!(
+            stale(&host),
+            None,
+            "never downloaded: the first download is due anyway"
+        );
+        host.with_conn(|conn| calendar::set_history_checked(conn, "cal", checked, 0))
+            .unwrap();
+        history_behind(&*host, "cal", &["abc"], None);
+        assert_eq!(
+            stale(&host),
+            Some(false),
+            "October's series is all in the live band"
+        );
+        let started_long_ago = json!({ "start": { "dateTime": "2019-03-04T09:00:00Z" } });
+        history_behind(&*host, "cal", &[], Some(&started_long_ago));
+        assert_eq!(stale(&host), Some(true));
+        // A fetch that saw that one mark brings it up to date.
+        host.with_conn(|conn| calendar::set_history_checked(conn, "cal", checked, 1))
+            .unwrap();
+        let mut old = october()[0].clone();
+        old["id"] = json!("abc_20190304T090000Z");
+        old["start"] = json!({ "dateTime": "2019-03-04T09:00:00Z" });
+        old["end"] = json!({ "dateTime": "2019-03-04T10:00:00Z" });
+        let row = calendar::parse_event("cal", &old).unwrap();
+        host.with_conn(|conn| calendar::apply_write_effect(conn, "cal", &[row], &[]))
+            .unwrap();
+        history_behind(&*host, "cal", &["abc"], None);
+        assert_eq!(stale(&host), Some(true), "an occurrence kept from 2019");
     }
 
     #[test]

@@ -61,11 +61,15 @@ pub struct CalendarOverview {
     pub calendars: Vec<calendar::Calendar>,
     pub last_sync: Option<String>,
     pub window_days: i64,
-    /// The mirrored band `[start, end]` (RFC3339, from [`calendar::time_window`]) — so the unified
-    /// view can tell when the user has paged past the synced range and show an "outside synced
-    /// range" hint rather than a misleadingly-empty grid.
+    /// The live band `[start, end)` every sync fetches (RFC3339, from [`calendar::time_window`]).
+    /// Before it is history, kept whole once downloaded (`history_ready`); after it, the view loads
+    /// months as it scrolls to them ([`load_calendar_months`]).
     pub mirror_start: String,
     pub mirror_end: String,
+    /// Every selected Google and Outlook calendar has had its history downloaded (iCal feeds come
+    /// whole with every sync), so a month before `mirror_start` shows everything there is. While it's
+    /// false the view says the older events are still on their way.
+    pub history_ready: bool,
     /// Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`).
     /// Computed here only, from the stored choice and the account's calendar token.
     pub editing: BTreeMap<String, EditingStatus>,
@@ -116,6 +120,17 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
             calendar::auto_meets(&conn)?,
         )
     };
+    let history_ready = {
+        let conn = state.conn()?;
+        let mut ready = true;
+        for cal in calendars.iter().filter(|c| c.selected && !is_feed(c)) {
+            if calendar::history_state(&conn, &cal.id)?.is_none() {
+                ready = false;
+                break;
+            }
+        }
+        ready
+    };
     let default_length = by_account(&accounts, &lengths);
     let auto_meet = by_account(&accounts, &meets);
     // No fetch: Google's role and owner for each calendar are refreshed on every sync.
@@ -151,6 +166,7 @@ pub async fn calendar_overview(app: AppHandle) -> Result<CalendarOverview> {
         window_days: calendar::AGENDA_DAYS,
         mirror_start,
         mirror_end,
+        history_ready,
         editing,
         default_length,
         auto_meet,
@@ -666,19 +682,27 @@ pub async fn add_ics_feed(
 ) -> Result<()> {
     let provider = provider.unwrap_or_else(|| "other".to_string());
     let feed = calendar::build_feed(&label, &url, &provider)?;
-    // Resolve the user's zone (for floating/all-day ICS times) and the mirror window under a short
-    // lock, then drop it before the network sync (rule #4).
-    let (tz, (time_min, time_max)) = {
+    // Resolve the user's zone (for floating/all-day ICS times) and the live band under a short lock,
+    // then drop it before the network sync (rule #4). A feed is one download, so its whole history
+    // comes with it.
+    let (tz, live) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
-        (resolve_zone(&conn), calendar::time_window(&conn)?)
+        (resolve_zone(&conn), calendar::live_band(&conn)?)
     };
-    let (events, complete) = calendar::sync_feed(&feed, &time_min, &time_max, tz).await?;
+    let band = feed_band(&live);
+    let (events, complete) = calendar::sync_feed(&feed, &band, tz).await?;
+    let now = chrono::Utc::now();
+    let band = band.of_feed_listing(
+        feed_listing(&events),
+        now,
+        crate::clock::today_in_at(tz, now),
+    );
     let state = app.state::<AppState>();
     let conn = state.conn()?;
     calendar::save_new_feed(&feed)?;
     calendar::register_feed_source(&conn, &feed)?;
-    calendar::replace_events(&conn, &feed.id, &events, complete)?;
+    calendar::replace_band(&conn, &feed.id, &band, &events, complete)?;
     // "Last synced" means "last COMPLETE sync": a feed that parsed only partly is still added (the
     // events it gave are real), but stamping it clean would claim a picture we don't have.
     if complete {
@@ -836,14 +860,37 @@ struct SyncedOne {
     server_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Pull events from a single selected calendar (provider-dispatched) and write them to the mirror.
-/// Never holds the DB lock across the fetch (rule #4).
+/// An iCal feed's band for a sync: its whole history and the live band, as the feed is one download
+/// whatever is asked of it ([`calendar::Band::through_live`]).
+fn feed_band(live: &calendar::Band) -> calendar::Band {
+    match live.to {
+        Some(to) => calendar::Band::through_live(to),
+        None => *live,
+    }
+}
+
+/// Whether a calendar is an iCal subscription (any provider but Google's and Microsoft's sign-ins).
+fn is_feed(cal: &calendar::Calendar) -> bool {
+    !matches!(cal.provider.as_str(), "google" | "microsoft")
+}
+
+/// A feed download's events as [`calendar::Band::of_feed_listing`] reads them.
+fn feed_listing(events: &[CalendarEvent]) -> impl Iterator<Item = (&str, Option<&str>, bool)> {
+    events
+        .iter()
+        .map(|e| (e.start.as_str(), e.end.as_deref(), e.recurring))
+}
+
+/// Pull one band of a single selected calendar's events (provider-dispatched) and write them to the
+/// mirror, comparing them with what it holds there ([`calendar::replace_band`]). At most `max_pages`
+/// pages for Google and Outlook ([`calendar::MAX_PAGES`], [`calendar::HISTORY_PAGES`]). Never holds
+/// the DB lock across the fetch (rule #4).
 async fn sync_one_calendar(
     app: &AppHandle,
     cal: &calendar::Calendar,
     feed_by_id: &std::collections::HashMap<String, calendar::IcsFeed>,
-    time_min: &str,
-    time_max: &str,
+    band: &calendar::Band,
+    max_pages: usize,
     tz: chrono_tz::Tz,
 ) -> Result<SyncedOne> {
     // Taken before the fetch: only a fetch that began after a save may settle it (rule R4).
@@ -859,8 +906,8 @@ async fn sync_one_calendar(
                 &google_calendar_token_key(&email),
                 &cal.id,
                 remote,
-                time_min,
-                time_max,
+                band,
+                max_pages,
             )
             .await?;
             server_time = fetched.server_time;
@@ -875,8 +922,8 @@ async fn sync_one_calendar(
                 &outlook_calendar::account_token_key(&email),
                 &cal.id,
                 remote,
-                time_min,
-                time_max,
+                band,
+                max_pages,
             )
             .await?
         }
@@ -888,16 +935,37 @@ async fn sync_one_calendar(
                     cal.source_id
                 ))
             })?;
-            calendar::sync_feed(feed, time_min, time_max, tz).await?
+            calendar::sync_feed(feed, band, tz).await?
         }
     };
     let count = events.len();
     let state = app.state::<AppState>();
     let conn = state.conn()?;
+    // A feed asked for its whole history speaks for what's to come, and back only as far as it
+    // shows it keeps (`Band::of_feed_listing`): one that publishes a window mustn't take history
+    // with it. The events it lists by UID say where their other rows went: a series is the whole of
+    // itself at any date, and a one-off listed at another time was moved, from the start of today
+    // (`clear_unlisted_uid_rows`). Neither reaches past `band.to`: the months loaded further ahead
+    // aren't in this listing.
+    let band = if is_feed(cal) && band.from.is_none() {
+        let now = chrono::Utc::now();
+        let band = band.of_feed_listing(
+            feed_listing(&events),
+            now,
+            crate::clock::today_in_at(tz, now),
+        );
+        if complete {
+            calendar::clear_unlisted_uid_rows(&conn, &cal.id, &events, band.day_from, band.to)?;
+        }
+        band
+    } else {
+        *band
+    };
     write_fetched_events(
         &conn,
         &state.calendar_edit,
         cal,
+        &band,
         events,
         complete,
         fetch_started,
@@ -909,13 +977,20 @@ async fn sync_one_calendar(
     })
 }
 
-/// Write one calendar's fetch into the mirror, through the saves of the last ten minutes: a fetch
-/// that began before a save can't put the old version back (rule R4). The caller holds the DB lock,
-/// and the recent writes are locked inside it (lock order: the DB, then the recent writes).
+/// Write one calendar's fetch of `band` into the mirror, through the saves of the last ten minutes: a
+/// fetch that began before a save can't put the old version back (rule R4). The caller holds the DB
+/// lock, and the recent writes are locked inside it (lock order: the DB, then the recent writes).
+///
+/// Every fetch takes the sync lock, so they run one at a time. A save is settled only by a fetch of
+/// a band that holds it (seen there, or missing from a complete listing of it): a live fetch that
+/// rightly doesn't list last year's saved event leaves the save's protection in place for history's
+/// fetch, which may lag behind it. A deleted row's start isn't kept, so its entry settles only by
+/// being seen restored, or expires.
 fn write_fetched_events(
     conn: &rusqlite::Connection,
     edit: &super::CalendarEditState,
     cal: &calendar::Calendar,
+    band: &calendar::Band,
     events: Vec<CalendarEvent>,
     complete: bool,
     fetch_started: std::time::Instant,
@@ -926,15 +1001,162 @@ fn write_fetched_events(
         .map_err(|_| Error::Other("recent writes lock poisoned".into()))?;
     if recent.is_empty() {
         drop(recent);
-        return calendar::replace_events(conn, &cal.id, &events, complete);
+        calendar::replace_band(conn, &cal.id, band, &events, complete)?;
+        return Ok(());
     }
-    let merged = recent.merge(&cal.id, events, complete, fetch_started, Stamp::now());
+    let holds = |start: Option<&str>| match start {
+        Some(start) => band.holds(start),
+        None => band.from.is_none() && band.to.is_none(),
+    };
+    let merged = recent.merge_band(
+        &cal.id,
+        events,
+        complete,
+        fetch_started,
+        Stamp::now(),
+        holds,
+    );
     drop(recent);
-    calendar::replace_events(conn, &cal.id, &merged.rows, complete)?;
+    calendar::replace_band(conn, &cal.id, band, &merged.rows, complete)?;
     if !merged.deletes.is_empty() {
         calendar::apply_write_effect(conn, &cal.id, &[], &merged.deletes)?;
     }
     Ok(())
+}
+
+/// What a history pass did for one calendar.
+#[derive(Debug, PartialEq, Eq)]
+enum HistoryPass {
+    /// Nothing to do (an iCal feed, whose history comes with every sync; or one already up to date).
+    Unchanged,
+    /// History was fetched and written.
+    Fetched,
+}
+
+/// Bring one calendar's history (everything before the live band) up to date, after its live band
+/// has been fetched: download it whole the first time and when a save of PM's own left it behind;
+/// for Google, otherwise ask Google what changed since it was last known whole and fetch it again only
+/// when a change reaches it ([`crate::calendar_history::reaches_history`]); for Outlook, which has no
+/// cheap check, fetch it again once a day, in slices ([`crate::calendar_history::outlook_slices`]).
+/// `changes` is a listing the caller already has (the change check's first page, and whether more
+/// pages followed), read instead of asking again; it is only ever handed over for a Google calendar
+/// whose history has been downloaded. Runs under the sync lock, like every fetch.
+async fn sync_history(
+    app: &AppHandle,
+    cal: &calendar::Calendar,
+    live: &calendar::Band,
+    tz: chrono_tz::Tz,
+    changes: Option<(&[calendar::Changed], bool)>,
+) -> Result<HistoryPass> {
+    use crate::calendar_history::{self as history, Next};
+    let Some(live_from) = live.from else {
+        return Ok(HistoryPass::Unchanged);
+    };
+    if is_feed(cal) {
+        return Ok(HistoryPass::Unchanged);
+    }
+    let state_now = {
+        let state = app.state::<AppState>();
+        let conn = state.conn()?;
+        calendar::history_state(&conn, &cal.id)?
+    };
+    // The marks a save had left when this began: one landing while it runs keeps history stale.
+    let seen_marks = state_now.as_ref().map_or(0, |s| s.marks);
+    let google = cal.provider == "google";
+    // When a Google check found nothing reaching history: Google's time for it, to count from next.
+    let mut checked_at = None;
+    let fetch = if google {
+        match (history::next_step(state_now.as_ref()), changes) {
+            (Next::Fetch, _) => true,
+            (Next::Check(_), Some((items, more))) => {
+                let state = app.state::<AppState>();
+                let conn = state.conn()?;
+                // More than a page changed: rather than read every page, fetch history.
+                more || history::reaches_history(items, |c| {
+                    calendar::held_of(&conn, &cal.id, live_from, c).unwrap_or(history::Held {
+                        before: true,
+                        ..Default::default()
+                    })
+                })
+            }
+            (Next::Check(since), None) => {
+                let Some(email) = calendar::account_email_of(&cal.source_id) else {
+                    return Ok(HistoryPass::Unchanged);
+                };
+                let remote = cal.remote_id.as_deref().unwrap_or(&cal.id);
+                match calendar::check_for_changes(&google_calendar_token_key(&email), remote, since)
+                    .await?
+                {
+                    calendar::Changes::TooOld => true,
+                    calendar::Changes::Listed {
+                        items,
+                        more,
+                        server_time,
+                    } => {
+                        let state = app.state::<AppState>();
+                        let conn = state.conn()?;
+                        // More than a page changed: rather than read every page, fetch history.
+                        let reaches = more
+                            || history::reaches_history(&items, |c| {
+                                calendar::held_of(&conn, &cal.id, live_from, c).unwrap_or(
+                                    history::Held {
+                                        before: true,
+                                        ..Default::default()
+                                    },
+                                )
+                            });
+                        checked_at = server_time;
+                        reaches
+                    }
+                }
+            }
+        }
+    } else {
+        history::outlook_due(state_now.as_ref(), chrono::Utc::now())
+    };
+    if !fetch {
+        if let Some(at) = checked_at {
+            let state = app.state::<AppState>();
+            let conn = state.conn()?;
+            calendar::set_history_checked(&conn, &cal.id, at, seen_marks)?;
+        }
+        return Ok(HistoryPass::Unchanged);
+    }
+    // Google in one listing; Outlook in slices of a few years, as Graph's `calendarView` may not take
+    // a century at once. A slice that fails stops the pass: what came in stays, and the pass runs
+    // again at the next sync.
+    let bands = if google {
+        vec![calendar::Band::before(live_from)]
+    } else {
+        history::outlook_slices(live_from)
+    };
+    let no_feeds = std::collections::HashMap::new();
+    let mut server_time = None;
+    for band in &bands {
+        let one = sync_one_calendar(app, cal, &no_feeds, band, calendar::HISTORY_PAGES, tz).await?;
+        server_time = server_time.or(one.server_time);
+        if !one.complete {
+            eprintln!(
+                "calendar: '{}' history came back incomplete; what arrived is kept, nothing removed",
+                cal.id
+            );
+        }
+    }
+    // Google counts its next check from Google's own time of this fetch (this computer's clock can run
+    // hours off, and an `updatedMin` in Google's future would hide every change), falling back to an
+    // earlier Google time, then to a day ago; Outlook counts from this computer's.
+    let at = if google {
+        server_time
+            .or(checked_at)
+            .or(state_now.map(|s| s.checked_at))
+            .unwrap_or_else(|| chrono::Utc::now() - chrono::TimeDelta::days(1))
+    } else {
+        chrono::Utc::now()
+    };
+    let state = app.state::<AppState>();
+    let conn = state.conn()?;
+    calendar::set_history_checked(&conn, &cal.id, at, seen_marks)?;
+    Ok(HistoryPass::Fetched)
 }
 
 /// Re-fetch each connected OAuth account's calendar LIST and reconcile the registry before events are
@@ -1026,13 +1248,13 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     reconcile_calendar_lists(&app).await;
 
     // Phase 1 (brief lock): snapshot what to sync.
-    let (calendars, feeds, (time_min, time_max), tz) = {
+    let (calendars, feeds, live, tz) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         (
             calendar::selected_calendars(&conn)?,
             calendar::load_feeds()?,
-            calendar::time_window(&conn)?,
+            calendar::live_band(&conn)?,
             resolve_zone(&conn),
         )
     };
@@ -1053,14 +1275,14 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let mut total = 0usize;
     let mut ok_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     // A source whose fetch SUCCEEDED but couldn't see the whole calendar. Its events were written
-    // (merged, never reaped — see `calendar::replace_events`), so it is neither a failure nor a
+    // (merged, never reaped — see `calendar::replace_band`), so it is neither a failure nor a
     // clean sync; it gets its own bucket and the 'error' state, meaning "the pass ran but didn't
     // finish", exactly as Drive and the local folder already use it.
     let mut partial_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut failed_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_err: Option<Error> = None;
 
-    // Fetch a few calendars at a time (the fetch half holds no DB lock; each `replace_events`
+    // Fetch a few calendars at a time (the fetch half holds no DB lock; each `replace_band`
     // write inside stays its own short lock). `buffered` keeps results in calendar order, so the
     // per-calendar accounting below matches the old sequential loop.
     use futures_util::stream::StreamExt;
@@ -1072,10 +1294,11 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let fetches: Vec<_> = calendars
         .iter()
         .map(|cal| {
-            let (app, feed_by_id) = (&app, &feed_by_id);
-            let (time_min, time_max) = (&time_min, &time_max);
+            let (app, feed_by_id, live) = (&app, &feed_by_id, &live);
             async move {
-                let r = sync_one_calendar(app, cal, feed_by_id, time_min, time_max, tz).await;
+                let band = if is_feed(cal) { feed_band(live) } else { *live };
+                let r =
+                    sync_one_calendar(app, cal, feed_by_id, &band, calendar::MAX_PAGES, tz).await;
                 (cal, r)
             }
         })
@@ -1083,6 +1306,8 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     let mut results = futures_util::stream::iter(fetches).buffered(CALENDAR_FETCH_CONCURRENCY);
     // Every calendar whose events this pass wrote, for the views to re-read.
     let mut written: Vec<String> = Vec::new();
+    // The calendars whose live band came in whole: their history is brought up to date after.
+    let mut history_due: Vec<&calendar::Calendar> = Vec::new();
     while let Some((cal, result)) = results.next().await {
         let google = cal.provider == "google";
         match result {
@@ -1090,6 +1315,9 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
                 total += one.count;
                 written.push(cal.id.clone());
                 if one.complete {
+                    if !is_feed(cal) {
+                        history_due.push(cal);
+                    }
                     ok_sources.insert(cal.source_id.clone());
                     // The change check counts from this fetch on (and a sign-in pause is over).
                     if google {
@@ -1152,11 +1380,70 @@ pub async fn sync_calendar(app: AppHandle) -> Result<usize> {
     }
     announce_synced(&app, written);
 
+    // History, once the live band is on screen, and after this sync has answered: the first sync of
+    // a calendar downloads every event it has ever had, which can take minutes, and neither Refresh
+    // nor anything time-sensitive waits on it. It takes the sync lock again, so it still runs alone;
+    // a sync asked for meanwhile waits behind it.
+    let due: Vec<calendar::Calendar> = history_due.into_iter().cloned().collect();
+    if !due.is_empty() {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            let _single = state.calendar_edit.sync_lock.lock().await;
+            let due: Vec<&calendar::Calendar> = due.iter().collect();
+            sync_histories(&app, &due, &live, tz).await;
+        });
+    }
+
     if let Some(e) = last_err {
         return Err(e);
     }
     Ok(total)
 }
+
+/// Bring each calendar's history up to date ([`sync_history`]), a few at a time, then pack what has
+/// aged past a year and tell the views. A failure is only logged: the live band is what the
+/// account's state reports on, and history is tried again at the next sync. Runs under the sync lock.
+async fn sync_histories(
+    app: &AppHandle,
+    calendars: &[&calendar::Calendar],
+    live: &calendar::Band,
+    tz: chrono_tz::Tz,
+) {
+    use futures_util::stream::StreamExt;
+    const HISTORY_CONCURRENCY: usize = 3;
+    let passes: Vec<_> = calendars
+        .iter()
+        .map(|cal| async move { (*cal, sync_history(app, cal, live, tz, None).await) })
+        .collect();
+    let mut results = futures_util::stream::iter(passes).buffered(HISTORY_CONCURRENCY);
+    let mut written: Vec<String> = Vec::new();
+    while let Some((cal, result)) = results.next().await {
+        match result {
+            Ok(HistoryPass::Fetched) => written.push(cal.id.clone()),
+            Ok(HistoryPass::Unchanged) => {}
+            Err(e) => eprintln!("calendar: '{}' history not brought up to date: {e}", cal.id),
+        }
+    }
+    let state = app.state::<AppState>();
+    if let Ok(conn) = state.conn() {
+        // As after the live pass: a calendar unticked while its history downloaded keeps none of it.
+        if let Ok(active) = calendar::selected_calendars(&conn) {
+            let keep: Vec<String> = active.into_iter().map(|c| c.id).collect();
+            let _ = calendar::prune_unselected(&conn, &keep);
+            written.retain(|id| keep.contains(id));
+        }
+        if let Err(e) = calendar::pack_aged(&conn, chrono::Utc::now(), PACK_BATCH) {
+            eprintln!("calendar: packing events older than a year failed: {e}");
+        }
+    }
+    announce_synced(app, written);
+}
+
+/// How many aged events one sync packs ([`calendar::pack_aged`]). History is packed as it's written,
+/// so this only meets events crossing the one-year line as time passes — a handful a day — and the
+/// cap just keeps the lock brief.
+const PACK_BATCH: usize = 5_000;
 
 /// Update the change check's bookkeeping (a short lock, never held across an await).
 fn note_fresh(app: &AppHandle, update: impl FnOnce(&mut Freshness)) {
@@ -1238,7 +1525,7 @@ pub async fn check_google_calendars(app: AppHandle) -> Result<CalendarCheck> {
     if !go {
         return Ok(CalendarCheck::default());
     }
-    let (calendars, (time_min, time_max), tz) = {
+    let (calendars, live, tz) = {
         let conn = state.conn()?;
         let selected = calendar::selected_calendars(&conn)?;
         let ids: HashSet<&str> = selected.iter().map(|c| c.id.as_str()).collect();
@@ -1247,7 +1534,7 @@ pub async fn check_google_calendars(app: AppHandle) -> Result<CalendarCheck> {
             .into_iter()
             .filter(|c| c.provider == "google")
             .collect();
-        (google, calendar::time_window(&conn)?, resolve_zone(&conn))
+        (google, calendar::live_band(&conn)?, resolve_zone(&conn))
     };
     let no_feeds = std::collections::HashMap::new();
 
@@ -1256,10 +1543,9 @@ pub async fn check_google_calendars(app: AppHandle) -> Result<CalendarCheck> {
     let checks: Vec<_> = calendars
         .iter()
         .map(|cal| {
-            let (app, no_feeds) = (&app, &no_feeds);
-            let (time_min, time_max) = (&time_min, &time_max);
+            let (app, no_feeds, live) = (&app, &no_feeds, &live);
             async move {
-                let outcome = check_one_calendar(app, cal, no_feeds, time_min, time_max, tz).await;
+                let outcome = check_one_calendar(app, cal, no_feeds, live, tz).await;
                 (cal, outcome)
             }
         })
@@ -1309,21 +1595,40 @@ pub async fn check_google_calendars(app: AppHandle) -> Result<CalendarCheck> {
     Ok(report)
 }
 
+/// A change listing as the change check's bookkeeping keeps it: (event id, `updated`) pairs.
+fn changed_pairs(changes: &[calendar::Changed]) -> Vec<(String, String)> {
+    changes
+        .iter()
+        .map(|c| (c.id.clone(), c.updated.clone()))
+        .collect()
+}
+
 /// One Google calendar's part in [`check_google_calendars`]: check it (or fetch it, if nothing yet
-/// says from when to check), and fetch it again when something changed.
+/// says from when to check), and fetch its live band again when something changed. A change that
+/// reaches history (an old event edited in Google, say), or a save of PM's own that left history
+/// behind, fetches history too, so it shows within the half minute as well
+/// ([`sync_history`]). A calendar whose history has never been downloaded waits for the full sync.
 async fn check_one_calendar(
     app: &AppHandle,
     cal: &calendar::Calendar,
     no_feeds: &std::collections::HashMap<String, calendar::IcsFeed>,
-    time_min: &str,
-    time_max: &str,
+    live: &calendar::Band,
     tz: chrono_tz::Tz,
 ) -> CheckOutcome {
     let mut plan = Plan::Skip;
     note_fresh(app, |f| plan = f.plan(&cal.id, Instant::now()));
-    let absorb = match plan {
+    let history = {
+        let state = app.state::<AppState>();
+        state
+            .conn()
+            .ok()
+            .and_then(|conn| calendar::history_state(&conn, &cal.id).ok().flatten())
+    };
+    let stale = history.as_ref().is_some_and(|h| h.stale);
+    // The listing's first page, and whether more pages followed it.
+    let (changes, more): (Vec<calendar::Changed>, bool) = match plan {
         Plan::Skip => return CheckOutcome::Unchanged,
-        Plan::Fetch => Vec::new(),
+        Plan::Fetch => (Vec::new(), false),
         Plan::Check(since) => {
             let Some(email) = calendar::account_email_of(&cal.source_id) else {
                 return CheckOutcome::Unchanged;
@@ -1332,20 +1637,34 @@ async fn check_one_calendar(
             match calendar::check_for_changes(&google_calendar_token_key(&email), remote, since)
                 .await
             {
-                Ok(calendar::Changes::TooOld) => Vec::new(),
+                // Too long ago to list: the full sync's own check (or fetch) of history judges it.
+                Ok(calendar::Changes::TooOld) => (Vec::new(), false),
                 Ok(calendar::Changes::Listed {
                     items,
                     more,
                     server_time,
                 }) => {
+                    let pairs = changed_pairs(&items);
                     let mut verdict = Verdict::Unchanged;
                     note_fresh(app, |f| {
-                        verdict = f.checked(&cal.id, &items, more, server_time)
+                        verdict = f.checked(&cal.id, &pairs, more, server_time)
                     });
                     if verdict == Verdict::Unchanged {
+                        // Nothing new in the live band, but a save of PM's own may still have left
+                        // history behind: fetch just that.
+                        if stale {
+                            match sync_history(app, cal, live, tz, Some((&[], false))).await {
+                                Ok(HistoryPass::Fetched) => return CheckOutcome::Fetched,
+                                Ok(HistoryPass::Unchanged) => {}
+                                Err(e) => eprintln!(
+                                    "calendar: '{}' history not brought up to date: {e}",
+                                    cal.id
+                                ),
+                            }
+                        }
                         return CheckOutcome::Unchanged;
                     }
-                    items
+                    (items, more)
                 }
                 Err(e) => {
                     note_fresh_failure(app, &cal.id, &e);
@@ -1354,11 +1673,17 @@ async fn check_one_calendar(
             }
         }
     };
-    match sync_one_calendar(app, cal, no_feeds, time_min, time_max, tz).await {
+    let absorb = changed_pairs(&changes);
+    match sync_one_calendar(app, cal, no_feeds, live, calendar::MAX_PAGES, tz).await {
         Ok(one) if one.complete => {
             note_fresh(app, |f| {
                 f.fetched(&cal.id, one.server_time, &absorb, Instant::now())
             });
+            if history.is_some() && (stale || more || !changes.is_empty()) {
+                if let Err(e) = sync_history(app, cal, live, tz, Some((&changes, more))).await {
+                    eprintln!("calendar: '{}' history not brought up to date: {e}", cal.id);
+                }
+            }
             CheckOutcome::Fetched
         }
         // Written, but not all of it: the full sync will judge it; meanwhile back off.
@@ -1373,23 +1698,142 @@ async fn check_one_calendar(
     }
 }
 
-/// Every mirrored event across the widened window — the read backing the unified calendar view
-/// (card 8). The focus view keeps the narrow forward agenda ([`list_calendar_events`]); this returns
-/// the whole band (previous month included) and the client filters to the visible range.
+/// The mirrored events touching `[from, to)` (RFC 3339; either may be left out) — the read backing
+/// the unified calendar view (card 8), which asks for the months around what it shows now that the
+/// mirror keeps every event (#1047) — and only `uid`'s when it's given (a task's linked event, however
+/// old). The focus view keeps the narrow forward agenda ([`list_calendar_events`]).
 ///
 /// Each row says whether PM could edit it (`edit_block`), delete it (`can_delete`) and reply to it
 /// (`can_respond`), as far as the mirror can tell; the editor asks Google again when it opens, and
 /// every write checks again on Google's copy.
 #[tauri::command]
-pub fn list_all_calendar_events(state: State<'_, AppState>) -> Result<Vec<ListedEvent>> {
+pub fn list_all_calendar_events(
+    state: State<'_, AppState>,
+    from: Option<String>,
+    to: Option<String>,
+    uid: Option<String>,
+) -> Result<Vec<ListedEvent>> {
     let conn = state.conn()?;
-    let rows = calendar::list_all_events(&conn)?;
+    let rows =
+        calendar::list_events_between(&conn, from.as_deref(), to.as_deref(), uid.as_deref())?;
     let rights = super::calendar_edit::list_rights(&conn, &rows)?;
     Ok(rows
         .into_iter()
         .zip(rights)
         .map(|(event, rights)| ListedEvent::new(event, rights))
         .collect())
+}
+
+/// The most hits one [`search_calendar_events`] call returns.
+const SEARCH_MAX_HITS: u32 = 50;
+
+/// The search palette's calendar hits: [`calendar::search_events`] over every kept event but the
+/// `hidden` calendars' (the Calendar tab's hidden set, a per-device view pref the client holds), at
+/// most `limit` (20 by default), each with its editing rights as [`list_all_calendar_events`] gives
+/// them, so the event popover a hit opens can edit it. All-day events are judged by the user's own
+/// date, in their chosen zone.
+#[tauri::command]
+pub fn search_calendar_events(
+    state: State<'_, AppState>,
+    query: String,
+    hidden: Option<Vec<String>>,
+    limit: Option<u32>,
+) -> Result<Vec<ListedEvent>> {
+    let limit = limit.unwrap_or(20).clamp(1, SEARCH_MAX_HITS) as usize;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let conn = state.conn()?;
+    let today = crate::clock::today_sql_in(super::shared::resolve_zone(&conn));
+    let hidden = hidden.unwrap_or_default();
+    let rows = calendar::search_events(&conn, &query, &now, &today, &hidden, limit)?;
+    let rights = super::calendar_edit::list_rights(&conn, &rows)?;
+    Ok(rows
+        .into_iter()
+        .zip(rights)
+        .map(|(event, rights)| ListedEvent::new(event, rights))
+        .collect())
+}
+
+/// The longest stretch one [`load_calendar_months`] call fetches: four years, inside what one
+/// Outlook `calendarView` may take with its margins. The view asks for a few months at a time; this
+/// just bounds a bad request.
+const LOAD_MAX_DAYS: i64 = 4 * 365;
+
+/// Fetch every selected calendar's events in `[from, to)` (RFC 3339) and write them to the mirror:
+/// how the calendar view loads the months after the live band as it scrolls to them (Bobby: "lazy
+/// loading and only loading when we scroll to it is the best idea"). Each calendar's listing is a
+/// complete one of that stretch, so an event deleted there in Google goes here too. Waits behind a
+/// running sync (the first download of a calendar's history can take a while). Returns how many
+/// events it read; the views re-read on `calendar://synced`.
+#[tauri::command]
+pub async fn load_calendar_months(app: AppHandle, from: String, to: String) -> Result<usize> {
+    let at = |s: &str| {
+        crate::calendar_history::start_instant(s)
+            .ok_or_else(|| Error::Other(format!("bad calendar date {s:?}")))
+    };
+    let (from, to) = (at(&from)?, at(&to)?);
+    if to <= from || to - from > chrono::TimeDelta::days(LOAD_MAX_DAYS) {
+        return Err(Error::Other(
+            "PM loads at most four years of a calendar at a time.".into(),
+        ));
+    }
+    let state = app.state::<AppState>();
+    let _single = state.calendar_edit.sync_lock.lock().await;
+    let (calendars, feeds, tz) = {
+        let conn = state.conn()?;
+        (
+            calendar::selected_calendars(&conn)?,
+            calendar::load_feeds()?,
+            resolve_zone(&conn),
+        )
+    };
+    let feed_by_id: std::collections::HashMap<String, calendar::IcsFeed> =
+        feeds.into_iter().map(|f| (f.id.clone(), f)).collect();
+    let band = calendar::Band::between(from, to);
+    use futures_util::stream::StreamExt;
+    const LOAD_CONCURRENCY: usize = 3;
+    let loads: Vec<_> = calendars
+        .iter()
+        .map(|cal| {
+            let (app, feed_by_id, band) = (&app, &feed_by_id, &band);
+            async move {
+                let r =
+                    sync_one_calendar(app, cal, feed_by_id, band, calendar::MAX_PAGES, tz).await;
+                (cal, r)
+            }
+        })
+        .collect();
+    let mut results = futures_util::stream::iter(loads).buffered(LOAD_CONCURRENCY);
+    let mut total = 0usize;
+    let mut written: Vec<String> = Vec::new();
+    let mut last_err = None;
+    while let Some((cal, result)) = results.next().await {
+        match result {
+            Ok(one) => {
+                total += one.count;
+                written.push(cal.id.clone());
+            }
+            Err(e) => {
+                eprintln!("calendar: '{}' couldn't load those months: {e}", cal.id);
+                last_err = Some(e);
+            }
+        }
+    }
+    {
+        let conn = state.conn()?;
+        let keep: Vec<String> = calendar::selected_calendars(&conn)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        calendar::prune_unselected(&conn, &keep)?;
+        written.retain(|id| keep.contains(id));
+    }
+    let none_loaded = written.is_empty();
+    announce_synced(&app, written);
+    match last_err {
+        // Every calendar failed (offline, say): say so, so the view can offer to try again.
+        Some(e) if none_loaded => Err(e),
+        _ => Ok(total),
+    }
 }
 
 /// A row of the unified calendar view.
@@ -1499,13 +1943,67 @@ mod tests {
             .collect()
     }
 
+    /// A listing of the whole calendar.
+    const WHOLE: calendar::Band = calendar::Band::everything();
+
+    /// A save to last year's event, then a complete fetch of the live band that (rightly) doesn't
+    /// list it: the row stays, as no band but history's may remove it, and the save isn't settled
+    /// there, so history's own fetch, lagging behind the save, can't put the old version back.
+    #[test]
+    fn a_live_fetch_leaves_a_saved_history_row_alone() {
+        let (_d, conn, cal) = store();
+        let edit = super::super::CalendarEditState::default();
+        let mut old = event("old", "Offsite", "\"1\"", "2025-10-09T10:00:00Z");
+        old.start = "2025-10-12T09:00:00Z".into();
+        let live = event("a", "Dentist", "\"1\"", "2026-10-09T10:00:00Z");
+        write_fetched_events(
+            &conn,
+            &edit,
+            &cal,
+            &WHOLE,
+            vec![old.clone(), live.clone()],
+            true,
+            Instant::now(),
+        )
+        .unwrap();
+        let mut saved = old.clone();
+        saved.summary = "Offsite (renamed)".into();
+        saved.etag = Some("\"2\"".into());
+        calendar::apply_write_effect(&conn, CAL, std::slice::from_ref(&saved), &[]).unwrap();
+        edit.recent
+            .lock()
+            .unwrap()
+            .record_upsert(saved, Stamp::now());
+        let at = |s: &str| crate::calendar_history::start_instant(s).unwrap();
+        let band = calendar::Band::live(at("2026-10-01T00:00:00Z"), at("2027-12-01T00:00:00Z"));
+        write_fetched_events(&conn, &edit, &cal, &band, vec![live], true, Instant::now()).unwrap();
+        assert_eq!(titles(&conn), vec!["Offsite (renamed)", "Dentist"]);
+        assert!(
+            !edit.recent.lock().unwrap().is_empty(),
+            "not settled by a band that doesn't hold it"
+        );
+        // History's fetch, begun after the save but still listing the old version.
+        let history = calendar::Band::before(at("2026-10-01T00:00:00Z"));
+        write_fetched_events(
+            &conn,
+            &edit,
+            &cal,
+            &history,
+            vec![old],
+            true,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(titles(&conn), vec!["Offsite (renamed)", "Dentist"]);
+    }
+
     #[test]
     fn a_sync_that_began_before_a_save_cant_put_the_old_version_back() {
         let (_d, conn, cal) = store();
         let edit = super::super::CalendarEditState::default();
         let before = Instant::now();
         let old = event("a", "Dentist", "\"1\"", "2026-10-09T10:00:00Z");
-        write_fetched_events(&conn, &edit, &cal, vec![old.clone()], true, before).unwrap();
+        write_fetched_events(&conn, &edit, &cal, &WHOLE, vec![old.clone()], true, before).unwrap();
         // The save lands after that sync began.
         let saved = event("a", "Dentist (moved)", "\"2\"", "2026-10-09T11:00:00Z");
         edit.recent
@@ -1513,14 +2011,23 @@ mod tests {
             .unwrap()
             .record_upsert(saved.clone(), Stamp::now());
         // The older fetch finishes now, still showing the old version: the save stays.
-        write_fetched_events(&conn, &edit, &cal, vec![old], true, before).unwrap();
+        write_fetched_events(&conn, &edit, &cal, &WHOLE, vec![old], true, before).unwrap();
         assert_eq!(titles(&conn), vec!["Dentist (moved)"]);
         assert!(
             !edit.recent.lock().unwrap().is_empty(),
             "not settled by an older fetch"
         );
         // A fetch begun after the save shows it: settled.
-        write_fetched_events(&conn, &edit, &cal, vec![saved], true, Instant::now()).unwrap();
+        write_fetched_events(
+            &conn,
+            &edit,
+            &cal,
+            &WHOLE,
+            vec![saved],
+            true,
+            Instant::now(),
+        )
+        .unwrap();
         assert_eq!(titles(&conn), vec!["Dentist (moved)"]);
         assert!(edit.recent.lock().unwrap().is_empty());
     }
@@ -1532,7 +2039,16 @@ mod tests {
         let before = Instant::now();
         let a = event("a", "Dentist", "\"1\"", "2026-10-09T10:00:00Z");
         let b = event("b", "Gym", "\"1\"", "2026-10-09T10:00:00Z");
-        write_fetched_events(&conn, &edit, &cal, vec![a.clone(), b.clone()], true, before).unwrap();
+        write_fetched_events(
+            &conn,
+            &edit,
+            &cal,
+            &WHOLE,
+            vec![a.clone(), b.clone()],
+            true,
+            before,
+        )
+        .unwrap();
         edit.recent.lock().unwrap().record_delete(
             CAL,
             &a.id,
@@ -1541,7 +2057,7 @@ mod tests {
             Stamp::now(),
         );
         // An incomplete fetch only upserts, so the deleted row is removed explicitly.
-        write_fetched_events(&conn, &edit, &cal, vec![a], false, before).unwrap();
+        write_fetched_events(&conn, &edit, &cal, &WHOLE, vec![a], false, before).unwrap();
         assert_eq!(titles(&conn), vec!["Gym"]);
     }
 

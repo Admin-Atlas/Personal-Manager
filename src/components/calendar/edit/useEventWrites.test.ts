@@ -1593,14 +1593,9 @@ describe("creating an event", () => {
     ]);
     expect(writeLastCreate).toHaveBeenCalledWith(CAL);
     act(() => mod.noteCreateResult(sent, null, savedOutcome(), { name: "Me", hidden: true }));
-    act(() => mod.noteCreateResult(sent, null, savedOutcome(["outside_mirror"]), shown));
     act(() => mod.noteCreateResult(sent, null, savedOutcome(["mirror_refresh_pending"]), shown));
     expect(hook.result.current.notices.slice(1).map((n) => [n.tone, n.text])).toEqual([
       ["warn", "Created “Dentist” in Me, which is hidden here."],
-      [
-        "warn",
-        "Created “Dentist” in Google. It starts outside the months PM syncs, so it won't show here.",
-      ],
       ["ok", "Created “Dentist” in Google. PM's calendar will show it after the next refresh."],
     ]);
     writeLastCreate.mockClear();
@@ -1614,7 +1609,7 @@ describe("creating an event", () => {
     );
     const notices = hook.result.current.notices;
     expect(notices[notices.length - 1]).toEqual({
-      id: 5,
+      id: 4,
       tone: "error",
       text: "“Dentist” wasn't created: PM couldn't reach Google.",
     });
@@ -1623,7 +1618,7 @@ describe("creating an event", () => {
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
-    expect(hook.result.current.notices.map((n) => n.tone)).toEqual(["warn", "warn", "error"]);
+    expect(hook.result.current.notices.map((n) => n.tone)).toEqual(["warn", "error"]);
   });
 
   it("keeps an ambiguous create with Check again, for good, holding what was sent", async () => {

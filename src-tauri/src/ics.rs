@@ -1231,10 +1231,10 @@ mod tests {
 
     #[test]
     fn an_override_never_collides_with_the_master_row_id() {
-        // `replace_events` skips an unchanged resync only while the stored row count equals
-        // `events.len()`, and its INSERT OR REPLACE collapses two events sharing an id. Two rows
-        // at one id would therefore make that gate unreachable and delete-and-reinsert the whole
-        // calendar on every poll — the churn F-49 exists to prevent.
+        // The mirror keeps one row per id (`calendar::replace_band` keeps the last copy of a
+        // repeated one). Two events at one id would overwrite each other on every poll — one of them
+        // never shown, and the row rewritten each time — so an override must never share its
+        // master's.
         let timed = "BEGIN:VEVENT\nUID:s3\nSUMMARY:Weekly\n\
                      DTSTART:20260601T100000Z\nDTEND:20260601T103000Z\n\
                      RRULE:FREQ=WEEKLY;BYDAY=MO\nEND:VEVENT\n\

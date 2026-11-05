@@ -7,7 +7,7 @@
 // "Event's date" deadline follows (spec R1), and passes it back as `pinnedDate` to show. A read of
 // the mirror and no more: this file never imports a calendar write wrapper (the calendar write fence).
 //
-// The choices come in as a prop (`eventChoices` over `listAllCalendarEvents()`, loaded by the
+// The choices come in as a prop (`eventChoices` over `listAllCalendarEvents`, loaded by the
 // editor), because the editor needs the chosen event's date too, to show what an "Event's date"
 // deadline resolves to.
 //

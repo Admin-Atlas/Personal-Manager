@@ -85,6 +85,7 @@ function overview(editing: EditingStatus): CalendarOverview {
     window_days: 21,
     mirror_start: "2026-09-09T00:00:00Z",
     mirror_end: "2027-11-09T00:00:00Z",
+    history_ready: true,
     editing: { [ID]: editing },
     default_length: {},
     auto_meet: {},

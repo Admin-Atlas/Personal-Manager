@@ -1186,9 +1186,33 @@ export const checkGoogleCalendars = () => invoke<CalendarCheck>("check_google_ca
  *  the strict gate to also list events that finished earlier today so the view can grey them. */
 export const listCalendarEvents = () => invoke<AgendaEvent[]>("list_calendar_events");
 
-/** Every mirrored event across the widened band (previous month → ~a year ahead), for the unified
- *  calendar view (card 8). The client filters to the visible range + locally-hidden calendars. */
-export const listAllCalendarEvents = () => invoke<CalendarEvent[]>("list_all_calendar_events");
+/** Mirrored events touching `[from, to)` (ISO instants; either left out is open), for the unified
+ *  calendar view (card 8) and the pickers that list events. PM keeps every event (#1047), so a view
+ *  asks for the months around what it shows rather than for everything. `uid` narrows it to one
+ *  event's occurrences (a task's linked event, however old). The client still filters to the
+ *  visible range and locally-hidden calendars. An all-day date reads as UTC midnight, so pad a day
+ *  either side when asking by local days. */
+export const listAllCalendarEvents = (range: { from?: string; to?: string; uid?: string } = {}) =>
+  invoke<CalendarEvent[]>("list_all_calendar_events", {
+    from: range.from ?? null,
+    to: range.to ?? null,
+    uid: range.uid ?? null,
+  });
+
+/** Fetch every selected calendar's events in `[from, to)` (ISO instants, at most four years) and keep
+ *  them: how the calendar view loads the months after the live band as it scrolls to them. Waits
+ *  behind a running sync; the views re-read on `calendar://synced`. Rejects when no calendar could
+ *  be reached. */
+export const loadCalendarMonths = (from: string, to: string) =>
+  invoke<number>("load_calendar_months", { from, to });
+
+/** Kept events whose title or location holds every word of `query` (case aside, in any script), for
+ *  the search palette: one per repeating event (its next occurrence, or its last once over) and one
+ *  per occurrence on several calendars, upcoming soonest first, then past latest first; at most
+ *  `limit` (default 20, at most 50). Every kept event is searched, however old; descriptions and
+ *  guests aren't. `hidden` (the Calendar tab's hidden calendars) are left out before the limit. */
+export const searchCalendarEvents = (query: string, hidden: string[] = [], limit?: number) =>
+  invoke<CalendarEvent[]>("search_calendar_events", { query, hidden, limit: limit ?? null });
 
 /** The active PM flags anchored on a calendar event's iCal UID — for the event detail popup. */
 export const eventFlags = (uid: string) => invoke<Flag[]>("event_flags", { uid });

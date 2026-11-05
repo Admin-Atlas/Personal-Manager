@@ -26,7 +26,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "nav-calendar": {
     title: "Calendar",
-    body: "One place to see everything from the calendars you've connected (Google, Outlook and iCal subscriptions), laid over each other. Switch between Day, Week, Month, Year and Agenda (your tasks on the Runway board, or a dated list of events), jump to today, and choose which calendars show. On a Google account with editing turned on you can do most of what Google Calendar does from here: create events, change, move and delete the ones you can edit, and answer invitations, and every change goes straight to Google. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
+    body: "One place to see everything from the calendars you've connected (Google, Outlook and iCal subscriptions), laid over each other. PM keeps every event they've ever had: the first sync downloads each calendar's whole history, events that ended over a year ago are stored compressed, and months more than a year ahead load as you scroll to them. Switch between Day, Week, Month, Year and Agenda (your tasks on the Runway board, or a dated list of events), jump to today, and choose which calendars show. On a Google account with editing turned on you can do most of what Google Calendar does from here: create events, change, move and delete the ones you can edit, and answer invitations, and every change goes straight to Google. PM also reads these events to answer schedule questions in chat and to flag a project 'Due soon' when an event names it.",
   },
   "nav-documents": {
     title: "Documents",
@@ -62,7 +62,7 @@ export const HELP: Record<string, HelpEntry> = {
   },
   "sidebar-search": {
     title: "Search",
-    body: "Opens the command palette — a quick-jump to any project, file, or past conversation. You can also open it anytime with Ctrl+K (⌘K on a Mac).",
+    body: "Opens the command palette — a quick-jump to any project, file, past conversation, or calendar event. You can also open it anytime with Ctrl+K (⌘K on a Mac).",
   },
 
   // Teach (entity resolution)
@@ -169,7 +169,7 @@ export const HELP: Record<string, HelpEntry> = {
   // Command palette (Step 5b)
   "command-palette": {
     title: "Command palette",
-    body: "Type to jump anywhere: a project opens its focus view, a file opens its project with the file highlighted, a conversation reopens it, and 'Go to' jumps to a section. Use ↑↓ to move, Enter to open, Esc to close.",
+    body: "Type to jump anywhere: a project opens its focus view, a file opens its project with the file highlighted, a conversation reopens it, an event opens the Calendar on its day with its details, and 'Go to' jumps to a section. Events are found by title or place, however old, with one entry per repeating event. Use ↑↓ to move, Enter to open, Esc to close.",
   },
 
   // Documents view

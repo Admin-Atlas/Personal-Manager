@@ -48,6 +48,8 @@ interface Props {
     /** A move of it is being asked about or saved: drawn where it was dropped, dashed. */
     pending: boolean;
   };
+  /** The event's id, whether or not it drags: what a jump from Search finds the chip by. */
+  pieceOf?: string;
 }
 
 export function EventChip({
@@ -61,6 +63,7 @@ export function EventChip({
   declined = false,
   onClick,
   drag,
+  pieceOf,
 }: Props) {
   return (
     <div
@@ -78,6 +81,7 @@ export function EventChip({
       )}
       data-draft-event={ghost !== null ? "" : undefined}
       data-event-id={drag?.eventId}
+      data-piece-of={pieceOf}
       style={{
         background: eventFill(own, color, 16),
         borderLeftColor: color,

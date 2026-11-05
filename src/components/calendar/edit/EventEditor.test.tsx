@@ -3687,6 +3687,7 @@ describe("EventEditor, its calendar", () => {
     window_days: 7,
     mirror_start: "2026-09-01T00:00:00Z",
     mirror_end: "2027-11-01T00:00:00Z",
+    history_ready: true,
     editing: Object.fromEntries(accounts.map((a) => [a, "on" as const])),
     default_length: {},
     auto_meet: {},

@@ -16,8 +16,8 @@
 // exactly the rule a save sends; the list sits inside the dialog and Escape closes only it, never
 // the editor; the backend's words say where it really starts, or why it can't be saved
 // (a start the clocks skip said once), and every way to save but Check again waits for them; the
-// zone it repeats in is said when it isn't this computer's; one from before the months PM syncs is
-// said to show inside them; a rule's own day follows a moved start; and the Custom dialog, opened
+// zone it repeats in is said when it isn't this computer's; one from long ago says nothing of where
+// it shows (PM keeps every event); a rule's own day follows a moved start; and the Custom dialog, opened
 // here or handed over by quick create, closes alone on Escape and holds every save while open.
 
 import { StrictMode } from "react";
@@ -138,6 +138,7 @@ const overview: CalendarOverview = {
   window_days: 7,
   mirror_start: "2026-09-01T00:00:00Z",
   mirror_end: "2027-11-01T00:00:00Z",
+  history_ready: true,
   editing: { [ME]: "on", [WORK]: "on" },
   // Work's account makes half-hour events; Personal's has none read, so an hour.
   default_length: { [WORK]: 30 },
@@ -584,19 +585,19 @@ describe("NewEventEditor", () => {
     expect(noteHeldCreate).not.toHaveBeenCalled();
   });
 
-  it("the notice shows for a start outside the mirror and for a hidden calendar", () => {
+  it("the notice shows for a hidden calendar, and never for a start far ahead", () => {
     open({ calendarId: WORK_CAL, hidden: new Set([WORK_CAL]) });
     expect(
       screen.getByText(
         "Work is hidden in your calendar list, so the new event won't show until you show that calendar again.",
       ),
     ).toBeTruthy();
-    expect(screen.queryByText(/outside the months PM syncs/)).toBeNull();
     const start = screen.getByLabelText<HTMLInputElement>("Start date");
     start.focus();
     fireEvent.change(start, { target: { value: "12-12-2027" } });
     fireEvent.blur(start);
-    expect(screen.getByText(/^This starts outside the months PM syncs \(/)).toBeTruthy();
+    // #1047: PM keeps every event, so a start past the live band shows here like any other.
+    expect(screen.queryByText(/months PM syncs/)).toBeNull();
   });
 
   it("discard asks only when changed from the seed", () => {
@@ -1350,8 +1351,9 @@ describe("NewEventEditor", () => {
     expect(screen.getByRole("group", { name: "When" }).className.split(" ")).toContain("min-w-0");
   });
 
-  // The backend lists and lands its occurrences inside the months PM syncs, wherever it starts.
-  it("a repeat that starts before the months PM syncs says only its occurrences there show", async () => {
+  // #1047: PM keeps every event, history included, so a start long ago says nothing, repeating or
+  // not.
+  it("a repeat that starts long ago says nothing of where it shows", async () => {
     const draft: EditorFields = {
       ...seed,
       summary: "Gym",
@@ -1360,17 +1362,9 @@ describe("NewEventEditor", () => {
     };
     open({ handover: handed(draft) });
     await act(async () => {});
-    expect(
-      screen.getByText(
-        /^This starts before the months PM syncs \(.+\), so only its occurrences within them will show here\.$/,
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByText(/won't show here/)).toBeNull();
-    // Not repeating, none of it would.
+    expect(screen.queryByText(/months PM syncs|won't show here/)).toBeNull();
     await pickRepeat("Does not repeat");
-    expect(
-      screen.getByText(/^This starts outside the months PM syncs \(.+\), so it'll be saved/),
-    ).toBeTruthy();
+    expect(screen.queryByText(/months PM syncs|won't show here/)).toBeNull();
   });
 
   // The When fields already refuse a start the clocks skip, and the backend refuses a first

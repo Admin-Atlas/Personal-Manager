@@ -518,6 +518,7 @@ export function TimeGridView({
                     continuesBefore={card.continuesBefore}
                     continuesAfter={card.continuesAfter}
                     tabStop={card.tabStop}
+                    pieceOf={card.ev.id}
                     onSelect={onEventClick ? (rect) => onEventClick(card.ev, rect) : undefined}
                     drag={
                       interaction && cap

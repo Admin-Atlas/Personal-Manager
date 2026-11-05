@@ -1043,12 +1043,16 @@ export interface CalendarOverview {
   last_sync: string | null;
   /** How far ahead the focus-view agenda looks (the narrow horizon), in days. */
   window_days: number;
-  /** The mirrored band start (RFC3339): the unified view shows an "outside synced range" hint
-   *  when the user pages before this. */
+  /** The live band's start (RFC3339), the start of last month: every sync fetches from here. Before
+   *  it is history, kept whole once downloaded (`history_ready`). */
   mirror_start: string;
-  /** The mirrored band end (RFC3339): the unified view shows an "outside synced range" hint when
-   *  the user pages after this. */
+  /** The live band's end (RFC3339), 13 months out: the view loads the months after it as it scrolls
+   *  to them (`loadCalendarMonths`). */
   mirror_end: string;
+  /** Every selected Google and Outlook calendar has had its history downloaded, so a month before
+   *  `mirror_start` shows everything there is. While false, the view says older events are still
+   *  on their way. */
+  history_ready: boolean;
   /** Whether PM may edit each Google account's calendars, keyed by account id (`gcal:<email>`). */
   editing: Record<string, EditingStatus>;
   /** Google's default length for a new event, in minutes, keyed by account id like `editing`. An
@@ -2168,9 +2172,7 @@ export type SeriesChoices =
 /** Which occurrences of a repeating event a save or delete is for. */
 export type SeriesScope = "this" | "following" | "all";
 
-/** `outside_mirror`: a new event saved in Google, a one-off made to repeat, or the one event "Does
- *  not repeat" leaves of a repeating one (for all events or from one on), that starts outside the
- *  months PM mirrors, so PM's calendar won't show it. `milestone_not_offered`: a "this and
+/** `milestone_not_offered`: a "this and
  *  following" change landed, but PM couldn't tell which repeating event Google made of the new
  *  part, so the milestones `milestone_moves` lists stay on the earlier part. `partly_applied`: Google
  *  applied a one-event save without keeping all of it (a colour it wouldn't clear beside a new
@@ -2183,7 +2185,6 @@ export type SeriesScope = "this" | "following" | "all";
 export type WriteWarning =
   | "mirror_refresh_pending"
   | "left_on_old_series"
-  | "outside_mirror"
   | "milestone_not_offered"
   | "partly_applied"
   | "kept_own_reply"

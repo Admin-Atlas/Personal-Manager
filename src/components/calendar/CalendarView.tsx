@@ -37,6 +37,7 @@ import {
   listArchivedProjects,
   listTasks,
   listTaskStacks,
+  loadCalendarMonths,
   onCalendarSynced,
   onCalendarWriteLanded,
   onTasksChanged,
@@ -44,6 +45,15 @@ import {
   syncCalendar,
 } from "../../lib/ipc";
 import type { CalendarEvent, CalendarOverview, Milestone, Task, TaskStack } from "../../lib/types";
+import {
+  laterToLoad,
+  nextWindow,
+  rangeHintText,
+  windowAround,
+  windowRead,
+  type LaterLoad,
+  type MonthWindow,
+} from "../../lib/calendarWindow";
 import { subscribeUntilCleanup } from "../../lib/subscribe";
 import { taskOverlayEvents } from "../../lib/runway";
 import { askOwnerFor, copyRank, duplicable, eventRights } from "../../lib/calendarEdit/editReasons";
@@ -187,6 +197,21 @@ let cachedPinboard: PinboardEntry[] = [];
 let cachedTasks: Task[] = [];
 let cachedStacks: TaskStack[] = [];
 let cachedArchived: Set<string> = new Set();
+// The stretch of the mirror the view reads (#1047): PM keeps every event, so the view asks for the
+// months around the cursor, and moves that stretch once the cursor nears an edge.
+let cachedWindow: MonthWindow | null = null;
+const WINDOW_BACK = 18;
+const WINDOW_AHEAD = 18;
+const WINDOW_MARGIN = 6;
+// The months after the live band loaded from the calendars this session (`YYYY-MM`), kept across tab
+// switches, so scrolling back to one doesn't fetch it again. A save or a Refresh forgets them, as a
+// change there is only seen by loading them again.
+const laterLoaded = new Set<string>();
+// The months a load has been asked for and hasn't answered yet, so moving the cursor meanwhile
+// doesn't ask for them again.
+const laterPending = new Set<string>();
+// How far past the visible months the view loads ahead, so scrolling on doesn't wait at each month.
+const LATER_LEAD_MONTHS = 2;
 // A quick-create draft whose box went with the tab, titled and with nothing sent (a click in the
 // sidebar switches tabs, and a titled box stays through a click): it opens again on return.
 let leftQuick: LeftDraft | null = null;
@@ -275,9 +300,24 @@ interface CalendarViewProps {
   onOpenPinboard?: () => void;
   /** Open the Calendar in a window of its own (#1039). Absent in that window itself. */
   onPopOut?: () => void;
+  /** An event to show, from the search palette (#1047): the view moves to its day and opens its
+   *  details. A new `nonce` shows it again. */
+  reveal?: { event: CalendarEvent; nonce: number } | null;
+  /** Called once `reveal` is taken, so the owner can drop it and a later visit doesn't jump. */
+  onRevealTaken?: () => void;
 }
 
-export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: CalendarViewProps) {
+/** How long a revealed event may take to be drawn before its details open over the grid instead
+ *  (its months still loading, or a view that draws no piece of it, like the Year view). */
+const REVEAL_WAIT_MS = 1500;
+
+export function CalendarView({
+  onOpenProject,
+  onOpenPinboard,
+  onPopOut,
+  reveal,
+  onRevealTaken,
+}: CalendarViewProps) {
   const { system, accent, colorblind } = useTheme();
   const { coords } = useUserTime();
   const [overview, setOverview] = useState<CalendarOverview | null>(() => cachedOverview);
@@ -351,9 +391,15 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
   // closing and its row arriving (`ghostAfterRead`).
   const [landed, setLanded] = useState<LandedGhost | null>(null);
   const readsStarted = useRef(0);
+  // The months of the mirror read (#1047): around the cursor, moved once it nears an edge. A ref
+  // beside the state, as the read below must stay one function (`useMirrorReads`).
+  const [loadWindow, setLoadWindow] = useState<MonthWindow>(
+    () => cachedWindow ?? windowAround(cursor, WINDOW_BACK, WINDOW_AHEAD),
+  );
+  const windowRef = useRef(loadWindow);
   const readEvents = useCallback(() => {
     readsStarted.current += 1;
-    return listAllCalendarEvents();
+    return listAllCalendarEvents(windowRead(windowRef.current));
   }, []);
   const applyEvents = useCallback((evts: CalendarEvent[]) => {
     setEvents(evts);
@@ -373,6 +419,57 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
   // by a read that knows how it ended. A delete that settles reads again.
   const loadEvents = useMirrorReads(readEvents, applyEvents, eventsReadFailed);
 
+  // What's on show nearing an edge of the months read moves them, and reads the new stretch. The
+  // visible range, not the cursor: a Year view shows months up to eleven away from it.
+  useEffect(() => {
+    const visible = visibleRange(view, cursor, dayCount);
+    setLoadWindow((w) => nextWindow(w, visible, cursor, WINDOW_BACK, WINDOW_AHEAD, WINDOW_MARGIN));
+  }, [view, cursor, dayCount]);
+  useEffect(() => {
+    if (windowRef.current === loadWindow) return;
+    windowRef.current = loadWindow;
+    cachedWindow = loadWindow;
+    void loadEvents();
+  }, [loadWindow, loadEvents]);
+
+  // Months after the live band load from the calendars as the view reaches them (Bobby: "lazy
+  // loading and only loading when we scroll to it"): the visible months and a couple after, once a
+  // session. The backend tells every view when they've landed (`calendar://synced`). `laterEpoch`
+  // moves when a save or a Refresh forgets what was loaded, so the months on screen load again.
+  const [later, setLater] = useState<LaterLoad>("idle");
+  const [laterEpoch, setLaterEpoch] = useState(0);
+  const forgetLater = useCallback(() => {
+    laterLoaded.clear();
+    setLaterEpoch((n) => n + 1);
+  }, []);
+  const mirrorEnd = overview?.mirror_end ?? null;
+  const anySelected = overview?.calendars.some((c) => c.selected) ?? false;
+  useEffect(() => {
+    if (mirrorEnd === null || !anySelected) return;
+    const { start, end } = visibleRange(view, cursor, dayCount);
+    const lead = new Date(end.getFullYear(), end.getMonth() + LATER_LEAD_MONTHS, 1);
+    const known = new Set([...laterLoaded, ...laterPending]);
+    const need = laterToLoad({ start, end: lead }, mirrorEnd, known);
+    if (!need) {
+      // Nothing to ask for: done, unless an earlier ask for these months is still out.
+      if (laterPending.size === 0) setLater((s) => (s === "loading" ? "idle" : s));
+      return;
+    }
+    for (const m of need.months) laterPending.add(m);
+    setLater("loading");
+    // The answer lands whether or not the cursor has moved on meanwhile: those months are loaded
+    // either way, and the hint says how the last ask went.
+    void loadCalendarMonths(need.from, need.to)
+      .then(() => {
+        for (const m of need.months) laterLoaded.add(m);
+        return "idle" as const;
+      })
+      .catch(() => "failed" as const)
+      .then((done) => {
+        for (const m of need.months) laterPending.delete(m);
+        if (aliveRef.current) setLater(done);
+      });
+  }, [mirrorEnd, anySelected, view, cursor, dayCount, laterEpoch]);
   const loadMilestones = useCallback(async () => {
     try {
       const ms = await listAllMilestones();
@@ -449,10 +546,13 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
   useEffect(() => {
     let alive = true;
     let unlisten: (() => void) | null = null;
-    // Milestones too: a linked one takes its date from its event, so moving the event moves it.
+    // Milestones too: a linked one takes its date from its event, so moving the event moves it. A
+    // save may have put an event (or a repeating one's occurrences) in months after the live band,
+    // which only loading them again shows.
     void onCalendarWriteLanded(() => {
       void loadEvents();
       void loadMilestones();
+      forgetLater();
     })
       .then((stop) => {
         if (alive) unlisten = stop;
@@ -463,7 +563,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
       alive = false;
       unlisten?.();
     };
-  }, [loadEvents, loadMilestones]);
+  }, [loadEvents, loadMilestones, forgetLater]);
 
   // A sync or the ~30 s change check wrote events (a change made in Google, say): re-read, so the
   // open calendar shows it without waiting for a focus change. The overview too, for "synced".
@@ -526,6 +626,8 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
   const onRefresh = useCallback(async () => {
     setSyncing(true);
     setError(null);
+    // The months after the live band are read again too: a sync only fetches the live band.
+    forgetLater();
     try {
       await syncCalendar();
       await Promise.all([
@@ -540,7 +642,7 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
     } finally {
       if (aliveRef.current) setSyncing(false);
     }
-  }, [loadEvents, loadOverview, loadMilestones, loadPinboard, loadTasks]);
+  }, [loadEvents, loadOverview, loadMilestones, loadPinboard, loadTasks, forgetLater]);
 
   // The visibility TOGGLES moved to the sidebar block (one control, one home), so this view only
   // reads the set — but the sidebar is mounted right beside it, so a tick there has to land here
@@ -1266,6 +1368,70 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
     });
   }, []);
 
+  // A search hit (#1047): move to its day, in whatever view is on, then open its details on its
+  // first piece once that's drawn (`data-piece-of`, on every piece whether or not it drags), focused
+  // so Escape hands focus back to it. The hit came from the store, so the ranged read around the new
+  // cursor brings it in. The same occurrence on two calendars is drawn once (`visibleEvents`), so the
+  // hit lands on the copy the view kept. A view that draws no piece of it (Year) opens them over the
+  // grid once it's read; one it never shows (filtered out meanwhile) after REVEAL_WAIT_MS.
+  const [revealing, setRevealing] = useState<CalendarEvent | null>(null);
+  const revealNonce = reveal?.nonce;
+  const revealTakenRef = useRef(onRevealTaken);
+  revealTakenRef.current = onRevealTaken;
+  useEffect(() => {
+    if (!reveal) return;
+    const ev = reveal.event;
+    const day = parseLocal(ev.start, ev.all_day);
+    if (day) setCursor(view === "week" ? startOfWeek(day) : day);
+    setEventPopup(null);
+    setRevealing(ev);
+    revealTakenRef.current?.();
+    // Only a new reveal moves the view: switching views afterwards mustn't jump back to it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealNonce]);
+  useEffect(() => {
+    if (!revealing) return;
+    const key = occurrenceKey(revealing);
+    const shown =
+      shownEvents.find((e) => e.id === revealing.id) ??
+      (key !== null ? shownEvents.find((e) => occurrenceKey(e) === key) : undefined);
+    const target = shown ?? revealing;
+    const pieceOf = () => {
+      const pieces = [...document.querySelectorAll<HTMLElement>("[data-piece-of]")].filter(
+        (el) => el.dataset.pieceOf === target.id,
+      );
+      return pieces.find((el) => el.tabIndex === 0) ?? pieces[0] ?? null;
+    };
+    const open = (anchor: DOMRect) => {
+      setRevealing(null);
+      setEventPopup({ ev: target, anchor });
+    };
+    const overGrid = () => {
+      const grid = gridWrapperRef.current?.getBoundingClientRect();
+      const left = grid ? grid.left + grid.width / 2 : window.innerWidth / 2;
+      return new DOMRect(left, (grid?.top ?? 0) + 48, 0, 0);
+    };
+    const read = shown !== undefined;
+    const frame = requestAnimationFrame(() => {
+      const el = pieceOf();
+      if (el) {
+        el.scrollIntoView?.({ block: "center", inline: "nearest" });
+        el.focus({ preventScroll: true });
+        open(el.getBoundingClientRect());
+      } else if (read) {
+        open(overGrid());
+      }
+    });
+    const fallback = window.setTimeout(
+      () => open(pieceOf()?.getBoundingClientRect() ?? overGrid()),
+      REVEAL_WAIT_MS,
+    );
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(fallback);
+    };
+  }, [revealing, shownEvents]);
+
   // A drop: shown at once where it went, sent at once when it asks nothing, else asked about in
   // `MoveFlow`, one at a time.
   const drops = useMoveDrops({
@@ -1319,26 +1485,16 @@ export function CalendarView({ onOpenProject, onOpenPinboard, onPopOut }: Calend
     announce,
   });
 
-  // "Outside the synced range" hint: fires when the visible window falls before mirror_start or after
-  // mirror_end (the mirror is a fixed −1…+13-month band, so paging far enough leaves it). Neutral, not
-  // an error — the band is by design. Today/now logic elsewhere never assumes today is inside the band.
-  const rangeHint = useMemo(() => {
-    if (!overview || runwayShown) return null;
-    const ms = new Date(overview.mirror_start);
-    const me = new Date(overview.mirror_end);
-    if (Number.isNaN(ms.getTime()) || Number.isNaN(me.getTime())) return null;
-    // Compare on LOCAL calendar days, not raw instants: the band bounds are UTC-ish while the visible
-    // window is built from local midnights, so a sub-day tz offset at a band edge would otherwise trip
-    // the hint on a month whose every displayed day is actually in-band. `end` is exclusive → last
-    // visible day is end−1.
-    const { start, end } = visibleRange(view, cursor, dayCount);
-    const bandStart = startOfDay(ms).getTime();
-    const bandEnd = startOfDay(me).getTime();
-    const firstVisible = startOfDay(start).getTime();
-    const lastVisible = startOfDay(addDays(end, -1)).getTime();
-    if (firstVisible >= bandStart && lastVisible <= bandEnd) return null;
-    return `Outside the synced range — only ${formatDateLocal(ms)} – ${formatDateLocal(me)} is mirrored.`;
-  }, [overview, view, cursor, dayCount, runwayShown]);
+  // What the view says when what it shows isn't all here yet (#1047): months after the live band
+  // loading, or not reached; or, before it, a calendar's history still downloading. PM keeps every
+  // event, so otherwise there's nothing to say. Neutral, not an error.
+  const rangeHint = useMemo(
+    () =>
+      overview && !runwayShown
+        ? rangeHintText(overview, visibleRange(view, cursor, dayCount), later)
+        : null,
+    [overview, view, cursor, dayCount, runwayShown, later],
+  );
 
   // The count the Terminal chrome strip shows at Power depth. For the bounded grids it's the events
   // touching the visible period (so it matches what's on screen, not the whole −1..+13-month mirror);

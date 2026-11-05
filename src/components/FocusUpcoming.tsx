@@ -19,13 +19,15 @@
 // hour windows are its OWN (readFocusUpcomingBounds), so tightening Work to suit this pane doesn't
 // tighten the full-page week grid. The editor itself is the Calendar tab's RangeControl, reused.
 //
-// The list uses the focus agenda feed the parent already loads; the grid lazily pulls the full mirror
-// (listAllCalendarEvents) so days either side of today are populated. Synced events only — the same
-// set the agenda shows — with no first-party overlays (milestones live on the Calendar tab).
+// The list uses the focus agenda feed the parent already loads; the grid lazily pulls the mirror
+// (listAllCalendarEvents) for the months around the days it shows, so days either side of today are
+// populated. Synced events only — the same set the agenda shows — with no first-party overlays
+// (milestones live on the Calendar tab).
 
 import { useEffect, useMemo, useState } from "react";
 import type { AgendaEvent, Calendar, CalendarEvent } from "../lib/types";
 import { listAllCalendarEvents, onCalendarSynced } from "../lib/ipc";
+import { nextWindow, windowAround, windowRead, type MonthWindow } from "../lib/calendarWindow";
 import { useHorizontalWheelShift } from "../lib/useHorizontalWheelShift";
 import { resolveRangeBounds } from "../lib/calendarGeom";
 import { readHidden, swipeDays, type CalendarRange, type RangeBounds } from "../lib/calendarPrefs";
@@ -59,9 +61,14 @@ const NOOP = () => {};
  *  card whole rather than hitting the floor and scrolling. See the header comment. */
 const COMPACT_MIN_ROW_H = 12;
 
-// Last-good full mirror for the grid, kept in module scope so switching to Week (or back to the tab)
+// Last-good events for the grid, kept in module scope so switching to Week (or back to the tab)
 // doesn't flash an empty grid before the read lands — mirrors FocusView's other caches.
 let cachedAllEvents: CalendarEvent[] = [];
+// The months the grid reads: a couple either side of the days it shows, moved once those near an
+// edge (`nextWindow`). The pane steps a day or a few at a time, so this rarely moves.
+const WINDOW_BACK = 2;
+const WINDOW_AHEAD = 3;
+const WINDOW_MARGIN = 1;
 
 interface Props {
   /** The focus agenda feed (upcoming synced events, incl. today's already-ended). Used by List mode. */
@@ -127,7 +134,17 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
     });
   }
 
-  // Lazily load the full mirror only while the grid is on (List mode needs nothing extra). Refresh on
+  // The months read, around the anchor (#1047: the mirror keeps every event, so the grid asks only
+  // for what's near the days it shows).
+  const [readWindow, setReadWindow] = useState<MonthWindow>(() =>
+    windowAround(anchor, WINDOW_BACK, WINDOW_AHEAD),
+  );
+  useEffect(() => {
+    const visible = { start: anchor, end: addDays(anchor, days) };
+    setReadWindow((w) => nextWindow(w, visible, anchor, WINDOW_BACK, WINDOW_AHEAD, WINDOW_MARGIN));
+  }, [anchor, days]);
+
+  // Lazily load the mirror only while the grid is on (List mode needs nothing extra). Refresh on
   // window focus so an edit made elsewhere shows on return, and when a sync or the ~30 s change check
   // writes events. Keep the last-good set on a read failure.
   useEffect(() => {
@@ -135,7 +152,7 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
     let alive = true;
     let unlisten: (() => void) | null = null;
     const load = () => {
-      void listAllCalendarEvents()
+      void listAllCalendarEvents(windowRead(readWindow))
         .then((evts) => {
           if (!alive) return;
           setAllEvents(evts);
@@ -158,7 +175,7 @@ export function FocusUpcoming({ listEvents, calendars, onOpenProject }: Props) {
       window.removeEventListener("focus", load);
       unlisten?.();
     };
-  }, [mode]);
+  }, [mode, readWindow]);
 
   const gridDays = useMemo(
     () => Array.from({ length: days }, (_, i) => addDays(anchor, i)),

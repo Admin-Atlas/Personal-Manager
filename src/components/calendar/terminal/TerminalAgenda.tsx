@@ -117,6 +117,7 @@ export function TerminalAgenda({ events, colorOf, days, fromDay, now, onEventCli
                   return (
                     <li
                       key={ev.id}
+                      data-piece-of={ev.id}
                       className={cn(
                         "flex items-baseline gap-2 text-sm",
                         clickable && "cursor-pointer rounded-[var(--radius-sm)] hover:bg-surface",

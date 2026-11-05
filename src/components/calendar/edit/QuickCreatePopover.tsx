@@ -673,7 +673,7 @@ export function QuickCreatePopover({
   const lines = [...new Set(check.problems.map(problemText))];
   const notes = [
     ...(timeOff ? [NO_ZONE_CREATE] : []),
-    ...createNotes(t, draft.recurrence.kind === "rule", overview, hidden, calendarId),
+    ...createNotes(overview, hidden, calendarId),
     // The compact button has no line of its own (critique C2-L4).
     ...(meetNote !== null ? [meetNote] : []),
   ];
