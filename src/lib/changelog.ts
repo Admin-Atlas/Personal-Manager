@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.172.0-alpha",
+    date: "2026-11-05",
+    highlights: [
+      "When a link PM opens for you doesn't open, because your browser or mail app didn't start, PM now tells you instead of doing nothing. For an email address it shows the address, so you can copy it.",
+      "Under the hood, PM is getting ready for mods, the add-ons coming soon. A mod will run in a sealed frame that can't reach the internet, your files or the rest of PM on its own, and PM checks every mod's signature before it runs. Nothing changes in how you use PM today.",
+    ],
+  },
+  {
     version: "3.171.0-alpha",
     date: "2026-11-05",
     highlights: [
