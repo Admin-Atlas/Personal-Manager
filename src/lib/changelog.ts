@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.169.2-alpha",
+    date: "2026-11-05",
+    highlights: [
+      "Removing the speech model in Settings → Storage now removes only the speech model. It used to delete PM's search models too, so search and indexing had to download them again, and couldn't offline. The size shown for it is now its own, and the total no longer counts the search model twice.",
+      "Save as note under a chat answer works again. It failed every time; your saved answers now become notes you can search, and saving the same answer twice updates it instead of making a copy.",
+    ],
+  },
+  {
     version: "3.169.1-alpha",
     date: "2026-11-03",
     release: true,

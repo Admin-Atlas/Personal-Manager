@@ -1296,6 +1296,16 @@ struct ExistingNote {
     vault_path: String,
 }
 
+/// Whether `id` may name a note: non-empty, and only ASCII letters, digits, `-` and `_`. The derived
+/// vault name is then always one ordinary filename inside the vault that can't point anywhere else.
+/// Pinboard ids (a UUID, or the `w-…` fallback) and Chat's `chat-<message id>` all pass.
+fn valid_note_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_note_document(
     state: &AppState,
@@ -1308,6 +1318,12 @@ pub fn ingest_note_document(
     title: &str,
     body: &str,
 ) -> Result<Document> {
+    // The note is named by its widget id, which arrives over IPC, so the id is checked before
+    // anything else: it used to be checked only after the body had been chunked and embedded, so a
+    // refused id (Chat's old `chat:<id>`) paid for a full embed and then failed.
+    if !valid_note_id(widget_id) {
+        return Err(Error::Other("invalid note id".into()));
+    }
     let source_id = format!("note:{widget_id}");
     let content_hash = crate::index_only::pointer_content_hash(&source_id, body);
 
@@ -1403,17 +1419,8 @@ pub fn ingest_note_document(
         None => Vec::new(),
     };
 
-    // The note is named by its widget id, which arrives over IPC. Restrict it to a conservative id
-    // charset so the derived name is always a single, ordinary filename inside the vault and can't
-    // point anywhere else. Real ids (a UUID, or the `w-…` fallback) are unaffected.
-    if widget_id.is_empty()
-        || !widget_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(Error::Other("invalid note id".into()));
-    }
-    // Name the file by the stable widget id so an edit overwrites the same file.
+    // Name the file by the stable widget id (checked by `valid_note_id` above) so an edit overwrites
+    // the same file.
     let vault_name = cipher.on_disk_name(&format!("note-{widget_id}.md"));
     let vault_file = vault.join(&vault_name);
     // If we're overwriting an existing note's file in place, snapshot its bytes first so a failed DB
@@ -4869,6 +4876,21 @@ impl OptionalExists for std::result::Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_ids_from_the_pinboard_and_chat_are_accepted() {
+        assert!(valid_note_id("3f2b9c1e-8a4d-4f6b-9c2e-1a2b3c4d5e6f"));
+        assert!(valid_note_id("w-1730800000000-ab12"));
+        assert!(valid_note_id("chat-42"));
+    }
+
+    #[test]
+    fn note_ids_that_could_leave_one_vault_filename_are_refused() {
+        // `chat:42` is the id Chat used to send, which is why every "Save as note" failed.
+        for bad in ["", "chat:42", "../x", "a/b", "a\\b", "a.md", "a b", "é"] {
+            assert!(!valid_note_id(bad), "{bad:?} must be refused");
+        }
+    }
 
     #[test]
     fn an_imported_file_is_its_own_source() {
