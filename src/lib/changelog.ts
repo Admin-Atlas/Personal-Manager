@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.173.1-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "Under-the-hood tidying. The note editor picks up fixes for typing, among them Enter and Backspace no longer acting while you're still composing a character with an input method. The map's layout, the tools PM is built and tested with and a few building blocks underneath are updated too. Nothing else changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.173.0-alpha",
     date: "2026-11-05",
     highlights: [
