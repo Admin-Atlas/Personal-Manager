@@ -82,7 +82,11 @@ export const LOCKS = [
  *                    LicenseRef-AGG-2.3 (Anti-Grain Geometry 2.3: copy, use, modify, sell and
  *                    distribute, keeping the notice), bzip2-1.0.6 (bzip2, linked statically into
  *                    the FreeType in pillow's Linux wheel: BSD-style, with an altered version to be
- *                    marked as such).
+ *                    marked as such), OFL-1.1 (the SIL Open Font License, for fonts: OpenCV 5 compiles
+ *                    its Rubik font into cv2, for putText, which PM never calls. A font under it may
+ *                    be used, embedded and redistributed with any software; what it forbids is selling
+ *                    the font on its own, and releasing a modified font under another licence.
+ *                    Allowed for every package, Bobby 2026-11-06).
  *
  * Adding an entry is a decision: it means PM is prepared to put that licence on a user's machine.
  * Note what is deliberately absent — no GPL of any version outside the GCC runtime's exception, and
@@ -134,6 +138,7 @@ const ALLOWED = new Set([
   "WTFPL",
   "LicenseRef-AGG-2.3",
   "bzip2-1.0.6",
+  "OFL-1.1",
 ]);
 
 /**
@@ -158,19 +163,13 @@ export const PACKAGE_EXCEPTIONS = {
   // rubberband and vidstab (GPL-2.0-or-later; GPL-3.0-or-later as a whole); every x86_64 wheel
   // links Intel's IPP ICV statically (binary-only terms); the Linux wheel carries OpenSSL 1.1.1
   // (the old OpenSSL licence, and end-of-life upstream). Accepted for now, 2026-11-06 (Bobby chose
-  // "Accept now, look for a swap"); a board card looks for photo OCR without OpenCV.
-  //
-  // OFL-1.1 was found after that decision and is allowed here under it, for the same package and
-  // the same swap: OpenCV 5 compiles its built-in Rubik font (SIL Open Font License 1.1) into
-  // every wheel, for putText, which PM never calls. The OFL lets the font be used, embedded and
-  // redistributed with any software; what it forbids is selling the font on its own, and releasing
-  // a modified font under any other licence.
+  // "Accept now, look for a swap"); a board card looks for photo OCR without OpenCV. (Its fonts'
+  // OFL-1.1 is on the general list above, not here: it is a permissive font licence.)
   "opencv-python-headless": [
     "GPL-3.0-or-later",
     "GPL-2.0-or-later",
     "LicenseRef-Intel-ISSL",
     "OpenSSL",
-    "OFL-1.1",
   ],
 };
 
