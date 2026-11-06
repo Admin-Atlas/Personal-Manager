@@ -255,6 +255,32 @@ describe("Forget the backup passphrase", () => {
   });
 });
 
+describe("Proton's own usage reporting", () => {
+  // PM can't switch off what Proton's CLI reports: it follows the Proton account's own setting.
+  // So the section says where that setting is, connected or not, once the CLI is there.
+  it("says where to turn it off, connected or not", async () => {
+    await mountPanel();
+    expect(await screen.findByText(/Collect usage diagnostics/)).toBeTruthy();
+    // The CLI reads the setting only when it signs in, so a connected user has to sign in again.
+    expect(screen.getByText(/disconnect it and connect it again/)).toBeTruthy();
+    expect(screen.getByText(/reads that setting\s+only when it signs in/)).toBeTruthy();
+    // And what reconnecting can't stop: a crash before the tool has read the setting.
+    expect(screen.getByText(/fails while starting up/)).toBeTruthy();
+    cleanup();
+    protonStatus.mockResolvedValue({ connected: false, account: null, error: null });
+    await mountPanel();
+    expect(await screen.findByText(/Collect usage diagnostics/)).toBeTruthy();
+    expect(screen.getByText(/Privacy and data collection/)).toBeTruthy();
+  });
+
+  it("says nothing about it before the CLI is installed", async () => {
+    protonCliStatus.mockResolvedValue({ installed: false, path: null, install_url: "https://x" });
+    await mountPanel();
+    await screen.findByText(/isn.t installed/);
+    expect(screen.queryByText(/Collect usage diagnostics/)).toBeNull();
+  });
+});
+
 describe("Disconnect a backup destination", () => {
   it("asks first for Proton, and says what survives and what stops", async () => {
     await mountPanel();

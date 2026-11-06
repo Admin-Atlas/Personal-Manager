@@ -22,6 +22,21 @@ import { remarkPlainLines } from "./markdownPlainLines";
 // the two halves are deliberately separate so the pure suite keeps its node environment.
 
 describe("safeUrl", () => {
+  it("gives an image no source at all, whatever its URL", () => {
+    for (const url of [
+      "https://example.com/x.png",
+      "/local.png",
+      "./rel.png",
+      "#a",
+      "data:image/png;base64,AA",
+    ]) {
+      expect(safeUrl(url, "src"), url).toBe("");
+    }
+    // A link's URL is judged as before.
+    expect(safeUrl("https://example.com/x", "href")).toBe("https://example.com/x");
+    expect(safeUrl("/path", "href")).toBe("/path");
+  });
+
   it("keeps http(s) / mailto absolute URLs", () => {
     expect(safeUrl("https://example.com/x")).toBe("https://example.com/x");
     expect(safeUrl("http://example.com")).toBe("http://example.com");

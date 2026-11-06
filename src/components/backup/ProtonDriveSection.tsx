@@ -127,6 +127,18 @@ export function ProtonDriveSection({
           onClearRestored={onClearRestored}
         />
       )}
+      {proton?.installed && (
+        <p className="mt-2 max-w-sm text-xs text-ink4">
+          Proton&rsquo;s command-line tool sends Proton usage statistics and crash and error reports
+          if your Proton account allowed it when the tool last signed in, as accounts do by default.
+          It can also send a crash report if it fails while starting up, before it has read that
+          setting. PM can&rsquo;t switch either off. To stop the rest, sign in to Proton on the web
+          and turn off <span className="text-ink3">Collect usage diagnostics</span> under Settings
+          &rarr; All settings &rarr; Security and privacy &rarr; Privacy and data collection. Then,
+          if Proton Drive is connected here, disconnect it and connect it again: the tool reads that
+          setting only when it signs in.
+        </p>
+      )}
       <SectionInfo title="How Proton Drive backups work">
         <p>
           Keep your encrypted backups off-machine on your own Proton Drive — end-to-end-encrypted

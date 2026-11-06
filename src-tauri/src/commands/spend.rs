@@ -36,9 +36,10 @@ pub struct CostSummary {
 }
 
 /// Per-model spend (trailing 30 days + all time) joined against the cached OpenRouter
-/// prices. CHECK-ON-READ: if the price cache is empty or older than a day, refresh it
-/// from the public catalogue first (no key, no model call, no scheduler — mirrors the
-/// briefing's staleness rule). Read-mostly; safe on every Settings open.
+/// prices. CHECK-ON-READ: if an OpenRouter key is stored and the price cache is empty or older
+/// than a day, refresh it from the public catalogue first (the request itself needs no key; no
+/// model call, no scheduler — mirrors the briefing's staleness rule). Without a key nothing is
+/// fetched: see [`ensure_pricing_fresh`]. Read-mostly; safe on every Settings open.
 #[tauri::command]
 pub async fn cost_summary(app: AppHandle) -> Result<CostSummary> {
     // Best-effort refresh: if it fails (offline, etc.) still return the summary —
@@ -166,9 +167,18 @@ pub(super) fn log_background_usage(
     }
 }
 
-/// Refresh the cached pricing when it's stale (check-on-read). Resolves staleness
-/// under a short lock, then does the network fetch + upsert without holding it (rule #4).
+/// Refresh the cached pricing when it's stale (check-on-read), for a user who has chosen OpenRouter.
+/// Resolves staleness under a short lock, then does the network fetch + upsert without holding it
+/// (rule #4).
+///
+/// Only with an OpenRouter key stored (the main one or a background-only one): opening Settings →
+/// AI & Models must not contact openrouter.ai for someone who never set it up, a local-AI-only user
+/// above all. Such a user reaches it only by pressing "Refresh prices" or opening the model
+/// picker. A keychain that can't be read counts as no key, so the check fails closed.
 async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
+    if !uses_openrouter(&crate::secrets::get_background_or_primary_key()) {
+        return Ok(());
+    }
     let stale = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -186,6 +196,12 @@ async fn ensure_pricing_fresh(app: &AppHandle) -> Result<()> {
         refresh_pricing_now(app).await?;
     }
     Ok(())
+}
+
+/// Whether the stored-key read says this user has chosen OpenRouter: a key is there. No key, and a
+/// read that failed, both say no.
+fn uses_openrouter<T>(key: &Result<Option<T>>) -> bool {
+    matches!(key, Ok(Some(_)))
 }
 
 /// Pull the public OpenRouter catalogue (no key) and upsert every model's prices into the cache,
@@ -356,6 +372,60 @@ fn total_cost(rows: &[ModelSpend]) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::commands::shared::temp_db;
+
+    /// The automatic price refresh runs only for a user with an OpenRouter key; with none, or with a
+    /// keychain that can't be read, Settings → AI & Models contacts nothing.
+    #[test]
+    fn prices_refresh_by_themselves_only_with_a_key_stored() {
+        assert!(uses_openrouter::<&str>(&Ok(Some("sk-or-v1-a"))));
+        assert!(!uses_openrouter::<&str>(&Ok(None)));
+        assert!(!uses_openrouter::<&str>(&Err(crate::error::Error::Other(
+            "keychain locked".into()
+        ))));
+    }
+
+    /// The gate is wired in, not only defined: `ensure_pricing_fresh` asks it first, before the
+    /// staleness read and the fetch, and `cost_summary` is the one caller that refreshes by itself.
+    /// The names are built from parts so this test can't match itself.
+    #[test]
+    fn the_automatic_refresh_asks_for_a_key_before_anything_else() {
+        let src = include_str!("spend.rs");
+        let sig = concat!("async fn ensure_pricing_", "fresh(");
+        assert_eq!(src.matches(sig).count(), 1);
+        let body = src.split(sig).nth(1).unwrap();
+        let body = &body[..body.find("\n}\n").unwrap()];
+        // Code only: a commented-out gate must not count as one, in either comment form.
+        let mut body: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        while let Some(open) = body.find("/*") {
+            let close = body[open..]
+                .find("*/")
+                .map_or(body.len(), |end| open + end + 2);
+            body.replace_range(open..close, "");
+        }
+        let gate = body
+            .find(concat!(
+                "if !uses_open",
+                "router(&crate::secrets::get_background_or_primary_key()) {"
+            ))
+            .expect("the key check");
+        let stale = body
+            .find(concat!("let ", "stale"))
+            .expect("the staleness read");
+        let fetch = body
+            .find(concat!("refresh_pricing_", "now(app)"))
+            .expect("the fetch");
+        assert!(gate < stale && gate < fetch);
+        assert!(body[gate..stale].contains(concat!("return ", "Ok(());")));
+        // The definition and `cost_summary`'s call: no other caller refreshes by itself.
+        assert_eq!(src.matches(concat!("ensure_pricing_", "fresh(")).count(), 2);
+        // The ungated fetch: its definition, the button (`refresh_pricing`) and the gated check
+        // above. Another caller would be a way round the gate.
+        assert_eq!(src.matches(concat!("refresh_pricing_", "now(")).count(), 3);
+    }
 
     /// Cost is ROW-ADDITIVE: a model's real reported spend always shows, with an estimate filling in
     /// only the rows that lacked one. The earlier all-or-nothing rule went blank for any model that

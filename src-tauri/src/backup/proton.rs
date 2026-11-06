@@ -189,6 +189,24 @@ fn no_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn no_window(_command: &mut Command) {}
 
+/// The log level every Proton CLI run gets. Left unset, the CLI logs at DEBUG to its own file
+/// (`~/.local/state/proton-drive-cli/proton-drive.log`, on every OS), outside PM's data folder: each
+/// session load, the client id it mints, and the requests it makes. Those lines also ride along as
+/// breadcrumbs in the crash and error reports it sends Proton. ERROR drops them and keeps failures.
+/// It does not reach the CLI's metric events, which it writes to the same file at any level: JSON
+/// lines per upload or download (finished or failed), per block it encrypts or decrypts, per API
+/// retry (with the request's URL), and a few more. PM can't turn those off. The CLI upper-cases the
+/// value and falls back to DEBUG for anything it doesn't know, `WARN` included, so the spelling
+/// matters.
+const PROTON_LOG_LEVEL: (&str, &str) = ("PROTON_DRIVE_LOG_LEVEL", "ERROR");
+
+/// Everything PM sets on a Proton CLI child: no console window on Windows, and [`PROTON_LOG_LEVEL`].
+/// Every spawn goes through here.
+fn prepare(command: &mut Command) {
+    no_window(command);
+    command.env(PROTON_LOG_LEVEL.0, PROTON_LOG_LEVEL.1);
+}
+
 /// Does this CLI output signal "no active session"? Deliberately narrow — matches the CLI's
 /// actual `You need to login first` (captured), NOT the `auth login` flow's "Sign in in your
 /// browser" prompt, so a *connect* is never misread as *not-connected*.
@@ -226,7 +244,7 @@ fn run_proton_polled(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    no_window(&mut cmd);
+    prepare(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
@@ -539,7 +557,7 @@ pub(crate) fn connect(cli: &Path, app: &AppHandle) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    no_window(&mut cmd);
+    prepare(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::Other(format!("could not run the Proton Drive CLI: {e}")))?;
@@ -770,6 +788,24 @@ pub(crate) fn apply_retention(cli: &Path, keep_n: usize, prefix: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Proton CLI run gets the ERROR log level, which keeps the CLI's DEBUG session and
+    /// request lines out of its log outside PM's folder. `ERROR` exactly, since the CLI reads `WARN`
+    /// and other unknown values as DEBUG.
+    #[test]
+    fn every_proton_run_sets_the_error_log_level() {
+        let mut command = Command::new("proton-drive");
+        prepare(&mut command);
+        let level = command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PROTON_DRIVE_LOG_LEVEL"))
+            .and_then(|(_, v)| v);
+        assert_eq!(level, Some(std::ffi::OsStr::new("ERROR")));
+        // Both spawns go through `prepare`, so neither can miss it.
+        let src = include_str!("proton.rs");
+        assert_eq!(src.matches(concat!("prepare(&mut ", "cmd);")).count(), 2);
+        assert_eq!(src.matches(concat!("Command::", "new(cli)")).count(), 2);
+    }
 
     #[test]
     fn cli_stop_reason_prioritizes_cancel_then_timeout() {
