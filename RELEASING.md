@@ -215,6 +215,20 @@ macOS `.app.tar.gz` + `.dmg`, Linux `.AppImage` + `.rpm` + `.deb`, plus `latest.
 AppImage is the only Linux format the updater handles; rpm/deb users update by
 reinstalling the next release's package), `SHA256SUMS`, and `THIRD-PARTY-NOTICES.txt`.
 
+> **Raising the minimum macOS ships in two releases.** `latest.json` carries
+> `minimum_macos_version`, written from `tauri.conf.json`'s `minimumSystemVersion` by
+> `scripts/build-updater-manifest.mjs` and checked against it by
+> `scripts/verify-updater-manifest.mjs`. From 3.175.0 on, PM compares it with the running
+> macOS before it downloads an update and, if the Mac is too old, downloads nothing and
+> shows which macOS the update needs (`src/lib/updateGate.ts`). A copy older than 3.175.0
+> can't read the field: on a macOS below the new minimum it downloads the update, the
+> updater replaces PM in place, and macOS then refuses to open it. So the check always
+> ships first, in an earlier release that keeps the old minimum (3.175.0 did this for the
+> first raise, staying on 10.15), and the raise comes in a later one; that protects every
+> install that launched in between. Never raise the minimum in the release that adds or
+> changes the check, and whenever it moves, say in that release's notes that a Mac below
+> it should update macOS first, because a copy from before 3.175.0 still can't tell.
+
 > **Linux lane dry-run:** `.github/workflows/linux-bundle-dryrun.yml` builds the real
 > AppImage + rpm + deb and smoke-tests the bundled interpreter **without a tag and without
 > secrets** (it signs with a throwaway key). It runs automatically on PRs touching the

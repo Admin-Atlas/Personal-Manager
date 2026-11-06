@@ -14,13 +14,18 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const install = vi.fn<() => Promise<void>>();
+const download = vi.fn(async () => undefined);
 const showMainWindow = vi.fn<() => Promise<void>>();
 const relaunch = vi.fn(async () => undefined);
+const macosVersion = vi.fn<() => Promise<string | null>>();
+/** The feed as the updater received it; a test sets the minimum macOS it states. */
+let rawJson: Record<string, unknown> = {};
 
 vi.mock("@tauri-apps/plugin-updater", () => ({
   check: vi.fn(async () => ({
     version: "3.140.0-alpha",
-    download: vi.fn(async () => undefined),
+    rawJson,
+    download: () => download(),
     install: () => install(),
   })),
 }));
@@ -29,6 +34,7 @@ vi.mock("@tauri-apps/api/app", () => ({ getVersion: vi.fn(async () => "3.139.4-a
 vi.mock("./ipc", () => ({
   smartAppControlState: vi.fn(async () => "off"),
   packageManagedLinux: vi.fn(async () => false),
+  macosVersion: () => macosVersion(),
   showMainWindow: () => showMainWindow(),
 }));
 
@@ -39,6 +45,8 @@ beforeEach(() => {
   localStorage.clear();
   install.mockRejectedValue(new Error("the installer would not launch"));
   showMainWindow.mockResolvedValue(undefined);
+  macosVersion.mockResolvedValue(null);
+  rawJson = {};
 });
 afterEach(cleanup);
 
@@ -86,5 +94,44 @@ describe("useUpdater restart", () => {
     await waitFor(() => expect(relaunch).toHaveBeenCalledTimes(1));
     expect(showMainWindow).not.toHaveBeenCalled();
     expect(result.current.installFailed).toBe(false);
+  });
+});
+
+// An update that needs a newer macOS than this Mac has would install a PM macOS refuses to open,
+// replacing the one that works. So nothing is downloaded, and the banner is told which macOS.
+describe("useUpdater and the update's minimum macOS", () => {
+  it("downloads nothing when the update needs a newer macOS than this Mac has", async () => {
+    rawJson = { minimum_macos_version: "15.0" };
+    macosVersion.mockResolvedValue("14.5");
+    const { result } = await staged();
+    expect(result.current.macosBlock).toEqual({ required: "15", running: "14.5" });
+    expect(result.current.version).toBe("3.140.0-alpha");
+    expect(download).not.toHaveBeenCalled();
+    // Nothing is staged, so a restart does nothing.
+    act(() => result.current.restart());
+    await act(async () => {});
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it("downloads as usual when this Mac's macOS is new enough", async () => {
+    rawJson = { minimum_macos_version: "14.0" };
+    macosVersion.mockResolvedValue("14.0");
+    const { result } = await staged();
+    expect(result.current.macosBlock).toBeNull();
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it("downloads as usual off macOS, or when the macOS version can't be read", async () => {
+    rawJson = { minimum_macos_version: "15.0" };
+    macosVersion.mockResolvedValue(null);
+    const first = await staged();
+    expect(first.result.current.macosBlock).toBeNull();
+    expect(download).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    macosVersion.mockRejectedValue(new Error("no such command"));
+    const second = await staged();
+    expect(second.result.current.macosBlock).toBeNull();
+    expect(download).toHaveBeenCalledTimes(2);
   });
 });

@@ -32,6 +32,7 @@ function update(over: Partial<AppUpdate> = {}): AppUpdate {
     sac: "off",
     blockedByPriorAttempt: false,
     packageManaged: false,
+    macosBlock: null,
     releasesUrl: "https://example.invalid/releases",
     restart: vi.fn(),
     dismiss: vi.fn(),
@@ -87,5 +88,29 @@ describe("UpdateBanner after a failed install", () => {
     expect(screen.queryByText(/open it again to retry/)).toBeNull();
     fireEvent.click(tryAgain()!);
     expect(u.restart).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("UpdateBanner when the update needs a newer macOS", () => {
+  const block = { required: "15", running: "14.5" };
+
+  it("says which macOS it needs and what to do, and offers no restart", () => {
+    const u = update({ macosBlock: block });
+    render(<UpdateBanner update={u} platform="mac" />);
+    const text = screen.getByText(/needs macOS/).textContent;
+    expect(text).toContain("Version 3.140.0-alpha needs macOS 15 or newer");
+    expect(text).toContain("this Mac has macOS 14.5");
+    expect(text).toContain("update macOS first");
+    expect(screen.queryByRole("button", { name: /Restart/ })).toBeNull();
+    expect(tryAgain()).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Later" }));
+    expect(u.dismiss).toHaveBeenCalledTimes(1);
+    expect(u.restart).not.toHaveBeenCalled();
+  });
+
+  it("collapses to a chip that still names the macOS it needs", () => {
+    render(<UpdateBanner update={update({ macosBlock: block, dismissed: true })} platform="mac" />);
+    expect(screen.getByText("Version 3.140.0-alpha needs macOS 15 or newer")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });

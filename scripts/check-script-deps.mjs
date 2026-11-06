@@ -112,6 +112,13 @@ const ALLOWED = [
       "Same reason as the vitest entries: jsdom is a repo-wide devDependency on a `^` range, governed by the normal npm/Dependabot flow and used by every component test in the tree. One scripts/ test must not dictate its version for all of them.",
   },
   {
+    file: "scripts/updater-manifest.test.mjs",
+    specifier: "vitest",
+    why: "The repo's existing test runner, on the same terms as the entries around it. The updater feed decides which Macs are offered an update: dropping or misstating the minimum macOS PM checks before it downloads would install a PM that macOS won't open, and only a real release would show it. So the builder and the verifier are pinned here, and run as the publish job runs them; `just frontend-test` already collects this file through a vitest include glob, so no dependency is added.",
+    pinExempt:
+      "Same reason as the neighbouring entries: vitest is the repo-wide test runner on a `^` range, governed by the normal npm/Dependabot flow. A scripts/ test must not dictate the whole repo's runner version.",
+  },
+  {
     file: "scripts/generate-local-catalog.test.mjs",
     specifier: "vitest",
     why: "The repo's existing test runner, reached by a scripts/ test the same way 56 src/ tests reach it. It adds no new dependency — `just frontend-test` already runs this file via a vitest include glob.",

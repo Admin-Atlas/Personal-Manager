@@ -2056,6 +2056,7 @@ pub fn run() {
             commands::prune_own_backups,
             commands::smart_app_control_state,
             commands::package_managed_linux,
+            commands::macos_version,
             // Mods (spec §1.4): a frame's one-time entry URL and session, and the bridge's relay.
             // Main window only.
             mods::mod_frame_open,
