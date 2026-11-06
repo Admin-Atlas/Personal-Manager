@@ -249,7 +249,55 @@ const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
 /// wheel a third of the size.
 const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.10.0", "pi-heif==1.4.0"];
 
-/// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
+/// The OPTIONAL voice-input engine (Mods spec D8), pinned. **Not** in `requirements.txt` since voice
+/// became a switch: it sat in the base venv for every user, about 240 MB of CTranslate2 and FFmpeg
+/// that nobody who never dictates needs. Switching voice on installs it
+/// ([`SidecarManager::install_optional_voice`]); switching it off offers to remove it. faster-whisper
+/// runs Whisper on CTranslate2 and decodes audio with the FFmpeg inside the PyAV wheel, so no system
+/// ffmpeg is needed, and it shares onnxruntime, tokenizers, huggingface-hub and numpy with fastembed
+/// (the lock is resolved against the base lock, so those stay on the base venv's versions).
+///
+/// **`av` is pinned too, exactly.** It was the `av<19` tripwire in requirements.txt: faster-whisper
+/// 1.2.1 calls `av.open(..., metadata_errors="ignore")`, PyAV 19 removed that parameter, and
+/// faster-whisper itself asks only for `av>=11`, so without a bound the next `just lock-regen`
+/// resolves PyAV 19 and every transcription raises TypeError with nothing offline to notice. An
+/// optional component's pins are exact (`just requirements-lock` reads them as `name==version`), so
+/// the bound became the version the lock already held. Revisit it once a faster-whisper release
+/// includes SYSTRAN/faster-whisper#1495 (merged, unreleased at 1.2.1).
+const OPTIONAL_VOICE_PINS: &[&str] = &["faster-whisper==1.2.1", "av==18.1.0"];
+
+/// The Whisper model's own folder under `runtime/models`. The worker loads
+/// `WhisperModel(WHISPER_MODEL, download_root=<runtime/models>)` (`pm_sidecar.py`, `get_whisper`), and
+/// faster-whisper hands that root to huggingface_hub as its `cache_dir`, which lays the repo out as
+/// `models--<org>--<name>`. The same root also holds the embedder and reranker (`fastembed/`), the hf
+/// and xet caches (`hf/`) and the photo-OCR weights (`rapidocr/`), so nothing that means "the speech
+/// model" may measure or remove more than this folder (and its lock folder, [`whisper_paths`]).
+///
+/// It is also D8's evidence that someone used voice before it became a switch: the folder appears
+/// only after a first transcription. `runtime/models` being non-empty proves nothing, because the
+/// embedder lives there too.
+pub(crate) const WHISPER_REPO_DIR: &str = "models--Systran--faster-whisper-base.en";
+
+/// Every path the Whisper download leaves under `models`: the repo folder and huggingface_hub's lock
+/// folder for it.
+pub(crate) fn whisper_paths(models: &Path) -> [PathBuf; 2] {
+    [
+        models.join(WHISPER_REPO_DIR),
+        models.join(".locks").join(WHISPER_REPO_DIR),
+    ]
+}
+
+/// Remove the Whisper model's folders and nothing else under `models`.
+pub(crate) fn remove_whisper(models: &Path) -> std::io::Result<()> {
+    for p in whisper_paths(models) {
+        if p.exists() {
+            std::fs::remove_dir_all(&p)?;
+        }
+    }
+    Ok(())
+}
+
+/// One on-demand pip component (t-SNE / photo-OCR / voice). The per-component ready/install/uninstall
 /// operations differ only in these fields, so they share one implementation each
 /// (`optional_ready` / `install_optional` / `uninstall_optional` on [`SidecarManager`]); the
 /// public per-component methods are one-line delegates.
@@ -268,9 +316,11 @@ struct OptionalComponent {
     /// The component's top-level pins — the source of truth for its identity, mirrored into
     /// `sidecar/requirements-optional.txt` for `just pip-audit` and into the lock's `pm-pins` stamp.
     pins: &'static [&'static str],
-    /// The packages `pip uninstall` removes. Only the top-level ones: heavier transitive deps are
-    /// deliberately LEFT in place so a removal can never break the base venv by pulling a package
-    /// something else relies on (see the public delegates' docs for each component's cascade).
+    /// The packages `pip uninstall` removes, and never one anything else needs. For t-SNE and OCR
+    /// that means the top-level ones only: their heavier transitive deps are LEFT in place so a
+    /// removal can never break the base venv by pulling a package something else relies on (see the
+    /// public delegates' docs for each component's cascade). Voice removes every package only its own
+    /// lock brings, which a test checks against all four locks.
     uninstall: &'static [&'static str],
     /// Packages an older lock of this component installed that the current lock replaces with a
     /// differently-named distribution of the SAME files, uninstalled before the lock is installed.
@@ -305,11 +355,33 @@ const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     superseded: &["opencv-python"],
 };
 
+const OPTIONAL_VOICE_COMPONENT: OptionalComponent = OptionalComponent {
+    marker: SidecarPaths::voice_marker,
+    lock: "requirements-voice.lock",
+    pins: OPTIONAL_VOICE_PINS,
+    // The whole tree only voice brings, not just the two pins, unlike the components above: none of
+    // these is in the base lock or another component's (`voice_removes_exactly_what_only_voice_needs`
+    // reads all four locks), so removing them can't take anything else's, and leaving CTranslate2 and
+    // PyAV behind would strand the ~240 MB that switching voice off promised to free. setuptools
+    // arrives only as CTranslate2's dependency.
+    //
+    // faster-whisper goes LAST. pip removes the packages one at a time and stops at the first that
+    // fails (a native library something else still holds open, on Windows), and faster-whisper's
+    // import dir is the plainest sign that an engine is here. Removed first, a failure on
+    // CTranslate2 would leave the two heavy libraries behind an engine that looked gone.
+    // `components::voice_engine_on_disk` looks for all three import dirs as well.
+    uninstall: &["av", "ctranslate2", "setuptools", "faster-whisper"],
+    superseded: &[],
+};
+
 /// Every optional component, so a caller that must treat them all alike can't miss one. `provision`
 /// is the reason this exists: a venv rebuild removes their markers along with the venv, and each new
 /// component would otherwise need remembering there too.
-const ALL_OPTIONAL_COMPONENTS: &[&OptionalComponent] =
-    &[&OPTIONAL_TSNE_COMPONENT, &OPTIONAL_OCR_COMPONENT];
+const ALL_OPTIONAL_COMPONENTS: &[&OptionalComponent] = &[
+    &OPTIONAL_TSNE_COMPONENT,
+    &OPTIONAL_OCR_COMPONENT,
+    &OPTIONAL_VOICE_COMPONENT,
+];
 
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
@@ -377,6 +449,21 @@ impl SidecarPaths {
     /// so a future bump re-installs.
     fn ocr_marker(&self) -> PathBuf {
         self.venv_dir.join(".pm-ocr")
+    }
+
+    /// Marker that the OPTIONAL voice engine is installed in this venv (separate from `.pm-ready`
+    /// like the two above). A venv that has faster-whisper but not this marker predates voice
+    /// becoming a switch: an older PM installed it with the base lock (see `legacy_voice_action`).
+    fn voice_marker(&self) -> PathBuf {
+        self.venv_dir.join(".pm-voice")
+    }
+
+    /// Set when someone switched voice off and chose to keep such an older engine (no `.pm-voice`).
+    /// The one-off clean-up then leaves it: "keep" was an answer, and the stored switch alone reads
+    /// the same as the upgrade's default off. Dropped whenever the engine is installed as the
+    /// component or removed, so it never speaks for an engine it wasn't about.
+    fn voice_kept_marker(&self) -> PathBuf {
+        self.venv_dir.join(".pm-voice-kept")
     }
 
     /// Where the speech model's weights are cached — a sibling of the venv under
@@ -856,6 +943,11 @@ pub struct SidecarManager {
         )
     ))]
     sandbox_report: Mutex<SandboxReport>,
+    /// What the open store's voice switch says (Mods spec D8), for the one-off upgrade of a venv an
+    /// older PM built with the speech engine in its base install (`legacy_voice_action`). `None`
+    /// until a store has been opened: neither keeping nor removing that engine can be decided
+    /// before then. A watch channel because the engine reconciler (`voice_switch`) wakes on it.
+    voice_wanted: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 impl SidecarManager {
@@ -866,6 +958,7 @@ impl SidecarManager {
             status: Mutex::new(SidecarStatus::NotInstalled),
             install: Mutex::new(()),
             req_seq: AtomicU64::new(0),
+            voice_wanted: tokio::sync::watch::Sender::new(None),
             #[cfg(any(
                 windows,
                 target_os = "macos",
@@ -958,10 +1051,22 @@ impl SidecarManager {
     /// that no longer exists. Best-effort and idempotent — used only by the "Remove PM data"
     /// teardown ([`crate::wipe`]).
     pub fn prepare_for_runtime_removal(&self) {
+        self.stop_worker();
+        self.set_status(SidecarStatus::NotInstalled);
+    }
+
+    /// Stop the running child, if any; the next request spawns a fresh one. Taking the `Process`
+    /// out of the mutex drops it, and its `Drop` kills the child, releasing every file it holds
+    /// open. Waits for a request in flight, since each holds `proc` for its whole run.
+    ///
+    /// Before pip removes packages too, not only before `runtime/` goes: a worker that has
+    /// transcribed or read a photo has CTranslate2's, PyAV's or OpenCV's native libraries loaded,
+    /// and Windows refuses to delete a DLL a running process has mapped, which would leave the
+    /// package half removed.
+    fn stop_worker(&self) {
         if let Ok(mut proc) = self.proc.lock() {
             proc.take(); // drop → Process::drop kills the child, freeing the interpreter's locks
         }
-        self.set_status(SidecarStatus::NotInstalled);
     }
 
     /// Provision the venv if needed: create it from a base Python and install the
@@ -1080,7 +1185,7 @@ impl SidecarManager {
             self.paths.ready_marker().exists(),
             detected,
         );
-        let reinstall: Vec<&OptionalComponent> = ALL_OPTIONAL_COMPONENTS
+        let mut reinstall: Vec<&OptionalComponent> = ALL_OPTIONAL_COMPONENTS
             .iter()
             .copied()
             .filter(|c| {
@@ -1088,9 +1193,23 @@ impl SidecarManager {
                     rebuild,
                     (c.marker)(&self.paths).exists(),
                     self.optional_ready(c),
+                    // An engine kept when voice was switched off is not fetched again for it.
+                    c.lock == OPTIONAL_VOICE_COMPONENT.lock && self.voice_wanted() == Some(false),
                 )
             })
             .collect();
+        // A speech engine an older PM installed with its base lock (D8) has no marker, so the rule
+        // above can't see it. Decided here, before a teardown can take it: kept as a component if
+        // the open store has voice on (it becomes one by installing its lock, which in place
+        // downloads only what the lock moved, and is what a rebuilt venv needs anyway), removed after
+        // the base install if voice is off and nobody chose to keep it. Undecided until a store has
+        // said, and then the reconciler does it.
+        //
+        // The base install below makes the venv current before either action runs.
+        let legacy_voice = self.legacy_voice(true);
+        if legacy_voice == LegacyVoice::Adopt {
+            reinstall.push(&OPTIONAL_VOICE_COMPONENT);
+        }
         if rebuild {
             // Drop any live child first: on Windows it would hold a lock on the
             // venv's python.exe and block removal.
@@ -1171,6 +1290,16 @@ impl SidecarManager {
                 eprintln!(
                     "sidecar: provisioned the venv but could not reinstall an optional component ({e}); \
                      reinstall it from Settings -> Storage"
+                );
+            }
+        }
+        // Retired after the base install, not before: a failure part-way leaves the venv as usable
+        // as it was. A rebuilt venv never had it. Best-effort for the same reason as above.
+        if legacy_voice == LegacyVoice::Retire && !rebuild {
+            if let Err(e) = self.uninstall_optional_locked(&OPTIONAL_VOICE_COMPONENT) {
+                eprintln!(
+                    "sidecar: couldn't remove the speech engine an earlier PM installed ({e}); \
+                     the next launch tries again"
                 );
             }
         }
@@ -1511,7 +1640,9 @@ impl SidecarManager {
 
     /// Transcribe an audio clip to text with the local Whisper model. The first
     /// call downloads the model (~145 MB) and is slow; later calls are fast and
-    /// fully local. `path` is a temp file the caller writes (and then deletes).
+    /// fully local. `path` is a temp file the caller writes (and then deletes). The
+    /// engine is an optional component, so the caller installs it first
+    /// ([`Self::install_optional_voice`]).
     pub fn transcribe(&self, path: &Path) -> Result<String> {
         let result = self.request(
             "transcribe",
@@ -1658,6 +1789,144 @@ impl SidecarManager {
         self.uninstall_optional(&OPTIONAL_OCR_COMPONENT)
     }
 
+    /// Whether the OPTIONAL voice engine is installed in this venv at the pinned versions. Cheap (a
+    /// marker read and a hash of the small voice lock), for the Storage row.
+    pub fn optional_voice_ready(&self) -> bool {
+        self.optional_ready(&OPTIONAL_VOICE_COMPONENT)
+    }
+
+    /// Install the OPTIONAL voice engine (faster-whisper with CTranslate2 and PyAV) — the shared
+    /// [`Self::install_optional`] flow. Switching voice on calls it, before the switch is written.
+    pub fn install_optional_voice(&self, on_progress: impl FnMut(f32)) -> Result<()> {
+        self.install_optional(&OPTIONAL_VOICE_COMPONENT, on_progress)
+    }
+
+    /// The same install, for a transcription that finds the engine gone (its marker absent or
+    /// stale). Refused once voice has been switched off, checked under the install lock: a switch-off
+    /// that removed the engine while this waited for the lock must win, not be undone by a ~240 MB
+    /// download for a recording that may no longer be transcribed.
+    pub fn install_optional_voice_for_recording(&self, on_progress: impl FnMut(f32)) -> Result<()> {
+        self.install_optional_checked(
+            &OPTIONAL_VOICE_COMPONENT,
+            || match self.voice_wanted() {
+                Some(false) => Err(Error::Other(crate::voice_switch::OFF_REFUSAL.into())),
+                _ => Ok(()),
+            },
+            on_progress,
+        )
+    }
+
+    /// Record that voice was switched off with its engine kept, before the off is published to the
+    /// reconciler (see [`SidecarPaths::voice_kept_marker`]). Only an engine an older PM installed
+    /// needs it: one with the component's marker is never touched by the clean-up. No venv or no
+    /// engine, nothing to record.
+    pub fn keep_voice_engine(&self) -> Result<()> {
+        if crate::components::voice_engine_on_disk(&self.paths.venv_dir)
+            && !(OPTIONAL_VOICE_COMPONENT.marker)(&self.paths).exists()
+        {
+            std::fs::write(self.paths.voice_kept_marker(), b"")?;
+        }
+        Ok(())
+    }
+
+    /// Remove the OPTIONAL voice engine — the shared [`Self::uninstall_optional`] flow, which for
+    /// voice takes the whole tree only voice brings (see its `uninstall`). The speech model's
+    /// weights are a separate download with their own removal ([`Self::remove_whisper_model`]).
+    pub fn uninstall_optional_voice(&self) -> Result<()> {
+        self.uninstall_optional(&OPTIONAL_VOICE_COMPONENT)
+    }
+
+    /// Whether the Whisper model has been downloaded (its own folder, [`WHISPER_REPO_DIR`]): D8's
+    /// evidence that this machine's user dictated before voice became a switch.
+    pub fn whisper_model_present(&self) -> bool {
+        self.paths.models_dir().is_some_and(|models| {
+            std::fs::read_dir(models.join(WHISPER_REPO_DIR))
+                .map(|mut rd| rd.next().is_some())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Delete the Whisper model's weights, and nothing else under `runtime/models`.
+    pub fn remove_whisper_model(&self) -> Result<()> {
+        if let Some(models) = self.paths.models_dir() {
+            remove_whisper(&models)?;
+        }
+        Ok(())
+    }
+
+    /// Tell the manager what the open store's voice switch says. Every store open and every switch
+    /// does, so the upgrade rule below and in `provision` always acts on the current answer.
+    pub fn set_voice_wanted(&self, on: bool) {
+        self.voice_wanted.send_replace(Some(on));
+    }
+
+    fn voice_wanted(&self) -> Option<bool> {
+        *self.voice_wanted.borrow()
+    }
+
+    /// For the engine reconciler, which wakes on each answer.
+    pub fn subscribe_voice_wanted(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
+        self.voice_wanted.subscribe()
+    }
+
+    /// The one-off upgrade of a venv an older PM built with the speech engine in its base install
+    /// (D8): pip never removes a package because a lock stopped listing it, so without this every
+    /// existing user keeps ~240 MB of CTranslate2 and PyAV whether or not voice is on. With voice
+    /// off it is removed (safe on any venv: nothing else needs those packages), unless someone
+    /// switched voice off and chose to keep it; with voice on it is adopted as the component by
+    /// installing its lock, once the base venv is current, because that lock is resolved against
+    /// the current base and installing it into an older one would half-upgrade the packages the two
+    /// share. `provision` makes the same call when it runs, so an outdated venv is settled there
+    /// instead.
+    ///
+    /// Acts on the answer [`Self::set_voice_wanted`] last gave, and does nothing before one.
+    /// Blocking (pip); run it off the async runtime. Idempotent: a venv that has the marker, or no
+    /// engine, is left alone, so running it on every store open costs a directory read. A removal
+    /// that fails part-way leaves an engine the next pass still sees, and tries again.
+    pub fn reconcile_voice_engine(&self) {
+        // Cheap first look, so the common case never waits on the install lock behind a download.
+        if self.voice_wanted().is_none()
+            || !self.paths.venv_python().exists()
+            || !crate::components::voice_engine_on_disk(&self.paths.venv_dir)
+            || (OPTIONAL_VOICE_COMPONENT.marker)(&self.paths).exists()
+        {
+            return;
+        }
+        let _install = self.install.lock().unwrap();
+        // The answer can have moved while this waited for the lock; act on the latest.
+        let action = self.legacy_voice(self.is_ready_marker_current().unwrap_or(false));
+        match action {
+            LegacyVoice::Leave => {}
+            LegacyVoice::Retire => {
+                if let Err(e) = self.uninstall_optional_locked(&OPTIONAL_VOICE_COMPONENT) {
+                    eprintln!(
+                        "sidecar: couldn't remove the speech engine an earlier PM installed ({e}); \
+                         the next store open tries again"
+                    );
+                }
+            }
+            LegacyVoice::Adopt => {
+                if let Err(e) = self.install_optional_locked(&OPTIONAL_VOICE_COMPONENT, |_| {}) {
+                    eprintln!(
+                        "sidecar: couldn't adopt the speech engine an earlier PM installed ({e}); \
+                         the next recording installs it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`legacy_voice_action`] on this venv as it is now, for `provision` and the reconciler.
+    fn legacy_voice(&self, base_current: bool) -> LegacyVoice {
+        legacy_voice_action(
+            crate::components::voice_engine_on_disk(&self.paths.venv_dir),
+            (OPTIONAL_VOICE_COMPONENT.marker)(&self.paths).exists(),
+            self.paths.voice_kept_marker().exists(),
+            self.voice_wanted(),
+            base_current,
+        )
+    }
+
     /// Shared readiness check for an [`OptionalComponent`]: the venv exists and the component's
     /// marker holds exactly the pinned stamp (so a pin bump reads as not-installed and re-installs).
     /// What a current marker must hold, and what a fresh install stamps: the component's pins AND
@@ -1702,6 +1971,18 @@ impl SidecarManager {
     fn install_optional(
         &self,
         component: &OptionalComponent,
+        on_progress: impl FnMut(f32),
+    ) -> Result<()> {
+        self.install_optional_checked(component, || Ok(()), on_progress)
+    }
+
+    /// [`Self::install_optional`] with a last word: `check` runs once the install lock is held,
+    /// before anything is downloaded, and its error stops the install. For a condition that can
+    /// change while the caller waited for the lock behind another install or a removal.
+    fn install_optional_checked(
+        &self,
+        component: &OptionalComponent,
+        check: impl FnOnce() -> Result<()>,
         mut on_progress: impl FnMut(f32),
     ) -> Result<()> {
         on_progress(0.03);
@@ -1710,6 +1991,7 @@ impl SidecarManager {
         on_progress(0.10);
 
         let _install = self.install.lock().unwrap();
+        check()?;
         if self.optional_ready(component) {
             on_progress(1.0);
             return Ok(());
@@ -1791,21 +2073,41 @@ impl SidecarManager {
             (component.marker)(&self.paths),
             self.optional_stamp(component)?,
         )?;
+        if component.lock == OPTIONAL_VOICE_COMPONENT.lock {
+            // The component now, with its marker: the "kept" note was about the older engine.
+            let _ = std::fs::remove_file(self.paths.voice_kept_marker());
+        }
         on_progress(1.0);
         Ok(())
     }
 
     /// Shared removal flow for an [`OptionalComponent`]. Drops the marker first — that alone
     /// disables the feature (`optional_ready` then reports false) — then `pip uninstall`s the
-    /// component's top-level packages to reclaim space. Idempotent.
+    /// component's packages (its `uninstall` list) to reclaim space. Idempotent.
     fn uninstall_optional(&self, component: &OptionalComponent) -> Result<()> {
         let _install = self.install.lock().unwrap();
-        // Drop the marker first so the feature is off even if the pip call below fails.
+        self.uninstall_optional_locked(component)
+    }
+
+    /// The removal itself, for a caller that already holds `self.install` (`provision` and the
+    /// voice reconciler retire an older PM's speech engine under it).
+    ///
+    /// The marker goes first, so the feature is off whatever pip then does. pip's own failure is
+    /// returned, not swallowed: pip stops at the first package it can't remove (a native library
+    /// something else holds open, on Windows), and the person who asked for the space back has to
+    /// be told some of it is still taken. What is left stays on disk, measured on its Storage row
+    /// with its own Remove.
+    fn uninstall_optional_locked(&self, component: &OptionalComponent) -> Result<()> {
         let _ = std::fs::remove_file((component.marker)(&self.paths));
+        if component.lock == OPTIONAL_VOICE_COMPONENT.lock {
+            // A removal is an answer too: what is left after a failed one is for the next pass.
+            let _ = std::fs::remove_file(self.paths.voice_kept_marker());
+        }
         let py = self.paths.venv_python();
         if !py.exists() {
             return Ok(());
         }
+        self.stop_worker();
         let mut pip = Command::new(&py);
         pip.args([
             "-m",
@@ -1817,13 +2119,10 @@ impl SidecarManager {
         pip.args(component.uninstall);
         clean_python_env(&mut pip);
         no_window(&mut pip);
-        // Best-effort: the marker is already gone, so a pip hiccup just leaves the (unused) packages
-        // on disk rather than failing the user's "remove".
-        let _ = run_command(
+        run_command(
             &mut pip,
             &format!("pip uninstall {}", component.uninstall.join(" ")),
-        );
-        Ok(())
+        )
     }
 
     /// `pip uninstall -y` the given packages from the managed venv — the Storage manager's guarded
@@ -1842,6 +2141,8 @@ impl SidecarManager {
             return Ok(());
         }
         let _install = self.install.lock().unwrap();
+        // OpenCV, shapely and scipy are native too (see `stop_worker`).
+        self.stop_worker();
         let mut pip = Command::new(&py);
         pip.args([
             "-m",
@@ -2747,9 +3048,55 @@ fn should_rebuild_venv(
 /// Whether provisioning must put an optional component back: the user installed it (its marker is
 /// present, current or not; removing a component deletes the marker first) and the venv being
 /// provisioned no longer satisfies it — rebuilt from scratch, or updated in place to locks that
-/// moved its stamp.
-fn should_reinstall_optional(rebuild: bool, marker_present: bool, ready: bool) -> bool {
-    marker_present && (rebuild || !ready)
+/// moved its stamp. Never for a component whose feature is `switched_off` (voice input, kept on
+/// disk when voice was turned off): a download for something switched off is the opposite of what
+/// the switch is for, and turning it back on installs it.
+fn should_reinstall_optional(
+    rebuild: bool,
+    marker_present: bool,
+    ready: bool,
+    switched_off: bool,
+) -> bool {
+    marker_present && !switched_off && (rebuild || !ready)
+}
+
+/// What to do with a speech engine an older PM installed as part of its base lock (D8).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum LegacyVoice {
+    /// Nothing to do, or nothing that can be decided yet.
+    Leave,
+    /// Voice is on: install the voice lock over it, which stamps the marker and makes it the
+    /// component (in place it downloads nothing the base lock already put there).
+    Adopt,
+    /// Voice is off: uninstall it, as switching voice off with "remove" would.
+    Retire,
+}
+
+/// The one-off upgrade rule for that engine. Pure, so the table is tested. It is "legacy" only when
+/// it is on disk without the component's marker; an engine installed by the switch always has the
+/// marker (removal drops the marker first, and a stale one is `should_reinstall_optional`'s case).
+/// Nothing is decided before a store has said what voice is (`wanted` is `None`). Adoption waits
+/// for a current base venv (`base_current`), because the voice lock is resolved against the
+/// current base and installing it into an older one would move packages the base still owns;
+/// removal never has to wait, since nothing else needs the voice packages. An off that came with
+/// "keep the engine" (`kept`) is not the upgrade's default and is never overridden by it.
+fn legacy_voice_action(
+    engine_on_disk: bool,
+    marker_present: bool,
+    kept: bool,
+    wanted: Option<bool>,
+    base_current: bool,
+) -> LegacyVoice {
+    if !engine_on_disk || marker_present {
+        return LegacyVoice::Leave;
+    }
+    match wanted {
+        None => LegacyVoice::Leave,
+        Some(false) if kept => LegacyVoice::Leave,
+        Some(false) => LegacyVoice::Retire,
+        Some(true) if base_current => LegacyVoice::Adopt,
+        Some(true) => LegacyVoice::Leave,
+    }
 }
 
 /// Parse a `python --version`-style string into `(major, minor)`. Tolerates the
@@ -3777,14 +4124,19 @@ mod tests {
     fn an_installed_component_survives_a_base_lock_update() {
         // The in-place update after a base lock moves: the marker is there but stale. Before, this
         // left photo OCR off with Storage still showing it installed.
-        assert!(should_reinstall_optional(false, true, false));
+        assert!(should_reinstall_optional(false, true, false, false));
         // Rebuilt venv: whatever the user had goes back, current marker or not.
-        assert!(should_reinstall_optional(true, true, true));
-        assert!(should_reinstall_optional(true, true, false));
+        assert!(should_reinstall_optional(true, true, true, false));
+        assert!(should_reinstall_optional(true, true, false, false));
         // Already satisfied, or never installed / removed by the user: leave it alone.
-        assert!(!should_reinstall_optional(false, true, true));
-        assert!(!should_reinstall_optional(true, false, false));
-        assert!(!should_reinstall_optional(false, false, false));
+        assert!(!should_reinstall_optional(false, true, true, false));
+        assert!(!should_reinstall_optional(true, false, false, false));
+        assert!(!should_reinstall_optional(false, false, false, false));
+        // Kept on disk when its switch went off (voice): never downloaded again for it, whether the
+        // venv was rebuilt or its lock moved. Turning voice on is what installs it.
+        assert!(!should_reinstall_optional(false, true, false, true));
+        assert!(!should_reinstall_optional(true, true, true, true));
+        assert!(!should_reinstall_optional(true, true, false, true));
     }
 
     /// A superseded package is uninstalled before its component's lock installs, so it must never be
@@ -3817,8 +4169,8 @@ mod tests {
     }
 
     /// L-6: the audit-only `sidecar/requirements-optional.txt` (which `just pip-audit` scans) must list
-    /// exactly the optional pins whose source of truth is `OPTIONAL_TSNE_PIN` + `OPTIONAL_OCR_PINS`, so
-    /// a bumped/added optional pin can't silently escape CVE scanning.
+    /// exactly the optional pins whose source of truth is `OPTIONAL_TSNE_PIN` + `OPTIONAL_OCR_PINS` +
+    /// `OPTIONAL_VOICE_PINS`, so a bumped/added optional pin can't silently escape CVE scanning.
     #[test]
     fn optional_requirements_file_matches_the_pins() {
         let path = concat!(
@@ -3835,10 +4187,359 @@ mod tests {
             .collect();
         let mut expected = vec![OPTIONAL_TSNE_PIN.to_string()];
         expected.extend(OPTIONAL_OCR_PINS.iter().map(|s| s.to_string()));
+        expected.extend(OPTIONAL_VOICE_PINS.iter().map(|s| s.to_string()));
         assert_eq!(
             listed, expected,
             "requirements-optional.txt must list exactly the optional pins, in order"
         );
+    }
+
+    /// The package names a committed lock pins, PEP 503-normalised (uv writes `opentsne`, a pin may
+    /// say `openTSNE`; `faster_whisper` and `faster-whisper` are one package).
+    fn locked_names(lock: &str) -> std::collections::BTreeSet<String> {
+        let path = format!("{}/../sidecar/{lock}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("{lock} is checked in"))
+            .lines()
+            .filter(|l| !l.starts_with(char::is_whitespace) && !l.starts_with('#'))
+            .filter_map(|l| l.split_once("=="))
+            .map(|(name, _)| normalised(name))
+            .collect()
+    }
+
+    fn normalised(name: &str) -> String {
+        name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
+    }
+
+    /// The voice component as D8 describes it: its own lock and marker, the pins its lock was
+    /// resolved from, and one of the components `provision` treats alike (so a rebuilt venv puts it
+    /// back). Its pins are gone from the base lock — that is the whole change — and present in its
+    /// own.
+    #[test]
+    fn the_voice_engine_is_an_optional_component_with_its_own_lock() {
+        let c = &OPTIONAL_VOICE_COMPONENT;
+        assert_eq!(c.lock, "requirements-voice.lock");
+        assert_eq!(c.pins, OPTIONAL_VOICE_PINS);
+        assert!(c.superseded.is_empty());
+        let paths = SidecarPaths {
+            source_dir: PathBuf::from("/pm/sidecar"),
+            venv_dir: PathBuf::from("/pm/runtime/venv"),
+        };
+        assert_eq!(
+            (c.marker)(&paths),
+            PathBuf::from("/pm/runtime/venv/.pm-voice")
+        );
+        // By lock name: a `&CONST` is not one address, so pointer equality would prove nothing.
+        assert!(ALL_OPTIONAL_COMPONENTS.iter().any(|x| x.lock == c.lock));
+
+        let base = locked_names("requirements.lock");
+        let voice = locked_names(c.lock);
+        for pin in OPTIONAL_VOICE_PINS {
+            let name = normalised(pin.split_once("==").unwrap().0);
+            assert!(voice.contains(&name), "{name} is missing from {}", c.lock);
+            assert!(
+                !base.contains(&name),
+                "{name} is still in the base lock, so every user would get it"
+            );
+        }
+    }
+
+    /// Removing voice takes exactly the packages only the voice lock brings: nothing the base venv or
+    /// another component runs on (so removal can't break them), and nothing left behind (so the space
+    /// switching voice off promised really comes back). A lock regeneration that changes the set
+    /// fails here, so the list is updated on purpose rather than drifting.
+    #[test]
+    fn voice_removes_exactly_what_only_voice_needs() {
+        let mut others = locked_names("requirements.lock");
+        for c in ALL_OPTIONAL_COMPONENTS {
+            if c.lock != OPTIONAL_VOICE_COMPONENT.lock {
+                others.extend(locked_names(c.lock));
+            }
+        }
+        let only_voice: std::collections::BTreeSet<String> =
+            locked_names(OPTIONAL_VOICE_COMPONENT.lock)
+                .difference(&others)
+                .cloned()
+                .collect();
+        let removed: std::collections::BTreeSet<String> = OPTIONAL_VOICE_COMPONENT
+            .uninstall
+            .iter()
+            .copied()
+            .map(normalised)
+            .collect();
+        assert_eq!(removed, only_voice);
+        assert!(removed.contains("faster-whisper") && removed.contains("ctranslate2"));
+    }
+
+    /// D8's upgrade rule for an engine an older PM put in the base venv.
+    #[test]
+    fn an_older_pms_speech_engine_is_kept_where_voice_is_on_and_removed_where_off() {
+        use LegacyVoice::*;
+        // Voice off: removed, whether or not the base venv is current (nothing else needs it).
+        assert_eq!(
+            legacy_voice_action(true, false, false, Some(false), false),
+            Retire
+        );
+        assert_eq!(
+            legacy_voice_action(true, false, false, Some(false), true),
+            Retire
+        );
+        // Unless it was switched off with "keep the engine": that answer stands.
+        for base in [false, true] {
+            assert_eq!(
+                legacy_voice_action(true, false, true, Some(false), base),
+                Leave
+            );
+        }
+        // Voice on: adopted as the component, but only into a current base venv, kept or not.
+        for kept in [false, true] {
+            assert_eq!(
+                legacy_voice_action(true, false, kept, Some(true), true),
+                Adopt
+            );
+            assert_eq!(
+                legacy_voice_action(true, false, kept, Some(true), false),
+                Leave
+            );
+            // No store has said yet: nothing is decided.
+            assert_eq!(legacy_voice_action(true, false, kept, None, true), Leave);
+        }
+        // Not legacy: installed by the switch (it has the marker), or not there at all.
+        for wanted in [None, Some(false), Some(true)] {
+            for base in [false, true] {
+                for kept in [false, true] {
+                    assert_eq!(legacy_voice_action(true, true, kept, wanted, base), Leave);
+                    assert_eq!(legacy_voice_action(false, false, kept, wanted, base), Leave);
+                    assert_eq!(legacy_voice_action(false, true, kept, wanted, base), Leave);
+                }
+            }
+        }
+    }
+
+    /// A `runtime/models` laid out the way a real install fills it: the embedder and reranker, the hf
+    /// and xet caches, the photo-OCR weights, and the Whisper repo with its lock folder.
+    fn seeded_models(models: &Path) {
+        let put = |rel: &str, bytes: usize| {
+            let p = models.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; bytes]).unwrap();
+        };
+        put(
+            "fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx",
+            1000,
+        );
+        put("hf/xet/chunk", 100);
+        put("rapidocr/det.onnx", 300);
+        put(&format!("{WHISPER_REPO_DIR}/snapshots/abc/model.bin"), 50);
+        put(&format!(".locks/{WHISPER_REPO_DIR}/x.lock"), 7);
+    }
+
+    /// D8's evidence is the Whisper folder itself, never a non-empty `runtime/models` (the embedder
+    /// lives there too), and switching voice off with "remove" takes that folder and nothing else.
+    #[test]
+    fn the_speech_model_is_found_and_removed_by_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: dir.path().join("runtime").join("venv"),
+        });
+        let models = dir.path().join("runtime").join("models");
+        assert!(!mgr.whisper_model_present(), "nothing downloaded yet");
+
+        seeded_models(&models);
+        assert!(mgr.whisper_model_present());
+        mgr.remove_whisper_model().unwrap();
+        assert!(!mgr.whisper_model_present());
+        assert!(!models.join(WHISPER_REPO_DIR).exists());
+        assert!(!models.join(".locks").join(WHISPER_REPO_DIR).exists());
+        assert!(models
+            .join("fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx")
+            .is_file());
+        assert!(models.join("hf/xet/chunk").is_file());
+        assert!(models.join("rapidocr/det.onnx").is_file());
+        // Only the search models left: still no evidence of voice. Removing again is not an error.
+        assert!(!mgr.whisper_model_present());
+        mgr.remove_whisper_model().unwrap();
+    }
+
+    #[test]
+    fn whisper_folder_name_matches_the_sidecar_model() {
+        // `WHISPER_REPO_DIR` is derived from the sidecar's model name; if that changes, D8's default
+        // and the removal would silently stop finding the download.
+        let sidecar = include_str!("../../sidecar/pm_sidecar.py");
+        assert!(sidecar.contains("WHISPER_MODEL = \"base.en\""));
+        assert_eq!(WHISPER_REPO_DIR, "models--Systran--faster-whisper-base.en");
+    }
+
+    /// The reconciler's answer is held until a store gives one, and each answer replaces the last.
+    #[test]
+    fn the_voice_answer_starts_unknown_and_follows_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: dir.path().join("venv"),
+        });
+        assert_eq!(mgr.voice_wanted(), None);
+        let mut rx = mgr.subscribe_voice_wanted();
+        mgr.set_voice_wanted(false);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), Some(false));
+        mgr.set_voice_wanted(true);
+        assert_eq!(mgr.voice_wanted(), Some(true));
+        // No venv: the reconciler has nothing to settle and returns without touching pip.
+        mgr.reconcile_voice_engine();
+    }
+
+    /// A venv whose interpreter only records what pip is asked, with an older PM's speech engine in
+    /// it (faster-whisper on disk, no `.pm-voice`) and neutral fixture locks. Returns the manager,
+    /// the pip log, site-packages and the sidecar source dir.
+    #[cfg(unix)]
+    fn fake_voice_venv(dir: &Path) -> (SidecarManager, PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let source_dir = dir.join("sidecar");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        // Only their existence and hashes matter here.
+        std::fs::write(
+            source_dir.join("requirements.lock"),
+            b"base==0 \\\n    --hash=sha256:aaa\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_dir.join(OPTIONAL_VOICE_COMPONENT.lock),
+            b"voice==0 \\\n    --hash=sha256:bbb\n",
+        )
+        .unwrap();
+        let venv = dir.join("runtime").join("venv");
+        let log = dir.join("pip.log");
+        let py = venv.join("bin").join("python");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(
+            &py,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Python 3.12.0'; exit 0; fi\n\
+                 echo \"$@\" >> '{}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let site = venv.join("lib").join("python3.12").join("site-packages");
+        std::fs::create_dir_all(site.join("faster_whisper")).unwrap();
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: source_dir.clone(),
+            venv_dir: venv,
+        });
+        (mgr, log, site, source_dir)
+    }
+
+    /// The reconciler end to end, on [`fake_voice_venv`]: an older PM's engine is left until a store
+    /// says, removed whole where voice is off (and again if a removal left part of it), left alone
+    /// where voice was switched off with "keep", left for `provision` while the base venv is
+    /// outdated, and adopted (the voice lock installed, the marker stamped) once it is current. As
+    /// the component it is never touched again.
+    #[cfg(unix)]
+    #[test]
+    fn the_reconciler_removes_or_adopts_an_older_pms_speech_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, source_dir) = fake_voice_venv(dir.path());
+        let venv = dir.path().join("runtime").join("venv");
+        let logged = || std::fs::read_to_string(&log).unwrap_or_default();
+        let forget = || {
+            let _ = std::fs::remove_file(&log);
+        };
+        let removal =
+            "-m pip uninstall -y --disable-pip-version-check av ctranslate2 setuptools faster-whisper";
+
+        mgr.reconcile_voice_engine();
+        assert_eq!(logged(), "", "nothing is decided before a store says");
+
+        mgr.set_voice_wanted(false);
+        mgr.reconcile_voice_engine();
+        assert_eq!(logged().trim(), removal);
+
+        // A removal pip stopped part-way: faster-whisper is gone and CTranslate2 is not. Still an
+        // engine on disk, so the next pass tries again.
+        forget();
+        std::fs::remove_dir_all(site.join("faster_whisper")).unwrap();
+        std::fs::create_dir_all(site.join("ctranslate2")).unwrap();
+        mgr.set_voice_wanted(false);
+        mgr.reconcile_voice_engine();
+        assert_eq!(logged().trim(), removal);
+        std::fs::remove_dir_all(site.join("ctranslate2")).unwrap();
+        std::fs::create_dir_all(site.join("faster_whisper")).unwrap();
+
+        // Switched off with "keep the engine": what `set_voice_enabled(false, false)` does, in its
+        // order. The upgrade's clean-up leaves it.
+        forget();
+        mgr.keep_voice_engine().unwrap();
+        mgr.set_voice_wanted(false);
+        mgr.reconcile_voice_engine();
+        assert_eq!(logged(), "", "an engine someone chose to keep stays");
+
+        // The fake pip removed nothing, so the engine is still there for the next two cases.
+        forget();
+        mgr.set_voice_wanted(true);
+        mgr.reconcile_voice_engine();
+        assert_eq!(
+            logged(),
+            "",
+            "an outdated base venv is provision's to settle"
+        );
+
+        let base = crate::ingest::hex_digest(
+            &std::fs::read(source_dir.join("requirements.lock")).unwrap(),
+        );
+        std::fs::write(venv.join(".pm-ready"), base).unwrap();
+        mgr.reconcile_voice_engine();
+        let adopted = logged();
+        assert!(
+            adopted.starts_with("-m pip install")
+                && adopted.contains(OPTIONAL_VOICE_COMPONENT.lock),
+            "the voice lock is installed: {adopted}"
+        );
+        assert!(mgr.optional_voice_ready(), "and the marker stamped");
+        assert!(
+            !venv.join(".pm-voice-kept").exists(),
+            "the note about the older engine goes with it"
+        );
+
+        forget();
+        mgr.set_voice_wanted(false);
+        mgr.reconcile_voice_engine();
+        assert_eq!(
+            logged(),
+            "",
+            "the component is the switch's to remove, not the upgrade's"
+        );
+    }
+
+    /// A recording that finds the engine gone installs it, unless voice was switched off while it
+    /// waited: checked under the install lock, and nothing is downloaded.
+    #[cfg(unix)]
+    #[test]
+    fn a_recording_never_reinstalls_the_engine_once_voice_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, _site, source_dir) = fake_voice_venv(dir.path());
+        let venv = dir.path().join("runtime").join("venv");
+        let base = crate::ingest::hex_digest(
+            &std::fs::read(source_dir.join("requirements.lock")).unwrap(),
+        );
+        std::fs::write(venv.join(".pm-ready"), base).unwrap();
+
+        mgr.set_voice_wanted(false);
+        let refused = mgr
+            .install_optional_voice_for_recording(|_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("Voice input is off"), "{refused}");
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("install"));
+        assert!(!mgr.optional_voice_ready());
+
+        mgr.set_voice_wanted(true);
+        mgr.install_optional_voice_for_recording(|_| {}).unwrap();
+        assert!(mgr.optional_voice_ready());
     }
 
     /// Every sidecar file the app READS at runtime must be bundled, in BOTH manifests. The resource

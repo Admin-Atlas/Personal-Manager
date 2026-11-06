@@ -401,8 +401,12 @@ describe("the tab's shape, in every state", () => {
       const { container } = await mount();
       expectShape(container);
       expect(container.querySelectorAll('[data-variant="primary"]').length).toBeLessThanOrEqual(1);
-      // The pane's first-child rule (no top rule, no top margin) lands on the start section.
-      expect((container.firstElementChild as HTMLElement).id).toBe("sec-localai-start");
+      // The pane's first-child rule (no top rule, no top margin) lands on the Local AI switch (D7),
+      // the tab's master, so the start section's own top rule is what sets the switch apart from
+      // the sections it switches.
+      const first = container.firstElementChild as HTMLElement;
+      expect(first.querySelector('[data-help="settings-localai-switch"]')).not.toBeNull();
+      expect((first.nextElementSibling as HTMLElement).id).toBe("sec-localai-start");
     });
   }
 

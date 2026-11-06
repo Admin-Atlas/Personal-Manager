@@ -832,6 +832,18 @@ pub struct LocalRuntime {
     /// AppState is built once (lib.rs), a tray close only hides the window (tray.rs), and quitting
     /// goes through app.exit → RunEvent::Exit → process::exit. NEVER persisted.
     keep_local: AtomicBool,
+    /// The Local AI switch (D7) as the open store last said, for the parts that cannot read the
+    /// store: the executor's gate on a plan resolved before the switch went off, the two background
+    /// loops, and the jobs that must stop the moment it does. Learned on every store open
+    /// (`AppState::open_session`) and written beside the stored row by the switch itself.
+    ///
+    /// Starts off, so nothing local runs before a store has said it may: a passphrase vault is shut
+    /// at launch, and PM has loaded nothing in this process yet, so there is nothing to look after
+    /// until it opens. A closed store keeps the last answer, as the release policy cache does.
+    ///
+    /// A watch channel rather than a bool, because the loops park on it: a parked loop wakes only
+    /// when the switch goes on, with no polling and no missed wake-up however the two race.
+    local_ai_on: tokio::sync::watch::Sender<bool>,
 }
 
 /// The claim on the one in-flight power read. Released on drop, so a read that panics or is
@@ -1025,6 +1037,32 @@ impl LocalRuntime {
     /// real change.
     pub fn set_keep_local(&self, on: bool) -> bool {
         self.keep_local.swap(on, Ordering::SeqCst) != on
+    }
+
+    /// Whether Local AI is switched on, as the open store last said (see the field).
+    pub fn local_ai_on(&self) -> bool {
+        *self.local_ai_on.borrow()
+    }
+
+    /// Record the switch. Returns whether it changed. Every waiter on the other side wakes.
+    pub fn set_local_ai_on(&self, on: bool) -> bool {
+        self.local_ai_on.send_if_modified(|v| {
+            let changed = *v != on;
+            *v = on;
+            changed
+        })
+    }
+
+    /// Resolves once Local AI is on, at once if it already is. What the two local loops park on.
+    pub async fn wait_local_ai_on(&self) {
+        // The sender lives as long as this runtime, so the wait can only end with the switch on.
+        let _ = self.local_ai_on.subscribe().wait_for(|on| *on).await;
+    }
+
+    /// Resolves once Local AI is off, at once if it already is. Raced against a running pull, a
+    /// test and a background call, so switching off stops each of them where it stands.
+    pub async fn wait_local_ai_off(&self) {
+        let _ = self.local_ai_on.subscribe().wait_for(|on| !*on).await;
     }
 
     /// Record that PM is about to put this model on the wire.
@@ -2125,5 +2163,48 @@ mod tests {
         assert_eq!(snap.state, crate::power::PowerState::Mains);
         assert_eq!(snap.threshold, None);
         assert_eq!(rt.power_on_battery_for(Instant::now()), None);
+    }
+
+    /// The Local AI switch's runtime half (D7): off until a store says otherwise, a change is
+    /// reported only once, and each wait ends exactly when its side of the switch is reached.
+    #[tokio::test]
+    async fn the_local_ai_switch_starts_off_and_wakes_each_waiter_on_its_own_side() {
+        let rt = Arc::new(LocalRuntime::default());
+        assert!(
+            !rt.local_ai_on(),
+            "nothing local may run before a store has said so"
+        );
+        // Already off: the off-wait returns at once rather than waiting for a change.
+        tokio::time::timeout(Duration::from_secs(1), rt.wait_local_ai_off())
+            .await
+            .expect("off is already reached");
+
+        // A parked loop wakes when the switch goes on, however late it registered.
+        let waiter = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.wait_local_ai_on().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "parked while off");
+        assert!(rt.set_local_ai_on(true), "off to on is a change");
+        assert!(!rt.set_local_ai_on(true), "on to on is not");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("woken by the switch")
+            .unwrap();
+
+        // And a running job racing the off-wait is stopped by the switch going off.
+        let stopper = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.wait_local_ai_off().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!stopper.is_finished(), "nothing stops while on");
+        assert!(rt.set_local_ai_on(false));
+        tokio::time::timeout(Duration::from_secs(1), stopper)
+            .await
+            .expect("stopped by the switch")
+            .unwrap();
+        assert!(!rt.local_ai_on());
     }
 }

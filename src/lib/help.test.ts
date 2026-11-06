@@ -203,9 +203,10 @@ describe("the description's formatting help agrees with its toolbar", () => {
 // in a panel that can't scroll (HelpOverlay's is fixed with no height limit), and says nothing the
 // editing stack made untrue.
 describe("the calendar's help", () => {
-  /** Every component's source, tests left out: where the help ids are put on elements. */
+  /** Every component's source, tests left out: where the help ids are put on elements. Plus lib/nav,
+   *  where each sidebar tab names its literal id for SidebarNav to put on the tab. */
   const SHIPPED = Object.entries(
-    import.meta.glob<string>("../components/**/*.tsx", {
+    import.meta.glob<string>(["../components/**/*.tsx", "./nav.ts"], {
       query: "?raw",
       import: "default",
       eager: true,

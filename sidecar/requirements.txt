@@ -8,24 +8,11 @@
 #
 #   markitdown     — convert PDFs, Office docs, HTML, images (OCR), CSV/JSON to Markdown
 #   fastembed      — local on-device ONNX embeddings (BAAI/bge-small-en-v1.5, 384-d)
-#   faster-whisper — local on-device speech-to-text for voice input (base.en)
 #
 # We pin markitdown's document extras explicitly rather than `[all]`: `[all]`
 # also pulls youtube-transcript-api (~=1.0.0, no Python 3.14 wheel — breaks the
 # install) and audio transcription (needs ffmpeg), neither of which this
 # document pipeline uses.
-#
-# faster-whisper decodes its own audio via the bundled `av` (PyAV) wheel, so no
-# system ffmpeg is needed; it shares onnxruntime/tokenizers/numpy with fastembed
-# (they co-resolve to single versions — verified on the user's Python 3.14). The
-# base.en weights (~145 MB) download once on first use, like the embedding model.
-#
-#   av<19 — a tripwire, not a pin (the lock pins the exact version). faster-whisper
-#     1.2.1 calls `av.open(..., metadata_errors="ignore")` and PyAV 19 removed that
-#     parameter, so every transcription would raise TypeError. faster-whisper itself
-#     asks only for `av>=11`, so without this bound the next `just lock-regen`
-#     resolves PyAV 19 and nothing offline notices. Remove it once a faster-whisper
-#     release includes SYSTRAN/faster-whisper#1495 (merged, unreleased at 1.2.1).
 #
 # Photo OCR (rapidocr + pi-heif) is an OPTIONAL component, NOT listed here —
 # like the t-SNE reducer, it installs on demand and is removable from Settings, so
@@ -34,6 +21,12 @@
 # already ships (it pulls no runtime of its own) and downloads its small ONNX models
 # on first use; the extra image deps (opencv/shapely/pyclipper) and pi-heif ship
 # binary wheels for both the bundled 3.12 release interpreter and dev 3.14.
+#
+# Voice input's speech engine (faster-whisper, with CTranslate2 and PyAV, about
+# 240 MB) is OPTIONAL too since voice became a switch, and is NOT listed here:
+# switching voice on installs it, switching it off offers to remove it. Its pins,
+# and why PyAV is pinned beside faster-whisper, live in Rust (sidecar.rs
+# OPTIONAL_VOICE_PINS).
 #
 #   openpyxl — spreadsheet parsing for the dedicated .xlsx/.csv ingest path (board card:
 #     Spreadsheet Processing). Those extensions BYPASS MarkItDown now — routed to the sidecar's
@@ -58,8 +51,6 @@
 #     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.9
 fastembed==0.9.1
-faster-whisper==1.2.1
-av<19
 openpyxl==3.1.5
 pillow==13.0.0
 defusedxml==0.7.1

@@ -55,8 +55,15 @@ pub struct DetectedEndpoint {
 /// Probe the three known loopback ports and return each that answers like an OpenAI `/v1/models`
 /// server. A port that is merely open (some other service) is rejected by the shape check, so this
 /// never claims a server that isn't one.
+///
+/// This and every other command that reaches a model server, scans the machine or writes a local
+/// choice refuses while Local AI is switched off (`local_ai_switch::require_on`). Their controls go
+/// with the tab, so only a stale view or a script could ask, and off promises that nothing local
+/// runs. The commands that forget, reset or read settings stay open: "Forget server and token" has
+/// to work while off.
 #[tauri::command]
-pub async fn probe_local_llm_ports() -> Result<Vec<DetectedEndpoint>> {
+pub async fn probe_local_llm_ports(app: AppHandle) -> Result<Vec<DetectedEndpoint>> {
+    crate::local_ai_switch::require_on(&app)?;
     let mut found = Vec::new();
     for (port, label) in KNOWN_PORTS {
         let url = format!("http://127.0.0.1:{port}");
@@ -103,7 +110,12 @@ pub struct EndpointCheck {
 /// hostname string — `localhost` can resolve anywhere), apply the http posture, then — unless the
 /// posture refuses it — probe reachability and whether a loopback server is also exposed on the LAN.
 #[tauri::command]
-pub async fn check_local_llm_endpoint(url: String, token: Option<String>) -> Result<EndpointCheck> {
+pub async fn check_local_llm_endpoint(
+    app: AppHandle,
+    url: String,
+    token: Option<String>,
+) -> Result<EndpointCheck> {
+    crate::local_ai_switch::require_on(&app)?;
     let normalized = openai_compat::normalize_base_url(&url)?;
     let (scheme, host, port) = split_scheme_host_port(&normalized)?;
     let class = resolve_endpoint_class(&host, port).await?;
@@ -435,6 +447,7 @@ pub fn get_local_llm_config(state: State<'_, AppState>) -> Result<LocalLlmConfig
 /// (defence in depth): a public cleartext URL is REFUSED, never stored. Returns the normalised URL.
 #[tauri::command]
 pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<String> {
+    crate::local_ai_switch::require_on(&app)?;
     let normalized = openai_compat::normalize_base_url(&url)?;
     let (scheme, host, port) = split_scheme_host_port(&normalized)?;
     let class = resolve_endpoint_class(&host, port).await?;
@@ -466,7 +479,9 @@ pub async fn set_local_llm_endpoint(app: AppHandle, url: String) -> Result<Strin
 }
 
 /// Forget the local endpoint entirely: the base URL, both role models, and the token. Routing
-/// preferences are left as-is (absent base URL already makes them fall through to cloud).
+/// preferences are left as-is (absent base URL already makes them fall through to cloud), and so,
+/// with the models, goes the "pick a model" state switching Local AI off left a role in
+/// ([`forget_endpoint_rows`]).
 ///
 /// The token goes first, in the order [`reset_local_ai_settings`] uses and for its reason: a
 /// keychain that refuses, or that PM couldn't read at launch and so can't say the token is gone
@@ -480,9 +495,7 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     drop(state.conn()?);
     secrets::clear_local_llm_endpoint_token()?;
     let conn = state.conn()?;
-    db::delete_setting(&conn, LOCAL_BASE_URL_KEY)?;
-    db::delete_setting(&conn, LOCAL_CHAT_MODEL_KEY)?;
-    db::delete_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?;
+    forget_endpoint_rows(&conn)?;
     drop(conn);
     // No endpoint now owns a token — see `set_local_llm_endpoint`.
     state.local_ai.cache_release_endpoint(None);
@@ -493,21 +506,84 @@ pub fn clear_local_llm_endpoint(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// The store half of [`clear_local_llm_endpoint`]: the address and both role models, in one
+/// transaction, and, only while Local AI is on, both [`llm_gateway::Emptied`] records.
+///
+/// On, this is Disconnect in the Local AI tab, whose confirm says a "Local, fall back to cloud" job
+/// then uses the cloud model; a record kept would instead leave the role waiting on a pick the tab
+/// can't offer with no server. Off, this is "Forget server and token" in AI & Models, whose confirm
+/// says nothing about the cloud, so the records stay: back on, a role the switch emptied still waits
+/// for a model (the Local AI tab shows the connect form, then the roles) and never falls through to
+/// the cloud unannounced ("never fall back to cloud silently", D7).
+fn forget_endpoint_rows(conn: &rusqlite::Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let on = crate::local_ai_switch::read(&tx)?;
+    for key in [
+        LOCAL_BASE_URL_KEY,
+        LOCAL_CHAT_MODEL_KEY,
+        LOCAL_BACKGROUND_MODEL_KEY,
+    ] {
+        db::delete_setting(&tx, key)?;
+    }
+    if on {
+        db::delete_setting(&tx, llm_gateway::CHAT_MODEL_EMPTIED_KEY)?;
+        db::delete_setting(&tx, llm_gateway::BACKGROUND_MODEL_EMPTIED_KEY)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_local_llm_role_model(app: AppHandle, role: String, model: String) -> Result<()> {
     let key = role_model_key(&role)?;
+    // Clearing a model is fine while off; choosing one would undo the "empty it" of switching off.
+    if !model.trim().is_empty() {
+        crate::local_ai_switch::require_on(&app)?;
+    }
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    if model.trim().is_empty() {
-        db::delete_setting(&conn, key)?;
-    } else {
-        db::set_setting(&conn, key, model.trim())?;
-    }
+    write_role_model(&conn, key, role_emptied_key(&role)?, &model)?;
     drop(conn);
     // The sidebar's per-role model rows (#794) read the status snapshot; without a ping they named
     // the OLD model until the next real call — for the background role, potentially hours. Same
     // rule as the endpoint set/clear above: a settings change the sidebar reports must show at once.
     crate::llm_gateway::ping_status(&app);
+    Ok(())
+}
+
+/// The store half of [`set_local_llm_role_model`]: a blank model clears the role's; any other is
+/// chosen, and choosing one ends the "pick a model" state switching Local AI off left the role in
+/// ([`llm_gateway::Emptied`]). One transaction, so the role never reads as chosen and still waiting.
+fn write_role_model(
+    conn: &rusqlite::Connection,
+    model_key: &str,
+    emptied_key: &str,
+    model: &str,
+) -> Result<()> {
+    if model.trim().is_empty() {
+        return db::delete_setting(conn, model_key);
+    }
+    let tx = conn.unchecked_transaction()?;
+    db::set_setting(&tx, model_key, model.trim())?;
+    db::delete_setting(&tx, emptied_key)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The store half of [`set_local_llm_routing`]. Choosing where a role runs, with the Roles section
+/// saying beside it what that choice does, also ends the "pick a model" state switching Local AI
+/// off left it in: from here the route is the one chosen (AI & Models' "Use the cloud model" is one
+/// such choice).
+fn write_routing(
+    conn: &rusqlite::Connection,
+    routing_key: &str,
+    emptied_key: &str,
+    pref: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    db::set_setting(&tx, routing_key, pref)?;
+    db::delete_setting(&tx, emptied_key)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -518,9 +594,14 @@ pub fn set_local_llm_routing(app: AppHandle, role: String, pref: String) -> Resu
     if !matches!(pref.as_str(), "cloud" | "local" | "local-then-cloud") {
         return Err(Error::Other(format!("unknown routing preference '{pref}'")));
     }
+    // "cloud" is what AI & Models' model picker writes while Local AI is off, to give a role that
+    // has nothing to answer it the cloud model; a local preference then would answer nothing.
+    if pref != "cloud" {
+        crate::local_ai_switch::require_on(&app)?;
+    }
     let state = app.state::<AppState>();
     let conn = state.conn()?;
-    db::set_setting(&conn, key, &pref)?;
+    write_routing(&conn, key, role_emptied_key(&role)?, &pref)?;
     drop(conn);
     // Same as the role-model write: routing decides which model the sidebar names.
     crate::llm_gateway::ping_status(&app);
@@ -563,6 +644,14 @@ fn role_routing_key(role: &str) -> Result<&'static str> {
     }
 }
 
+fn role_emptied_key(role: &str) -> Result<&'static str> {
+    match role {
+        "chat" => Ok(llm_gateway::CHAT_MODEL_EMPTIED_KEY),
+        "background" => Ok(llm_gateway::BACKGROUND_MODEL_EMPTIED_KEY),
+        other => Err(Error::Other(format!("unknown role '{other}'"))),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reset the tab to its defaults (#445)
 // ---------------------------------------------------------------------------------------------
@@ -583,6 +672,9 @@ fn role_routing_key(role: &str) -> Result<&'static str> {
 /// - The tray icon ([`crate::tray::TRAY_ENABLED_KEY`]). Model memory shows its toggle beside what it
 ///   means for a loaded model, but it is General's setting, and the confirm and What's New both say
 ///   the reset leaves it.
+/// - The Local AI switch itself ([`crate::local_ai_switch::LOCAL_AI_ENABLED_KEY`]). It is the tab's
+///   master, not a setting on it: a reset must not make the tab vanish under the person pressing
+///   it, and this list is what the switch's own default is read from.
 ///
 /// The endpoint token is not a row — it lives in the OS keychain — so the reset clears it beside
 /// these, and "at its defaults" asks after it too.
@@ -593,6 +685,11 @@ const LOCAL_AI_SETTINGS: &[&str] = &[
     LOCAL_BACKGROUND_MODEL_KEY,
     CHAT_ROUTING_KEY,
     BACKGROUND_ROUTING_KEY,
+    // The "pick a model" state switching Local AI off leaves a role in: nobody sets it on the tab,
+    // but the reset puts routing back to the cloud, and a stale one would outlive the role it was
+    // about. Only ever written beside the switch's own row, so it can't move D7's default.
+    llm_gateway::CHAT_MODEL_EMPTIED_KEY,
+    llm_gateway::BACKGROUND_MODEL_EMPTIED_KEY,
     // Model memory: the release policy and both quiet periods.
     residency::RELEASE_POLICY_KEY,
     residency::RELEASE_IDLE_MINUTES_KEY,
@@ -618,8 +715,9 @@ fn delete_local_ai_settings(conn: &rusqlite::Connection) -> Result<()> {
 }
 
 /// Whether any row in [`LOCAL_AI_SETTINGS`] is stored. A row holding the default value still
-/// counts: the question is whether there is anything for a reset to clear.
-fn local_ai_settings_stored(conn: &rusqlite::Connection) -> Result<bool> {
+/// counts: the question is whether there is anything for a reset to clear. Also D7's test for
+/// "an existing Local AI user", who starts with the switch on (`local_ai_switch::stamp_default`).
+pub(crate) fn local_ai_settings_stored(conn: &rusqlite::Connection) -> Result<bool> {
     for key in LOCAL_AI_SETTINGS {
         if db::get_setting(conn, key)?.is_some() {
             return Ok(true);
@@ -706,6 +804,7 @@ pub fn reset_local_ai_settings(app: AppHandle) -> Result<()> {
 /// friendly message if nothing is configured or it can't be reached.
 #[tauri::command]
 pub async fn list_local_llm_models(app: AppHandle) -> Result<Vec<ServedModel>> {
+    crate::local_ai_switch::require_on(&app)?;
     let (base_url, token) = match configured_endpoint(&app).await? {
         Endpoint::Ready(base_url, token) => (base_url, token),
         Endpoint::Unconfigured => {
@@ -739,6 +838,7 @@ pub async fn pull_local_model(
     model: String,
     on_event: tauri::ipc::Channel<openai_compat::PullProgress>,
 ) -> Result<()> {
+    crate::local_ai_switch::require_on(&app)?;
     let (base_url, token) = match configured_endpoint(&app).await? {
         Endpoint::Ready(base_url, token) => (base_url, token),
         Endpoint::Unconfigured => {
@@ -775,9 +875,15 @@ pub async fn pull_local_model(
     // Cancellation drops the pull future, which aborts the HTTP request — Ollama ties the download
     // to the request context, so the server-side pull stops too (partial blobs are kept for a
     // resume). A cancel is deliberate, so it lands as Ok with a "cancelled" snapshot, not an error.
-    let outcome = tokio::select! {
-        outcome = pull => Some(outcome),
-        _ = cancel.notified() => None,
+    // Switching Local AI off is a cancel too (D7: "stop ai"); raced here as well as sent as one, so
+    // a switch that lands between the claim above and this select still stops the download.
+    let outcome = {
+        let state = app.state::<AppState>();
+        tokio::select! {
+            outcome = pull => Some(outcome),
+            _ = cancel.notified() => None,
+            _ = state.local_ai.wait_local_ai_off() => None,
+        }
     };
     // The pull just changed what is on disk, so the cached crawl (#449) is now a lie — and it is
     // cached for the whole process, so without this PM answers its own download with its own
@@ -961,7 +1067,10 @@ pub(crate) fn power_view(
     let ctx = llm_gateway::RuntimeContext::from_parts(snap, settings, keep_local);
     let role = |role: Role, bound: Option<&str>, key: KeyPresence| {
         let local_ready = endpoint_set && bound.is_some();
-        let blocked = llm_gateway::power_blocked(prefs.for_role(role), local_ready, key);
+        // The preference `resolve_provider` serves the role by: a role switching Local AI off
+        // emptied is "Local only" until a model is picked.
+        let pref = prefs.served_pref(role);
+        let blocked = llm_gateway::power_blocked(pref, local_ready, key);
         let route = match llm_gateway::power_route(role, &ctx, blocked) {
             // Plugged back in, with the latch still waiting out its minute: there is nothing left to
             // ask about. The question says "you're on battery" and offers the cloud "until you plug
@@ -979,7 +1088,8 @@ pub(crate) fn power_view(
             blocked,
             local_model: bound.map(str::to_string),
             effective: llm_gateway::effective_route(
-                prefs.for_role(role),
+                pref,
+                prefs.local_ai_on,
                 local_ready,
                 key,
                 route == PowerRoute::Cloud,
@@ -1054,7 +1164,11 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
         let base_url = db::get_setting(&conn, LOCAL_BASE_URL_KEY)?;
-        let configured = base_url.is_some();
+        let prefs = llm_gateway::routing_prefs(&conn)?;
+        // Local AI switched off reads as nothing configured, though the address is kept for when it
+        // comes back on (D7): every surface that renders this (the footer's Local row, the chips,
+        // the On battery strip) then draws nothing, and the 30-second poll never probes the server.
+        let configured = base_url.is_some() && prefs.local_ai_on;
         let chat = role_local_model(
             db::get_setting(&conn, CHAT_ROUTING_KEY)?.as_deref(),
             db::get_setting(&conn, LOCAL_CHAT_MODEL_KEY)?.as_deref(),
@@ -1063,7 +1177,6 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
             db::get_setting(&conn, BACKGROUND_ROUTING_KEY)?.as_deref(),
             db::get_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY)?.as_deref(),
         );
-        let prefs = llm_gateway::routing_prefs(&conn)?;
         let power_settings = PowerSettings::read(&conn);
         (
             base_url,
@@ -1335,6 +1448,7 @@ pub async fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus> {
 /// refresh. The probes are blocking, so they run off the async runtime.
 #[tauri::command]
 pub async fn local_hardware_scan(app: AppHandle, force: bool) -> Result<hardware::Hardware> {
+    crate::local_ai_switch::require_on(&app)?;
     if !force {
         if let Some(hw) = app.state::<AppState>().local_ai.cached_hardware() {
             return Ok(hw);
@@ -1362,6 +1476,12 @@ pub async fn local_hardware_scan(app: AppHandle, force: bool) -> Result<hardware
 /// scan and on-disk crawl (running each at most once per session), and everything after that is pure.
 #[tauri::command]
 pub async fn local_better_fit_notice(app: AppHandle) -> Result<Option<better_fit::Suggestion>> {
+    // With Local AI switched off there is nothing to suggest a better model for, and the shell calls
+    // this for everyone as they move around, so a cloud-only user never pays for the hardware scan
+    // and disk crawl below (D7).
+    if !app.state::<AppState>().local_ai.local_ai_on() {
+        return Ok(None);
+    }
     let cat = local_catalog::catalog();
 
     // Is it even time to look? `manual` never fires; the default only fires when a shipped update
@@ -1598,6 +1718,7 @@ pub struct GpuResidency {
 /// What the graphics card is holding, for the Local AI tab's lifecycle section.
 #[tauri::command]
 pub async fn local_gpu_residency(app: AppHandle) -> Result<GpuResidency> {
+    crate::local_ai_switch::require_on(&app)?;
     let (policy, idle_minutes) = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -1697,11 +1818,22 @@ const RELEASE_TICK: std::time::Duration = std::time::Duration::from_secs(20);
 /// after the user locks up and walks away, which is precisely when the card is worth handing back.
 /// The policy is read whenever it can be and remembered, so a locked vault keeps honouring the last
 /// one PM saw.
+///
+/// Parked while Local AI is switched off (D7): it wakes only when the switch goes on. Switching off
+/// hands back what PM loaded on its own pass (`local_ai_switch::set_local_ai_enabled`), and nothing
+/// local runs while off, so there is nothing for a timer to look after. A tick that finds the
+/// switch gone off during its sleep goes back to waiting without acting.
 pub fn spawn_release_scheduler(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
         loop {
+            state.local_ai.wait_local_ai_on().await;
             tokio::time::sleep(RELEASE_TICK).await;
-            release_tick(&app).await;
+            if state.local_ai.local_ai_on() {
+                release_tick(&app).await;
+            }
         }
     });
 }
@@ -1805,9 +1937,18 @@ fn stored_release_config(conn: &rusqlite::Connection) -> residency::ReleaseConfi
 /// lane behind a minutes-long stream (`release_pm_models` unloads inside it), and the power poll
 /// must not stall with it. Reads FIRST, so an install unplugged at launch has a reading at once. No
 /// shutdown path: `process::exit` ends it, like every other scheduler.
+///
+/// Parked while Local AI is switched off (D7): the policy only ever moves a local role, and with the
+/// switch off there is none. It reads first on waking too, so switching on takes a reading at once.
+/// A latch left unwatched while parked reads as mains once it goes stale (`PowerTracker::stale`),
+/// the side that sends nothing to the cloud.
 pub fn spawn_power_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
         loop {
+            state.local_ai.wait_local_ai_on().await;
             power_tick(&app).await;
             tokio::time::sleep(power::POLL).await;
         }
@@ -1883,7 +2024,9 @@ pub struct ReleaseSummary {
 /// Records no health outcome at any point. Housekeeping is not evidence about the endpoint in either
 /// direction: a success here would clear a failing host's strike streak, and a failure would eject a
 /// healthy one.
-async fn release_pm_models(
+///
+/// Also the Local AI switch's way of handing the card back when it goes off.
+pub(crate) async fn release_pm_models(
     state: &State<'_, AppState>,
     base_url: &str,
     token: Option<&str>,
@@ -2053,6 +2196,7 @@ const TEST_REPLY_CAP: usize = 240;
 ///     endpoint is resting, and it cannot make that better or worse.
 #[tauri::command]
 pub async fn test_local_llm(app: AppHandle, role: String) -> Result<LocalTestResult> {
+    crate::local_ai_switch::require_on(&app)?;
     let model = {
         let state = app.state::<AppState>();
         let conn = state.conn()?;
@@ -2142,11 +2286,31 @@ pub async fn test_local_llm(app: AppHandle, role: String) -> Result<LocalTestRes
     // a diagnostic that made someone wait for their reply would be a poor trade — but it is not the
     // Tasks model answering, and counting it as one would have the footer name the wrong role: click
     // Test on the Chat row and the Tasks row would light up.
-    let outcome = state
-        .local_ai
-        .slot
-        .run_background(crate::local_slot::Lane::Housekeeping, attempt)
-        .await;
+    //
+    // Switching Local AI off stops it where it stands (D7: "stop ai"). Raced rather than only
+    // asked, because a cold load can run for minutes. The model it may have started loading stays
+    // marked, and the switch's own release pass hands it back.
+    let raced = tokio::select! {
+        outcome = state
+            .local_ai
+            .slot
+            .run_background(crate::local_slot::Lane::Housekeeping, attempt) => Some(outcome),
+        _ = state.local_ai.wait_local_ai_off() => None,
+    };
+    let Some(outcome) = raced else {
+        let result = LocalTestResult {
+            model: model.clone(),
+            ok: false,
+            reply: None,
+            elapsed_ms: waiting_since.elapsed().as_millis() as u64,
+            loaded_for_test,
+            was_holding,
+            message: Some("the test stopped because Local AI was switched off.".into()),
+        };
+        state.local_ai.finish_test(result.clone());
+        crate::llm_gateway::ping_status(&app);
+        return Ok(result);
+    };
     // Every arm, including the ones that never reached the server. A test is never evidence.
     state
         .local_ai
@@ -2487,6 +2651,7 @@ pub fn set_local_model_scan_dir(state: State<'_, AppState>, dir: Option<String>)
 /// (or runs one), never forcing a re-scan.
 #[tauri::command]
 pub async fn local_model_recommendations(app: AppHandle) -> Result<Recommendations> {
+    crate::local_ai_switch::require_on(&app)?;
     let hardware = match app.state::<AppState>().local_ai.cached_hardware() {
         Some(hw) => hw,
         None => scan_hardware(&app).await?,
@@ -4206,6 +4371,8 @@ mod tests {
         RoutingPrefs {
             chat: pref,
             background: pref,
+            local_ai_on: true,
+            emptied: llm_gateway::Emptied::default(),
         }
     }
 
@@ -4231,6 +4398,35 @@ mod tests {
         assert_eq!(view.return_at, 75);
         assert_eq!(view.state, PowerState::BatteryLow);
         assert_eq!(view.percent, Some(40));
+    }
+
+    /// Local AI switched off (D7): the status a surface reads says nothing answers a local role —
+    /// not "the cloud" — whatever the battery, the keys and the stored models say.
+    #[test]
+    fn with_local_ai_off_a_local_role_reads_as_nothing_answering() {
+        for pref in [ProviderPref::Local, ProviderPref::LocalThenCloud] {
+            let view = power_view(
+                &low_battery(),
+                &policy(true),
+                false,
+                &RoutingPrefs {
+                    local_ai_on: false,
+                    ..both(pref)
+                },
+                true,
+                Some("gemma3:4b"),
+                Some("qwen3:8b"),
+                KeyPresence::Present,
+                KeyPresence::Present,
+            );
+            use crate::llm_gateway::EffectiveRoute;
+            assert_eq!(view.chat.effective, EffectiveRoute::Nothing, "{pref:?}");
+            assert_eq!(
+                view.background.effective,
+                EffectiveRoute::Nothing,
+                "{pref:?}"
+            );
+        }
     }
 
     #[test]
@@ -4393,6 +4589,8 @@ mod tests {
             &RoutingPrefs {
                 chat: ProviderPref::LocalThenCloud,
                 background: ProviderPref::Cloud,
+                local_ai_on: true,
+                emptied: llm_gateway::Emptied::default(),
             },
             true,
             Some("gemma3:4b"),
@@ -4444,6 +4642,8 @@ mod tests {
             &RoutingPrefs {
                 chat: ProviderPref::Local,
                 background: ProviderPref::Cloud,
+                local_ai_on: true,
+                emptied: llm_gateway::Emptied::default(),
             },
             true,
             None,
@@ -6271,6 +6471,9 @@ mod tests {
         ("local_llm_background_model", "qwen2.5:7b"),
         ("local_llm_chat_routing", "local"),
         ("local_llm_background_routing", "local-then-cloud"),
+        // Written by switching Local AI off, not on the tab, but the reset clears them too.
+        ("local_llm_chat_model_emptied", "true"),
+        ("local_llm_background_model_emptied", "true"),
         ("local_llm_release_policy", "idle"),
         ("local_llm_release_idle_minutes", "10"),
         ("local_llm_battery_idle_minutes", "3"),
@@ -6341,6 +6544,165 @@ mod tests {
                 idle_after: residency::idle_after(None),
                 battery_idle_after: None,
             }
+        );
+    }
+
+    /// Choosing a model or a routing for a role ends the "pick a model" state switching Local AI off
+    /// left it in, for that role only; clearing a model does not end it.
+    #[test]
+    fn choosing_a_model_or_a_routing_ends_the_pick_a_model_state() {
+        let (_dir, conn) = temp_db();
+        let emptied =
+            |conn: &rusqlite::Connection| llm_gateway::routing_prefs(conn).unwrap().emptied;
+        db::set_bool(&conn, llm_gateway::CHAT_MODEL_EMPTIED_KEY, true).unwrap();
+        db::set_bool(&conn, llm_gateway::BACKGROUND_MODEL_EMPTIED_KEY, true).unwrap();
+        let chat = role_emptied_key("chat").unwrap();
+        let background = role_emptied_key("background").unwrap();
+
+        write_role_model(&conn, LOCAL_CHAT_MODEL_KEY, chat, "  ").unwrap();
+        assert!(emptied(&conn).chat, "clearing a model is not picking one");
+
+        write_role_model(&conn, LOCAL_CHAT_MODEL_KEY, chat, " gemma3:4b ").unwrap();
+        assert_eq!(
+            db::get_setting(&conn, LOCAL_CHAT_MODEL_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("gemma3:4b")
+        );
+        assert_eq!(
+            emptied(&conn),
+            llm_gateway::Emptied {
+                chat: false,
+                background: true,
+            }
+        );
+
+        write_routing(&conn, BACKGROUND_ROUTING_KEY, background, "cloud").unwrap();
+        assert_eq!(emptied(&conn), llm_gateway::Emptied::default());
+        assert_eq!(
+            db::get_setting(&conn, BACKGROUND_ROUTING_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("cloud")
+        );
+    }
+
+    /// Off, back on, then Disconnect: forgetting the server ends the "pick a model" state with the
+    /// models, so a "Local, fall back to cloud" role the switch emptied falls through to the cloud as
+    /// Disconnect's doc promises, instead of waiting on a pick the Local AI tab can't offer with no
+    /// server. Routing and the switch stay; only the server's rows and the records go.
+    #[test]
+    fn forgetting_the_server_ends_the_pick_a_model_state_and_keeps_routing() {
+        use crate::local_ai_switch;
+        use llm_gateway::{resolve_provider, ProviderChoice, RuntimeContext};
+        let (_dir, conn) = temp_db();
+        let ctx = RuntimeContext::default();
+        db::set_setting(&conn, LOCAL_BASE_URL_KEY, "http://127.0.0.1:11434").unwrap();
+        db::set_setting(&conn, CHAT_ROUTING_KEY, "local-then-cloud").unwrap();
+        db::set_setting(&conn, LOCAL_CHAT_MODEL_KEY, "gemma3:4b").unwrap();
+        db::set_setting(&conn, BACKGROUND_ROUTING_KEY, "local").unwrap();
+        db::set_setting(&conn, LOCAL_BACKGROUND_MODEL_KEY, "qwen3:8b").unwrap();
+        // What `set_local_ai_enabled` writes, off and then on.
+        local_ai_switch::write_off(&conn).unwrap();
+        db::set_bool(&conn, local_ai_switch::LOCAL_AI_ENABLED_KEY, true).unwrap();
+        let prefs = llm_gateway::routing_prefs(&conn).unwrap();
+        assert_eq!(
+            prefs.emptied,
+            llm_gateway::Emptied {
+                chat: true,
+                background: true,
+            }
+        );
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &ctx),
+            ProviderChoice::Local,
+            "before Disconnect the emptied role waits for a pick"
+        );
+        let before = all_settings(&conn);
+
+        forget_endpoint_rows(&conn).unwrap();
+
+        let prefs = llm_gateway::routing_prefs(&conn).unwrap();
+        assert_eq!(prefs.emptied, llm_gateway::Emptied::default());
+        assert!(prefs.local_ai_on, "forgetting the server leaves the switch");
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &ctx),
+            ProviderChoice::LocalThenCloud,
+            "with no server, local-then-cloud falls through to the cloud"
+        );
+        assert_eq!(
+            llm_gateway::no_provider_message_with(&prefs, Role::Chat),
+            llm_gateway::no_provider_message(),
+            "never sent to pick a model in a tab that has none to offer"
+        );
+        assert_eq!(
+            resolve_provider(Role::Background, &prefs, &ctx),
+            ProviderChoice::Local,
+            "Local only stays Local only"
+        );
+        // Exactly the server's three rows and the two records went; routing and all else stayed.
+        let gone = [
+            LOCAL_BASE_URL_KEY,
+            LOCAL_CHAT_MODEL_KEY,
+            LOCAL_BACKGROUND_MODEL_KEY,
+            llm_gateway::CHAT_MODEL_EMPTIED_KEY,
+            llm_gateway::BACKGROUND_MODEL_EMPTIED_KEY,
+        ];
+        let expected: Vec<_> = before
+            .into_iter()
+            .filter(|(k, _)| !gone.contains(&k.as_str()))
+            .collect();
+        assert_eq!(all_settings(&conn), expected);
+        assert_eq!(
+            db::get_setting(&conn, CHAT_ROUTING_KEY).unwrap().as_deref(),
+            Some("local-then-cloud")
+        );
+    }
+
+    /// "Forget server and token" while Local AI is off moves no route: off, every local role still
+    /// has nothing to answer it and is told Local AI is off. It keeps the "pick a model" records, so
+    /// back on, a "Local, fall back to cloud" role the switch emptied still waits for a model and
+    /// never falls through to the cloud (that dialog says nothing about the cloud).
+    #[test]
+    fn forgetting_the_server_while_off_still_answers_nothing_until_on() {
+        use crate::local_ai_switch;
+        use llm_gateway::{resolve_provider, ProviderChoice, RuntimeContext};
+        let (_dir, conn) = temp_db();
+        let ctx = RuntimeContext::default();
+        db::set_setting(&conn, LOCAL_BASE_URL_KEY, "http://127.0.0.1:11434").unwrap();
+        db::set_setting(&conn, CHAT_ROUTING_KEY, "local-then-cloud").unwrap();
+        db::set_setting(&conn, LOCAL_CHAT_MODEL_KEY, "gemma3:4b").unwrap();
+        local_ai_switch::write_off(&conn).unwrap();
+
+        forget_endpoint_rows(&conn).unwrap();
+
+        let prefs = llm_gateway::routing_prefs(&conn).unwrap();
+        assert!(!prefs.local_ai_on);
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &ctx),
+            ProviderChoice::LocalAiOff,
+            "off, never the cloud"
+        );
+        assert_eq!(
+            llm_gateway::no_provider_message_with(&prefs, Role::Chat),
+            local_ai_switch::LOCAL_AI_OFF_MESSAGE
+        );
+
+        assert!(db::get_setting(&conn, LOCAL_BASE_URL_KEY)
+            .unwrap()
+            .is_none());
+        assert!(prefs.emptied.chat, "the record outlives Forget while off");
+
+        db::set_bool(&conn, local_ai_switch::LOCAL_AI_ENABLED_KEY, true).unwrap();
+        let prefs = llm_gateway::routing_prefs(&conn).unwrap();
+        assert_eq!(
+            resolve_provider(Role::Chat, &prefs, &ctx),
+            ProviderChoice::Local,
+            "back on with no server, the emptied role waits for a pick, never the cloud"
+        );
+        assert_eq!(
+            llm_gateway::no_provider_message_with(&prefs, Role::Chat),
+            local_ai_switch::PICK_A_MODEL_MESSAGE
         );
     }
 

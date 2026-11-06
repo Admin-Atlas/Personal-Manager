@@ -1604,10 +1604,18 @@ export interface StorageComponent {
   blockers: StorageBlocker[];
   manage: StorageManage | null;
   note: string | null;
+  /** A feature switch on this row and where it stands (voice input's), else null. With it,
+   *  `status` describes the engine on disk, and the switch decides Turn on vs Turn off. */
+  switch: boolean | null;
 }
 export interface StorageReport {
   total_bytes: number;
   components: StorageComponent[];
+}
+
+/** The voice switch (Mods spec D8, voice_switch.rs `VoiceSwitch`). */
+export interface VoiceSwitch {
+  on: boolean;
 }
 
 /** Global progress for the semantic-layout precompute (fires regardless of which view started it). */
@@ -3062,6 +3070,17 @@ export interface LocalLlmConfig {
   chat_routing: string;
   background_routing: string;
   has_token: boolean;
+}
+
+/** The Local AI switch (D7, local_ai_switch.rs `LocalAiSwitch`). */
+export interface LocalAiSwitch {
+  on: boolean;
+  /** Chat is routed to a local model while the switch is off, so nothing answers it until a model
+   *  is picked. Always false while on. */
+  chat_needs_model: boolean;
+  background_needs_model: boolean;
+  /** A server address or token is still saved, so "Forget server and token" has something to do. */
+  server_saved: boolean;
 }
 
 /** Whether an AI provider is available, for the keyless-onboarding gate (#295, settings.rs

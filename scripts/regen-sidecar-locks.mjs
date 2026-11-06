@@ -17,10 +17,19 @@
 // path it was given, so a relative path is what keeps the committed file machine-independent.
 // The optional components are fed on STDIN instead — their pins live in Rust, not in a file uv
 // could name, and stdin leaves no path in the output at all.
+//
+// `PM_LOCK_KEEP=1 just lock-regen` resolves with the committed locks as PREFERENCES (uv keeps a
+// version an `--output-file` already holds unless an input forces it to move), for a change that
+// moves packages between locks rather than upgrading them. Without it every regen also takes
+// whatever upstream released since the last one, which is right for a Dependabot batch and wrong
+// for a change like voice leaving the base install: that one regen would have upgraded some thirty
+// unrelated packages, majors among them, for every user. A new lock prefers what the base lock held,
+// so a package that moves out of the base keeps its version and an installed copy stays valid.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -46,14 +55,17 @@ export function pythonFloor(rustSource) {
   return `${m[1]}.${m[2]}`;
 }
 
-/** The optional components' pins, read from Rust — the source of truth for both (L-6). */
+/** The optional components' pins, read from Rust — the source of truth for each (L-6). */
 export function optionalPins(rustSource) {
   const tsne = rustSource.match(/const OPTIONAL_TSNE_PIN:\s*&str\s*=\s*"([^"]+)"/);
   const ocr = rustSource.match(/const OPTIONAL_OCR_PINS:\s*&\[&str\]\s*=\s*&\[([^\]]+)\]/);
-  if (!tsne || !ocr) throw new Error(`could not find the optional pins in ${SIDECAR_RS}`);
+  const voice = rustSource.match(/const OPTIONAL_VOICE_PINS:\s*&\[&str\]\s*=\s*&\[([^\]]+)\]/);
+  if (!tsne || !ocr || !voice) throw new Error(`could not find the optional pins in ${SIDECAR_RS}`);
+  const list = (m) => [...m[1].matchAll(/"([^"]+)"/g)].map((p) => p[1]);
   return {
     tsne: [tsne[1]],
-    ocr: [...ocr[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]),
+    ocr: list(ocr),
+    voice: list(voice),
   };
 }
 
@@ -85,14 +97,37 @@ function header(lines) {
   ].join("\n");
 }
 
-function compile({ label, args, stdin, stamps }) {
+/**
+ * What a lock is resolved with as preferences in keep mode (see the header): its own committed
+ * text, or for a lock that doesn't exist yet the committed base lock, which is where every package
+ * a new optional lock takes over used to live. `committed` maps a path to its text, or null.
+ */
+export function preferenceFor(path, committed) {
+  return committed[path] ?? committed[BASE_LOCK] ?? null;
+}
+
+function compile({ label, args, stdin, stamps, prefer }) {
   process.stderr.write(`lock-regen: resolving ${label} ...\n`);
-  const body = execFileSync("uv", args, {
-    cwd: ROOT,
-    input: stdin,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  // uv reads preferences only from its `--output-file`, so keep mode hands it a scratch copy; the
+  // result is still taken from stdout, and the copy is thrown away.
+  const scratch = prefer ? mkdtempSync(join(tmpdir(), "pm-lock-")) : null;
+  const outArgs = [];
+  if (scratch) {
+    const file = join(scratch, "prefer.txt");
+    writeFileSync(file, prefer);
+    outArgs.push("--output-file", file);
+  }
+  let body;
+  try {
+    body = execFileSync("uv", [...args, ...outArgs], {
+      cwd: ROOT,
+      input: stdin,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } finally {
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+  }
   // uv emits CRLF on Windows; `.gitattributes` pins the tree to LF, so normalise here rather
   // than leaving a file that reports as modified the moment it is checked out elsewhere.
   const normalised = body.replace(/\r\n/g, "\n").replace(/^\n+/, "");
@@ -107,6 +142,14 @@ function main() {
   const pins = optionalPins(rust);
   const baseInputHash = sha256(read(BASE_INPUT));
   const overrideHash = sha256(read(BASE_OVERRIDE));
+  const optionalLocks = ["ocr", "tsne", "voice"].map((n) => `sidecar/requirements-${n}.lock`);
+  // Read before anything is rewritten: the base lock is about to change under the optional ones.
+  const keep = process.env.PM_LOCK_KEEP === "1";
+  const committed = Object.fromEntries(
+    [BASE_LOCK, ...optionalLocks].map((p) => [p, existsSync(join(ROOT, p)) ? read(p) : null]),
+  );
+  if (keep) process.stderr.write("lock-regen: keep mode, the committed locks are preferences\n");
+  const prefer = (path) => (keep ? preferenceFor(path, committed) : null);
 
   // `--override` on the base compile only: it lifts a dependency's declared bound (see that
   // file's header). The optional locks inherit the result through the
@@ -120,6 +163,7 @@ function main() {
       `# pm-input: ${BASE_INPUT}@sha256:${baseInputHash}`,
       `# pm-override: ${BASE_OVERRIDE}@sha256:${overrideHash}`,
     ],
+    prefer: prefer(BASE_LOCK),
   });
   writeFileSync(join(ROOT, BASE_LOCK), base);
 
@@ -131,6 +175,7 @@ function main() {
   for (const [name, list] of [
     ["ocr", pins.ocr],
     ["tsne", pins.tsne],
+    ["voice", pins.voice],
   ]) {
     const out = `sidecar/requirements-${name}.lock`;
     const body = compile({
@@ -144,6 +189,7 @@ function main() {
         `# pm-constraint: ${BASE_LOCK}@sha256:${baseLockHash}`,
         `# pm-pins: ${list.join(" ")}`,
       ],
+      prefer: prefer(out),
     });
     writeFileSync(join(ROOT, out), body);
   }

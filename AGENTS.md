@@ -47,7 +47,9 @@ on the user's Advanced-Protection account, so a live connector can't work (see t
 2026-06-19 Step 7 decision-log entry). **Voice input** to the chat bar is done
 (v0.8.0): a mic button in the shared `Composer` records a clip and transcribes it
 **on-device** via a `transcribe` handler in the Python sidecar (`faster-whisper`,
-`base.en`) — see `src/lib/useRecorder.ts` + the `transcribe_audio` command.
+`base.en`) — see `src/lib/useRecorder.ts` + the `transcribe_audio` command. It is a
+switch now (`voice_switch.rs`, on its row in Settings → Storage; off for new users), and
+the speech engine is an optional component that switching it on installs.
 
 **With that, every v1 spec feature was built** — v1 shipped its first public release as
 `v2.0.1-alpha` (2026-06-23), and PM is now well into **Stage 3**, a large body of work past
@@ -78,7 +80,9 @@ release remain the open post-v1 work.
     everywhere but this file, and the `frontend` CI job (pr.yml) runs it.
   - `src/lib/types.ts` — shared types mirroring the Rust structs.
   - `src/components/` — the nav surfaces (`Sidebar` → Focus / Chats / Documents / Review /
-    Map / Calendar / Pinboard, plus the capability-gated Teach + Dev): `FocusView` (status
+    Map / Calendar / Pinboard, plus the capability-gated Teach + Dev; the list itself, its gating
+    and the user's pin and hide live in `src/lib/nav.ts`, which the sidebar, the command palette
+    and App's fallback all read): `FocusView` (status
     cards + triage + milestones + the calendar agenda + the daily briefing), `ProjectView`
     (per-project files + scoped chat), `ChatView` / `Composer` (+ `ContextMeter`,
     `RetrievalExplainPanel`), `DocumentsView` + `DocumentReader`, `ReviewView`, `GraphView`
@@ -135,14 +139,16 @@ release remain the open post-v1 work.
   - **Platform** — `secrets.rs` (OS keychain: API key + background key + DB key + OAuth
     tokens + feed URLs), `openrouter.rs` (streaming SSE + non-streaming `complete()`; the key
     stays in Rust), `cost.rs`, `applock.rs` / `lock_session.rs`, `components.rs` (the Storage
-    manager), `sidecar.rs` / `python_fetch.rs`, `wipe.rs` (Remove-PM-data).
+    manager), `sidecar.rs` / `python_fetch.rs`, `wipe.rs` (Remove-PM-data), `local_ai_switch.rs`
+    and `voice_switch.rs` (the two feature switches, enforced in Rust).
 - **Sidecar** — `sidecar/pm_sidecar.py` + `requirements.txt` (committed code). A managed venv
   (provisioned on first run) speaks newline-JSON over stdio: `convert` (MarkItDown),
   `embed` / `count_tokens` / `rerank` (fastembed ONNX, model-parameterised — English
   `bge-small-en-v1.5` 384-d by default, multilingual e5-large 1024-d), `transcribe`
   (`faster-whisper` voice input), `analyze_image` (OCR), `analyze_spreadsheet`, and `reduce`
-  (PCA / optional t-SNE map layout). The venv and downloaded models are runtime artifacts,
-  never committed.
+  (PCA / optional t-SNE map layout). The voice engine, photo OCR and t-SNE are optional
+  components with their own locks (`sidecar.rs` `OptionalComponent`), installed on demand. The
+  venv and downloaded models are runtime artifacts, never committed.
 
 ## Design system (V2)
 

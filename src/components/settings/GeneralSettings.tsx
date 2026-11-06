@@ -50,6 +50,7 @@ import {
 import { setBriefingWindowVisible } from "../../lib/ipc";
 import { TrayIconRow } from "./TrayIconRow";
 import { readConfirmDelete, writeConfirmDelete } from "../../lib/pinboard/prefs";
+import { navPlacementIsDefault, resetNavPlacement, useNavPlacement } from "../../lib/nav";
 import {
   ACCENTS,
   accentName,
@@ -98,10 +99,6 @@ export function GeneralSettings() {
     setAccent,
     fontScale,
     setFontScale,
-    teachVisible,
-    setTeachVisible,
-    mapVisible,
-    setMapVisible,
     modelsVisible,
     setModelsVisible,
     appearanceIsDefault,
@@ -280,6 +277,9 @@ export function GeneralSettings() {
   }, []);
   const focusIsDefault = briefingIsDefault && focusViewDefault;
   const helpIsDefault = !help.enabled;
+  // Which tabs the sidebar shows, and in what order. Pinned and hidden from a right-click on the tab
+  // itself; only the Reset lives here. Live: the sidebar stays mounted behind this overlay.
+  const sidebarIsDefault = navPlacementIsDefault(useNavPlacement());
   const calendarIsDefault = !openOnLast && swipe === SWIPE_DAYS_MIN;
   // The Chats-tab sidebar folds, same story as the Focus prefs above: the control lives beside what
   // it changes (one control, one home) and only the RESET lives here, so this needs the same live
@@ -303,6 +303,7 @@ export function GeneralSettings() {
     focusIsDefault &&
     calendarIsDefault &&
     chatSectionsDefault &&
+    sidebarIsDefault &&
     helpIsDefault;
 
   function resetMap() {
@@ -341,6 +342,7 @@ export function GeneralSettings() {
     resetChatSections(); // the Chats-tab sidebar folds, back to density-derived
     resetShowThinking(); // the chat Thinking toggle, back to off
     setChatSectionsDefault(true);
+    resetNavPlacement(); // every tab back where it ships, nothing pinned or hidden
     help.setEnabled(false);
     // Time zone is intentionally left alone — it's derived from the device, not a taste preference.
   }
@@ -543,11 +545,27 @@ export function GeneralSettings() {
             />
           )}
         </SettingRow>
-        <SettingRow label="Review & Teach tabs" helpId="settings-teach-tab">
-          {(a11y) => <Toggle {...a11y} checked={teachVisible} onChange={setTeachVisible} />}
-        </SettingRow>
-        <SettingRow label="Map tab" helpId="settings-map-tab">
-          {(a11y) => <Toggle {...a11y} checked={mapVisible} onChange={setMapVisible} />}
+        {/* The tabs are pinned and hidden where they are, from a right-click in the sidebar (one
+            control, one home), so this row holds only the way back. The description says where
+            the controls went: without it, the Review & Teach and Map switches that used to sit here
+            would simply have vanished. The button stays when there is nothing to undo, disabled,
+            so the row still says it exists. */}
+        <SettingRow
+          label="Sidebar tabs"
+          helpId="settings-sidebar-placement"
+          description="Right-click a tab in the sidebar to pin it to the top or hide it."
+        >
+          {(a11y) => (
+            <Button
+              size="sm"
+              aria-describedby={a11y["aria-describedby"]}
+              disabled={sidebarIsDefault}
+              onClick={resetNavPlacement}
+              className="shrink-0"
+            >
+              Reset sidebar placement
+            </Button>
+          )}
         </SettingRow>
         <SettingRow label="Calendar opens where you left it" helpId="settings-calendar-open-on">
           {(a11y) => (
@@ -596,11 +614,12 @@ export function GeneralSettings() {
             and a gating hint, not explanation.
 
             It covers the five controls with no explanation anywhere else — System, Mode, Depth,
-            Accent, Text size — and deliberately stops there. The pinboard confirm toggle and the two
-            tab toggles already carry their own help-mode entries (`settings-pinboard-confirm-delete`,
-            `settings-teach-tab`, `settings-map-tab` in lib/help.ts), and repeating those here would
-            be a second copy to keep in step. Depth is the reason this was worth writing at all: it's
-            the only control in the section with neither an option tooltip nor a word of prose. */}
+            Accent, Text size — and deliberately stops there. The pinboard confirm toggle and the
+            sidebar tabs row already carry their own help-mode entries in lib/help.ts
+            (`settings-pinboard-confirm-delete`, `settings-sidebar-placement`), and repeating those
+            here would be a second copy to keep in step. Depth is the reason this was worth writing
+            at all: it's the only control in the section with neither an option tooltip nor a word
+            of prose. */}
         <SectionInfo title="What these settings do">
           <p>Everything here applies instantly and is remembered on this device.</p>
           <p>
@@ -853,8 +872,8 @@ export function GeneralSettings() {
             Restores appearance (System, Mode, Accent, Depth, Location), the memory-map view, the
             pinboard delete confirmation, the Focus tab (which panels it shows and where the
             briefing appears), where the Calendar opens and how far a swipe moves it, the Chats
-            sidebar's folds, the chat Thinking button (back to off), and help mode to their
-            defaults. Your time zone is left as-is.
+            sidebar's folds, the chat Thinking button (back to off), the sidebar's tabs (nothing
+            pinned or hidden), and help mode to their defaults. Your time zone is left as-is.
           </>
         }
       />

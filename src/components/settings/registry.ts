@@ -150,6 +150,42 @@ export const SETTINGS_GROUPS: readonly SettingsGroupDef[] = [
 /** Every tab, flattened out of the groups — the order the rail renders them in. */
 export const SETTINGS_TABS: readonly SettingsTabDef[] = SETTINGS_GROUPS.flatMap((g) => g.tabs);
 
+/** The switches that decide whether a tab exists at all (Mods spec §2: when a feature is off, its
+ *  UI is gone). Only Local AI today; a new switched feature adds a field and its tab's line in
+ *  `tabShown`. */
+export interface SettingsFeatures {
+  localAi: boolean;
+}
+
+/** Whether a tab is on the rail with these features. */
+export function tabShown(id: SettingsTab, features: SettingsFeatures): boolean {
+  return id !== "localai" || features.localAi;
+}
+
+/** The rail with every switched-off tab left out, and any group that leaves empty dropped with
+ *  its heading. Pure, so what the rail can show is tested rather than seen. */
+export function visibleGroups(
+  groups: readonly SettingsGroupDef[],
+  features: SettingsFeatures,
+): SettingsGroupDef[] {
+  return groups
+    .map((g) => ({ ...g, tabs: g.tabs.filter((t) => tabShown(t.id, features)) }))
+    .filter((g) => g.tabs.length > 0);
+}
+
+/** Where the reader lands when the open tab vanishes: the first tab left in its group, which for
+ *  Local AI is AI & Models, where the switch's way back on lives; General if the whole group went.
+ *  The open tab itself while it is still shown. */
+export function fallbackTab(
+  open: SettingsTab,
+  groups: readonly SettingsGroupDef[],
+  features: SettingsFeatures,
+): SettingsTab {
+  if (tabShown(open, features)) return open;
+  const group = groups.find((g) => g.tabs.some((t) => t.id === open));
+  return group?.tabs.find((t) => tabShown(t.id, features))?.id ?? "general";
+}
+
 /** The sub-nav sections for a tab (empty if it doesn't expand). */
 export function sectionsFor(id: SettingsTab): readonly SettingsSectionDef[] {
   return SETTINGS_TABS.find((t) => t.id === id)?.sections ?? [];

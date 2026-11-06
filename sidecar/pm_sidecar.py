@@ -6,9 +6,10 @@
 A long-lived helper process that does the jobs the Rust backend cannot do
 natively: convert arbitrary files to Markdown (MarkItDown), embed text locally
 with an on-device ONNX model (fastembed), re-rank passages with a local
-cross-encoder (fastembed), transcribe voice clips locally (faster-whisper), and
-read text + capture metadata out of photos (rapidocr OCR + Pillow EXIF — an
-OPTIONAL component the user installs on demand, like the t-SNE reducer).
+cross-encoder (fastembed), transcribe voice clips locally (faster-whisper — an
+OPTIONAL component that switching voice input on installs), and read text +
+capture metadata out of photos (rapidocr OCR + Pillow EXIF — an OPTIONAL
+component the user installs on demand, like the t-SNE reducer).
 It is the only part of PM that runs Python, and it is deliberately dumb: it
 converts, embeds, scores, transcribes, and analyses images, nothing else.
 Chunking, hashing, prefixes, the vault, and the database all live in Rust.
@@ -576,10 +577,30 @@ def get_reranker(model, spec=None):
     return _rerankers[name]
 
 
+# The speech engine's own packages (the voice component's import dirs).
+_VOICE_ENGINE_MODULES = ("faster_whisper", "ctranslate2", "av")
+
+
 def get_whisper(model_dir):
     global _whisper
     if _whisper is None:
-        from faster_whisper import WhisperModel
+        # Imported here and nowhere else: the speech engine is an optional component, absent from
+        # every venv where voice input is off, so nothing outside the transcribe path may need it.
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            # Rust installs the engine before it asks (`install_optional_voice_for_recording`), so
+            # one of its packages missing means it was removed under a request. Say that, rather
+            # than a bare module name. Anything else (a native library that won't load, a package
+            # the engine needs gone) keeps its own words: the friendly line would send someone
+            # whose voice is already on to turn it on, and the cause would never reach Rust.
+            missing = (getattr(exc, "name", None) or "").split(".")[0]
+            if isinstance(exc, ModuleNotFoundError) and missing in _VOICE_ENGINE_MODULES:
+                raise RuntimeError(
+                    "voice input's speech engine isn't installed; turn voice input on in "
+                    "Settings → Storage"
+                ) from exc
+            raise RuntimeError(f"voice input's speech engine couldn't be loaded: {exc}") from exc
 
         # `model_dir` (passed by Rust) keeps the weights inside PM's data dir so
         # they uninstall cleanly with it; None falls back to the default cache.

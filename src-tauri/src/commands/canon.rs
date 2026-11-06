@@ -762,7 +762,10 @@ pub async fn propose_project_metadata(
     on_event: Channel<ProjectProposalEvent>,
 ) -> Result<()> {
     let Some(mut plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            &app,
+            Role::Background,
+        )));
     };
 
     // Bound the (untrusted webview) name list — one model call per name, so this

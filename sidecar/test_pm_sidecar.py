@@ -1830,6 +1830,106 @@ class TranscribeThreadBudgetTest(unittest.TestCase):
         self.assertGreaterEqual(captured["cpu_threads"], 4)
 
 
+class VoiceEngineIsOptionalTest(unittest.TestCase):
+    """Voice input's speech engine (faster-whisper, CTranslate2, PyAV) is an optional component:
+    absent from every venv where voice is off. So nothing but the transcribe path may load it, and
+    a transcription that reaches a venv without it must say what is missing."""
+
+    ENGINE = ("faster_whisper", "ctranslate2", "av")
+
+    def test_importing_the_sidecar_never_reaches_for_the_engine(self):
+        # A finder at the FRONT of the path records every attempt, so a top-level
+        # `try: import faster_whisper` fails this as surely as a hard import would. Run in a
+        # subprocess: this test process may already have imported anything.
+        code = (
+            "import sys\n"
+            "asked = []\n"
+            "class Watch:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            f"        if name.split('.')[0] in {self.ENGINE!r}:\n"
+            "            asked.append(name)\n"
+            "            raise ImportError(name)\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, Watch())\n"
+            "import pm_sidecar\n"
+            "print('asked=' + ','.join(asked))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "asked=", proc.stderr)
+
+    def test_a_transcription_without_the_engine_says_what_is_missing(self):
+        # `None` in sys.modules makes the import raise, as on a venv without the engine. Offline on
+        # purpose: the worker turns a failed MODEL load into ModelNotCached (which sends Rust to the
+        # network fetcher for nothing), and a missing engine must not be mistaken for one.
+        with mock.patch.dict(sys.modules, {"faster_whisper": None}):
+            with mock.patch.object(S, "_OFFLINE", True):
+                S._whisper = None
+                try:
+                    with self.assertRaises(RuntimeError) as caught:
+                        S.do_transcribe({"path": "clip.webm", "model_dir": None})
+                finally:
+                    S._whisper = None
+        self.assertNotIsInstance(caught.exception, S.ModelNotCached)
+        self.assertIn("speech engine isn't installed", str(caught.exception))
+
+    def _transcribe_with_import_failing(self, error):
+        """Transcribe offline with `import faster_whisper` raising `error`, as a venv where the
+        engine is present but broken would. Returns what the transcription raised."""
+
+        class Broken:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "faster_whisper":
+                    raise error
+                return None
+
+        finder = Broken()
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("faster_whisper", None)
+            sys.meta_path.insert(0, finder)
+            try:
+                with mock.patch.object(S, "_OFFLINE", True):
+                    S._whisper = None
+                    with self.assertRaises(RuntimeError) as caught:
+                        S.do_transcribe({"path": "clip.webm", "model_dir": None})
+            finally:
+                S._whisper = None
+                sys.meta_path.remove(finder)
+        return caught.exception
+
+    def test_an_engine_that_fails_to_load_keeps_its_own_words(self):
+        # A native library that won't load, on a venv where voice is on: "turn voice input on"
+        # would be wrong advice, and the loader's message is the only clue to the cause.
+        raised = self._transcribe_with_import_failing(
+            ImportError("libctranslate2.so.4: cannot open shared object file")
+        )
+        self.assertNotIsInstance(raised, S.ModelNotCached)
+        self.assertIn("libctranslate2.so.4", str(raised))
+        self.assertNotIn("isn't installed", str(raised))
+
+    def test_a_missing_package_the_engine_needs_is_named(self):
+        # Not one of the engine's own packages, so not "the engine isn't installed" either.
+        raised = self._transcribe_with_import_failing(
+            ModuleNotFoundError("No module named 'tokenizers'", name="tokenizers")
+        )
+        self.assertIn("tokenizers", str(raised))
+        self.assertNotIn("isn't installed", str(raised))
+
+    def test_each_engine_package_missing_reads_as_not_installed(self):
+        for module in S._VOICE_ENGINE_MODULES:
+            with self.subTest(module=module):
+                raised = self._transcribe_with_import_failing(
+                    ModuleNotFoundError(f"No module named '{module}'", name=module)
+                )
+                self.assertIn("speech engine isn't installed", str(raised))
+
+
 CORE_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties
     xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"

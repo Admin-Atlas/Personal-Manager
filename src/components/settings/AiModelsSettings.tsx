@@ -34,7 +34,9 @@ import {
   VisuallyHidden,
 } from "../ui";
 import { TabResetSection } from "./ResetControls";
+import { LocalAiOffRow, LocalAiPickPrompt } from "./LocalAiOffControls";
 import { readReviewAiEnabled, writeReviewAiEnabled } from "../../lib/reviewPrefs";
+import { useLocalAiSwitch } from "../../lib/localAiSwitch";
 
 /** Order-sensitive equality for the two model-role lists — a reset is offered only when a role's
  *  ordered list (or its auto-switch) differs from the default. */
@@ -97,6 +99,9 @@ export function AiModelsSettings({
   // gate (localStorage), shared with the Review tab's "Turn on AI" banner — off by default.
   const [reviewAi, setReviewAi] = useState(readReviewAiEnabled);
   const [error, setError] = useState<string | null>(null);
+  // The Local AI switch (D7): while it is off, this tab carries the way back on and a cloud model
+  // for any role that was routed to a local one. `null` until it answers, which shows neither.
+  const localAi = useLocalAiSwitch();
   // The two key fields' label/control wiring. Both labels sat above their Input with no htmlFor, so
   // the placeholder was the last-resort accessible name: the most consequential input in PM
   // announced as "sk-or-... , password", and lost even that the moment typing started.
@@ -341,6 +346,16 @@ export function AiModelsSettings({
         data-settings-section
         className="mt-5 space-y-5 border-t border-border pt-4"
       >
+        {/* First in the section, above the cloud models it offers: the reader who just switched
+            Local AI off lands here, and this is what they are being asked to do. */}
+        {localAi && (
+          <LocalAiPickPrompt
+            sw={localAi}
+            chatModel={settingsLoaded ? (chatModels[0] ?? null) : null}
+            backgroundModel={settingsLoaded ? (backgroundModels[0] ?? null) : null}
+            onError={setError}
+          />
+        )}
         <ModelListEditor
           label="Chat model"
           description="Answers your chats. Add several and turn on auto-switch to fall back when one runs out."
@@ -362,21 +377,30 @@ export function AiModelsSettings({
           onReset={backgroundRoleIsDefault ? undefined : resetBackgroundRole}
         />
         {/* A pointer, deliberately not a mirror: the local controls keep one home, in the Local AI
-         *  tab. Without this, the two roles above read as the whole of model choice. */}
-        <p className="text-xs text-ink4">
-          These are cloud models, run through OpenRouter. A model on your own machine is chosen
-          separately — same two roles, plus whether each one uses local, cloud, or local with a
-          cloud fallback.{" "}
-          {onOpenLocalAi && (
-            <button
-              type="button"
-              onClick={onOpenLocalAi}
-              className="text-accent-text hover:brightness-110"
-            >
-              Open Local AI →
-            </button>
-          )}
-        </p>
+         *  tab. Without this, the two roles above read as the whole of model choice. While Local AI
+         *  is off that tab is gone, and the pointer becomes the switch's one way back on (its home
+         *  while on is the top of the tab, so it is never in two places at once). */}
+        {localAi?.on && (
+          <p className="text-xs text-ink4">
+            These are cloud models, run through OpenRouter. A model on your own machine is chosen
+            separately — same two roles, plus whether each one uses local, cloud, or local with a
+            cloud fallback.{" "}
+            {onOpenLocalAi && (
+              <button
+                type="button"
+                onClick={onOpenLocalAi}
+                className="text-accent-text hover:brightness-110"
+              >
+                Open Local AI →
+              </button>
+            )}
+          </p>
+        )}
+        {localAi && !localAi.on && (
+          <div>
+            <LocalAiOffRow sw={localAi} onTurnedOn={onOpenLocalAi} onError={setError} />
+          </div>
+        )}
       </div>
 
       <div id="sec-ai-review" data-settings-section className="mt-5 border-t border-border pt-4">
@@ -533,10 +557,13 @@ export function AiModelsSettings({
           ) : (
             <p className="mt-2 text-xs text-ink4">No model calls logged yet.</p>
           )}
-          <p className="mt-2 text-xs text-ink4">
-            Local models (Settings → Local AI) aren&apos;t counted here — this ledger tracks only
-            your paid cloud calls.
-          </p>
+          {/* Names a tab that only exists while Local AI is on. */}
+          {localAi?.on && (
+            <p className="mt-2 text-xs text-ink4">
+              Local models (Settings → Local AI) aren&apos;t counted here — this ledger tracks only
+              your paid cloud calls.
+            </p>
+          )}
           <SectionInfo title="How this is calculated">
             <p>
               Your real per-call cost as reported by OpenRouter where available, otherwise estimated

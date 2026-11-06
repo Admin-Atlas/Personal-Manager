@@ -49,6 +49,7 @@ import { useRoleTests } from "./useRoleTests";
 import { useServerDetect } from "./useServerDetect";
 import { TabResetSection } from "../settings/ResetControls";
 import { ConfirmDialog } from "../ui";
+import { LocalAiSwitchBar } from "./LocalAiSwitchBar";
 
 /** The Local AI tab (#296): read this machine's hardware, size a curated model catalog against it,
  *  and turn on the local-endpoint provider (#297) — connect a local server, assign it to the chat /
@@ -141,6 +142,8 @@ export function LocalAiSettings({ onBetterFitChange, onLocate }: LocalAiSettings
 
   return (
     <>
+      {/* A better-fit dot in the sidebar is about a Workbench that is now off, so it is re-read. */}
+      <LocalAiSwitchBar onSwitchedOff={onBetterFitChange} />
       <LocalAiTab
         key={epoch}
         onBetterFitChange={onBetterFitChange}

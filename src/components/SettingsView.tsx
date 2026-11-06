@@ -11,12 +11,19 @@ import {
   setChatAutoSwitch,
   setChatModels,
   setIndexingSpeed,
+  setLocalLlmRouting,
   setOnboardingDone,
   setOpenRouterKey,
   setTimeZone,
   setVaultEmbedder,
   vaultStatus,
 } from "../lib/ipc";
+import {
+  localAiShown,
+  refreshLocalAiSwitch,
+  setLocalAiEnabled,
+  useLocalAiSwitch,
+} from "../lib/localAiSwitch";
 import { BackupSettings } from "./BackupSettings";
 import { AttentionDot } from "./Sidebar";
 import { ConnectorsSettings } from "./ConnectorsSettings";
@@ -34,7 +41,13 @@ import { StorageSettings } from "./StorageSettings";
 import type { LanguageOptions } from "../lib/types";
 import { useScrollSpy } from "../lib/useScrollSpy";
 import { deviceTimeZone, scrollBehavior } from "../theme";
-import { SETTINGS_GROUPS, sectionsFor, type SettingsTab } from "./settings/registry";
+import {
+  fallbackTab,
+  SETTINGS_GROUPS,
+  sectionsFor,
+  visibleGroups,
+  type SettingsTab,
+} from "./settings/registry";
 import { useSettingsPending } from "../lib/settingsPending";
 import { SavedTick } from "./settings/SavedTick";
 import {
@@ -88,6 +101,13 @@ export function SettingsView({
   // pane reports readiness (an endpoint + a chat model configured) up through `localReady`.
   const [aiMode, setAiMode] = useState<"cloud" | "local">("cloud");
   const [localReady, setLocalReady] = useState(false);
+  // The Local AI switch (D7). It decides whether the Local AI tab exists, and onboarding's "On this
+  // device" choice is what switches it on for a brand-new user.
+  const localAi = useLocalAiSwitch();
+  const features = { localAi: localAiShown(localAi) };
+  // Onboarding switched it on itself, so finishing with the cloud choice switches it back off.
+  // A switch that was already on (an existing local user back in the wizard) is theirs, and left.
+  const switchedOnHere = useRef(false);
   const [chatModels, setChatModelsState] = useState<string[]>([]);
   const [backgroundModels, setBackgroundModelsState] = useState<string[]>([]);
   // True once getSettings() has populated the model lists. Save gates on this (not a non-empty
@@ -114,7 +134,12 @@ export function SettingsView({
   const [embedderId, setEmbedderId] = useState("");
   // Active tab (non-onboarding only). The scrolling content pane is reset to the top on a
   // tab change so each tab opens from its first section.
-  const [tab, setTab] = useState<SettingsTab>("general");
+  const [chosenTab, setTab] = useState<SettingsTab>("general");
+  // The tab on screen. A chosen tab can vanish under the reader — switching Local AI off from its
+  // own tab is how — and they then stand on the first tab left in its group, AI & Models, where
+  // the way back on is. Derived rather than written back, so no render ever shows a vanished tab;
+  // and until the switch has answered, the chosen tab stands (it could only be one that was shown).
+  const tab = localAi === null ? chosenTab : fallbackTab(chosenTab, SETTINGS_GROUPS, features);
   const contentRef = useRef<HTMLDivElement>(null);
   // Edits on the current tab that save when you're done with them rather than per keystroke
   // (the backup schedule's "Keep last"), registered by their controls.
@@ -232,6 +257,25 @@ export function SettingsView({
     })();
   }, [onboarding]);
 
+  /** Onboarding's provider choice. "On this device" switches Local AI on (D7), before the local
+   *  pane mounts: everything that pane does (find a server, connect, choose a model) is refused by
+   *  the backend while it is off. */
+  async function chooseAiMode(next: "cloud" | "local") {
+    setAiMode(next);
+    if (next !== "local") return;
+    setError(null);
+    try {
+      // Asked, not assumed, when the first read hasn't answered yet: a switch that was already on
+      // belongs to the user, and marking it as onboarding's own would switch it off at the end.
+      const now = localAi ?? (await refreshLocalAiSwitch());
+      if (now.on) return;
+      await setLocalAiEnabled(true);
+      switchedOnHere.current = true;
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function changeIndexingSpeed(next: "fast" | "gentle") {
     setError(null);
     const prev = indexingSpeed;
@@ -259,6 +303,16 @@ export function SettingsView({
         await setOpenRouterKey(key.trim());
         setKey("");
         setKeyAlreadySet(true);
+      }
+      // Tried "On this device", then finished with the cloud: hand both roles to the cloud model
+      // (connecting pointed them local) and switch Local AI back off, which a brand-new user's
+      // cloud choice means. Routing first, while the switch is still on; off then empties the
+      // local models that connecting chose.
+      if (aiMode === "cloud" && switchedOnHere.current) {
+        await setLocalLlmRouting("chat", "cloud");
+        await setLocalLlmRouting("background", "cloud");
+        await setLocalAiEnabled(false);
+        switchedOnHere.current = false;
       }
       // Persist the model lists only once they've loaded from the backend — gating on the load
       // flag (not a non-empty list) lets the user clear a role back to "use the default" and have
@@ -331,7 +385,7 @@ export function SettingsView({
               <SegmentedControl
                 ariaLabel="AI provider"
                 value={aiMode}
-                onChange={setAiMode}
+                onChange={(m) => void chooseAiMode(m)}
                 options={[
                   { value: "cloud", label: "Cloud (OpenRouter)" },
                   { value: "local", label: "On this device" },
@@ -399,8 +453,12 @@ export function SettingsView({
                 />
               </div>
             </>
-          ) : (
+          ) : localAi?.on ? (
             <OnboardingLocalConnect onConfigured={setLocalReady} />
+          ) : (
+            // Mounted only once Local AI is on, so its first act (finding a running server) isn't
+            // refused. A switch that failed says so below, and this line stays.
+            <p className="mt-3 text-xs text-ink4">Turning on Local AI…</p>
           )}
 
           {joinedVault ? (
@@ -532,7 +590,7 @@ export function SettingsView({
 
       <div className="flex min-h-0 flex-1">
         <nav className="w-52 shrink-0 overflow-y-auto border-r border-border p-3">
-          {SETTINGS_GROUPS.map((group, gi) => {
+          {visibleGroups(SETTINGS_GROUPS, features).map((group, gi) => {
             const headerId = group.header
               ? `settings-group-${group.header.toLowerCase()}`
               : undefined;
@@ -632,7 +690,7 @@ export function SettingsView({
             />
           )}
 
-          {tab === "localai" && (
+          {tab === "localai" && features.localAi && (
             <LocalAiSettings onBetterFitChange={onBetterFitChange} onLocate={scrollToSection} />
           )}
 

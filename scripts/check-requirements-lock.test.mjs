@@ -31,6 +31,8 @@ import {
   scan,
   sha256,
 } from "./check-requirements-lock.mjs";
+// The generator's one decision that isn't uv's, tested beside the gate that checks its output.
+import { optionalPins, preferenceFor } from "./regen-sidecar-locks.mjs";
 
 const H = "a".repeat(64);
 const H2 = "b".repeat(64);
@@ -143,20 +145,50 @@ describe("parseRequirements", () => {
 });
 
 describe("readRustFacts", () => {
-  it("reads the floor and both optional pin constants", () => {
-    const rust = [
-      "const MIN_PYTHON: (u32, u32) = (3, 11);",
-      'const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";',
-      'const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pi-heif==1.4.0"];',
-    ].join("\n");
+  const rust = [
+    "const MIN_PYTHON: (u32, u32) = (3, 11);",
+    'const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";',
+    'const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pi-heif==1.4.0"];',
+    'const OPTIONAL_VOICE_PINS: &[&str] = &["faster-whisper==1.2.1", "av==18.1.0"];',
+  ].join("\n");
+
+  it("reads the floor and every optional pin constant", () => {
     expect(readRustFacts(rust)).toEqual({
       floor: "3.11",
-      pins: { tsne: ["openTSNE==1.0.4"], ocr: ["rapidocr==3.9.2", "pi-heif==1.4.0"] },
+      pins: {
+        tsne: ["openTSNE==1.0.4"],
+        ocr: ["rapidocr==3.9.2", "pi-heif==1.4.0"],
+        voice: ["faster-whisper==1.2.1", "av==18.1.0"],
+      },
     });
+  });
+
+  it("agrees with the generator about the pins", () => {
+    expect(optionalPins(rust)).toEqual(readRustFacts(rust).pins);
   });
 
   it("throws rather than guessing when the constants move", () => {
     expect(() => readRustFacts("fn main() {}")).toThrow(/MIN_PYTHON/);
+    // A source that lost the voice pins is the same failure, in both scripts.
+    const noVoice = rust.split("\n").slice(0, 3).join("\n");
+    expect(() => readRustFacts(noVoice)).toThrow(/optional pins/);
+    expect(() => optionalPins(noVoice)).toThrow(/optional pins/);
+  });
+});
+
+describe("lock-regen keep mode", () => {
+  // A lock prefers its own committed resolution; a lock that doesn't exist yet prefers the base
+  // lock, where every package a new optional lock takes over used to live (voice leaving the base).
+  it("prefers a lock's own committed text, else the committed base lock", () => {
+    const committed = {
+      "sidecar/requirements.lock": "base",
+      "sidecar/requirements-ocr.lock": "ocr",
+      "sidecar/requirements-voice.lock": null,
+    };
+    expect(preferenceFor("sidecar/requirements.lock", committed)).toBe("base");
+    expect(preferenceFor("sidecar/requirements-ocr.lock", committed)).toBe("ocr");
+    expect(preferenceFor("sidecar/requirements-voice.lock", committed)).toBe("base");
+    expect(preferenceFor("sidecar/requirements-voice.lock", {})).toBeNull();
   });
 });
 

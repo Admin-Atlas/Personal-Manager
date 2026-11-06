@@ -32,7 +32,7 @@ import { PinboardView } from "./components/PinboardView";
 import { ProjectView } from "./components/ProjectView";
 import { ReviewView } from "./components/ReviewView";
 import { TeachView } from "./components/TeachView";
-import { Sidebar, type View } from "./components/Sidebar";
+import { Sidebar } from "./components/Sidebar";
 import { SettingsView } from "./components/SettingsView";
 import { SettingsPendingProvider } from "./lib/settingsPending";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -60,8 +60,8 @@ import { useUpdater } from "./lib/useUpdater";
 import { useExternalLinks } from "./lib/useExternalLinks";
 import { useFollowSignIns } from "./lib/signInPages";
 import { followStoredPrefs, hydrateStoredPrefs } from "./lib/storedPrefs";
-import { isDevBuild, useDevMode } from "./lib/capabilities";
-import { useTheme } from "./theme";
+import { isDevBuild } from "./lib/capabilities";
+import { isModView, isReachable, learningToolsShown, useNav, type View } from "./lib/nav";
 
 const LAST_SEEN_VERSION_KEY = "pm:lastSeenVersion";
 import {
@@ -243,16 +243,15 @@ export default function App() {
   // per-message provenance). One instance, shared down — the "subscribe once" rule (#297 PR6).
   const localAi = useLocalLlmStatus(aiReady);
   const update = useUpdater();
-  const { teachVisible, mapVisible } = useTheme();
-  const { devMode } = useDevMode();
-  // If the Review/Teach (learning tools), Map or Dev tab gets hidden — a preset change, or the
-  // toggle turned off in Settings — while it's open, fall back to Focus so the user is never
-  // stranded on a view with no nav entry and no palette destination.
+  const { entries: navEntries, resolved: nav } = useNav();
+  const teachVisible = learningToolsShown(nav);
+  // If the open tab goes away entirely — developer mode switched off, a Depth change that leaves it
+  // out (Minimal's Review, Teach and Map) — fall back to Focus so the user is never stranded on a
+  // view with no nav entry and no palette destination. A tab the user HID stays: it's still in Ctrl
+  // K, which is how they got there.
   useEffect(() => {
-    if ((view === "teach" || view === "review") && !teachVisible) setView("focus");
-    if (view === "graph" && !mapVisible) setView("focus");
-    if (view === "dev" && !devMode) setView("focus");
-  }, [view, teachVisible, mapVisible, devMode]);
+    if (!isReachable(view, navEntries, nav)) setView("focus");
+  }, [view, navEntries, nav]);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [showWhatsNew, setShowWhatsNew] = useState(false);
   const [helpMode, setHelpModeState] = useState(false);
@@ -1225,7 +1224,11 @@ export default function App() {
                   `view`, React discards the errored instance and mounts a clean one, so no
                   `onReset` plumbing is needed. `selectedProject` is in the key too, or a project
                   that crashes ProjectView would poison the next project opened (`view` alone stays
-                  "project"). */}
+                  "project").
+
+                  A mod's tab (`mod:<id>`) draws nothing here yet: ModFrame comes in a later slice,
+                  no entry can open one until then, and the fallback effect sends a stray one to
+                  Focus. It must never fall through to the last branch, which is the chat's. */}
               <ErrorBoundary key={`${view}:${selectedProject ?? ""}`} what="This view">
                 {view === "focus" ? (
                   <main className="flex h-full flex-1 flex-col">
@@ -1255,7 +1258,8 @@ export default function App() {
                   </main>
                 ) : view === "documents" ? (
                   <main className="flex h-full flex-1 flex-col">
-                    {/* No "to review" jump when the learning tools are hidden — there's nowhere to land. */}
+                    {/* No "to review" jump when the learning tools are out of the sidebar: hiding them
+                        hides their way in from here too. */}
                     <DocumentsView
                       onReviewClick={teachVisible ? () => setView("review") : undefined}
                     />
@@ -1286,7 +1290,7 @@ export default function App() {
                   <main className="flex h-full flex-1 flex-col">
                     <DevView />
                   </main>
-                ) : (
+                ) : isModView(view) ? null : (
                   <main className="flex h-full flex-1 flex-col">
                     {chat.error && (
                       <Callout variant="strip" size="md" className="font-ui">

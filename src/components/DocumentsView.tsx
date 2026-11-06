@@ -49,7 +49,8 @@ import {
 import { archivedSet, splitByArchivedHome } from "../lib/archivedProjects";
 import { isDevBuild, useDevMode } from "../lib/capabilities";
 import { interactiveProps } from "../lib/interactiveProps";
-import { useDepth, useTheme } from "../theme";
+import { useDepth } from "../theme";
+import { useLearningToolsVisible } from "../lib/nav";
 import {
   DOC_COLUMN_CAPS,
   DOC_COLUMN_KEYS,
@@ -202,10 +203,9 @@ export function DocumentsView({ onReviewClick }: Props) {
     setColumnChoice(next);
     writeColumns(next);
   };
-  // Inline reclassify (issue #333) rides the same "show manual triage" switch as the Review/Teach
-  // tabs: when the user trusts the AI's filing and hides those, the per-row Edit affordance hides
-  // too (the table stays read-only).
-  const { teachVisible } = useTheme();
+  // Inline reclassify (issue #333) follows the Review/Teach tabs: when the user trusts the AI's
+  // filing and hides those, the per-row Edit affordance hides too (the table stays read-only).
+  const teachVisible = useLearningToolsVisible();
   // Persisted, because the tab router unmounts this view — see documentSort. `null` is the backend's
   // own newest-first order.
   const [sort, setSortState] = useState<DocSort | null>(readDocSort);

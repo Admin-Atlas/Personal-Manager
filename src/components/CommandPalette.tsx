@@ -11,9 +11,9 @@ import {
 import { readHidden } from "../lib/calendarPrefs";
 import { formatEventWhen } from "../lib/format";
 import type { CalendarEvent, Conversation, Document, ProjectOverview } from "../lib/types";
-import type { View } from "./Sidebar";
+import { useNav, type View } from "../lib/nav";
 import { Modal, STATUS_LABEL } from "./ui";
-import { useDepth, useTheme } from "../theme";
+import { useDepth } from "../theme";
 
 interface Props {
   onClose: () => void;
@@ -86,17 +86,6 @@ function normalizeQuery(query: string): string {
     .toLowerCase();
 }
 
-const NAV_DESTS: { label: string; view: View }[] = [
-  { label: "Focus", view: "focus" },
-  { label: "Chats", view: "chat" },
-  { label: "Calendar", view: "calendar" },
-  { label: "Documents", view: "documents" },
-  { label: "Review", view: "review" },
-  { label: "Teach", view: "teach" },
-  { label: "Map", view: "graph" },
-  { label: "Pinboard", view: "pinboard" },
-];
-
 /**
  * Global quick-jump (spec §4): one keystroke opens it, type to filter to any
  * project, file, past conversation, calendar event, or navigation destination, Enter jumps there.
@@ -112,8 +101,10 @@ export function CommandPalette({
   onOpenSettings,
 }: Props) {
   const { showPower } = useDepth();
-  // The Teach destination is only offered when the tab is visible (same Depth/Settings gate).
-  const { teachVisible, mapVisible } = useTheme();
+  // The tabs to offer under "Go to": the sidebar's, in its order, then any the user hid there —
+  // hiding a tab takes it out of the sidebar, never out of reach. A tab that isn't there at all
+  // (developer mode off, Minimal leaving the learning tools out) isn't offered either.
+  const { resolved: nav } = useNav();
   const [query, setQuery] = useState("");
   // The highlighted row, by its id: rows that land later (the lists, the calendar's hits) never
   // move the highlight off what was arrowed to, so Enter opens what's highlighted. `null` (a new
@@ -237,17 +228,13 @@ export function CommandPalette({
     }));
 
     const gotoItems: PaletteItem[] = [
-      ...NAV_DESTS.filter(
-        (dest) =>
-          ((dest.view !== "teach" && dest.view !== "review") || teachVisible) &&
-          (dest.view !== "graph" || mapVisible),
-      ).map((dest) => ({
-        id: `goto:${dest.view}`,
+      ...[...nav.shown, ...nav.hidden].map((dest) => ({
+        id: `goto:${dest.id}`,
         kind: "goto" as const,
         label: dest.label,
         search: `${dest.label} go to`.toLowerCase(),
         activate: () => {
-          cbRef.current.onNavigate(dest.view);
+          cbRef.current.onNavigate(dest.id);
           cbRef.current.onClose();
         },
       })),
@@ -264,7 +251,7 @@ export function CommandPalette({
     ];
 
     return [...projectItems, ...fileItems, ...convItems, ...gotoItems];
-  }, [projects, docs, convs, teachVisible, mapVisible]);
+  }, [projects, docs, convs, nav]);
 
   // The calendar's hits for this query, in the order Rust ranked them (upcoming soonest first, then
   // past latest first): already matched word by word, so they skip the fuzzy scorer. Only with a

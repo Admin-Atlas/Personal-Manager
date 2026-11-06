@@ -57,6 +57,9 @@ mod ingest;
 mod layout;
 mod llm_gateway;
 mod local_ai;
+// The Local AI switch (D7): one stored setting that turns the whole Workbench on or off, enforced
+// in routing, the executor and the local loops, not only by hiding the tab.
+mod local_ai_switch;
 // The curated local-model catalog (#296): in-repo GGUF table (include_str!), bridged into fit-scoring
 // and the endpoint window ladder's catalog rung.
 mod local_catalog;
@@ -135,6 +138,9 @@ mod tasks;
 mod tray;
 mod update_delivery;
 mod vault;
+// The voice switch (D8): one stored setting enforced in `transcribe_audio`, and the speech engine as
+// an optional component it installs and removes.
+mod voice_switch;
 mod wipe;
 
 use std::ops::{Deref, DerefMut};
@@ -643,6 +649,10 @@ pub struct AppState {
     /// mustn't undo, and the single-flight lock calendar syncs take. In memory; see
     /// `commands::calendar_edit`.
     pub calendar_edit: commands::CalendarEditState,
+    /// Single-flight guard for switching voice on or off (`voice_switch::set_voice_enabled`): an off
+    /// that landed while an on was still downloading the engine would remove it and then be undone
+    /// by the on writing itself down.
+    pub voice_busy: AtomicBool,
 }
 
 /// The sentence a command gets when it needs the store but the session is closed. Pure
@@ -684,6 +694,56 @@ impl Drop for BusyGuard<'_> {
 }
 
 impl AppState {
+    /// The state as launch builds it: the store and its vault runtime as the boot open left them
+    /// (both `None` for a vault that opened locked, or failed to open), the boot's fault and meta
+    /// notice, and everything else at rest. One constructor so a test can build exactly what launch
+    /// manages, and so a new field has one place to be initialised.
+    pub(crate) fn new(
+        db: Option<Connection>,
+        vault: Option<VaultRuntime>,
+        sidecar: SidecarManager,
+        vault_fault: Option<error::VaultFault>,
+        meta_warning: Option<String>,
+    ) -> Self {
+        AppState {
+            db: Mutex::new(db),
+            vault: Mutex::new(vault),
+            sidecar,
+            app_unlocked: AtomicBool::new(false),
+            instance_id: vault::lock::new_instance_id(),
+            lock_session: Mutex::new(lock_session::LockSession::default()),
+            drive_sync: Mutex::new(CloudSyncState::default()),
+            drive_sync_cancel: AtomicBool::new(false),
+            onedrive_sync: Mutex::new(CloudSyncState::default()),
+            onedrive_sync_cancel: AtomicBool::new(false),
+            local_sync: Mutex::new(LocalFolderSyncState::default()),
+            local_sync_cancel: AtomicBool::new(false),
+            duplicate_watch: Mutex::new(duplicates::DuplicateWatch::default()),
+            ingest_job: Mutex::new(IngestJobState::default()),
+            retag_job: Mutex::new(RetagJobState::default()),
+            retag_busy: AtomicBool::new(false),
+            ingest_busy: AtomicBool::new(false),
+            layout_job: Mutex::new(layout::LayoutJobState::default()),
+            last_user_activity: Mutex::new(Instant::now()),
+            chat_index_busy: AtomicBool::new(false),
+            summary_busy: AtomicBool::new(false),
+            title_busy: AtomicBool::new(false),
+            prefs_busy: AtomicBool::new(false),
+            layout_busy: AtomicBool::new(false),
+            backup_state: Mutex::new(BackupState::default()),
+            backup_cancel: AtomicBool::new(false),
+            backup_busy: AtomicBool::new(false),
+            pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
+            vault_fault: Mutex::new(vault_fault),
+            meta_warning: Mutex::new(meta_warning),
+            briefing_refresh: tokio::sync::Mutex::new(()),
+            briefing_dirty: AtomicBool::new(false),
+            local_ai: local_slot::LocalRuntime::default(),
+            calendar_edit: commands::CalendarEditState::default(),
+            voice_busy: AtomicBool::new(false),
+        }
+    }
+
     /// Mark the user as active right now. Bumped on a chat send, on ingest, and — via the
     /// `mark_activity` command (F-08) — on any real webview interaction (reading, scrolling,
     /// triaging, editing), so every idle-gated background job backs off during active use, not only
@@ -826,23 +886,81 @@ impl AppState {
         // unlock, adopt, repair, curtain take-over) lands here, so none can leave a stale
         // "vault unreachable" story behind.
         self.set_vault_fault(None);
-        // Drop the guards before reconciling — it re-locks both to (re)build the rules file or
-        // restore the mirror from it. Best-effort: a hiccup here never blocks the open. The
-        // index-only manifest reconcile runs AFTER the rules one (it resolves item projects through
-        // the rebuilt aliases).
+        // The guards are dropped above: every step re-locks what it needs.
+        self.after_store_open();
+        Ok(())
+    }
+
+    /// Everything a store needs once it is open, whichever way it opened: at launch (a device vault,
+    /// or a passphrase vault whose key this profile cached, neither of which passes through
+    /// [`Self::open_session`]) or later through `open_session` (unlock, adopt, repair, retry, a
+    /// curtain take-over). One list for both, because launch used to repeat these steps by hand and
+    /// missed the two switches when they were added: every store opened at launch then kept Local
+    /// AI reading off, and voice undecided, for the whole session.
+    ///
+    /// Best-effort throughout, and a no-op on a closed store: a hiccup here never blocks the open.
+    /// Idempotent, so a shareable vault that launch opens through `open_session` and then settles
+    /// here again pays only a second read.
+    pub(crate) fn after_store_open(&self) {
+        // The rules reconcile re-locks both guards to (re)build the rules file or restore the mirror
+        // from it. The index-only manifest reconcile runs AFTER it (it resolves item projects
+        // through the rebuilt aliases).
         self.reconcile_entity_rules();
         self.reconcile_index_only();
         // Repair chat vault files stripped by the pre-3.81.2 organisation-write bug. Runs on every
-        // open path (retry, unlock, adopt, repair, curtain take-over) so an affected store is healed
-        // during ordinary use, well before anyone reaches for Rebuild — which is also independently
-        // guarded (`rebuild_core` calls this first).
+        // open, launch included, so an affected store is healed during ordinary use, before the user
+        // can reach any surface that would make the damage permanent and well before anyone reaches
+        // for Rebuild — which is also independently guarded (`rebuild_core` calls this first).
         self.reconcile_chat_identity();
         // Teach the On battery latch this store's threshold now, not at the watcher's next tick. On
         // a passphrase vault the store was shut at launch, so the latch has been running on "never",
         // and the launch baseline — there so a cold start on battery can't load a model before the
         // policy engages — would otherwise arrive up to a poll after the first message.
         self.learn_power_threshold();
-        Ok(())
+        // The Local AI switch (D7), decided on this store's first open and then read: the loops
+        // park on it and the executor's gate reads it, and neither can read the store itself.
+        self.learn_local_ai_switch();
+        // The voice switch (D8), decided on this store's first open from whether the Whisper model
+        // was ever downloaded here, then read. Handing it to the sidecar is what lets an older PM's
+        // speech engine be removed (voice off) or kept as the component (voice on), in the
+        // background (`voice_switch::spawn_engine_reconciler`).
+        self.learn_voice_switch();
+    }
+
+    /// Hand the open store's voice switch to the sidecar, writing D8's default down first if the
+    /// store has none yet. Best-effort like `learn_local_ai_switch`. The model folder is looked at
+    /// before the DB guard is taken, and the guard closes before the sidecar is told.
+    fn learn_voice_switch(&self) {
+        let model_present = self.sidecar.whisper_model_present();
+        let on = self.conn().ok().and_then(|conn| {
+            voice_switch::stamp_default(&conn, model_present)
+                .or_else(|e| {
+                    eprintln!("voice: couldn't record the switch's default ({e})");
+                    voice_switch::read(&conn, model_present)
+                })
+                .ok()
+        });
+        if let Some(on) = on {
+            self.sidecar.set_voice_wanted(on);
+        }
+    }
+
+    /// Hand the open store's Local AI switch to the runtime, writing D7's default down first if the
+    /// store has none yet. Best-effort like the reconcilers: a store whose write fails is still read
+    /// (the default without the row), and one that can't be read at all keeps the runtime's last
+    /// answer rather than blocking the open. The guard closes before the runtime is told.
+    fn learn_local_ai_switch(&self) {
+        let on = self.conn().ok().and_then(|conn| {
+            local_ai_switch::stamp_default(&conn)
+                .or_else(|e| {
+                    eprintln!("local ai: couldn't record the switch's default ({e})");
+                    local_ai_switch::read(&conn)
+                })
+                .ok()
+        });
+        if let Some(on) = on {
+            self.local_ai.set_local_ai_on(on);
+        }
     }
 
     /// Hand the open store's On battery threshold to the latch (#432). The DB guard is dropped
@@ -1449,42 +1567,13 @@ pub fn run() {
                 venv_dir,
             });
 
-            app.manage(AppState {
-                db: Mutex::new(conn),
-                vault: Mutex::new(vault_runtime),
+            app.manage(AppState::new(
+                conn,
+                vault_runtime,
                 sidecar,
-                app_unlocked: AtomicBool::new(false),
-                instance_id: vault::lock::new_instance_id(),
-                lock_session: Mutex::new(lock_session::LockSession::default()),
-                drive_sync: Mutex::new(CloudSyncState::default()),
-                drive_sync_cancel: AtomicBool::new(false),
-                onedrive_sync: Mutex::new(CloudSyncState::default()),
-                onedrive_sync_cancel: AtomicBool::new(false),
-                local_sync: Mutex::new(LocalFolderSyncState::default()),
-                local_sync_cancel: AtomicBool::new(false),
-                duplicate_watch: Mutex::new(duplicates::DuplicateWatch::default()),
-                ingest_job: Mutex::new(IngestJobState::default()),
-                retag_job: Mutex::new(RetagJobState::default()),
-                retag_busy: AtomicBool::new(false),
-                ingest_busy: AtomicBool::new(false),
-                layout_job: Mutex::new(layout::LayoutJobState::default()),
-                last_user_activity: Mutex::new(Instant::now()),
-                chat_index_busy: AtomicBool::new(false),
-                summary_busy: AtomicBool::new(false),
-                title_busy: AtomicBool::new(false),
-                prefs_busy: AtomicBool::new(false),
-                layout_busy: AtomicBool::new(false),
-                backup_state: Mutex::new(BackupState::default()),
-                backup_cancel: AtomicBool::new(false),
-                backup_busy: AtomicBool::new(false),
-                pending_restore_keys: Mutex::new(std::collections::HashMap::new()),
-                vault_fault: Mutex::new(boot_fault),
-                meta_warning: Mutex::new(boot_meta_warning),
-                briefing_refresh: tokio::sync::Mutex::new(()),
-                briefing_dirty: AtomicBool::new(false),
-                local_ai: local_slot::LocalRuntime::default(),
-                calendar_edit: commands::CalendarEditState::default(),
-            });
+                boot_fault,
+                boot_meta_warning,
+            ));
 
             // Engage the cooperative writer lock for a shared vault (acquire it, or step
             // back behind another live profile), then run the heartbeat + hand-off watcher
@@ -1492,16 +1581,12 @@ pub fn run() {
             lock_session::engage(handle)?;
             lock_session::spawn_watcher(handle.clone());
 
-            // After the writer lock is settled (so a stepped-back profile doesn't write), reconcile
-            // the encrypted entity-rules file with the DB mirror: first run writes it from the v10
-            // backfill; later runs rebuild the mirror from it. No-op when the vault is locked. The
-            // index-only manifest reconcile runs AFTER it (it resolves item projects through the
-            // rebuilt aliases).
-            app.state::<AppState>().reconcile_entity_rules();
-            app.state::<AppState>().reconcile_index_only();
-            // Repair chat vault identity stripped by the pre-3.81.2 organisation-write bug, before
-            // the user can reach any surface that would make the damage permanent.
-            app.state::<AppState>().reconcile_chat_identity();
+            // After the writer lock is settled (so a stepped-back profile doesn't write), settle the
+            // store launch opened exactly as every later open is settled: the rules file and the
+            // index-only manifest reconciled with their DB mirrors (the first run writes the rules
+            // file from the v10 backfill), chat identity repaired, and the two switches and the On
+            // battery threshold learned. A no-op when the vault is locked.
+            app.state::<AppState>().after_store_open();
 
             // One-time: distil the legacy "Learning You" blob into structured preference records
             // (§4.5) so nothing accumulated is lost. Background, idempotent (a settings flag guards
@@ -1556,11 +1641,16 @@ pub fn run() {
             // also runs synchronously on every briefing refresh; gated on unlocked + idle + not
             // mid-sync, and a no-op until there are milestones/events in the near window.
             flags::spawn_flag_detection_scheduler(handle.clone());
+            // Both local loops park while Local AI is switched off (D7), which for a cloud-only
+            // user is always: they wake only when the switch goes on.
             local_ai::spawn_release_scheduler(handle.clone());
             // The On battery watcher (#432): reads the machine's power source every thirty seconds
             // and feeds the latch routing reads. Its own loop, so a release waiting on the slot's
             // lane can never stall it.
             local_ai::spawn_power_watcher(handle.clone());
+            // Settles an older PM's speech engine once a store has said what voice is (D8): removed
+            // where voice is off, kept as the component where it is on. Asleep otherwise.
+            voice_switch::spawn_engine_reconciler(handle.clone());
 
             // Tell the provider surfaces the moment a local call starts, not only when it ends.
             //
@@ -1657,6 +1747,12 @@ pub fn run() {
             // The tab's "Reset to defaults" footer (#445).
             local_ai::local_ai_settings_are_default,
             local_ai::reset_local_ai_settings,
+            // The Local AI switch (D7).
+            local_ai_switch::get_local_ai_switch,
+            local_ai_switch::set_local_ai_enabled,
+            // The voice switch (D8).
+            voice_switch::get_voice_switch,
+            voice_switch::set_voice_enabled,
             settings::get_settings,
             settings::settings_defaults,
             settings::set_indexing_speed,
@@ -2006,6 +2102,57 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store launch opens (a device vault) never passes through `open_session`, and is settled by
+    /// `after_store_open` alone. That hook must teach the runtime both switches and write their
+    /// defaults down, or Local AI reads off for the whole session and voice stays undecided.
+    #[test]
+    fn a_store_opened_at_launch_learns_both_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: dir.path().join("runtime").join("venv"),
+        });
+        // An existing Local AI user (a saved server) who dictated before voice was a switch.
+        let models = dir.path().join("runtime").join("models");
+        std::fs::create_dir_all(models.join(sidecar::WHISPER_REPO_DIR).join("snapshots")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        db::set_setting(
+            &conn,
+            llm_gateway::LOCAL_BASE_URL_KEY,
+            "http://127.0.0.1:11434",
+        )
+        .unwrap();
+        let state = AppState::new(Some(conn), None, sidecar, None, None);
+        let voice = state.sidecar.subscribe_voice_wanted();
+        assert!(!state.local_ai.local_ai_on(), "off until a store says on");
+        assert_eq!(*voice.borrow(), None);
+
+        state.after_store_open();
+
+        assert!(state.local_ai.local_ai_on());
+        assert_eq!(*voice.borrow(), Some(true));
+        let conn = state.conn().unwrap();
+        assert_eq!(
+            db::get_setting(&conn, local_ai_switch::LOCAL_AI_ENABLED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "D7's default is written down"
+        );
+        assert_eq!(
+            db::get_setting(&conn, voice_switch::VOICE_ENABLED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "and D8's, so removing the speech model later can't switch voice off"
+        );
+    }
 
     #[test]
     fn session_unavailable_message_tells_denied_apart_from_locked() {

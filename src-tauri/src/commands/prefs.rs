@@ -154,7 +154,10 @@ pub async fn parse_preference_statement(
         entities::canonical_project_names(&conn)?
     };
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            &app,
+            Role::Background,
+        )));
     };
 
     let mut draft = preferences::parse_statement(&app, &plan, &text, &projects).await?;
@@ -204,7 +207,10 @@ pub async fn import_ai_memory(app: AppHandle, text: String) -> Result<usize> {
         return Err(Error::Other("paste your exported memory first".into()));
     }
     let Some(plan) = llm_gateway::resolve(&app, Role::Background)? else {
-        return Err(Error::Other(llm_gateway::no_provider_message()));
+        return Err(Error::Other(llm_gateway::no_provider_message_for(
+            &app,
+            Role::Background,
+        )));
     };
     // Read the known values and DROP the connection before awaiting — never hold the DB lock across
     // an .await (the model call is a network round-trip).
