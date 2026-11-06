@@ -5,6 +5,13 @@
 # these crates move as one unit with Tauri (no fix reachable until Tauri moves to
 # gtk 0.19 / glib 0.22 or gtk4).
 # Mirrors src-tauri/.cargo/audit.toml; see the 2026-06-17 DECISIONS glib entry.
+#
+# Grouping: each ecosystem's minor and patch updates arrive as ONE pull request a week, not one
+# per package. Every Dependabot PR runs the whole PR workflow and both bundle dry-runs, and on
+# 2026-11-06 thirteen of them held the Actions queue for hours; PM merges them as one batch
+# anyway. Majors still arrive one per PR, because each needs its own decision (typescript 7,
+# jsdom 31) and closing a major's PR is how Dependabot remembers that it is held. Security
+# updates are not grouped, so a fix never waits behind an unrelated bump.
 version: 2
 updates:
   # --- Rust backend (src-tauri/Cargo.toml + Cargo.lock) ---
@@ -16,6 +23,10 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       - dependency-name: "glib*"
       - dependency-name: "gobject*"
@@ -35,6 +46,10 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # --- Python sidecar (sidecar/requirements*.txt) ---
   # The last ecosystem without coverage, and the one that matters most per-dependency: these
@@ -47,9 +62,16 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    groups:
+      pip-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # --- GitHub Actions (.github/workflows/*.yml) — keeps SHA pins current ---
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
