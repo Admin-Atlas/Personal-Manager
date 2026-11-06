@@ -149,7 +149,6 @@ describe("readRustFacts", () => {
     "const MIN_PYTHON: (u32, u32) = (3, 11);",
     'const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";',
     'const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.9.2", "pi-heif==1.4.0"];',
-    'const OPTIONAL_VOICE_PINS: &[&str] = &["faster-whisper==1.2.1", "av==18.1.0"];',
   ].join("\n");
 
   it("reads the floor and every optional pin constant", () => {
@@ -158,7 +157,6 @@ describe("readRustFacts", () => {
       pins: {
         tsne: ["openTSNE==1.0.4"],
         ocr: ["rapidocr==3.9.2", "pi-heif==1.4.0"],
-        voice: ["faster-whisper==1.2.1", "av==18.1.0"],
       },
     });
   });
@@ -169,26 +167,27 @@ describe("readRustFacts", () => {
 
   it("throws rather than guessing when the constants move", () => {
     expect(() => readRustFacts("fn main() {}")).toThrow(/MIN_PYTHON/);
-    // A source that lost the voice pins is the same failure, in both scripts.
-    const noVoice = rust.split("\n").slice(0, 3).join("\n");
-    expect(() => readRustFacts(noVoice)).toThrow(/optional pins/);
-    expect(() => optionalPins(noVoice)).toThrow(/optional pins/);
+    // A source that lost the OCR pins is the same failure, in both scripts.
+    const noOcr = rust.split("\n").slice(0, 2).join("\n");
+    expect(() => readRustFacts(noOcr)).toThrow(/optional pins/);
+    expect(() => optionalPins(noOcr)).toThrow(/optional pins/);
   });
 });
 
 describe("lock-regen keep mode", () => {
   // A lock prefers its own committed resolution; a lock that doesn't exist yet prefers the base
-  // lock, where every package a new optional lock takes over used to live (voice leaving the base).
+  // lock, where every package a new optional lock takes over used to live (a component moving out of
+  // the base install, as the old speech engine once did).
   it("prefers a lock's own committed text, else the committed base lock", () => {
     const committed = {
       "sidecar/requirements.lock": "base",
       "sidecar/requirements-ocr.lock": "ocr",
-      "sidecar/requirements-voice.lock": null,
+      "sidecar/requirements-new.lock": null,
     };
     expect(preferenceFor("sidecar/requirements.lock", committed)).toBe("base");
     expect(preferenceFor("sidecar/requirements-ocr.lock", committed)).toBe("ocr");
-    expect(preferenceFor("sidecar/requirements-voice.lock", committed)).toBe("base");
-    expect(preferenceFor("sidecar/requirements-voice.lock", {})).toBeNull();
+    expect(preferenceFor("sidecar/requirements-new.lock", committed)).toBe("base");
+    expect(preferenceFor("sidecar/requirements-new.lock", {})).toBeNull();
   });
 });
 

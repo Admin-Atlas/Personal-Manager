@@ -158,7 +158,7 @@ Drive it with a single `depth` value; gate optional blocks on it. Don't fork lay
   traffic-light titlebar with a `⌘K` search affordance; Terminal uses a `● pm [alpha] ~/pm/<view>`
   status bar. Sidebar = nav items + (Depth-gated) model footer + Settings.
 - **Chat / Home (dashboard)** — greeting + daily briefing + (Depth-gated) Upcoming and To-do +
-  a prominent chat/voice composer pinned to the bottom. Editorial sets it as a typeset page; Slate
+  a prominent chat composer pinned to the bottom. Editorial sets it as a typeset page; Slate
   uses cards; Terminal renders it as a prompt session with a briefing block.
 - **Focus** — every project with one honest status (the status taxonomy). Editorial = rule rows;
   Slate = cards; Terminal = table. Depth scales it from name+status only → +meta → full table with cost/active.
@@ -206,9 +206,9 @@ dates in the mock are not.
 
 ## Assets
 No raster/vector brand assets are required. Fonts: **Newsreader**, **Hanken Grotesk**, **JetBrains
-Mono** (Google Fonts) — self-host or use the codebase's font pipeline. The only inline SVG is a
-simple mic glyph in the composer; replace with the codebase's icon set. Status/empty marks are CSS
-shapes.
+Mono** (Google Fonts) — self-host or use the codebase's font pipeline. The mock's only inline SVG
+was a mic glyph in the composer, and PM no longer has voice input, so there is none to recreate.
+Status/empty marks are CSS shapes.
 
 ## Files in this bundle
 - `DESIGN_TOKENS.md` — token recipe + `themeVars()` (the source of truth)

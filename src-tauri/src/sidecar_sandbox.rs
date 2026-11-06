@@ -10,8 +10,9 @@
 //! vault. The short-lived `--fetch` helper stays a normal process (it needs the network to download
 //! models); it is the one component allowed out, and it never touches untrusted file bytes.
 //!
-//! Feasibility was proven before this was written: the venv Python + onnxruntime + fastembed +
-//! faster-whisper all run inside such a container, and an outbound socket is refused.
+//! Feasibility was proven before this was written: the venv Python + onnxruntime + fastembed (and
+//! the faster-whisper speech engine PM had then) all ran inside such a container, and an outbound
+//! socket was refused.
 //!
 //! Everything here is a best-effort HARDENING layer on top of the offline worker + at-rest encryption:
 //! if setup fails (`ensure` returns `Err(SbxError)`) the caller runs the worker unconfined rather than

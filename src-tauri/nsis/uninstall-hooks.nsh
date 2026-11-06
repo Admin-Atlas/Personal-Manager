@@ -9,9 +9,9 @@
 ;
 ; So, after the app's own files are removed, we delete that regenerable runtime folder under the
 ; data dir: the managed Python venv (including the optional t-SNE and photo-OCR stacks) and the
-; Whisper speech model — exactly what the in-app Settings -> Storage tab frees, and nothing the
-; user would miss (it re-downloads on next use). This is the counterpart to the app's "Remove PM
-; data" flow.
+; models PM downloaded into it — exactly what the in-app Settings -> Storage tab frees, and nothing
+; the user would miss (it re-downloads on next use). This is the counterpart to the app's "Remove
+; PM data" flow.
 ;
 ; Separately, and on EVERY uninstall, we force-remove the bundled standalone interpreter at
 ; $INSTDIR\python. It ships as an installer resource, but we run it IN PLACE to build the venv, so

@@ -7,8 +7,9 @@
 // script, injected into every frame, closing it on both.
 //
 // It acts only in a document whose origin is opaque (every mod frame: the sandbox) or whose URL is a
-// mod's, so PM's own page keeps WebRTC. PM uses none of it today, and voice's getUserMedia is not
-// WebRTC's to remove: it stays everywhere.
+// mod's, so PM's own page keeps WebRTC. PM uses none of it today. getUserMedia is not WebRTC's to
+// remove, so it stays everywhere; a mod frame's camera and microphone are refused by its
+// Permissions-Policy instead (`headers.rs`).
 //
 // Each name is deleted, then pinned to `undefined` and made non-configurable, so the mod can't put
 // one back. The marker lets the sealed-frame regression test see that the script ran in the frame.

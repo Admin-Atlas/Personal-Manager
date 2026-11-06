@@ -6,7 +6,7 @@
 //! Almost every command with a slow or DB-touching half runs it through `spawn_blocking`, and each
 //! site used to hand-roll the same three lines to turn a `JoinError` — the task panicked — into a
 //! [`crate::error::Error`]. That is the duplication; `label` is why it could not simply be deleted.
-//! The ~40 copies carried ~30 DISTINCT diagnostics ("transcription task panicked", "migration task
+//! The ~40 copies carried ~30 DISTINCT diagnostics ("ingest task panicked", "migration task
 //! panicked", …), and a helper with the string baked in would have collapsed all of them into one
 //! wrong sentence. Taking the label keeps every site's own message byte-for-byte, so adopting this
 //! is a no-op the user can never observe.
@@ -66,11 +66,11 @@ mod tests {
     async fn the_label_is_what_keeps_every_call_sites_own_message() {
         // The whole reason the helper takes a label: ~30 sites each had their own panic string, and a
         // helper with one baked in would have silently retyped all of them.
-        let err = spawn_blocking_result("transcription", || -> Result<()> { panic!("boom") })
+        let err = spawn_blocking_result("ingest", || -> Result<()> { panic!("boom") })
             .await
             .expect_err("a panicking task must not read as success");
         assert!(
-            err.to_string().starts_with("transcription task panicked: "),
+            err.to_string().starts_with("ingest task panicked: "),
             "expected the site's own label, got {err}"
         );
     }

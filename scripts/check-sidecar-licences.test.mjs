@@ -37,15 +37,14 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-/** A throwaway tree holding the four locks and a licences file. */
-function fixture({ base, ocr = [], tsne = [], voice = [], packages }) {
+/** A throwaway tree holding the three locks and a licences file. */
+function fixture({ base, ocr = [], tsne = [], packages }) {
   const root = mkdtempSync(join(tmpdir(), "pm-licences-"));
   roots.push(root);
   mkdirSync(join(root, "sidecar"));
   writeFileSync(join(root, LOCKS[0]), lock(base));
   writeFileSync(join(root, LOCKS[1]), lock(ocr));
   writeFileSync(join(root, LOCKS[2]), lock(tsne));
-  writeFileSync(join(root, LOCKS[3]), lock(voice));
   writeFileSync(join(root, LICENCES_FILE), JSON.stringify({ version: 1, packages }));
   return root;
 }
@@ -125,20 +124,6 @@ describe("lockedPackages", () => {
     const root = fixture({ base: [], ocr: [["rapidocr", "3.9.2"]], packages: {} });
     expect(lockedPackages(root).conflicts).toEqual([]);
   });
-
-  it("reads the voice lock too, so the speech engine's packages need a reviewed licence", () => {
-    const root = fixture({
-      base: [["numpy", "2.4.6"]],
-      voice: [
-        ["faster-whisper", "1.2.1"],
-        ["numpy", "2.4.6"],
-      ],
-      packages: {},
-    });
-    const locked = lockedPackages(root);
-    expect(locked.map((p) => p.name)).toContain("faster-whisper");
-    expect(locked.conflicts).toEqual([]);
-  });
 });
 
 describe("scan", () => {
@@ -146,7 +131,7 @@ describe("scan", () => {
     const root = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
     const { problems, count } = scan(root);
     expect(problems).toEqual([]);
-    // Around eighty across the four locks. A collapse to a handful means the parser broke.
+    // Nearly seventy across the three locks. A collapse to a handful means the parser broke.
     expect(count).toBeGreaterThan(60);
   });
 

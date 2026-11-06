@@ -22,11 +22,12 @@
 # on first use; the extra image deps (opencv/shapely/pyclipper) and pi-heif ship
 # binary wheels for both the bundled 3.12 release interpreter and dev 3.14.
 #
-# Voice input's speech engine (faster-whisper, with CTranslate2 and PyAV, about
-# 240 MB) is OPTIONAL too since voice became a switch, and is NOT listed here:
-# switching voice on installs it, switching it off offers to remove it. Its pins,
-# and why PyAV is pinned beside faster-whisper, live in Rust (sidecar.rs
-# OPTIONAL_VOICE_PINS).
+# Voice input has been removed until a better speech engine replaces it, so its
+# old engine (faster-whisper, with CTranslate2 and PyAV) is pinned nowhere: not
+# here, not in requirements-optional.txt, and its lock is gone. PM takes the
+# engine and its model off installs an earlier PM put them on. This note was
+# reworded in the same change on purpose: editing this file re-stamps
+# requirements.lock, so every upgraded install re-provisions its venv once.
 #
 #   openpyxl — spreadsheet parsing for the dedicated .xlsx/.csv ingest path (board card:
 #     Spreadsheet Processing). Those extensions BYPASS MarkItDown now — routed to the sidecar's

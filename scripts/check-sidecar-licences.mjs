@@ -5,7 +5,7 @@
 //
 // WHY. pr.yml's `dependencies` job is named for all three ecosystems. Rust had cargo-deny, npm got
 // its gate with the AGPL-conveyance work, and Python had only pip-audit — which looks for CVEs and
-// says nothing about terms. The locks pull ~80 packages, nearly all of them transitive, and a
+// says nothing about terms. The locks pull ~70 packages, nearly all of them transitive, and a
 // re-licence four levels down would have arrived with no one reading it.
 //
 // WHAT THIS IS NOT. PM does not *convey* these packages. The installers ship `requirements.lock`;
@@ -36,7 +36,6 @@ export const LOCKS = [
   "sidecar/requirements.lock",
   "sidecar/requirements-ocr.lock",
   "sidecar/requirements-tsne.lock",
-  "sidecar/requirements-voice.lock",
 ];
 
 /**

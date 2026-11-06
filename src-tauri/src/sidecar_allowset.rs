@@ -76,7 +76,7 @@ pub struct SandboxPaths<'a> {
     pub venv_dir: &'a Path,
     /// The BASE interpreter's `bin` dir, read from `pyvenv.cfg`'s `home =`.
     pub base_python_home: &'a Path,
-    /// The embedding/whisper model cache. The worker reads it; the unconfined `--fetch` helper
+    /// The model cache (embedder, reranker, OCR). The worker reads it; the unconfined `--fetch` helper
     /// writes it.
     pub models_dir: &'a Path,
     /// Where `pm_sidecar.py` lives.

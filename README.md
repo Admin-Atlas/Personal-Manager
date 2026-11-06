@@ -95,8 +95,6 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   quietly become the less private option; you can still enter any model id by hand. PM
   starts you on a cheap default; add a second model and turn on auto-switch to get automatic
   fallback when one is rate-limited.
-- **Voice input.** Speak into the chat box and PM transcribes it **on your device** into
-  editable text — no audio leaves the machine.
 - **Command palette.** A single keystroke (Ctrl/Cmd+K) to jump to any project, file, or past
   conversation.
 
@@ -124,7 +122,7 @@ not an exhaustive list; the in-app **What's New** is the complete, current recor
   (vectors) + FTS5 (keyword), all vendored (no system libs)
 - **Secrets:** OS keychain (`keyring`) · **Model gateway:** OpenRouter (streaming)
 - **On-device ML:** a managed Python sidecar for document conversion, local embeddings,
-  and speech-to-text — provisioned on first use
+  and photo OCR — provisioned on first use
 - **Design system:** a token-driven, accent-driven OKLCH theme (`src/theme/`) with
   switchable System / Mode / Accent / Depth axes and self-hosted fonts. The full design
   reference lives in [`design-system-docs/`](design-system-docs/); the rules for working

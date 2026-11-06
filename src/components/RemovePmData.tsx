@@ -95,7 +95,7 @@ const ITEMS: Item[] = [
     key: "regenerable",
     label: "Downloaded components",
     detail:
-      "The document engine, the enhanced-map and photo-text add-ons, and the speech model — everything Settings → Storage can free.",
+      "The document engine, the enhanced-map and photo-text add-ons, and the downloaded search and OCR models.",
     consequence: "Frees the most space. Re-downloads automatically the next time it's needed.",
   },
   {

@@ -18,7 +18,7 @@
 //! asset, and SHA-256 are pinned below; the download is verified against that hash
 //! before it is unpacked (no trust-on-first-use); a stamp file makes a second run
 //! skip the work. The pinned interpreter version is deliberately exact — it's the
-//! one validated in CI against markitdown/fastembed/faster-whisper — unlike the
+//! one validated in CI against markitdown/fastembed — unlike the
 //! *probe*, which accepts any ≥ 3.11 already on the machine.
 //!
 //! macOS-only in practice: [`fetch_macos_python`] is only ever called from the

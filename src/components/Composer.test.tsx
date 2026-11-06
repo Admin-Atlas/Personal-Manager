@@ -11,19 +11,13 @@
 // a unit test of the grammar — it only exists once both handlers are on one element — so the fix is
 // pinned here, at the level the bug actually lived at.
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const listTags = vi.fn();
-const getVoiceSwitch = vi.fn();
 vi.mock("../lib/ipc", () => ({
   listTags: () => listTags(),
-  getVoiceSwitch: () => getVoiceSwitch(),
 }));
-// useRecorder reaches for browser media APIs jsdom does not have; what matters here is whether the
-// composer uses it at all.
-const useRecorder = vi.fn(() => ({ state: "idle", error: null, start: vi.fn(), stop: vi.fn() }));
-vi.mock("../lib/useRecorder", () => ({ useRecorder: () => useRecorder() }));
 // The same stub the other component tests use: <Textarea>/<Button> reach for `useTheme`, and the
 // real ThemeProvider pulls in IPC.
 vi.mock("../theme/ThemeContext", async (importOriginal) => ({
@@ -46,15 +40,9 @@ vi.mock("../theme/ThemeContext", async (importOriginal) => ({
   }),
 }));
 
-import { announceVoiceSwitch } from "../lib/voiceSwitch";
 import { Composer } from "./Composer";
 
 afterEach(cleanup);
-beforeEach(() => {
-  useRecorder.mockClear();
-  getVoiceSwitch.mockReset();
-  getVoiceSwitch.mockResolvedValue({ on: false });
-});
 
 // jsdom implements no layout: the composer measures its parent to cap its own height, and the
 // suggestion list scrolls the highlighted row into view. Neither is what these tests are about.
@@ -199,39 +187,5 @@ describe("what the box says it will do", () => {
   it("says why it is refusing when the queue is full", () => {
     render(<Composer disabled busy onSend={vi.fn()} />);
     expect(screen.getByPlaceholderText(/Waiting for the queue to clear/)).toBeTruthy();
-  });
-});
-
-// Voice is a switch (Mods spec D8). Off, the mic is gone and so is the recorder behind it: nothing
-// asks for the microphone, and nothing is left to send a clip the backend would refuse.
-describe("the mic follows the voice switch", () => {
-  const mic = () => screen.queryByRole("button", { name: /Record voice/ });
-
-  it("is absent while voice is off, and the recorder is never used", async () => {
-    render(<Composer disabled={false} onSend={vi.fn()} />);
-    await waitFor(() => expect(getVoiceSwitch).toHaveBeenCalled());
-    expect(mic()).toBeNull();
-    expect(useRecorder).not.toHaveBeenCalled();
-  });
-
-  it("is absent while the switch is unknown", async () => {
-    getVoiceSwitch.mockRejectedValue("the vault is locked");
-    render(<Composer disabled={false} onSend={vi.fn()} />);
-    await waitFor(() => expect(getVoiceSwitch).toHaveBeenCalled());
-    expect(mic()).toBeNull();
-  });
-
-  it("appears while voice is on, and goes when it is switched off elsewhere", async () => {
-    getVoiceSwitch.mockResolvedValue({ on: true });
-    render(<Composer disabled={false} onSend={vi.fn()} />);
-    await waitFor(() => expect(mic()).not.toBeNull());
-    expect(mic()?.getAttribute("data-help")).toBe("composer-mic");
-    expect(useRecorder).toHaveBeenCalled();
-
-    // Settings → Storage is a modal over the chat, so the chat hears the switch move.
-    act(() => announceVoiceSwitch({ on: false }));
-    expect(mic()).toBeNull();
-    act(() => announceVoiceSwitch({ on: true }));
-    expect(mic()).not.toBeNull();
   });
 });
