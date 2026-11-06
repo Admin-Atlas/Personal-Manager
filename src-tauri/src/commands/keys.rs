@@ -99,6 +99,14 @@ pub fn package_managed_linux() -> bool {
     crate::update_delivery::package_managed_linux()
 }
 
+/// The running macOS version (e.g. "14.5"), so the updater UI can hold back an update that
+/// states a newer minimum macOS than this Mac has: macOS wouldn't open it, and the updater
+/// replaces PM in place. `None` off macOS, or when the version can't be read.
+#[tauri::command]
+pub fn macos_version() -> Option<String> {
+    crate::update_delivery::macos_version()
+}
+
 /// The OpenRouter model catalogue (public endpoint, no key needed) so the user can
 /// browse, search, and pick a model with pricing in Settings (spec §6 — any model,
 /// swappable).

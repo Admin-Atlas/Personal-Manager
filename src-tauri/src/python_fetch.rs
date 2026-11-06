@@ -5,17 +5,16 @@
 //!
 //! On Windows the app ships a bundled interpreter (`scripts/fetch-python.mjs` +
 //! `tauri.windows.conf.json`), so the venv is built without any system Python. On
-//! macOS we can't do that yet — `python-build-standalone` has no universal2 build
-//! and bundling unsigned dylibs inside the signed `.app` needs the Apple-signing
-//! pipeline (see `docs/MACOS-SIGNING.md`). So the fallback here is the other half
-//! of the same idea: when [`crate::sidecar::SidecarManager::resolve_base_python`]
+//! macOS we can't do that yet — bundling unsigned dylibs inside the signed `.app`
+//! needs the Apple-signing pipeline (see `docs/MACOS-SIGNING.md`). So the fallback
+//! here is the other half of the same idea: when [`crate::sidecar::SidecarManager::resolve_base_python`]
 //! probes the machine and finds **no** interpreter ≥ 3.11, it downloads one at
 //! runtime into PM's data-home (a subprocess download into a user directory, not
 //! a build-time bundle into the signed app — so it isn't gated on signing, and a
 //! `reqwest` download carries no `com.apple.quarantine` flag).
 //!
-//! This mirrors `fetch-python.mjs`'s discipline exactly: the version, per-arch
-//! asset, and SHA-256 are pinned below; the download is verified against that hash
+//! This mirrors `fetch-python.mjs`'s discipline exactly: the version, asset, and
+//! SHA-256 are pinned below; the download is verified against that hash
 //! before it is unpacked (no trust-on-first-use); a stamp file makes a second run
 //! skip the work. The pinned interpreter version is deliberately exact — it's the
 //! one validated in CI against markitdown/fastembed — unlike the
@@ -40,20 +39,20 @@ use crate::error::{Error, Result};
 
 // ---- the pin -------------------------------------------------------------
 // Kept in lockstep with `scripts/fetch-python.mjs` (Windows uses the same tag +
-// version; only the per-arch asset/SHA differ). To advance: pick a new
-// python-build-standalone release that ships BOTH macOS `install_only` assets
+// version; only the asset/SHA differ). To advance: pick a new
+// python-build-standalone release that ships the macOS arm64 `install_only` asset
 // *and* the Windows one, and update every field from its signed SHA256SUMS.
-// The three SHA-256 values below are the real ones from the release's SHA256SUMS
-// (the Windows one matches `fetch-python.mjs`'s pin exactly, cross-checking the
-// file's authenticity).
+// The SHA-256 below is the real one from the release's SHA256SUMS.
+//
+// Apple Silicon only, like PM's Mac build (release.yml builds aarch64-apple-darwin
+// alone, for macOS 14 or newer): onnxruntime, which runs the document engine's
+// search and photo models, publishes no Intel Mac wheel, so an Intel interpreter
+// could never get as far as a working engine. There is no Intel pin to keep current.
 const PY_VERSION: &str = "3.12.13";
 const PBS_TAG: &str = "20260610";
 
 const ASSET_AARCH64: &str = "cpython-3.12.13+20260610-aarch64-apple-darwin-install_only.tar.gz";
 const SHA256_AARCH64: &str = "e18ddd4c1e8f4a1d6c4590b37f423d76aec734447edc20ed08e93983d95f2132";
-
-const ASSET_X86_64: &str = "cpython-3.12.13+20260610-x86_64-apple-darwin-install_only.tar.gz";
-const SHA256_X86_64: &str = "ba02164e4db381af8c288c0bc1657584a835e9121a0fa2836b0f2e712ff8cdf5";
 
 /// GitHub Releases base; the asset URL is `{BASE}/{PBS_TAG}/{ASSET}` (same shape
 /// `fetch-python.mjs` builds).
@@ -63,22 +62,24 @@ const RELEASE_BASE: &str = "https://github.com/astral-sh/python-build-standalone
 /// so the two provisioning paths are recognisable as siblings.
 const STAMP_FILE: &str = ".pm-pyver";
 
-/// Pick the asset + expected hash for a given arch string. Pure (takes the arch
-/// explicitly) so both branches are unit-testable without cross-compiling. Rosetta
-/// is a non-issue: a single-arch binary reports its *own* arch via
-/// `std::env::consts::ARCH`, which is what must match the interpreter we run.
-fn macos_asset_for(arch: &str) -> (&'static str, &'static str) {
-    match arch {
-        "aarch64" => (ASSET_AARCH64, SHA256_AARCH64),
-        // x86_64 (and any unexpected value, which can't happen on a macOS build
-        // target PM ships) falls back to the Intel asset.
-        _ => (ASSET_X86_64, SHA256_X86_64),
-    }
+/// Pick the asset + expected hash for a given arch string: the Apple Silicon one, or
+/// `None` for any other arch, which PM doesn't ship on macOS (an Intel build made from
+/// source). Pure (takes the arch explicitly) so both answers are unit-testable without
+/// cross-compiling. Rosetta is a non-issue: a single-arch binary reports its *own*
+/// arch via `std::env::consts::ARCH`, which is what must match the interpreter we run.
+fn macos_asset_for(arch: &str) -> Option<(&'static str, &'static str)> {
+    (arch == "aarch64").then_some((ASSET_AARCH64, SHA256_AARCH64))
 }
 
-/// The asset + hash for the running binary's architecture.
-fn macos_asset() -> (&'static str, &'static str) {
-    macos_asset_for(std::env::consts::ARCH)
+/// The asset + hash for the running binary's architecture, or why there is none.
+fn macos_asset() -> Result<(&'static str, &'static str)> {
+    macos_asset_for(std::env::consts::ARCH).ok_or_else(|| {
+        Error::Other(
+            "PM's document engine needs an Apple Silicon Mac: the engine that runs its search \
+             and photo models isn't made for Intel Macs."
+                .to_string(),
+        )
+    })
 }
 
 /// The interpreter path inside an unpacked `install_only` archive: it extracts to
@@ -89,7 +90,7 @@ fn interpreter_path(dest_dir: &Path) -> PathBuf {
 }
 
 /// Identity written to the stamp file: version+tag+hash, so ANY pin change (new
-/// version, tag, or a different arch's asset) invalidates a previous download and
+/// version, tag, or asset) invalidates a previous download and
 /// forces a re-fetch — exactly like `fetch-python.mjs`'s `STAMP`.
 fn stamp_for(sha256: &str) -> String {
     format!("{PY_VERSION}+{PBS_TAG} {sha256}")
@@ -115,7 +116,7 @@ pub(crate) fn fetch_macos_python(
     dest_dir: &Path,
     mut on_progress: impl FnMut(f32),
 ) -> Result<PathBuf> {
-    let (asset, sha256) = macos_asset();
+    let (asset, sha256) = macos_asset()?;
     let stamp = stamp_for(sha256);
 
     if let Some(p) = downloaded_python_current(dest_dir, &stamp) {
@@ -211,11 +212,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asset_selection_is_arch_specific() {
-        assert_eq!(macos_asset_for("aarch64"), (ASSET_AARCH64, SHA256_AARCH64));
-        assert_eq!(macos_asset_for("x86_64"), (ASSET_X86_64, SHA256_X86_64));
-        // An unexpected arch defaults to the Intel asset rather than panicking.
-        assert_eq!(macos_asset_for("weird"), (ASSET_X86_64, SHA256_X86_64));
+    fn only_apple_silicon_has_an_interpreter() {
+        assert_eq!(
+            macos_asset_for("aarch64"),
+            Some((ASSET_AARCH64, SHA256_AARCH64))
+        );
+        assert!(ASSET_AARCH64.contains("aarch64-apple-darwin"));
+        // Intel, or any other arch, has none: PM on Mac is Apple Silicon only.
+        assert_eq!(macos_asset_for("x86_64"), None);
+        assert_eq!(macos_asset_for("weird"), None);
     }
 
     #[test]
@@ -224,8 +229,8 @@ mod tests {
         assert!(s.contains(PY_VERSION));
         assert!(s.contains(PBS_TAG));
         assert!(s.contains(SHA256_AARCH64));
-        // A different pin (arch/hash) produces a different stamp, so it invalidates.
-        assert_ne!(stamp_for(SHA256_AARCH64), stamp_for(SHA256_X86_64));
+        // A different pin (a new hash) produces a different stamp, so it invalidates.
+        assert_ne!(stamp_for(SHA256_AARCH64), stamp_for(&"0".repeat(64)));
     }
 
     #[test]
@@ -263,7 +268,7 @@ mod tests {
 
         // (d) stale stamp (a pin bump) → None, forcing a re-download.
         assert_eq!(
-            downloaded_python_current(dest, &stamp_for(SHA256_X86_64)),
+            downloaded_python_current(dest, &stamp_for(&"0".repeat(64))),
             None
         );
     }

@@ -211,9 +211,28 @@ Two checks:
 
 Per-platform artifact set to expect on the release page: Windows `-setup.exe`,
 macOS `.app.tar.gz` + `.dmg`, Linux `.AppImage` + `.rpm` + `.deb`, plus `latest.json`
-(updater feed: `windows-x86_64`, `darwin-x86_64`/`aarch64`, `linux-x86_64` — the
+(updater feed: `windows-x86_64`, `darwin-aarch64`, `linux-x86_64` — the
 AppImage is the only Linux format the updater handles; rpm/deb users update by
 reinstalling the next release's package), `SHA256SUMS`, and `THIRD-PARTY-NOTICES.txt`.
+
+> **macOS is Apple Silicon only, macOS 14 or newer** (`minimumSystemVersion` in
+> `tauri.conf.json`). onnxruntime, which runs PM's search and photo models, has published
+> no Intel Mac or pre-14 Mac wheel since 1.24.1 (1.23.2 of October 2025 was the last), so
+> the document engine can't be set up on those Macs. The macOS leg builds
+> `aarch64-apple-darwin` alone, and `scripts/check-macos-bundle.sh` fails the build unless
+> the `.app` is arm64 only and states that minimum. Two consequences to keep in mind:
+>
+> - **Intel Macs get no updates.** The feed lists the Mac bundle under `darwin-aarch64`
+>   only, and the publish job's verifier refuses a `darwin-x86_64` entry. An Intel Mac on
+>   an older, universal PM looks up `darwin-x86_64`, finds nothing, and keeps its version
+>   with no prompt.
+> - **Raising the minimum macOS.** `latest.json` carries `minimum_macos_version`, written
+>   from `tauri.conf.json` and checked by the verifier. From 3.175.0 on, PM compares it
+>   with the running macOS before it downloads an update and, if the Mac is too old, shows
+>   which macOS the update needs instead (`src/lib/updateGate.ts`). Releases before 3.175.0
+>   can't read the field: on an older macOS they download the update, and macOS then
+>   refuses to open it. So a raise reaches those copies as an app that won't open until
+>   macOS is updated — say so in the release notes whenever the minimum moves.
 
 > **Linux lane dry-run:** `.github/workflows/linux-bundle-dryrun.yml` builds the real
 > AppImage + rpm + deb and smoke-tests the bundled interpreter **without a tag and without

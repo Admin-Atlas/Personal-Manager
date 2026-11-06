@@ -16,8 +16,8 @@
 // build runner needs NO Python toolchain (we fetch a prebuilt binary, never
 // compile), so the "no Python in CI to build" rule still holds.
 //
-// SCOPE: Windows + Linux (x86_64). macOS bundling is deferred (no universal2
-// build; unsigned venv dylibs need signing — see docs/MACOS-SIGNING.md); there
+// SCOPE: Windows + Linux (x86_64). macOS bundling is deferred (unsigned venv
+// dylibs need signing — see docs/MACOS-SIGNING.md); there
 // the app downloads a private interpreter at runtime instead (python_fetch.rs),
 // so on macOS this stays a no-op. The interpreter is a fetched runtime artifact,
 // never committed (git-ignored and asserted-untracked by check-files-in-place).

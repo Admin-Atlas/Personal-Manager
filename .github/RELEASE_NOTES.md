@@ -5,7 +5,8 @@ PM desktop release — **v3.169.1-alpha**.
 ⬇️ **Download ONE file — the one for your system. Ignore everything else on this page.**
 
 🪟 **Windows** — download the file ending in **`-setup.exe`** and run it.
-🍎 **macOS** — download the **`.dmg`** file, then drag **PM** to **Applications**.
+🍎 **macOS** (an Apple Silicon Mac with macOS 14 or newer) — download the **`.dmg`** file, then
+drag **PM** to **Applications**.
 🐧 **Linux (x86_64)** — the **`.AppImage`** runs on any distro and auto-updates like the
 others; or install the native **`.rpm`** (Fedora/RHEL) or **`.deb`** (Debian/Ubuntu). One-line
 commands and how to pick are in the **Linux guide** near the bottom of this page.
@@ -40,7 +41,20 @@ all stay exactly as they are.
 **🍎 If the banner says the update couldn't apply** (possible on macOS while PM is
 unsigned): download the `.dmg` above and drag **PM** to **Applications** again, choosing
 **Replace** when asked. Everything you have is kept — just replace the old copy rather
-than keeping two around.
+than keeping two around. **Not on macOS 13 or older:** this version won't open there, so
+update macOS first (next paragraph).
+
+**🍎 On macOS 13 or older? Update macOS first.** PM now needs macOS 14 or newer, because the
+engine behind its search and photo models no longer supports older Macs. Update macOS in **System
+Settings → General → Software Update** (on macOS 12 or older, **Apple menu → System Preferences →
+Software Update**) before you click **Restart now**: macOS won't open the new PM until it's on
+macOS 14. **Intel Macs** no longer receive updates and keep the version they have.
+
+Already clicked **Restart now** on macOS 13 or older, and PM won't open? Update macOS to 14 and PM
+opens as the new version. If you need PM before you can do that, reinstall the version you had
+from its release page (everything you have is kept) — but that copy will offer this version
+again, so don't click **Restart now**, **Restart to update**, **Try again** or **Download it
+manually** on it until macOS is on 14.
 
 **🐧 Linux.** The **AppImage** updates itself exactly like the Windows app. A **package**
 install (**`.rpm`** or **`.deb`**) can't self-update — PM only shows a small "reinstall to

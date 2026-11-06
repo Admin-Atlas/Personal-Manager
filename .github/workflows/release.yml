@@ -109,8 +109,13 @@ jobs:
         include:
           - os: windows-latest
             args: ""
+          # Apple Silicon only, macOS 14 or newer (tauri.conf.json's minimumSystemVersion):
+          # onnxruntime, which runs PM's search and photo models, publishes no Intel Mac or
+          # pre-14 Mac wheel since 1.24.1, so an Intel build would install a PM whose
+          # document engine can't be set up. The target is named rather than left to the
+          # runner's host arch, so the artifact stays arm64 whatever macos-latest points at.
           - os: macos-latest
-            args: "--target universal-apple-darwin"
+            args: "--target aarch64-apple-darwin"
           # Pinned, NOT ubuntu-latest: the AppImage bundles webkit/gtk but never
           # glibc, so the build runner's distro sets the artifact's glibc floor.
           # Building on the oldest supported LTS keeps the AppImage running on
@@ -144,7 +149,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (re-pin to advance Rust) # zizmor: ignore[impostor-commit]
         with:
           toolchain: stable
-          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -308,7 +313,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p staged
-          base=src-tauri/target/universal-apple-darwin/release/bundle
+          base=src-tauri/target/aarch64-apple-darwin/release/bundle
+          # The same check macos-bundle-dryrun.yml runs on every PR: the executable is arm64
+          # alone and the bundle states tauri.conf.json's minimum macOS.
+          bash scripts/check-macos-bundle.sh "$base"
           cp "$base"/macos/*.app.tar.gz staged/
           cp "$base"/macos/*.app.tar.gz.sig staged/
           # NOT `|| true`. That shrug meant a bundler run which produced no .dmg

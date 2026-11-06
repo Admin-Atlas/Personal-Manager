@@ -146,9 +146,8 @@ For a full tour of the architecture and the rules for working in this repo, see
   — so end users need no Python install. On **macOS**, packaged apps instead **download** a
   pinned standalone interpreter into PM's data directory on first run **only if** no suitable
   Python is found — so macOS end users need no manual install either. The two use different
-  mechanisms for different reasons: `python-build-standalone` has no universal2 build and
-  build-time bundling into the signed `.app` is gated on the Apple-signing pipeline, whereas a
-  runtime download picks the right per-arch build and isn't gated on signing — see
+  mechanisms because build-time bundling into the signed `.app` is gated on the Apple-signing
+  pipeline, whereas a runtime download into PM's data directory isn't — see
   [`docs/MACOS-SIGNING.md`](docs/MACOS-SIGNING.md). Development from source still needs Python
   3.11+ on your machine on every platform.)
 - **Tauri OS prerequisites:** see <https://tauri.app/start/prerequisites/>
@@ -197,6 +196,31 @@ warn once on first launch — Windows SmartScreen (**More info → Run anyway**)
 Gatekeeper (**Open Anyway**); the release notes spell this out for downloaders. The
 macOS Apple-signing pipeline is already wired and dormant: add the `APPLE_*` GitHub
 Actions secrets and macOS builds sign + notarize automatically, with no code change.
+
+## Installing on macOS
+
+PM on Mac needs an **Apple Silicon Mac (M1 or later) with macOS 14 Sonoma or newer**. Download
+the `.dmg` from the releases page, open it and drag **PM** to **Applications**.
+
+Why: the engine that runs PM's search and photo models (onnxruntime) no longer supports Intel
+Macs, or macOS 13 and older, so PM's documents, search and map couldn't be set up on those Macs.
+
+- **Intel Macs** stop receiving updates. A PM already installed on one stays on the version it
+  has: the update feed no longer lists Intel Macs, so its update check finds nothing. (Its
+  document engine already can't be set up there, for the same reason.)
+- **macOS 13 or older on Apple Silicon:** update macOS first (**System Settings → General →
+  Software Update**, or on macOS 12 or older, **Apple menu → System Preferences → Software
+  Update**; every Apple Silicon Mac can run macOS 14), then install or update PM. A PM from
+  before 3.175 is still offered the update there and can't tell it needs macOS 14, and macOS
+  won't open the updated PM until it's on macOS 14 — so update macOS before you click **Restart
+  now**. From 3.175 on, PM checks which macOS an update needs before it downloads it, and if
+  this Mac's macOS is too old it says so instead.
+
+  Already clicked **Restart now** and PM won't open? Update macOS to 14 and PM opens as the new
+  version. If you need PM before you can do that, reinstall the version you had from its release
+  page (your documents, projects and settings are kept) — but that copy will offer the new
+  version again, so don't click **Restart now**, **Restart to update**, **Try again** or
+  **Download it manually** on it until macOS is on 14.
 
 ## Installing on Linux
 

@@ -5,9 +5,9 @@ import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
-import { smartAppControlState, packageManagedLinux, showMainWindow } from "./ipc";
+import { smartAppControlState, packageManagedLinux, macosVersion, showMainWindow } from "./ipc";
 import type { SmartAppControlState } from "./types";
-import { evaluateAttemptMarker } from "./updateGate";
+import { evaluateAttemptMarker, macosUpdateBlock, type MacosBlock } from "./updateGate";
 
 /**
  * Background auto-update. On launch we silently ask the release feed whether a
@@ -26,6 +26,11 @@ import { evaluateAttemptMarker } from "./updateGate";
  * the AppImage update and would silently download the whole thing before `install()` fails. We ask
  * the backend up front whether this is a package install and, if so, skip the download entirely and
  * surface a "reinstall to update" banner pointing at the releases page instead.
+ *
+ * macOS caveat this hook defends against: an update can need a newer macOS than this Mac has (the
+ * release states its minimum in latest.json). macOS won't open such an app, and the updater
+ * replaces PM in place, so installing it would leave a PM that doesn't open. We compare first and,
+ * when the update needs a newer macOS, download nothing and say which macOS it needs instead.
  *
  * Windows caveat this hook defends against: our installer is an unsigned NSIS setup, so the OS can
  * refuse it — Smart App Control (SAC) enforced, a SmartScreen "Don't run", an antivirus quarantine.
@@ -73,6 +78,9 @@ export interface AppUpdate {
    *  The banner then invites a reinstall from the releases page rather than a restart, and no
    *  AppImage is downloaded. False on Windows, macOS, and the Linux AppImage. */
   packageManaged: boolean;
+  /** Set when the offered update needs a newer macOS than this Mac runs. Nothing is downloaded;
+   *  the banner says which macOS it needs. Null everywhere else, macOS included when it fits. */
+  macosBlock: MacosBlock | null;
   /** The releases page for the manual-download fallback. */
   releasesUrl: string;
   restart: () => void;
@@ -92,6 +100,7 @@ export function useUpdater(): AppUpdate {
   const [sac, setSac] = useState<SmartAppControlState>("unknown");
   const [blockedByPriorAttempt, setBlockedByPriorAttempt] = useState(false);
   const [packageManaged, setPackageManaged] = useState(false);
+  const [macosBlock, setMacosBlock] = useState<MacosBlock | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -113,6 +122,15 @@ export function useUpdater(): AppUpdate {
         if (!cancelled) setPackageManaged(pkg);
       } catch {
         // Leave false — treat as self-updating.
+      }
+
+      // This Mac's version, to hold back an update that needs a newer macOS. Null off macOS, and
+      // best-effort: a failed read leaves null, which proceeds as before this check existed.
+      let macos: string | null = null;
+      try {
+        macos = await macosVersion();
+      } catch {
+        // Leave null.
       }
 
       let running = "";
@@ -147,6 +165,15 @@ export function useUpdater(): AppUpdate {
       if (!found || cancelled) return;
 
       setVersion(found.version);
+
+      // The update needs a newer macOS than this Mac has: macOS wouldn't open it, and installing it
+      // replaces the PM that works. Download nothing; the banner says which macOS it needs.
+      const block = macosUpdateBlock(found.rawJson, macos);
+      if (block) {
+        setMacosBlock(block);
+        setStatus("ready");
+        return;
+      }
 
       // A Linux package install can't be updated in place by the plugin — don't download the
       // AppImage (it would only fail to apply). Surface a "reinstall to update" banner instead.
@@ -261,6 +288,7 @@ export function useUpdater(): AppUpdate {
     sac,
     blockedByPriorAttempt,
     packageManaged,
+    macosBlock,
     releasesUrl: RELEASES_URL,
     restart,
     dismiss,
