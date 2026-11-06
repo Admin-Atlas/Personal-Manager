@@ -464,6 +464,8 @@ keeps a mod's page from becoming a top document holding Tauri's invoke key.
 
 **Co-signers.** A new window goes through `build_window` with `Role::NoMods`. Only the main window is
 `Role::Main`, the one that may load a mod frame and whose switches decide whether the engine is sealed.
+The exception is a switch whose setting WebView2 shares between every window (SmartScreen's,
+`Platform::folder_wide_switches`): its failure in a `Role::NoMods` window unseals the engine too.
 
 ### I-27 · A mod reaches the webview only as verified bytes, and its id only as a `ModId` — **Held**
 
