@@ -25,8 +25,16 @@ use crate::vault::kdf::KdfParams;
 
 /// File magic (8 bytes) identifying a PM backup archive.
 pub const MAGIC: &[u8; 8] = b"PMBACKUP";
-/// The only container version this build writes/accepts.
-pub const FORMAT_VERSION: u16 = 1;
+/// The container version this build writes. 2 from the Mods release on (Mods spec §1.11): the
+/// container itself is unchanged, but a format-2 archive may hold a store at schema v60 or later,
+/// which an older PM would misread. Every PM before it accepts exactly 1 and refuses anything else
+/// with its "written by a newer version of the app" error, so the bump is what keeps a post-mods
+/// backup out of a build that can't read it. Never lower it, and bump it again whenever an archive
+/// this build writes must stay out of the builds before it.
+pub const FORMAT_VERSION: u16 = 2;
+/// Every container version this build restores: format 1 (every backup made before mods, whose
+/// store then migrates up as it opens) and its own.
+pub const READABLE_FORMATS: [u16; 2] = [1, FORMAT_VERSION];
 /// Cipher identifier recorded in the header (informational + a guard against a future
 /// scheme change opening under the wrong reader).
 pub const CIPHER_ID: &str = "xchacha20poly1305-stream-be32";
@@ -78,15 +86,23 @@ pub struct KdfBlock {
 }
 
 /// Write the cleartext container header and return the exact JSON bytes, so the caller
-/// can bind them to the payload as AAD (`aad(flags, &bytes)`).
+/// can bind them to the payload as AAD (`aad(header.format_version, flags, &bytes)`). The
+/// preamble carries `header.format_version`, so the two copies can't disagree; a version this
+/// build couldn't read back is refused rather than written.
 pub fn write_header<W: Write>(w: &mut W, flags: u16, header: &Header) -> Result<Vec<u8>> {
+    if !READABLE_FORMATS.contains(&header.format_version) {
+        return Err(Error::Other(format!(
+            "refusing to write backup format {}",
+            header.format_version
+        )));
+    }
     let json = serde_json::to_vec(header)
         .map_err(|e| Error::Other(format!("could not encode backup header: {e}")))?;
     if json.len() > MAX_HEADER_LEN {
         return Err(Error::Other("backup header unexpectedly large".into()));
     }
     w.write_all(MAGIC)?;
-    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    w.write_all(&header.format_version.to_le_bytes())?;
     w.write_all(&flags.to_le_bytes())?;
     w.write_all(&(json.len() as u32).to_le_bytes())?;
     w.write_all(&json)?;
@@ -94,8 +110,9 @@ pub fn write_header<W: Write>(w: &mut W, flags: u16, header: &Header) -> Result<
 }
 
 /// Parse and validate the cleartext header, returning the flags, the exact header JSON
-/// bytes (for AAD), and the decoded [`Header`]. Reads nothing past the header, so an
-/// unknown version fails before any crypto.
+/// bytes (for AAD), and the decoded [`Header`], whose `format_version` is the archive's (one of
+/// [`READABLE_FORMATS`]). Reads nothing past the header, so an unknown version fails before any
+/// crypto.
 pub fn read_header<R: Read>(r: &mut R) -> Result<(u16, Vec<u8>, Header)> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)
@@ -108,7 +125,7 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<(u16, Vec<u8>, Header)> {
     let mut ver = [0u8; 2];
     r.read_exact(&mut ver)?;
     let version = u16::from_le_bytes(ver);
-    if version != FORMAT_VERSION {
+    if !READABLE_FORMATS.contains(&version) {
         return Err(Error::Other(format!(
             "this backup was written by a newer version of the app (format {version}); update to restore it"
         )));
@@ -146,14 +163,18 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<(u16, Vec<u8>, Header)> {
 }
 
 /// Additional authenticated data binding the WHOLE cleartext preamble to the encrypted
-/// payload: `blake3(MAGIC ‖ FORMAT_VERSION ‖ flags ‖ header_json)`. Covering the binary
+/// payload: `blake3(MAGIC ‖ format_version ‖ flags ‖ header_json)`. Covering the binary
 /// preamble — not just the JSON — makes the format version and the provenance flags
 /// (`FLAG_*`) tamper-evident too (L-4): any change to them alters the AAD and so fails
 /// every chunk's authentication, rather than being silently accepted on restore.
-pub fn aad(flags: u16, header_json: &[u8]) -> [u8; 32] {
+///
+/// `format_version` is the archive's own, as written or as read back, never this build's
+/// constant: a format-1 archive was sealed with 1 here, and relabelling a format-2 archive as 1
+/// (to slip it past an older PM's check, or a newer one's) changes the AAD and fails to decrypt.
+pub fn aad(format_version: u16, flags: u16, header_json: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(MAGIC);
-    h.update(&FORMAT_VERSION.to_le_bytes());
+    h.update(&format_version.to_le_bytes());
     h.update(&flags.to_le_bytes());
     h.update(header_json);
     *h.finalize().as_bytes()
@@ -425,25 +446,90 @@ mod tests {
         assert_eq!(flags, FLAG_DB_KEY_EMBEDDED);
         assert_eq!(json, written_json);
         assert_eq!(back, h);
-        // The AAD is a pure function of the flags + header bytes.
-        assert_eq!(aad(flags, &json), aad(FLAG_DB_KEY_EMBEDDED, &written_json));
+        // The AAD is a pure function of the version, the flags and the header bytes.
+        let v = back.format_version;
+        assert_eq!(
+            aad(v, flags, &json),
+            aad(FORMAT_VERSION, FLAG_DB_KEY_EMBEDDED, &written_json)
+        );
         // L-4: the flags are now bound into the AAD, so tampering with them changes it.
         assert_ne!(
-            aad(flags, &json),
-            aad(flags ^ FLAG_SOURCE_MD_ENCRYPTED, &json)
+            aad(v, flags, &json),
+            aad(v, flags ^ FLAG_SOURCE_MD_ENCRYPTED, &json)
         );
+    }
+
+    /// Spec §1.11: this build writes format 2. Every PM before the Mods release accepts exactly 1
+    /// and refuses anything else with its "written by a newer version of the app" error (its
+    /// `read_header` compared against a constant 1), so a post-mods archive, whose store an older
+    /// build would misread, never restores there. Pinned so the bump can't be undone quietly.
+    #[test]
+    fn this_build_writes_format_2_which_every_older_pm_refuses() {
+        assert_eq!(FORMAT_VERSION, 2);
+        assert_ne!(FORMAT_VERSION, 1, "the one version older PMs accept");
+        assert_eq!(READABLE_FORMATS, [1, 2], "and this one still reads theirs");
+    }
+
+    /// A header written as format `version`, byte for byte as a PM of that version wrote it.
+    fn header_bytes_as(version: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let h = Header {
+            format_version: version,
+            ..sample_header()
+        };
+        write_header(&mut buf, 0, &h).unwrap();
+        buf
+    }
+
+    #[test]
+    fn a_format_1_header_still_reads_as_format_1() {
+        let (_, _, back) = read_header(&mut &header_bytes_as(1)[..]).unwrap();
+        assert_eq!(back.format_version, 1);
+        let (_, _, back) = read_header(&mut &header_bytes_as(2)[..]).unwrap();
+        assert_eq!(back.format_version, 2);
+    }
+
+    #[test]
+    fn relabelling_the_version_changes_the_aad() {
+        // The version is part of what each chunk authenticates, so a format-2 archive relabelled
+        // as format 1 (or the reverse) fails to decrypt instead of restoring under the wrong reader.
+        let json = b"{}";
+        assert_ne!(aad(1, 0, json), aad(2, 0, json));
+    }
+
+    #[test]
+    fn a_version_this_build_cannot_read_is_never_written() {
+        for version in [0u16, 3, 999] {
+            let h = Header {
+                format_version: version,
+                ..sample_header()
+            };
+            assert!(
+                write_header(&mut Vec::new(), 0, &h).is_err(),
+                "format {version}"
+            );
+        }
     }
 
     #[test]
     fn rejects_bad_magic_and_version() {
         assert!(read_header(&mut &b"not-a-backup-file-at-all"[..]).is_err());
-        // Correct magic, unsupported (future) version.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&999u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        assert!(read_header(&mut &buf[..]).is_err());
+        // Correct magic, unsupported (future) versions, each refused with the update message.
+        for version in [0u16, 3, 999] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(MAGIC);
+            buf.extend_from_slice(&version.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            let err = read_header(&mut &buf[..]).unwrap_err().to_string();
+            assert!(err.contains("newer version"), "format {version}: {err}");
+        }
+        // The JSON copy and the preamble must agree (L-4): a format-1 preamble over a format-2 body
+        // is refused, not read under either.
+        let mut buf = header_bytes_as(2);
+        buf[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&1u16.to_le_bytes());
+        let err = read_header(&mut &buf[..]).unwrap_err().to_string();
+        assert!(err.contains("mismatch"), "{err}");
     }
 
     fn cipher_from(key: [u8; 32]) -> XChaCha20Poly1305 {

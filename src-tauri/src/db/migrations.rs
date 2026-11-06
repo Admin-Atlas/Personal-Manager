@@ -1714,10 +1714,203 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_tasks_stack   ON tasks(stack_id);
     CREATE INDEX idx_tasks_status  ON tasks(status);
     "#,
+    // v60: mods (the Mods spec, §1.12). Every table both Mods PRs need lands here, so PR-2 adds no
+    // migration, and only generic ones, because a core table can never be dropped later. Purely
+    // additive; Mods PR-1's later slice adds the retired `doc_layout` drop and the existing-user
+    // markers (§5) to this same migration before it ships.
+    //
+    // `mods` is the ledger: one row per installed mod, holding everything needed to rebuild the mod at
+    // startup without believing the disk (the verified manifest verbatim, every file's sha256 and
+    // size, the `.pmmod`'s own sha256), the publisher pin an update must match (§1.1), its state and
+    // why, the AI cap and this month's settled spend, the notify day counter, and the manifest's
+    // `projectRefs`, copied so a project rename can rewrite them while the mod's files are missing.
+    // `consented_at` is NULL only for an auto-installed pilot whose first-open screen hasn't been
+    // accepted yet (D17): its frame never starts until it is set. The id CHECK is a coarse superset of
+    // the grammar (`ModId::parse` is the gate, I-27), there so no bug can put a path-shaped id in the
+    // row the boot sweep turns into a folder name.
+    //
+    // Everything keyed to a mod cascades from `mods` (§1.3: uninstall is one DELETE), with one
+    // deliberate exception: `mod_ledger`, the attribution of tasks and milestones a mod created. It
+    // names the mod as plain text and cascades only from its target, so "made by X" outlives the mod
+    // and a reinstall can edit its own gifts again; exactly one target per row, at most one row per
+    // target. It also keeps who the maker was, because its `mods` row goes at uninstall: the
+    // publisher pin (tier, author, source repo), whether it was signed, and its install id
+    // (`mods.install_id`, minted by each fresh install and kept by an update or a repair). "Its own"
+    // (`mods::policy::made_it`) is the same id and signedness, then, for a signed maker, the same
+    // pin, which the signature vouched for, so a reinstall edits its gifts again; for an unsigned
+    // one, whose pin is only what its own manifest claimed, the same install id, so a file that
+    // copies a removed mod's id and pin starts with no claim on its gifts (§1.1: an unsigned file
+    // with the same id is a fresh install).
+    // `usage_log.mod_id` is plain text so it outlives the mod too: spend history stays, shown as
+    // "removed mod". `mod_doc_data` also cascades from `documents`, so a document delete (or a
+    // Rebuild) reaches mod storage while the mod is closed (§1.5).
+    //
+    // Money is REAL dollars, like `usage_log.cost_usd` and `model_pricing`. A NULL `ai_cap_usd` means
+    // the user hasn't set one, and no mod gets a default spend (§1.6). `ai_reservations` holds only
+    // in-flight worst-case costs; a call settles by deleting its row and adding the real cost to
+    // `mods.ai_spent_usd` in one transaction, so the cap never reads the best-effort `usage_log`.
+    //
+    // CHECK sets have one owner each (I-12): `mods::store` holds the sets, `mods::ids::Tier` the
+    // tiers; a pin test in this file reads them back out of this text. Free-text vocabularies
+    // (`state_reason`, `mod_grants.permission`) stay unchecked here, because the dispatch table and
+    // the ledger own them in Rust and a CHECK would turn each new value into a schema patch.
+    //
+    // `writable_schema=RESET` first: `usage_log` is a `writable_schema`-patched table (v36), and an
+    // ALTER on it must see the current definition (AGENTS.md rule 3's gotcha; v37 does the same).
+    r#"
+    PRAGMA writable_schema = RESET;
+
+    CREATE TABLE mods (
+        id             TEXT PRIMARY KEY
+                       CHECK (length(id) BETWEEN 3 AND 159 AND id NOT GLOB '*[^a-z0-9.-]*'),
+        name           TEXT NOT NULL,
+        version        TEXT NOT NULL,                 -- the mod's own semver
+        tier           TEXT NOT NULL CHECK (tier IN ('first','second','third')),
+        author         TEXT NOT NULL,
+        source_repo    TEXT NOT NULL,
+        source_commit  TEXT NOT NULL,
+        signed         INTEGER NOT NULL CHECK (signed IN (0,1)),
+        install_id     TEXT NOT NULL                  -- minted by a fresh install, kept by an update
+                       CHECK (length(install_id) = 16 AND install_id NOT GLOB '*[^0-9a-f]*'),
+        installed_from TEXT NOT NULL CHECK (installed_from IN ('catalogue','file','folder')),
+        package_sha256 TEXT CHECK (package_sha256 IS NULL
+                                   OR (length(package_sha256) = 64
+                                       AND package_sha256 NOT GLOB '*[^0-9a-f]*')),
+        manifest       TEXT NOT NULL,                 -- manifest.json as verified, verbatim
+        files          TEXT NOT NULL,                 -- JSON [{path, sha256, size}] as verified
+        project_refs   TEXT NOT NULL DEFAULT '[]',    -- JSON, the manifest's data.projectRefs
+        state          TEXT NOT NULL DEFAULT 'installing'
+                       CHECK (state IN ('active','paused','parked','installing')),
+        state_reason   TEXT,
+        consented_at   TEXT,
+        ai_cap_usd     REAL CHECK (ai_cap_usd IS NULL OR ai_cap_usd >= 0),
+        ai_month       TEXT,                          -- the month ai_spent_usd belongs to
+        ai_spent_usd   REAL NOT NULL DEFAULT 0 CHECK (ai_spent_usd >= 0),
+        notify_day     TEXT,                          -- the day notify_count belongs to
+        notify_count   INTEGER NOT NULL DEFAULT 0 CHECK (notify_count >= 0),
+        installed_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        -- Only a developer's unpacked test folder has no .pmmod to hash.
+        CHECK (installed_from = 'folder' OR package_sha256 IS NOT NULL)
+    );
+
+    CREATE TABLE mod_grants (
+        mod_id     TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+        permission TEXT NOT NULL,                     -- an id from the dispatch table
+        decision   TEXT NOT NULL CHECK (decision IN ('granted','denied')),
+        decided_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (mod_id, permission)
+    );
+
+    CREATE TABLE mod_kv (
+        mod_id     TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+        key        TEXT NOT NULL,
+        class      TEXT NOT NULL CHECK (class IN ('content','cache')),
+        value      TEXT NOT NULL,
+        revision   INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (mod_id, key)
+    );
+
+    CREATE TABLE mod_doc_data (
+        mod_id      TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        key         TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (mod_id, document_id, key)
+    );
+    CREATE INDEX idx_mod_doc_data_document ON mod_doc_data(document_id);
+
+    CREATE TABLE mod_ledger (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        mod_id       TEXT NOT NULL,                   -- plain text: no FK to mods, by design
+        mod_name     TEXT NOT NULL,
+        tier         TEXT NOT NULL CHECK (tier IN ('first','second','third')),
+        author       TEXT NOT NULL,                   -- the maker, as its mods row had it
+        source_repo  TEXT NOT NULL,
+        signed       INTEGER NOT NULL CHECK (signed IN (0,1)),
+        install_id   TEXT NOT NULL
+                     CHECK (length(install_id) = 16 AND install_id NOT GLOB '*[^0-9a-f]*'),
+        task_id      INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        milestone_id INTEGER REFERENCES project_milestones(id) ON DELETE CASCADE,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        CHECK ((task_id IS NOT NULL) + (milestone_id IS NOT NULL) = 1)
+    );
+    CREATE UNIQUE INDEX idx_mod_ledger_task      ON mod_ledger(task_id)      WHERE task_id IS NOT NULL;
+    CREATE UNIQUE INDEX idx_mod_ledger_milestone ON mod_ledger(milestone_id) WHERE milestone_id IS NOT NULL;
+    CREATE INDEX idx_mod_ledger_mod ON mod_ledger(mod_id);
+
+    CREATE TABLE mod_secrets (
+        mod_id     TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,                     -- the manifest's secret slot
+        host       TEXT NOT NULL,                     -- the one host it goes to
+        header     TEXT NOT NULL,                     -- the one header it goes in
+        value      TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (mod_id, name)
+    );
+
+    CREATE TABLE mod_overlay (
+        mod_id     TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+        id         TEXT NOT NULL,                     -- the mod's own entry id
+        date       TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+        label      TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        PRIMARY KEY (mod_id, id)
+    );
+    CREATE INDEX idx_mod_overlay_date ON mod_overlay(date);
+
+    CREATE TABLE mcp_clients (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT NOT NULL,
+        token_hash   TEXT NOT NULL UNIQUE,            -- the token itself is shown once, never stored
+        scopes       TEXT NOT NULL DEFAULT '[]',      -- JSON array of permission ids
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        last_used_at TEXT
+    );
+
+    CREATE TABLE ai_reservations (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        mod_id       TEXT NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+        reserved_usd REAL NOT NULL CHECK (reserved_usd >= 0),
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX idx_ai_reservations_mod ON ai_reservations(mod_id);
+
+    ALTER TABLE usage_log ADD COLUMN mod_id TEXT;
+    "#,
 ];
+
+/// Whether a store at `stored` is one this build can open: at or below the migrations it knows.
+///
+/// A higher version was written by a newer PM, whose later migrations this build has never seen
+/// and may not survive (the Mods v60 drop and the Pinboard move are the first such breaks), so it
+/// must be refused rather than opened as if current. A negative one is a version no PM writes, and
+/// untouched is the only safe answer for a schema this build can't name either. Pure, so the gate
+/// is pinned without a store.
+fn opens_here(stored: i64, known: usize) -> bool {
+    usize::try_from(stored).is_ok_and(|v| v <= known)
+}
+
+/// The refusal for a store a newer PM wrote (INVARIANTS.md I-28). A typed fault, so every recovery
+/// surface can tell it apart from a wrong key or a damaged file and offer nothing destructive: the
+/// store is healthy, it just needs the newer build.
+fn newer_store_fault() -> crate::error::Error {
+    crate::error::Error::Vault(crate::error::VaultFault {
+        code: crate::error::VaultFaultCode::NewerStore,
+        op: "open the vault's database".into(),
+        path: None,
+        message: super::NEWER_STORE_MSG.into(),
+    })
+}
 
 pub fn run(conn: &Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // Before anything writes: a refused store is left exactly as it was found.
+    if !opens_here(current, MIGRATIONS.len()) {
+        return Err(newer_store_fault());
+    }
     let mut version = current as usize;
     while version < MIGRATIONS.len() {
         // Each step is atomic: the DDL and its `user_version` bump commit together,
@@ -1750,6 +1943,17 @@ pub fn run(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Test-only: apply exactly the first `n` migrations (versions 1..=n) from the real `MIGRATIONS`,
+/// so a test can start from the genuine historical schema rather than a teardown of the current one.
+#[cfg(test)]
+pub(super) fn apply_through(conn: &Connection, n: usize) -> Result<()> {
+    for (i, sql) in MIGRATIONS.iter().take(n).enumerate() {
+        conn.execute_batch(sql)?;
+        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// Every existing index-only document comes out of the v54 upgrade with EXACTLY ONE location —
@@ -1766,7 +1970,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
         conn.execute_batch(
-            "DROP TABLE tasks;
+            "DROP TABLE mod_ledger;
+             DROP TABLE mod_grants;
+             DROP TABLE mod_kv;
+             DROP TABLE mod_doc_data;
+             DROP TABLE mod_secrets;
+             DROP TABLE mod_overlay;
+             DROP TABLE ai_reservations;
+             DROP TABLE mods;
+             DROP TABLE mcp_clients;
+             ALTER TABLE usage_log DROP COLUMN mod_id;
+             DROP TABLE tasks;
              DROP TABLE task_stacks;
              DROP TABLE document_locations;              ALTER TABLE documents DROP COLUMN source_folder_path;
              ALTER TABLE calendar_events DROP COLUMN etag;
@@ -1865,7 +2079,7 @@ mod tests {
             "every migration applied"
         );
         assert_eq!(
-            version, 59,
+            version, 60,
             "migration count pin (connector registry is v14; usage cost_usd is v15; \
              semantic-map doc_layout is v16; importance 'archive' level is v17; \
              multi-provider calendar foundation is v18; shared-drive access relation is v19; \
@@ -1896,7 +2110,8 @@ mod tests {
              the folder trail above a file is v56; \
              what editing a Google event needs to know is v57; \
              archiving a project is v58; \
-             tasks and task_stacks are v59)"
+             tasks and task_stacks are v59; \
+             the mods tables and usage_log.mod_id are v60)"
         );
 
         // A minimal insert takes the additive defaults (index_only mode, ok state, NULL cursor).
@@ -3135,11 +3350,7 @@ mod tests {
     /// `MIGRATIONS` array — the genuine historical schema, not a teardown of the
     /// current one.
     fn apply_through(conn: &rusqlite::Connection, n: usize) {
-        for (i, sql) in super::MIGRATIONS.iter().take(n).enumerate() {
-            conn.execute_batch(sql).unwrap();
-            conn.pragma_update(None, "user_version", (i + 1) as i64)
-                .unwrap();
-        }
+        super::apply_through(conn, n).unwrap();
     }
 
     #[test]
@@ -3383,5 +3594,369 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dormant, 1);
+    }
+
+    // --- v60: the mod tables ---------------------------------------------------------------------
+
+    /// The newer-store gate's arithmetic (I-28): at or below the known migrations opens; anything
+    /// above, or a negative version no PM writes, is refused.
+    #[test]
+    fn only_a_store_at_or_below_this_builds_version_opens() {
+        assert!(super::opens_here(0, 60), "a fresh file migrates from zero");
+        assert!(super::opens_here(59, 60), "an older store migrates up");
+        assert!(super::opens_here(60, 60), "a current store opens as it is");
+        assert!(!super::opens_here(61, 60), "a newer PM's store is refused");
+        assert!(!super::opens_here(i64::MAX, 60));
+        assert!(!super::opens_here(-1, 60), "a negative version is no PM's");
+        assert!(!super::opens_here(i64::MIN, 60));
+    }
+
+    /// The string inside `CHECK (<column> IN (…))` in v60, as its values.
+    /// The set a v60 CHECK on `column` allows. A column checked in more than one table (`tier`, on
+    /// `mods` and `mod_ledger`) must allow the same set everywhere.
+    fn v60_check_set(column: &str) -> Vec<String> {
+        let sql = super::MIGRATIONS[59];
+        let open = format!("CHECK ({column} IN (");
+        let sets: Vec<Vec<String>> = sql
+            .match_indices(&open)
+            .map(|(at, _)| {
+                let start = at + open.len();
+                let end = start + sql[start..].find(')').unwrap();
+                sql[start..end]
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('\'').to_string())
+                    .collect()
+            })
+            .collect();
+        let first = sets
+            .first()
+            .unwrap_or_else(|| panic!("v60 has no CHECK on {column}"))
+            .clone();
+        assert!(
+            sets.iter().all(|s| *s == first),
+            "v60's CHECKs on {column} disagree: {sets:?}"
+        );
+        first
+    }
+
+    /// I-12: each v60 CHECK set is exactly the set its one owner in Rust holds.
+    #[test]
+    fn v60_check_sets_match_their_owners() {
+        use crate::mods::{ids::Tier, store};
+        let owned = |set: &[&str]| set.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(v60_check_set("state"), owned(&store::STATES));
+        assert_eq!(
+            v60_check_set("installed_from"),
+            owned(&store::INSTALLED_FROM)
+        );
+        assert_eq!(v60_check_set("decision"), owned(&store::DECISIONS));
+        assert_eq!(v60_check_set("class"), owned(&store::KV_CLASSES));
+        let tiers = [Tier::First, Tier::Second, Tier::Third].map(Tier::as_str);
+        assert_eq!(v60_check_set("tier"), owned(&tiers));
+        assert_eq!(
+            super::MIGRATIONS[59].matches("CHECK (tier IN (").count(),
+            2,
+            "the pin on mods and on mod_ledger"
+        );
+        for tier in v60_check_set("tier") {
+            assert!(Tier::parse(&tier).is_some(), "{tier} parses as a Tier");
+        }
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const INSTALL: &str = "0123456789abcdef";
+
+    fn v60_store() -> (tempfile::TempDir, rusqlite::Connection) {
+        const DB_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pm.sqlite"), DB_KEY).unwrap();
+        (dir, conn)
+    }
+
+    fn insert_mod(conn: &rusqlite::Connection, id: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO mods(id, name, version, tier, author, source_repo, source_commit, signed, \
+                              install_id, installed_from, package_sha256, manifest, files) \
+             VALUES (?1, 'A mod', '1.0.0', 'first', 'Atlas', 'itsAtlas-org/pm-mods', ?2, 1, ?3, \
+                     'catalogue', ?4, '{}', '[]')",
+            rusqlite::params![id, COMMIT, INSTALL, SHA],
+        )
+    }
+
+    fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Every connection `db::open` hands out enforces foreign keys, which every cascade below (and
+    /// uninstall-as-one-DELETE, spec §1.3) depends on.
+    #[test]
+    fn v60_connections_enforce_foreign_keys() {
+        let (_d, conn) = v60_store();
+        assert_eq!(count(&conn, "PRAGMA foreign_keys"), 1);
+        let orphan = conn.execute(
+            "INSERT INTO mod_grants(mod_id, permission, decision) VALUES ('no.such', 'storage', 'granted')",
+            [],
+        );
+        assert!(orphan.is_err(), "a grant for a mod with no row is refused");
+    }
+
+    /// Uninstall is one DELETE of the `mods` row: everything keyed to the mod goes with it, while
+    /// the gift attribution and the spend history stay (spec §1.3).
+    #[test]
+    fn deleting_a_mod_takes_its_data_and_leaves_its_gifts_and_spend() {
+        let (_d, conn) = v60_store();
+        insert_mod(&conn, "atlas.pinboard").unwrap();
+        conn.execute_batch(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('n.md', 'N', 'h');
+             INSERT INTO projects(name) VALUES ('Atlas');
+             INSERT INTO project_milestones(project_name, label, due_date) VALUES ('Atlas', 'pitch', '2026-12-01');
+             INSERT INTO tasks(title) VALUES ('call Sam');
+             INSERT INTO mod_grants(mod_id, permission, decision) VALUES ('atlas.pinboard', 'storage', 'granted');
+             INSERT INTO mod_kv(mod_id, key, class, value) VALUES ('atlas.pinboard', 'board', 'content', '{}');
+             INSERT INTO mod_kv(mod_id, key, class, value) VALUES ('atlas.pinboard', 'layout', 'cache', '[]');
+             INSERT INTO mod_doc_data(mod_id, document_id, key, value)
+                 VALUES ('atlas.pinboard', (SELECT id FROM documents), 'status', 'x');
+             INSERT INTO mod_secrets(mod_id, name, host, header, value)
+                 VALUES ('atlas.pinboard', 'token', 'api.example.com', 'Authorization', 's');
+             INSERT INTO mod_overlay(mod_id, id, date, label) VALUES ('atlas.pinboard', 'w1:i1', '2026-12-01', 'ship');
+             INSERT INTO ai_reservations(mod_id, reserved_usd) VALUES ('atlas.pinboard', 0.02);
+             INSERT INTO mod_ledger(mod_id, mod_name, tier, author, source_repo, signed, install_id, task_id) VALUES ('atlas.pinboard', 'Pinboard', 'first', 'Atlas', 'r', 1, '0123456789abcdef', (SELECT id FROM tasks));
+             INSERT INTO mod_ledger(mod_id, mod_name, tier, author, source_repo, signed, install_id, milestone_id)
+                 VALUES ('atlas.pinboard', 'Pinboard', 'first', 'Atlas', 'r', 1, '0123456789abcdef', (SELECT id FROM project_milestones));
+             INSERT INTO usage_log(model, kind, mod_id) VALUES ('m', 'background', 'atlas.pinboard');",
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM mods WHERE id = 'atlas.pinboard'", [])
+            .unwrap();
+        for table in [
+            "mod_grants",
+            "mod_kv",
+            "mod_doc_data",
+            "mod_secrets",
+            "mod_overlay",
+            "ai_reservations",
+        ] {
+            assert_eq!(
+                count(&conn, &format!("SELECT count(*) FROM {table}")),
+                0,
+                "{table} cascades from mods"
+            );
+        }
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM mod_ledger WHERE mod_id = 'atlas.pinboard'"
+            ),
+            2,
+            "\"made by\" outlives the mod"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM usage_log WHERE mod_id = 'atlas.pinboard'"
+            ),
+            1,
+            "spend history stays, as \"removed mod\""
+        );
+        // The gifts themselves were never the mod's to take.
+        assert_eq!(count(&conn, "SELECT count(*) FROM tasks"), 1);
+        assert_eq!(count(&conn, "SELECT count(*) FROM project_milestones"), 1);
+    }
+
+    /// The other direction: each piece of mod data keyed to a core row goes when that row does.
+    #[test]
+    fn mod_rows_keyed_to_core_rows_cascade_from_them() {
+        let (_d, conn) = v60_store();
+        insert_mod(&conn, "atlas.map").unwrap();
+        conn.execute_batch(
+            "INSERT INTO documents(vault_path, title, content_hash) VALUES ('a.md', 'A', 'ha');
+             INSERT INTO mod_doc_data(mod_id, document_id, key, value)
+                 VALUES ('atlas.map', (SELECT id FROM documents), 'xy', '[0,0]');
+             INSERT INTO projects(name) VALUES ('Atlas');
+             INSERT INTO project_milestones(project_name, label, due_date) VALUES ('Atlas', 'pitch', '2026-12-01');
+             INSERT INTO tasks(title) VALUES ('one'), ('two');
+             INSERT INTO mod_ledger(mod_id, mod_name, tier, author, source_repo, signed, install_id, task_id) SELECT 'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, '0123456789abcdef', id FROM tasks;
+             INSERT INTO mod_ledger(mod_id, mod_name, tier, author, source_repo, signed, install_id, milestone_id)
+                 SELECT 'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, '0123456789abcdef', id FROM project_milestones;",
+        )
+        .unwrap();
+
+        // A document delete (or a Rebuild) reaches mod storage while the mod is closed (§1.5).
+        conn.execute("DELETE FROM documents", []).unwrap();
+        assert_eq!(count(&conn, "SELECT count(*) FROM mod_doc_data"), 0);
+
+        // A gift's attribution goes with the gift, and only with it.
+        conn.execute("DELETE FROM tasks WHERE title = 'one'", [])
+            .unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM mod_ledger WHERE task_id IS NOT NULL"
+            ),
+            1
+        );
+        // A project delete cascades to its milestones, and so to their attribution.
+        conn.execute("DELETE FROM projects WHERE name = 'Atlas'", [])
+            .unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM mod_ledger WHERE milestone_id IS NOT NULL"
+            ),
+            0
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM mods"),
+            1,
+            "the mod is untouched"
+        );
+    }
+
+    /// Each CHECK and key v60 declares refuses what it exists to refuse, and admits the valid shape
+    /// beside it, so none of them is vacuous.
+    #[test]
+    fn v60_refuses_rows_its_constraints_exist_to_refuse() {
+        let (_d, conn) = v60_store();
+        // Ids: the coarse superset of the grammar keeps path-shaped and uppercase ids out.
+        for bad in [
+            "Atlas.map",
+            "atlas/map",
+            "a.b/../c",
+            "atlas.map ",
+            "x",
+            "atlas.mäp",
+        ] {
+            assert!(insert_mod(&conn, bad).is_err(), "id {bad:?} refused");
+        }
+        insert_mod(&conn, "atlas.map").unwrap();
+        assert!(insert_mod(&conn, "atlas.map").is_err(), "one row per mod");
+
+        let refused = |sql: &str| {
+            assert!(conn.execute(sql, []).is_err(), "refused: {sql}");
+        };
+        let admitted = |sql: &str| {
+            conn.execute(sql, [])
+                .unwrap_or_else(|e| panic!("admitted: {sql}: {e}"));
+        };
+
+        // mods' own columns.
+        refused("UPDATE mods SET state = 'deleted'");
+        refused("UPDATE mods SET tier = 'fourth'");
+        refused("UPDATE mods SET installed_from = 'web'");
+        refused("UPDATE mods SET signed = 2");
+        refused("UPDATE mods SET package_sha256 = upper(package_sha256)");
+        refused("UPDATE mods SET package_sha256 = substr(package_sha256, 2)");
+        refused("UPDATE mods SET package_sha256 = NULL");
+        refused("UPDATE mods SET install_id = NULL");
+        refused("UPDATE mods SET install_id = upper(install_id)");
+        refused("UPDATE mods SET install_id = substr(install_id, 2)");
+        refused("UPDATE mods SET install_id = '../0123456789abc'");
+        refused(
+            "INSERT INTO mods(id, name, version, tier, author, source_repo, source_commit, signed, \
+                              installed_from, package_sha256, manifest, files) \
+             VALUES ('atlas.other', 'A mod', '1.0.0', 'first', 'Atlas', 'r', 'c', 1, 'catalogue', \
+                     '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', '{}', '[]')",
+        );
+        refused("UPDATE mods SET ai_cap_usd = -1");
+        refused("UPDATE mods SET ai_spent_usd = -0.01");
+        refused("UPDATE mods SET notify_count = -1");
+        admitted("UPDATE mods SET installed_from = 'folder', package_sha256 = NULL");
+        admitted(
+            "UPDATE mods SET state = 'parked', state_reason = 'files_missing', ai_cap_usd = 1",
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM mods WHERE consented_at IS NULL"
+            ),
+            1,
+            "nothing consents on a mod's behalf"
+        );
+
+        refused("INSERT INTO mod_grants(mod_id, permission, decision) VALUES ('atlas.map', 'ai', 'maybe')");
+        admitted("INSERT INTO mod_grants(mod_id, permission, decision) VALUES ('atlas.map', 'ai', 'denied')");
+        refused("INSERT INTO mod_grants(mod_id, permission, decision) VALUES ('atlas.map', 'ai', 'granted')");
+
+        refused("INSERT INTO mod_kv(mod_id, key, class, value) VALUES ('atlas.map', 'k', 'secret', 'v')");
+        refused("INSERT INTO mod_kv(mod_id, key, class, value, revision) VALUES ('atlas.map', 'k', 'cache', 'v', 0)");
+        refused("INSERT INTO mod_kv(mod_id, key, class, value) VALUES ('atlas.map', 'k', 'cache', NULL)");
+        admitted(
+            "INSERT INTO mod_kv(mod_id, key, class, value) VALUES ('atlas.map', 'k', 'cache', 'v')",
+        );
+        assert_eq!(
+            count(&conn, "SELECT revision FROM mod_kv"),
+            1,
+            "a new row starts at revision 1"
+        );
+
+        refused("INSERT INTO mod_overlay(mod_id, id, date, label) VALUES ('atlas.map', 'e', '1-12-2026', 'x')");
+        refused("INSERT INTO mod_overlay(mod_id, id, date, label) VALUES ('atlas.map', 'e', '2026-12-01T10:00', 'x')");
+        admitted("INSERT INTO mod_overlay(mod_id, id, date, label) VALUES ('atlas.map', 'e', '2026-12-01', 'x')");
+
+        refused("INSERT INTO ai_reservations(mod_id, reserved_usd) VALUES ('atlas.map', -0.5)");
+
+        // A gift names exactly one target, and a target has at most one maker.
+        conn.execute_batch(
+            "INSERT INTO projects(name) VALUES ('Atlas');
+             INSERT INTO project_milestones(project_name, label, due_date) VALUES ('Atlas', 'pitch', '2026-12-01');
+             INSERT INTO tasks(title) VALUES ('t');",
+        )
+        .unwrap();
+        // Every column but the target, as a valid row has them; `gift(maker, target)` names both.
+        let gift = |maker: &str, target: &str| {
+            format!(
+                "INSERT INTO mod_ledger(mod_id, mod_name, tier, author, source_repo, signed, \
+                                        install_id, {target}) \
+                 VALUES ({maker})"
+            )
+        };
+        let atlas_map = "'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, '0123456789abcdef'";
+        let task = "(SELECT id FROM tasks)";
+        refused(&format!(
+            "INSERT INTO mod_ledger(mod_id, mod_name, tier, author, source_repo, signed, install_id) \
+             VALUES ({atlas_map})"
+        ));
+        refused(&gift(
+            &format!("{atlas_map}, {task}, (SELECT id FROM project_milestones)"),
+            "task_id, milestone_id",
+        ));
+        refused(&gift(&format!("{atlas_map}, 99999"), "task_id"));
+        // The maker is part of every row: a gift without its pin couldn't tell a reinstall from
+        // another publisher's mod under the same id, and an unsigned maker's gift without its
+        // signedness and install id couldn't tell its own install from a file copying its pin.
+        refused(&format!(
+            "INSERT INTO mod_ledger(mod_id, mod_name, task_id) VALUES ('atlas.map', 'Map', {task})"
+        ));
+        for maker in [
+            "'atlas.map', 'Map', 'fourth', 'Atlas', 'r', 1, '0123456789abcdef'",
+            "'atlas.map', 'Map', 'first', NULL, 'r', 1, '0123456789abcdef'",
+            "'atlas.map', 'Map', 'first', 'Atlas', NULL, 1, '0123456789abcdef'",
+            "'atlas.map', 'Map', 'first', 'Atlas', 'r', NULL, '0123456789abcdef'",
+            "'atlas.map', 'Map', 'first', 'Atlas', 'r', 2, '0123456789abcdef'",
+            "'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, NULL",
+            "'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, '0123456789ABCDEF'",
+            "'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, '0123456789abcde'",
+            "'atlas.map', 'Map', 'first', 'Atlas', 'r', 1, '../../0123456789'",
+        ] {
+            refused(&gift(&format!("{maker}, {task}"), "task_id"));
+        }
+        admitted(&gift(&format!("{atlas_map}, {task}"), "task_id"));
+        refused(&gift(
+            &format!(
+                "'other.mod', 'Other', 'third', 'Someone', 'x', 0, 'fedcba9876543210', {task}"
+            ),
+            "task_id",
+        ));
+        // No FK to mods: a gift from a mod that is no longer installed is still attributable.
+        admitted(&gift(
+            "'gone.mod', 'Gone', 'third', 'Ramit', 'ramit/gone', 0, 'fedcba9876543210', \
+             (SELECT id FROM project_milestones)",
+            "milestone_id",
+        ));
+
+        admitted("INSERT INTO mcp_clients(name, token_hash) VALUES ('Desk', 'h1')");
+        refused("INSERT INTO mcp_clients(name, token_hash) VALUES ('Again', 'h1')");
     }
 }

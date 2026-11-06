@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.173.0-alpha",
+    date: "2026-11-05",
+    highlights: [
+      "Backups made from this version on use a new format, which older versions of PM can't restore. If you restore one on another computer, update PM there first.",
+      "From this version on, if a newer PM has already updated your vault, this one says PM needs updating instead of opening it, and never offers to start fresh, so nothing in the vault can be lost that way.",
+      "Under the hood, PM can now keep mods and their data: installing, updating and removing a mod is all or nothing, so a crash part way never leaves half of one behind. Nothing to see yet.",
+    ],
+  },
+  {
     version: "3.172.0-alpha",
     date: "2026-11-05",
     highlights: [

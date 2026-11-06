@@ -142,6 +142,8 @@ jobs:
         run: cargo check --all-targets --tests --manifest-path src-tauri/Cargo.toml
       - name: "cargo test (vault:: — ACL/probe/migration on real NTFS)"
         run: "cargo test --lib --manifest-path src-tauri/Cargo.toml vault::"
+      - name: "cargo test (mods:: — the install ledger's folders, renames and sweep on real NTFS)"
+        run: "cargo test --lib --manifest-path src-tauri/Cargo.toml mods::"
 
   # --- backend on macOS: the shipped-OS compile/lint gate for the mac arm ---
   # Both the Linux `rust` and Windows `rust-windows` jobs compile out every

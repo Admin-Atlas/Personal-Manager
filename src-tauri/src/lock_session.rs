@@ -76,10 +76,37 @@ fn os_profile() -> String {
 }
 
 /// Close the store (drop the connection + runtime) — used when this instance is not the
-/// active writer, so any DB command fails cleanly rather than racing the other profile.
-fn close_store(state: &AppState) {
+/// active writer, so any DB command fails cleanly rather than racing the other profile. Its mods
+/// stop being served too: only the writer runs them.
+fn close_store(app: &AppHandle, state: &AppState) {
     let _ = state.take_conn();
     let _ = state.clear_vault_runtime();
+    crate::mods::ledger::on_store_closed(app);
+}
+
+/// Whether this instance writes the store it has open: a device vault (the session never engages,
+/// `root` is `None`) or a shared vault whose baton it holds. A profile waiting behind another, or
+/// asking for the baton, does not, and its store is closed anyway. The mods startup load and its
+/// sweep run only when this holds (spec §1.3: a sweep reading "no rows" there would remove mods it
+/// can't re-fetch).
+fn holds_writer(engaged: bool, mode: Option<LockMode>) -> bool {
+    !engaged || mode == Some(LockMode::Active)
+}
+
+/// Once the lock is settled: if this instance came out of it as the writer with the store still
+/// open, load its mods and sweep their folders; otherwise serve none. A store can close without
+/// `close_store` (a detach whose next vault is locked takes the connection itself), so this is
+/// what keeps the registry matching the store once `engage` returns.
+fn after_settle(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let state = state.inner();
+    crate::mods::ledger::after_settle(app, || {
+        let writer = {
+            let session = state.lock_session.lock().unwrap();
+            holds_writer(session.root.is_some(), session.mode)
+        };
+        writer && state.is_unlocked()
+    });
 }
 
 /// Reopen the store at the current (resolved) location with the cached key — used when we
@@ -102,8 +129,21 @@ fn reopen_store(app: &AppHandle) -> Result<()> {
 /// Bring the lock session into line with the current vault, after any open/migration. A
 /// shareable vault with the store open engages the lock (acquire, force-take a crashed
 /// owner, or step back behind a live one); anything else (device, or still locked)
-/// disengages. Idempotent — re-calling while already active here is a no-op.
+/// disengages. Idempotent — re-calling while already active here is a no-op. Every open path
+/// calls this once the store is open, so it is also where the writer's mods are loaded (a reload
+/// keeps any mod that hasn't changed, frames and all).
 pub fn engage(app: &AppHandle) -> Result<()> {
+    // A settle that fails part-way can leave the new store open with the writer unproved, so stop
+    // serving the previous store's mods rather than keep them running against this one.
+    if let Err(e) = settle(app) {
+        crate::mods::ledger::on_store_closed(app);
+        return Err(e);
+    }
+    after_settle(app);
+    Ok(())
+}
+
+fn settle(app: &AppHandle) -> Result<()> {
     let state = app.state::<AppState>();
     let state = state.inner();
     let id = state.instance_id.clone();
@@ -118,7 +158,7 @@ pub fn engage(app: &AppHandle) -> Result<()> {
     // gone), and emit `vault://fault` so the UI can raise its banner. The lockout incident was
     // exactly this branch swallowing an access-denied folder as a wordless lock.
     let close_and_disengage = |e: &crate::error::Error| {
-        close_store(state);
+        close_store(app, state);
         disengage(app);
         let fault = crate::error::VaultFault::from_error("reach the shared vault", e);
         eprintln!(
@@ -180,7 +220,7 @@ pub fn engage(app: &AppHandle) -> Result<()> {
             set_active(state, root, lock);
         }
         lock::Standing::HeldByLive(holder) => {
-            close_store(state);
+            close_store(app, state);
             {
                 let mut session = state.lock_session.lock().unwrap();
                 session.root = Some(root);
@@ -323,6 +363,7 @@ fn take_over(app: &AppHandle, root: &Path, id: &str) -> Result<()> {
     let state = state.inner();
     reopen_store(app)?;
     set_active(state, root.to_path_buf(), lock);
+    after_settle(app);
     let _ = app.emit("vault://acquired", ());
     Ok(())
 }
@@ -450,7 +491,7 @@ fn tick(app: &AppHandle) -> Result<()> {
                     // commands), release + ack, close the store, and curtain ourselves.
                     lock::release(&root, &id)?;
                     lock::ack_baton(&root, &id)?;
-                    close_store(state);
+                    close_store(app, state);
                     {
                         let mut session = state.lock_session.lock().unwrap();
                         session.mode = Some(LockMode::Waiting);
@@ -484,7 +525,7 @@ fn tick(app: &AppHandle) -> Result<()> {
                         }
                         Some(lock::RefreshOutcome::LostOwnership(new_owner)) => {
                             drop(session);
-                            close_store(state);
+                            close_store(app, state);
                             {
                                 let mut session = state.lock_session.lock().unwrap();
                                 session.mode = Some(LockMode::Waiting);
@@ -523,6 +564,20 @@ fn tick(app: &AppHandle) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mods startup load and sweep run only for the writer: a device vault, or a shared one
+    /// whose baton this instance holds. Never for a profile curtained behind another.
+    #[test]
+    fn only_the_writer_loads_and_sweeps_mods() {
+        assert!(
+            holds_writer(false, None),
+            "a device vault never engages and is its own writer"
+        );
+        assert!(holds_writer(true, Some(LockMode::Active)));
+        assert!(!holds_writer(true, Some(LockMode::Waiting)));
+        assert!(!holds_writer(true, Some(LockMode::Requesting)));
+        assert!(!holds_writer(true, None));
+    }
 
     #[test]
     fn active_hands_off_when_another_instance_requests() {

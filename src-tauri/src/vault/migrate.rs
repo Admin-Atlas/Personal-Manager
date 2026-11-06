@@ -717,6 +717,7 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
                 &new_meta,
                 &new_key,
                 lockdown,
+                &|| crate::mods::ledger::on_store_closed(app),
             )?;
         }
     }
@@ -785,8 +786,32 @@ pub fn migrate_vault(app: &AppHandle, plan: MigrationPlan) -> Result<Vec<String>
 /// near-empty dir, probe access, copy, probe again, open the real DB — and only then flip
 /// the pointer (the commit) and drop the source. A pre-commit failure aborts with the
 /// source vault intact and openable, and this reopens it so the session survives.
+///
+/// A failure that leaves no store open (the source wouldn't reopen, or the destination
+/// wouldn't install after the commit) runs `on_left_closed`: the command returns before
+/// `engage`, so this is where the profile's mods stop being served (I-30).
 #[allow(clippy::too_many_arguments)]
 fn relocate(
+    state: &AppState,
+    data_dir: &Path,
+    from_root: &Path,
+    to_root: &Path,
+    new_meta: &VaultMeta,
+    new_key: &Secret,
+    lockdown: bool,
+    on_left_closed: &dyn Fn(),
+) -> Result<()> {
+    let moved = relocate_and_reopen(
+        state, data_dir, from_root, to_root, new_meta, new_key, lockdown,
+    );
+    if moved.is_err() && !state.is_unlocked() {
+        on_left_closed();
+    }
+    moved
+}
+
+/// [`relocate`]'s move: close the store, move it, and open whichever store is then live.
+fn relocate_and_reopen(
     state: &AppState,
     data_dir: &Path,
     from_root: &Path,
@@ -1524,6 +1549,62 @@ mod tests {
             "the source is intact"
         );
         assert!(pointer::load(dd.path()).unwrap().is_none());
+    }
+
+    /// A move closes the store to copy it. When the move fails and the source won't reopen either,
+    /// no store is open and the command returns before `engage`, so `relocate` runs its hook (the
+    /// profile's mods stop being served, I-30). It doesn't when the source reopens, or when the move
+    /// commits and the destination opens.
+    #[test]
+    fn a_move_that_leaves_no_store_open_runs_its_hook() {
+        let dd = tempfile::tempdir().unwrap();
+        let src = dd.path().join("src");
+        let key = "ab".repeat(32);
+        let meta = build_test_vault(&src, &key);
+        let open_at_src = || {
+            let sidecar = crate::sidecar::SidecarManager::new(crate::sidecar::SidecarPaths {
+                source_dir: dd.path().join("sidecar"),
+                venv_dir: dd.path().join("venv"),
+            });
+            let conn = db::open(&src.join(DB_FILENAME), &key).unwrap();
+            AppState::new(Some(conn), None, sidecar, None, None)
+        };
+        // A different vault at the destination fails the move before anything is copied.
+        let foreign = dd.path().join("foreign");
+        let mut other = VaultMeta::new_device();
+        other.vault_id = "someone-elses-vault".into();
+        std::fs::create_dir_all(&foreign).unwrap();
+        store_meta(&foreign, &other).unwrap();
+        let closed = std::cell::Cell::new(0);
+        let hook = || closed.set(closed.get() + 1);
+        let move_to = |state: &AppState, to: &Path, key: String| {
+            relocate(
+                state,
+                dd.path(),
+                &src,
+                to,
+                &meta,
+                &Secret::from(key),
+                false,
+                &hook,
+            )
+        };
+
+        let state = open_at_src();
+        assert!(move_to(&state, &foreign, key.clone()).is_err());
+        assert!(state.is_unlocked(), "the source reopened");
+        assert_eq!(closed.get(), 0);
+
+        // The key it reopens with doesn't open the source: no store is left open.
+        assert!(move_to(&state, &foreign, "cd".repeat(32)).is_err());
+        assert!(!state.is_unlocked());
+        assert_eq!(closed.get(), 1);
+
+        let state = open_at_src();
+        let dst = dd.path().join("dst");
+        move_to(&state, &dst, key.clone()).expect("the move commits");
+        assert!(state.is_unlocked(), "the destination is open");
+        assert_eq!(closed.get(), 1);
     }
 
     #[test]

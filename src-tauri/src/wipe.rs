@@ -405,9 +405,16 @@ fn remove_db_files_retrying(db_path: &Path) -> bool {
 /// pointer. A relocated vault's user-chosen root is only removed if PM had it to itself (never
 /// wholesale — that would take the user's unrelated files, F-03). Returns the approximate bytes
 /// freed by the tree removals it sizes. Kept separate from [`remove_db_files_retrying`] so the DB
-/// file is confirmed gone first; shared by the wipe and the boot-error "start fresh" recovery.
+/// file is confirmed gone first; shared by the wipe and the boot-error "start fresh" recovery. The
+/// vault's installed mods (`data_dir/mods/<vault_id>/`) go too: the ledger that named them went with
+/// the store (Mods spec §6). The caller holds `mods::ledger::quiesce` meanwhile.
 fn remove_vault_artifacts(resolved: &vault::ResolvedVault, data_dir: &Path) -> u64 {
     let mut freed = 0u64;
+    // The vault's id names its mods folder; read it before the metadata goes with the sidecars.
+    let vault_id = vault::load_meta(&resolved.vault_root)
+        .ok()
+        .flatten()
+        .map(|m| m.vault_id);
     // One enumeration, shared with the migration's copy + delete. Naming the files here by hand had
     // already drifted: `vault-access.json` — the list of OS accounts linked to a shared vault, i.e.
     // account names — was in `vault_sidecar_files` and not in this list, so it survived "Remove PM
@@ -436,6 +443,27 @@ fn remove_vault_artifacts(resolved: &vault::ResolvedVault, data_dir: &Path) -> u
     let restore_staging = data_dir.join(RESTORE_STAGING_DIR);
     freed += dir_size(&restore_staging);
     remove_dir_all_retrying(&restore_staging);
+    if let Some(vault_id) = vault_id {
+        freed += remove_mod_files(data_dir, &vault_id);
+    }
+    freed
+}
+
+/// Remove one vault's installed mods, `data_dir/mods/<vault_id>/` with its quarantine (Mods spec
+/// §6: they belong to the vault-and-database class, not a checkbox of their own), and any package
+/// left in `mods/.staging` (only ever a download in flight, and none is while the ledger is
+/// quiesced). Then `mods/` itself, if no other vault's mods are left in it. Only that vault's
+/// folder: another vault's ledger is in another store, which this erase doesn't touch. An id that
+/// can't name a folder removes nothing.
+fn remove_mod_files(data_dir: &Path, vault_id: &str) -> u64 {
+    let Some(folder) = crate::mods::disk::vault_folder(data_dir, vault_id) else {
+        return 0;
+    };
+    let freed = dir_size(&folder);
+    remove_dir_all_retrying(&folder);
+    let mods = data_dir.join(crate::mods::disk::MODS_DIR);
+    remove_dir_all_retrying(&mods.join(crate::mods::disk::STAGING_DIR));
+    remove_empty_dir_retrying(&mods);
     freed
 }
 
@@ -1116,7 +1144,10 @@ pub async fn wipe_pm_data(
         report.freed_bytes += dir_size(&resolved.markdown_dir);
 
         // Drop the live connection (its `Drop` releases SQLite's file lock), then delete the store.
+        // Its mods stop being served with it (I-30): a removal that fails below returns with the
+        // store closed (here, or by the pointed vault's take above) and nothing re-engages it.
         let _ = state.take_conn();
+        crate::mods::ledger::on_store_closed(&app);
 
         if !remove_db_files_retrying(&resolved.db_path) {
             // The encrypted store is still on disk — a file lock we couldn't outwait (antivirus /
@@ -1130,7 +1161,11 @@ pub async fn wipe_pm_data(
             ));
         }
 
-        // The DB file is confirmed gone; now the rest of the vault artifacts.
+        // The DB file is confirmed gone; now the rest of the vault artifacts. No mod is served and
+        // no install or sweep runs while their folders go (an install caught mid-way fails its
+        // commit on the closed store and rolls itself back first). Dropped at the end of this
+        // block, before the keychain step's first `.await`.
+        let _mods = crate::mods::ledger::quiesce(&app);
         report.freed_bytes += remove_vault_artifacts(&resolved, &data_dir);
         // `delete_vault_artifacts` spares `vault.lock` for its boot-recovery callers, and the wipe
         // inherited that without inheriting the reason: here the lock is this profile's own, and
@@ -1146,6 +1181,13 @@ pub async fn wipe_pm_data(
             report.removed.push(format!(
                 "{swept} leftover staging file(s) from interrupted syncs"
             ));
+        }
+
+        // A pointed vault is the profile's active one, so its mods on this machine go with this
+        // profile's data whether or not the vault itself is deleted below (spec §6). (The default
+        // location's store, deleted above, took its own vault's mods with it.)
+        if let Some((_, Some(meta))) = &pointed_verdict {
+            report.freed_bytes += remove_mod_files(&data_dir, &meta.vault_id);
         }
 
         // Now the pointed vault, if this profile has one and it is provably ours.
@@ -1360,6 +1402,14 @@ fn reset_refusal(fault: &crate::error::VaultFault) -> Option<&'static str> {
              instead; it deletes nothing.",
         );
     }
+    // A newer PM's store opened fine and is whole; it only needs that newer build (I-28). Checked
+    // by code, before the message, so no wording can ever make it look like a brick.
+    if fault.code == crate::error::VaultFaultCode::NewerStore {
+        return Some(
+            "This vault isn't broken: a newer version of PM wrote it. Update PM to open it — \
+             nothing needs deleting, and nothing has been changed.",
+        );
+    }
     if !is_genuine_brick(&fault.message) {
         return Some(
             "The vault file looks momentarily unavailable — often antivirus or Windows Search \
@@ -1412,8 +1462,9 @@ pub fn reset_after_open_error(app: AppHandle, state: State<'_, AppState>) -> Res
     }
 
     let resolved = vault::resolve(&app)?;
-    // The store never opened, so there's no live connection — but be safe.
+    // The store never opened, so there's no live connection (nor a mod served) — but be safe.
     let _ = state.take_conn();
+    crate::mods::ledger::on_store_closed(&app);
     if !remove_db_files_retrying(&resolved.db_path) {
         return Err(Error::Other(
             "Couldn't remove the vault file — it may be held open by antivirus or Windows Search. \
@@ -1421,6 +1472,7 @@ pub fn reset_after_open_error(app: AppHandle, state: State<'_, AppState>) -> Res
                 .into(),
         ));
     }
+    let _mods = crate::mods::ledger::quiesce(&app);
     remove_vault_artifacts(&resolved, &data_dir);
     state.set_vault_fault(None);
     Ok(())
@@ -1836,6 +1888,25 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_store_never_arms_the_reset() {
+        // A newer PM's store is healthy data this build merely can't read yet (I-28). Refused by
+        // code, so even the brick literal in its message can't arm deletion…
+        let forged = fault_with(
+            crate::error::VaultFaultCode::NewerStore,
+            crate::db::WRONG_KEY_OR_CORRUPT_MSG,
+        );
+        assert!(reset_refusal(&forged).unwrap().contains("Update PM"));
+        // …and the real message shares nothing with that literal, so a fault folded to `Other`
+        // somewhere on its way here still reads as no brick.
+        assert!(!is_genuine_brick(crate::db::NEWER_STORE_MSG));
+        let folded = fault_with(
+            crate::error::VaultFaultCode::Other,
+            crate::db::NEWER_STORE_MSG,
+        );
+        assert!(reset_refusal(&folded).is_some());
+    }
+
+    #[test]
     fn the_in_flight_backup_refusal_names_the_run_and_promises_only_what_is_true() {
         // The erase refuses rather than cancels, so this sentence is the entire user-facing
         // outcome of that decision: it has to say what is running, how to stop it, and — the part
@@ -2016,6 +2087,43 @@ mod tests {
         }
         assert!(!root.join("vault").exists(), "the Markdown tree goes too");
         assert!(unrelated.exists(), "and nothing that isn't PM's is touched");
+    }
+
+    /// Mods spec §6: the vault's installed mods go with its store, and only that vault's.
+    #[test]
+    fn the_erase_removes_this_vaults_mods_and_no_other_vaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let meta = vault::VaultMeta::new_device();
+        vault::store_meta(&root, &meta).unwrap();
+        let mods = root.join(crate::mods::disk::MODS_DIR);
+        let ours = mods.join(&meta.vault_id);
+        // Every store of the vault on this machine: the erase takes every restored copy too.
+        for path in [
+            ours.join("0123456789abcdef/atlas.map/1.0.0/app/index.html"),
+            ours.join("0123456789abcdef/.quarantine/20261105T120000Z-acme.gone/1.0.0/x"),
+            ours.join("fedcba9876543210/atlas.map/1.0.0/app/index.html"),
+            mods.join(".staging/0011223344556677/app/x.js"),
+            mods.join("another-vault/atlas.map/1.0.0/app/index.html"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let resolved = vault::resolve_layout(&root, None);
+        let freed = remove_vault_artifacts(&resolved, &root);
+        assert!(freed >= 2, "the mods' bytes are counted");
+        assert!(!ours.exists());
+        assert!(!mods.join(".staging").exists());
+        assert!(mods
+            .join("another-vault/atlas.map/1.0.0/app/index.html")
+            .exists());
+
+        // The last vault's mods take the mods folder with them; an id that can't name a folder
+        // removes nothing.
+        assert_eq!(remove_mod_files(&root, "../.."), 0);
+        assert!(root.exists());
+        remove_mod_files(&root, "another-vault");
+        assert!(!mods.exists());
     }
 
     // --- F-03: a relocated vault's user-chosen root must never be deleted wholesale ---

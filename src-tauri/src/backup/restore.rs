@@ -123,7 +123,8 @@ pub fn restore(
     let nonce_prefix = B64
         .decode(&header.stream_nonce_prefix_b64)
         .map_err(|e| Error::Other(format!("corrupt backup nonce: {e}")))?;
-    let aad = format::aad(flags, &header_json);
+    // The archive's own version (format 1 or 2), which `read_header` checked both copies of.
+    let aad = format::aad(header.format_version, flags, &header_json);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
 
     // Progress is metered on archive (ciphertext) bytes consumed, whose total we know.
@@ -216,8 +217,15 @@ pub fn restore(
     // than a retyped literal that could drift from it.
     let db_path = staging_path.join(vault::DB_FILENAME);
     {
-        let conn = db::open(&db_path, &man.db_key_hex)
-            .map_err(|e| Error::Other(format!("the restored database could not be opened: {e}")))?;
+        // Opening migrates the staged copy, so a pre-mods store arrives at this build's schema. A
+        // store a newer PM wrote (inside an archive whose format this build reads) keeps its typed
+        // refusal (I-28): nothing is promoted, and the backup itself is never touched.
+        let conn = db::open(&db_path, &man.db_key_hex).map_err(|e| match e {
+            Error::Vault(f) if f.code == crate::error::VaultFaultCode::NewerStore => {
+                Error::Vault(f)
+            }
+            e => Error::Other(format!("the restored database could not be opened: {e}")),
+        })?;
         let status: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(|e| Error::Other(format!("integrity check failed: {e}")))?;
@@ -226,6 +234,14 @@ pub fn restore(
                 "the restored database failed its integrity check: {status}"
             )));
         }
+        // The copy keeps its vault's id, so it must not keep the store id that names the original
+        // store's mods folder: it would sweep, prune and uninstall that store's files (I-30). It
+        // mints its own when it first needs one. Its mods come back as exact copies from the store
+        // it was made from when that store is on this machine (`mods::disk::recover`), and
+        // otherwise park until repaired there.
+        crate::mods::ledger::forget_store_id(&conn).map_err(|e| {
+            Error::Other(format!("the restored database could not be prepared: {e}"))
+        })?;
     }
     // The metadata must belong to the same vault the manifest claims.
     let meta = vault::load_meta(&staging_path)?
@@ -316,8 +332,11 @@ mod tests {
         let db_path = dir.join("pm.sqlite");
         {
             let conn = db::open(&db_path, &key_hex).unwrap();
-            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
-                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(x); INSERT INTO t VALUES (42);
+                 INSERT INTO settings(key, value) VALUES ('mods_store_id', '0123456789abcdef');",
+            )
+            .unwrap();
         }
         for (rel, bytes) in vault_contents() {
             let path = dir.join(rel);
@@ -387,6 +406,18 @@ mod tests {
         let conn = db::open(&target.join("pm.sqlite"), outcome.db_key_hex.expose()).unwrap();
         let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(x, 42);
+        // A restored copy is a store of its own: the id that names the original's mods folder
+        // doesn't come with it (the original keeps it).
+        assert_eq!(
+            crate::mods::ledger::read_store_id(&conn).unwrap(),
+            None,
+            "the restored copy doesn't share the original's mods folder"
+        );
+        let src = db::open(&src_vault.join("pm.sqlite"), &key_hex).unwrap();
+        assert_eq!(
+            crate::mods::ledger::read_store_id(&src).unwrap().as_deref(),
+            Some("0123456789abcdef")
+        );
 
         // Every durable file came across byte-identically — the nested chat, the photo original's
         // raw bytes, and both encrypted sidecars, not just the one flat markdown file.
@@ -461,5 +492,110 @@ mod tests {
         let target = root.path().join("restored");
         assert!(restore(&archive, "pw", &target, |_, _| {}, &cancel).is_err());
         assert!(!target.exists());
+    }
+
+    /// A source vault whose store sits at exactly schema `version` (authentic, from the real
+    /// migrations) with one task in it, and its `VACUUM INTO` snapshot taken WITHOUT migrating it.
+    fn vault_at_version(root: &Path, version: usize) -> (PackInputs, String) {
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let meta = vault::ensure_device_meta(&src).unwrap();
+        let key_hex = "22".repeat(32);
+        let snap = root.join("snap.sqlite");
+        {
+            let conn = db::open_at_version(&src.join("pm.sqlite"), &key_hex, version).unwrap();
+            conn.execute("INSERT INTO tasks(title) VALUES ('call Sam')", [])
+                .unwrap();
+            let escaped = snap.to_string_lossy().replace('\'', "''");
+            conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
+                .unwrap();
+        }
+        let inputs = PackInputs {
+            vault_root: src.clone(),
+            db_snapshot: snap,
+            markdown_dir: src.join("vault"),
+            meta,
+            db_key_hex: Secret::from(key_hex.clone()),
+            app_version: "test".into(),
+            created_at: "2026-07-02T00:00:00Z".into(),
+        };
+        (inputs, key_hex)
+    }
+
+    fn schema_version(path: &Path, key_hex: &str) -> i64 {
+        db::open_unmigrated(path, key_hex)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn latest_version() -> i64 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.sqlite");
+        db::open(&path, &"33".repeat(32)).unwrap();
+        schema_version(&path, &"33".repeat(32))
+    }
+
+    /// Spec §1.11: every backup made before mods is format 1 around a pre-v60 store. This build
+    /// still restores it, and the restore's open carries the store up through v60 with the user's
+    /// data intact.
+    #[test]
+    fn a_pre_mods_format_1_backup_restores_and_migrates_to_this_builds_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let (inputs, key_hex) = vault_at_version(root.path(), 59);
+        assert_eq!(
+            schema_version(&inputs.db_snapshot, &key_hex),
+            59,
+            "the archive really holds a pre-mods store"
+        );
+        let archive = root.path().join("old.pmbackup");
+        let cancel = AtomicBool::new(false);
+        crate::backup::pack::pack_as(inputs, &archive, "pw", |_, _| {}, &cancel, 1).unwrap();
+        // What an older PM wrote: format 1 in the preamble, and so in the AAD.
+        let (_, _, header) = format::read_header(&mut File::open(&archive).unwrap()).unwrap();
+        assert_eq!(header.format_version, 1);
+
+        let target = root.path().join("restored");
+        restore(&archive, "pw", &target, |_, _| {}, &cancel).unwrap();
+        let restored = target.join("pm.sqlite");
+        assert_eq!(schema_version(&restored, &key_hex), latest_version());
+        let conn = db::open_unmigrated(&restored, &key_hex).unwrap();
+        let mods: i64 = conn
+            .query_row("SELECT count(*) FROM mods", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mods, 0, "v60's tables are there, empty");
+        let title: String = conn
+            .query_row("SELECT title FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "call Sam", "the user's data came through the ladder");
+    }
+
+    /// A store a newer PM wrote is refused at restore with its typed fault (I-28): nothing is
+    /// promoted, and the archive is left exactly as it was.
+    #[test]
+    fn a_backup_holding_a_newer_store_is_refused_and_promotes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (inputs, key_hex) = vault_at_version(root.path(), latest_version() as usize);
+        let newer = latest_version() + 1;
+        db::open_unmigrated(&inputs.db_snapshot, &key_hex)
+            .unwrap()
+            .pragma_update(None, "user_version", newer)
+            .unwrap();
+        let archive = root.path().join("new.pmbackup");
+        let cancel = AtomicBool::new(false);
+        pack(inputs, &archive, "pw", |_, _| {}, &cancel).unwrap();
+        let before = std::fs::read(&archive).unwrap();
+
+        let target = root.path().join("restored");
+        let err = match restore(&archive, "pw", &target, |_, _| {}, &cancel) {
+            Ok(_) => panic!("a newer store must not restore"),
+            Err(e) => e,
+        };
+        match err {
+            Error::Vault(f) => assert_eq!(f.code, crate::error::VaultFaultCode::NewerStore),
+            other => panic!("expected the newer-store fault, got {other:?}"),
+        }
+        assert!(!target.exists(), "nothing was promoted");
+        assert_eq!(std::fs::read(&archive).unwrap(), before);
     }
 }

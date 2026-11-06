@@ -10,6 +10,10 @@
 //! - [`ids`]: the mod id grammar and the trust tiers. [`package`]: the `.pmmod` verifier.
 //! - [`runtime`]: the installed-mod registry, the one-time entry URLs and the frame sessions, and
 //!   the serve decision. This file's three commands are its IPC surface.
+//! - [`store`]: the closed value sets of the v60 mod tables (`db/migrations.rs`).
+//! - [`ledger`]: install, update, repair and uninstall, and the writer's startup load and sweep
+//!   (§1.3); [`policy`] its pure decisions, [`disk`] the only code that writes under
+//!   `data_dir/mods` (§1.3, §6).
 //!
 //! This file wires them into PM:
 //! - [`EngineState`], managed from the first line of `setup()`: the sinkhole, the one set of WebView2
@@ -25,11 +29,15 @@
 //! second webview in the same user-data folder with different browser args, and every PM window
 //! shares one (Tauri gives each the app's local data folder).
 
+pub mod disk;
 pub mod engine;
 pub mod headers;
 pub mod ids;
+pub mod ledger;
 pub mod package;
+pub mod policy;
 pub mod runtime;
+pub mod store;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

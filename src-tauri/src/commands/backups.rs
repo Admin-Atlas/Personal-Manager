@@ -282,7 +282,13 @@ fn db_holds_user_data(conn: &rusqlite::Connection) -> bool {
     // exclusion list, because boot writes at least five keys of its own and that list would rot.
     let pinboard = "SELECT EXISTS(SELECT 1 FROM settings \
                       WHERE key = 'pinboard' AND trim(COALESCE(value, '')) <> '')";
-    for q in [entities, pinboard] {
+    // A mod's content-class storage is the user's (Mods spec §1.11), wherever its board or notes
+    // came from; its cache rows are rebuildable, and a mod installed with no content yet is not.
+    let mod_content = format!(
+        "SELECT EXISTS(SELECT 1 FROM mod_kv WHERE class = '{}')",
+        crate::mods::store::KV_CONTENT
+    );
+    for q in [entities, pinboard, mod_content.as_str()] {
         if conn
             .query_row(q, [], |r| r.get::<_, bool>(0))
             .unwrap_or(true)
@@ -308,10 +314,21 @@ pub(super) fn home_is_pristine(data_dir: &std::path::Path) -> Result<bool> {
     let Some(key) = vault::current_db_key(&meta)? else {
         return Ok(false); // can't resolve its key → treat as real, leave it alone
     };
-    let Ok(conn) = crate::db::open(&data_dir.join(vault::DB_FILENAME), key.expose()) else {
-        return Ok(false); // unreadable → treat as real, never clobber
-    };
-    Ok(!db_holds_user_data(&conn))
+    Ok(store_is_pristine(
+        &data_dir.join(vault::DB_FILENAME),
+        key.expose(),
+    ))
+}
+
+/// The keychain-free half of [`home_is_pristine`]: whether the store at `db_path` opens and holds
+/// nothing of the user's. Any open failure reads as real data, never clobbered: a wrong key, a
+/// damaged file, a passing lock, and a store a newer PM wrote (I-28), which `db::open` refuses
+/// untouched and which re-homing would otherwise delete.
+fn store_is_pristine(db_path: &std::path::Path, key_hex: &str) -> bool {
+    match crate::db::open(db_path, key_hex) {
+        Ok(conn) => !db_holds_user_data(&conn),
+        Err(_) => false,
+    }
 }
 
 /// Reconcile a just-activated restored vault to THIS machine (blocking; runs off the async thread).
@@ -352,9 +369,18 @@ fn adopt_restored_vault(
     let rehome = is_restore_staging && home_is_pristine(data_dir)?;
 
     // Vacate the pristine default so the relocate's collision guard sees a Vacant home. Only reached
-    // once `home_is_pristine` has confirmed it's an empty device vault — safe to drop.
+    // once `home_is_pristine` has confirmed it's an empty device vault — safe to drop. A home with
+    // only cache-class mods is still pristine, so its mods' files go with the store that named
+    // them (spec §6: no residue); its id is read before its metadata goes.
     if rehome {
+        let vacated = vault::load_meta(data_dir)
+            .ok()
+            .flatten()
+            .map(|m| m.vault_id);
         crate::vault::migrate::delete_vault_artifacts(data_dir);
+        if let Some(vault_id) = vacated {
+            crate::mods::ledger::remove_vacated_store(app, data_dir, &vault_id);
+        }
     }
 
     let mut warnings = Vec::new();
@@ -459,13 +485,18 @@ pub async fn switch_to_vault(
     // off the async runtime thread; it reads `AppState` back through the `AppHandle`, like the other
     // migration commands.
     let app2 = app.clone();
-    let mut warnings = spawn_blocking_result("adopt", move || {
-        adopt_restored_vault(&app2, &root, &meta, &data_dir, make_private)
+    // Unreported, as before: this command returns no warnings to the page.
+    let _warnings = spawn_blocking_result("adopt", move || {
+        let mut warnings = adopt_restored_vault(&app2, &root, &meta, &data_dir, make_private)?;
+        // Re-engage the writer lock for the final (possibly relocated) vault — best-effort,
+        // mirroring the other mode-change commands (a device vault needs none; a passphrase vault
+        // does). On this thread too: the first engage (`attach_profile_here`) began copying a
+        // same-machine restore's mods from the store it was made from, and this one's mod reload
+        // waits at the ledger lock until that copy is done.
+        engage_or_warn(&app2, &mut warnings);
+        Ok(warnings)
     })
     .await?;
-    // Re-engage the writer lock for the final (possibly relocated) vault — best-effort, mirroring the
-    // other mode-change commands (a device vault needs none; a passphrase vault does).
-    engage_or_warn(&app, &mut warnings);
 
     // Committed: drop the staged-restore banner so a reopened Backup panel doesn't offer to
     // "switch" to the vault that's now already active.
@@ -1658,6 +1689,11 @@ mod tests {
                 "the pinboard, which lives only in settings",
                 "INSERT OR REPLACE INTO settings(key, value) VALUES ('pinboard', '- a note')",
             ),
+            (
+                "a mod's content-class storage",
+                "INSERT INTO mod_kv(mod_id, key, class, value) \
+                 VALUES ('atlas.pinboard', 'board', 'content', '{}')",
+            ),
         ];
         for (what, sql) in cases {
             let (_d, c) = temp_db();
@@ -1682,6 +1718,52 @@ mod tests {
         assert!(
             !db_holds_user_data(&c),
             "boot-written settings and the seeded inbox are not user intent"
+        );
+
+        // An installed mod with only rebuildable cache rows holds nothing of the user's yet.
+        let (_d, c) = temp_db();
+        c.execute_batch(
+            "INSERT INTO mods(id, name, version, tier, author, source_repo, source_commit, signed, \
+                              install_id, installed_from, package_sha256, manifest, files) \
+             VALUES ('atlas.map', 'Map', '1.0.0', 'first', 'Atlas', 'itsAtlas-org/pm-mods', \
+                     '0123456789abcdef0123456789abcdef01234567', 1, '0123456789abcdef', 'catalogue', \
+                     '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', '{}', '[]'); \
+             INSERT INTO mod_kv(mod_id, key, class, value) VALUES ('atlas.map', 'layout', 'cache', '[]');",
+        )
+        .unwrap();
+        assert!(
+            !db_holds_user_data(&c),
+            "cache-class mod storage is rebuildable, not user intent"
+        );
+    }
+
+    /// Re-homing a restore deletes a pristine home vault, so a home store this build can't open is
+    /// never pristine, and a newer PM's store (I-28) least of all: it is the user's whole library.
+    #[test]
+    fn a_home_store_a_newer_pm_wrote_is_never_pristine() {
+        let key = "44".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pm.sqlite");
+        let latest: i64 = {
+            let conn = crate::db::open(&path, &key).unwrap();
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(
+            store_is_pristine(&path, &key),
+            "an empty current store is pristine"
+        );
+        crate::db::open_unmigrated(&path, &key)
+            .unwrap()
+            .pragma_update(None, "user_version", latest + 1)
+            .unwrap();
+        assert!(
+            !store_is_pristine(&path, &key),
+            "even empty, a newer PM's store is not ours to replace"
+        );
+        assert!(
+            !store_is_pristine(&path, &"55".repeat(32)),
+            "nor is one this key can't open"
         );
     }
 }

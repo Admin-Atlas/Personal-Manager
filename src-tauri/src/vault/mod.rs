@@ -928,6 +928,11 @@ impl MarkdownCipher {
         self.encryption != MarkdownEncryption::None
     }
 
+    /// The vault this cipher belongs to (`VaultMeta.vault_id`).
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
     /// Whether two ciphers read and write a file identically (same vault id, policy, and
     /// key). Used by the migration converter to skip a file already in the exact target
     /// form — but never to skip a re-encode when the key changed (a passphrase change
@@ -1307,17 +1312,27 @@ pub fn open_at_boot(resolved: &ResolvedVault, meta: &VaultMeta) -> Result<Option
             // flipped to Device, but a crash before `update_keychain` left the old
             // passphrase-derived key in the per-vault cache — which `current_db_key` prefers.
             // Retry once with the freshly derived device key; if that opens, the cache was
-            // stale, so clear it and continue on the clean device path. Any other failure (a
-            // genuine wrong key / corruption / transient file lock) propagates unchanged.
+            // stale, so clear it and continue on the clean device path. If the device key can't
+            // read the store either, the cached key's error stands. Any other failure of the device
+            // key is reported instead of the cached key's brick, so a reset is never offered on a
+            // store the device key may yet open (see `device_retry`).
             if meta.key_mode == KeyMode::Device
                 && secrets::get_cached_vault_key(&meta.vault_id)?.is_some()
             {
                 let device_key = secrets::get_or_create_db_key()?;
-                if let Ok(conn) = db::open(&resolved.db_path, device_key.expose()) {
-                    secrets::clear_cached_vault_key(&meta.vault_id)?;
-                    let master = master_from_db_key_hex(device_key.expose())?;
-                    let report = log_meta_auth(&resolved.vault_root, meta, &master);
-                    return Ok(Some((conn, master, report)));
+                match device_retry(db::open(&resolved.db_path, device_key.expose())) {
+                    DeviceRetry::Opened(conn) => {
+                        secrets::clear_cached_vault_key(&meta.vault_id)?;
+                        let master = master_from_db_key_hex(device_key.expose())?;
+                        let report = log_meta_auth(&resolved.vault_root, meta, &master);
+                        return Ok(Some((conn, master, report)));
+                    }
+                    DeviceRetry::Proven(fault) => {
+                        secrets::clear_cached_vault_key(&meta.vault_id)?;
+                        return Err(fault);
+                    }
+                    DeviceRetry::Unproven(err) => return Err(err),
+                    DeviceRetry::NotIt => {}
                 }
             }
             // No recovery applied, or the device key didn't open it either — the original
@@ -1328,6 +1343,39 @@ pub fn open_at_boot(resolved: &ResolvedVault, meta: &VaultMeta) -> Result<Option
     let master = master_from_db_key_hex(key.expose())?;
     let report = log_meta_auth(&resolved.vault_root, meta, &master);
     Ok(Some((conn, master, report)))
+}
+
+/// What the device-key retry of a stale per-vault cache (B1-3) found.
+enum DeviceRetry {
+    /// The device key opened the store: the cache was stale.
+    Opened(Connection),
+    /// The device key passed `db::open`'s key probe and the store was then refused as a newer PM's
+    /// (I-28: the refusal comes only after the probe). So the cache was stale too, and this typed
+    /// fault is the honest report: the cached key's "wrong key or corrupt file" would let a reset
+    /// treat a whole, newer store as a brick and delete it.
+    Proven(Error),
+    /// The device key failed some other way than "wrong key or corrupt file": a lock or a disk
+    /// error at the probe, or a migration failing after it (a full disk, a file held by antivirus).
+    /// Nothing says the store is unreadable, so this error is reported in place of the cached key's
+    /// brick, which would offer "Start fresh" on a store the device key may open next time. The
+    /// cache is kept, since the device key isn't proven either.
+    Unproven(Error),
+    /// The device key can't read the store either; the cached key's own error stands.
+    NotIt,
+}
+
+/// Classify the device-key retry's open by what its error proves. Only the brick literal itself
+/// leaves the cached key's brick standing; every other failure is reported as it is. Pure, so each
+/// case is tested without a keychain.
+fn device_retry(opened: Result<Connection>) -> DeviceRetry {
+    match opened {
+        Ok(conn) => DeviceRetry::Opened(conn),
+        Err(Error::Vault(f)) if f.code == VaultFaultCode::NewerStore => {
+            DeviceRetry::Proven(Error::Vault(f))
+        }
+        Err(e) if e.to_string().contains(db::WRONG_KEY_OR_CORRUPT_MSG) => DeviceRetry::NotIt,
+        Err(e) => DeviceRetry::Unproven(e),
+    }
 }
 
 /// Authenticate + repair the meta on the boot/reopen path, logging a warning and handing the report
@@ -1593,6 +1641,139 @@ mod tests {
         drop(conn);
         // The wrong passphrase fails at the verifier, before SQLCipher.
         assert!(open_with_passphrase(&resolved, &meta, "wrong").is_err());
+    }
+
+    /// I-28 on the unlock path: the right passphrase over a store a newer PM wrote reports the
+    /// newer-store fault, not "damaged" (which recovery screens treat as a brick) and not "wrong
+    /// passphrase" (which would send the user to retype one that is right).
+    #[test]
+    fn unlocking_a_newer_store_says_update_not_damaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = ResolvedVault {
+            vault_root: dir.path().to_path_buf(),
+            db_path: dir.path().join("pm.sqlite"),
+            markdown_dir: dir.path().join("vault"),
+        };
+        let (meta, master) = build_passphrase_meta("open-sesame", cheap_params()).unwrap();
+        store_meta(&resolved.vault_root, &meta).unwrap();
+        {
+            let key = db_key_hex(&master);
+            let conn = crate::db::open(&resolved.db_path, key.expose()).unwrap();
+            let latest: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            conn.pragma_update(None, "user_version", latest + 1)
+                .unwrap();
+        }
+        match open_with_passphrase(&resolved, &meta, "open-sesame") {
+            Err(Error::Vault(f)) => {
+                assert_eq!(f.code, VaultFaultCode::NewerStore);
+                assert_eq!(f.message, crate::db::NEWER_STORE_MSG);
+            }
+            Err(other) => panic!("expected the newer-store fault, got {other:?}"),
+            Ok(_) => panic!("a newer store must not open"),
+        }
+    }
+
+    /// I-28 on the boot path's device-key retry (B1-3): a Device vault with a stale cached key over
+    /// a store a newer PM wrote. The cached key fails the probe with the brick literal; the device
+    /// key passes it and is refused as newer, and that typed fault is what reaches the user, so
+    /// "Start fresh" (which refuses `NewerStore` by code) can never delete the store.
+    #[test]
+    fn the_device_key_retry_reports_a_newer_store_not_the_stale_keys_brick() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pm.sqlite");
+        let device_key = "22".repeat(32);
+        {
+            let conn = crate::db::open(&db_path, &device_key).unwrap();
+            let latest: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            conn.pragma_update(None, "user_version", latest + 1)
+                .unwrap();
+        }
+        let stale = crate::db::open(&db_path, &"33".repeat(32)).unwrap_err();
+        assert!(stale
+            .to_string()
+            .contains(crate::db::WRONG_KEY_OR_CORRUPT_MSG));
+        match device_retry(crate::db::open(&db_path, &device_key)) {
+            DeviceRetry::Proven(Error::Vault(f)) => {
+                assert_eq!(f.code, VaultFaultCode::NewerStore);
+                assert_eq!(f.message, crate::db::NEWER_STORE_MSG);
+            }
+            DeviceRetry::Proven(other) => panic!("expected the newer-store fault, got {other:?}"),
+            DeviceRetry::Opened(_) => panic!("a newer store must not open"),
+            DeviceRetry::Unproven(e) => panic!("the device key's proof was thrown away: {e}"),
+            DeviceRetry::NotIt => panic!("the device key's proof was thrown away"),
+        }
+        // A device key that doesn't open the store leaves the cached key's error standing.
+        assert!(matches!(
+            device_retry(crate::db::open(&db_path, &"44".repeat(32))),
+            DeviceRetry::NotIt
+        ));
+        // And one that opens a current store opens it.
+        let current = dir.path().join("current.sqlite");
+        crate::db::open(&current, &device_key).unwrap();
+        assert!(matches!(
+            device_retry(crate::db::open(&current, &device_key)),
+            DeviceRetry::Opened(_)
+        ));
+    }
+
+    /// The same retry, when the device key fails some other way than the brick: each failure is
+    /// reported as it is, never the cached key's "wrong key or corrupt file", so "Start fresh" (which
+    /// only a brick reaches) is never offered on a store the device key may open once the disk or
+    /// the lock clears.
+    #[test]
+    fn the_device_key_retry_reports_any_failure_but_a_brick_as_it_is() {
+        let unproven = |opened: Result<Connection>, says: &str| match device_retry(opened) {
+            DeviceRetry::Unproven(e) => {
+                let e = e.to_string();
+                assert!(e.contains(says), "{e}");
+                assert!(!e.contains(crate::db::WRONG_KEY_OR_CORRUPT_MSG), "{e}");
+            }
+            DeviceRetry::Opened(_) => panic!("nothing opened"),
+            DeviceRetry::Proven(e) => panic!("nothing was proven: {e}"),
+            DeviceRetry::NotIt => panic!("the device key's {says:?} was taken for a brick"),
+        };
+        // A migration that fails after the probe passed: a v59 store holding a table v60 creates.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pm.sqlite");
+        let device_key = "22".repeat(32);
+        crate::db::open_at_version(&db_path, &device_key, 59)
+            .unwrap()
+            .execute_batch("CREATE TABLE mods (x);")
+            .unwrap();
+        unproven(
+            crate::db::open(&db_path, &device_key),
+            "table mods already exists",
+        );
+        // The probe's lock and disk errors, as `db::open` words them, and an I/O error.
+        unproven(
+            Err(Error::Other(
+                "the database is in use by another program; close other copies of PM (or your \
+                 antivirus's lock) and try again"
+                    .into(),
+            )),
+            "in use by another program",
+        );
+        unproven(
+            Err(Error::Other(
+                "could not read the database file (disk I/O error): disk I/O error".into(),
+            )),
+            "disk I/O error",
+        );
+        unproven(
+            Err(Error::Io(std::io::Error::other("No space left on device"))),
+            "No space left",
+        );
+        // Only the brick itself leaves the cached key's brick standing.
+        assert!(matches!(
+            device_retry(Err(Error::Other(
+                crate::db::WRONG_KEY_OR_CORRUPT_MSG.into()
+            ))),
+            DeviceRetry::NotIt
+        ));
     }
 
     /// An encrypted cipher with a fixed subkey (no KDF needed for the file-IO tests).

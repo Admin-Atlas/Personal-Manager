@@ -34,8 +34,8 @@
 //! [`MAX_SERVING`] are read at once and [`MAX_WAITING`] more wait their turn ([`ServeGate`]); past
 //! that a request is refused with a 503.
 //!
-//! The registry is in memory; slice 3 persists installs and fills it at startup. Until then nothing
-//! is installed outside tests, so the handler serves nothing.
+//! The registry is in memory. The ledger (`ledger.rs`) persists installs in the `mods` table and
+//! fills the registry from it whenever this instance opens a store as its writer.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -145,7 +145,7 @@ pub struct FrameOpened {
 }
 
 /// One installed mod: its folder and exactly the files the verified package listed under `app/`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledMod {
     id: ModId,
     /// Canonical, so containment compares like with like (pathguard's contract).
@@ -163,24 +163,40 @@ pub struct ServedFile {
 
 impl InstalledMod {
     /// A verified package whose files have been written under `root`.
-    #[cfg_attr(not(test), allow(dead_code))] // the install path (slice 3) calls it; a test today
+    #[cfg_attr(not(test), allow(dead_code))] // the ledger's install, which the Mods tab calls (slice 6)
     pub fn from_package(pkg: &VerifiedPackage, root: &Path) -> std::io::Result<Self> {
-        let files = pkg
-            .files
-            .iter()
+        let files = pkg.files.iter().map(|(path, f)| {
+            let served = ServedFile {
+                sha256: f.sha256,
+                size: f.bytes.len() as u64,
+            };
+            (path.clone(), served)
+        });
+        Self::from_ledger(
+            pkg.manifest.id.clone(),
+            root,
+            &pkg.manifest.entry.page,
+            files,
+        )
+    }
+
+    /// A mod rebuilt from its `mods` row at startup (`ledger.rs`), from the row's own file list:
+    /// the disk is never asked what to serve, and every serve re-checks the bytes against these
+    /// hashes. Only `app/` files are served.
+    pub fn from_ledger(
+        id: ModId,
+        root: &Path,
+        entry: &str,
+        files: impl IntoIterator<Item = (String, ServedFile)>,
+    ) -> std::io::Result<Self> {
+        let files = files
+            .into_iter()
             .filter(|(path, _)| path.starts_with(headers::APP_DIR))
-            .map(|(path, f)| {
-                let served = ServedFile {
-                    sha256: f.sha256,
-                    size: f.bytes.len() as u64,
-                };
-                (path.clone(), served)
-            })
             .collect();
         Ok(Self {
-            id: pkg.manifest.id.clone(),
+            id,
             root: std::fs::canonicalize(root)?,
-            entry: pkg.manifest.entry.page.clone(),
+            entry: entry.to_owned(),
             files,
         })
     }
@@ -264,6 +280,10 @@ pub struct ModRuntime {
     frame_ancestors: Vec<String>,
     inner: Mutex<Inner>,
     gate: ServeGate,
+    /// Held by every change to the mod folders and the `mods` rows (`ledger.rs`: install, update,
+    /// uninstall, the startup load and sweep, the wipe), so the sweep can never see an install's
+    /// folder between its rename and its row's commit.
+    ledger: Mutex<()>,
 }
 
 impl ModRuntime {
@@ -273,7 +293,42 @@ impl ModRuntime {
             frame_ancestors,
             inner: Mutex::new(Inner::default()),
             gate: ServeGate::new(MAX_SERVING, MAX_WAITING),
+            ledger: Mutex::new(()),
         }
+    }
+
+    /// The ledger's lock. Synchronous work only: never held across an `.await`. A panic part way
+    /// through a ledger change leaves the disk in a state the next sweep handles, so a poisoned
+    /// lock is taken all the same.
+    pub fn ledger_lock(&self) -> MutexGuard<'_, ()> {
+        self.ledger.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Make the registry exactly `mods` (the startup load, a vault switch, a closed store). A mod
+    /// that stays exactly as it was keeps its frames; one that changed or left loses them.
+    pub fn replace_all(&self, mods: Vec<InstalledMod>) {
+        let mut inner = self.lock();
+        let incoming: HashMap<ModId, InstalledMod> =
+            mods.into_iter().map(|m| (m.id.clone(), m)).collect();
+        let stale: Vec<ModId> = inner
+            .installed
+            .iter()
+            .filter(|(id, m)| incoming.get(*id) != Some(m.as_ref()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            inner.installed.remove(id);
+            inner.drop_mod(id);
+        }
+        for (id, m) in incoming {
+            inner.installed.entry(id).or_insert_with(|| Arc::new(m));
+        }
+    }
+
+    /// Where an installed mod is served from, for the ledger's tests.
+    #[cfg(test)]
+    pub fn installed_root(&self, id: &ModId) -> Option<PathBuf> {
+        self.lock().installed.get(id).map(|m| m.root.clone())
     }
 
     /// The scheme handler's turnstile.
@@ -288,7 +343,7 @@ impl ModRuntime {
     }
 
     /// Install (or replace) a mod in the registry. A replacement ends every frame of the old one.
-    #[cfg_attr(not(test), allow(dead_code))] // the install path (slice 3) calls it
+    #[cfg_attr(not(test), allow(dead_code))] // the ledger's install, which the Mods tab calls (slice 6)
     pub fn install(&self, installed: InstalledMod) {
         let mut inner = self.lock();
         inner.drop_mod(&installed.id);
@@ -298,7 +353,7 @@ impl ModRuntime {
     }
 
     /// Remove a mod, its unused entry URLs and its sessions.
-    #[cfg_attr(not(test), allow(dead_code))] // uninstall and the blacklist (slices 3, 5) call it
+    #[cfg_attr(not(test), allow(dead_code))] // the ledger's uninstall and install (slice 6 calls them), the blacklist (slice 5)
     pub fn uninstall(&self, id: &ModId) {
         let mut inner = self.lock();
         inner.installed.remove(id);

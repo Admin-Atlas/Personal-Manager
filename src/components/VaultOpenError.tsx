@@ -14,6 +14,9 @@
 //                 Rebuild can restore the library from the notes. "Start fresh" is hidden and
 //                 backend-refused here — there is no unreadable file to delete, and it would
 //                 take the notes with it.
+//  - "newer-store" — a newer PM wrote this store. It opened fine and is whole; this build just
+//                 can't read it. Update PM is the only way forward, so neither "Start fresh" nor
+//                 "Start a new empty store" is offered, and the backend refuses both (I-28).
 //  - anything else — the transient story as before (antivirus or Windows Search holding
 //                 the file, disk I/O): Retry, with db::open's friendly message.
 //
@@ -52,6 +55,8 @@ export function VaultOpenError({
   // opposite of every other fault here: nothing may be deleted, and the way forward creates
   // rather than removes — so it gets its own copy and its own action.
   const storeMissing = fault?.code === "store-missing";
+  // A newer PM's store: healthy data this build can't read. Nothing here may delete or replace it.
+  const newer = fault?.code === "newer-store";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(fault?.message ?? null);
   // The destructive escape hatch, revealed only if the user asks for it.
@@ -143,21 +148,26 @@ export function VaultOpenError({
             ? "PM can't reach your vault right now"
             : storeMissing
               ? "PM's store is missing"
-              : "Couldn't open your vault"}
+              : newer
+                ? "This vault needs a newer PM"
+                : "Couldn't open your vault"}
         </h1>
         <p className="mt-1 max-w-xs text-sm text-ink4">
           {denied
             ? "Windows is refusing this account access to the vault folder. Your documents " +
               "are still there and still encrypted — nothing has been deleted."
-            : storeMissing
-              ? "The file PM keeps your library in has gone from the vault folder, but the " +
-                "vault itself is still here. PM hasn't deleted or re-created anything — it " +
-                "stopped so you can put the file back first, if you can."
-              : gone
-                ? "The folder PM points at doesn't hold a vault any more — it may have been " +
-                  "moved or deleted, or be on a drive that isn't connected."
-                : "Your documents are safe — the vault file was momentarily unavailable, often " +
-                  "because antivirus or Windows Search was scanning it. Try again in a moment."}
+            : newer
+              ? "A newer version of PM wrote this vault, so this version can't open it. Your " +
+                "data is safe and PM hasn't changed anything. Update PM, then open it again."
+              : storeMissing
+                ? "The file PM keeps your library in has gone from the vault folder, but the " +
+                  "vault itself is still here. PM hasn't deleted or re-created anything — it " +
+                  "stopped so you can put the file back first, if you can."
+                : gone
+                  ? "The folder PM points at doesn't hold a vault any more — it may have been " +
+                    "moved or deleted, or be on a drive that isn't connected."
+                  : "Your documents are safe — the vault file was momentarily unavailable, often " +
+                    "because antivirus or Windows Search was scanning it. Try again in a moment."}
         </p>
       </div>
 
@@ -220,8 +230,9 @@ export function VaultOpenError({
           data behind a permissions problem — the backend refuses both; the UI doesn't offer
           them in the first place. A MISSING store is the third: there is no unreadable file to
           delete, and this path would take the Markdown vault — the one copy of the notes that
-          could still rebuild the library — with it. "Start a new empty store" is its exit. */}
-      {status.pointed_root || denied || storeMissing ? null : !showReset ? (
+          could still rebuild the library — with it. "Start a new empty store" is its exit. A
+          NEWER store is the fourth: it is whole, and the only exit is updating PM. */}
+      {status.pointed_root || denied || storeMissing || newer ? null : !showReset ? (
         <button
           className="text-xs text-ink4 underline underline-offset-2 hover:text-ink3"
           disabled={busy || resetting}
