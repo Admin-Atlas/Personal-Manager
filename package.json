@@ -36,7 +36,7 @@
     "prosemirror-schema-list": "^1.5.1",
     "prosemirror-state": "^1.4.4",
     "prosemirror-tables": "^1.8.5",
-    "prosemirror-transform": "^1.12.2",
+    "prosemirror-transform": "^1.12.4",
     "prosemirror-view": "^1.42.6",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
