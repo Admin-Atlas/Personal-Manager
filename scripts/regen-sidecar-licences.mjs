@@ -65,6 +65,50 @@ async function fetchInfo(name, version) {
   return (await res.json()).info ?? {};
 }
 
+/**
+ * The licences.json entry for one package: its pinned `versions`, what PyPI declares for each of
+ * them now (`perVersion`, as `{version, evidence}`), and the entry the file held before (`old`, or
+ * undefined for a new package). Pure, so the carry-forward rules are tested without the network.
+ *
+ * A human's answer survives only while the versions AND the evidence behind them are unchanged.
+ * Otherwise the licence is blanked for review, and the last REVIEWED answer, licence and note, is
+ * kept in `previous` for the reviewer to compare the new wheels against: the note is where the
+ * bundled natives were written down, and it is the part a re-review most needs. An entry that was
+ * already blank keeps the `previous` it had, so a second run before anyone reviews it does not
+ * replace the answer with the blank.
+ */
+export function entryFor(versions, perVersion, old) {
+  const stamp = stampOf(perVersion);
+  const agree = perVersion.every(
+    (v) => JSON.stringify(v.evidence) === JSON.stringify(perVersion[0].evidence),
+  );
+  const shown = (e) => ({
+    expression: e.expression,
+    license: display(e.license),
+    classifiers: e.classifiers,
+  });
+  const sameVersions = old && JSON.stringify(old.versions ?? []) === JSON.stringify(versions);
+  const keep = Boolean(sameVersions && old.stamp === stamp);
+  const entry = {
+    versions,
+    licence: keep ? (old.licence ?? null) : null,
+    stamp,
+    // Where the pinned versions declare the same thing — nearly always — record it once. Where
+    // they diverge, show each, because that divergence IS the thing a reviewer needs to see.
+    evidence: agree
+      ? shown(perVersion[0].evidence)
+      : Object.fromEntries(perVersion.map((v) => [v.version, shown(v.evidence)])),
+  };
+  if (keep && old.note) entry.note = old.note;
+  if (old && !old.licence && old.previous) {
+    entry.previous = old.previous;
+  } else if (old && !keep) {
+    entry.previous = { versions: old.versions, licence: old.licence ?? null };
+    if (old.note) entry.previous.note = old.note;
+  }
+  return entry;
+}
+
 async function main() {
   const locked = lockedPackages(ROOT);
   const existing = JSON.parse(readFileSync(join(ROOT, LICENCES_FILE), "utf8"));
@@ -82,32 +126,7 @@ async function main() {
     for (const version of versions) {
       perVersion.push({ version, evidence: evidenceOf(await fetchInfo(name, version)) });
     }
-    const stamp = stampOf(perVersion);
-    const agree = perVersion.every(
-      (v) => JSON.stringify(v.evidence) === JSON.stringify(perVersion[0].evidence),
-    );
-    const shown = (e) => ({
-      expression: e.expression,
-      license: display(e.license),
-      classifiers: e.classifiers,
-    });
-    const old = previous[name];
-
-    // A human's answer survives only while the versions AND the evidence behind them are unchanged.
-    const sameVersions = old && JSON.stringify(old.versions ?? []) === JSON.stringify(versions);
-    const keep = sameVersions && old.stamp === stamp;
-    const entry = {
-      versions,
-      licence: keep ? old.licence : null,
-      stamp,
-      // Where the pinned versions declare the same thing — nearly always — record it once. Where
-      // they diverge, show each, because that divergence IS the thing a reviewer needs to see.
-      evidence: agree
-        ? shown(perVersion[0].evidence)
-        : Object.fromEntries(perVersion.map((v) => [v.version, shown(v.evidence)])),
-    };
-    if (keep && old.note) entry.note = old.note;
-    if (!keep && old) entry.previous = { versions: old.versions, licence: old.licence };
+    const entry = entryFor(versions, perVersion, previous[name]);
     if (entry.licence === null) review.push(name);
     packages[name] = entry;
   }
@@ -129,8 +148,13 @@ async function main() {
     process.stderr.write(
       `${review.length} need a licence written by hand (new, or upstream metadata changed):\n` +
         review.map((n) => `  - ${n}\n`).join("") +
-        `\nRead each one's \`evidence\` in ${LICENCES_FILE}, check the project's own LICENSE where the\n` +
-        `evidence is ambiguous, then fill in \`licence\` and add a \`note\` if it needed a judgement.\n`,
+        `\nFor each, read its \`evidence\` in ${LICENCES_FILE} and the project's own LICENSE. The\n` +
+        `licence records the wheel AS INSTALLED: for a compiled package it must also cover what its\n` +
+        `win_amd64, macOS and manylinux x86_64 wheels bundle (auditwheel's <pkg>.libs/, delocate's\n` +
+        `.dylibs/, delvewheel's DLLs, and code linked in statically), read from the wheels whose\n` +
+        `sha256 hashes are in the locks, never from PyPI's metadata alone. Compare what you find\n` +
+        `against the entry's \`previous\` licence and note, then fill in \`licence\`, and a \`note\`\n` +
+        `saying what was read and which side of any OR was taken.\n`,
     );
     process.exitCode = 1;
     return;

@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.174.1-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "PM's document engine is brought up to date: the libraries that read your PDFs, Office files and web pages, and the ones behind search, photo text recognition and the map's layout. Among them is a security fix for how the XML inside Word files is read. The first time PM starts after this update it sets the engine up again by itself, along with photo text recognition and the map's extra layout if you've added them.",
+      "The document engine no longer reports anything about you. The library that runs PM's search and photo models had Microsoft's usage reporting switched on (on Windows, through Windows' own diagnostics), the model downloader had transfer statistics of its own, and setting up the engine sent the Python package index a profile of your computer: its system, versions and processor. All of that is off now. PM also no longer sends a Hugging Face account token it finds on your computer with its model downloads, and photo text recognition no longer downloads models from modelscope.cn that it already has.",
+      "Removing photo text recognition in Settings → Storage now deletes its models too, about 30 MB, and its row counts them. While PM sets the engine up again after an update, anything that needs it waits or asks you to try again in a moment, instead of starting on a half-updated engine.",
+    ],
+  },
+  {
     version: "3.174.0-alpha",
     date: "2026-11-06",
     highlights: [

@@ -808,6 +808,23 @@ fn report_third_party_stores(app: &AppHandle, report: &mut WipeReport) {
             );
         }
     }
+    // onnxruntime's telemetry client (its Linux and macOS wheels; the Windows wheel has none, and
+    // writes no device id anywhere) kept a device id and queued usage events here for PM's model
+    // downloads until 3.174.1, which switched it off. The folder is shared by every program on the
+    // machine that uses onnxruntime, so it is named, not deleted.
+    #[cfg(not(windows))]
+    {
+        let store = onnxruntime_telemetry_store(&home, std::env::var_os("XDG_CACHE_HOME"));
+        if store.exists() {
+            report.leave_behind(
+                store.display(),
+                "a device id and usage events onnxruntime (the library PM runs its search and photo \
+                 models on) kept for Microsoft before PM switched its telemetry off. Other \
+                 programs that use onnxruntime share this folder; if none of yours do, it is safe \
+                 to delete",
+            );
+        }
+    }
     // macOS keeps the microphone grant in a system database no application may edit. PM no longer
     // asks for the microphone (voice input was removed), but a grant an earlier version was given
     // stays there until someone clears it.
@@ -819,6 +836,42 @@ fn report_third_party_stores(app: &AppHandle, report: &mut WipeReport) {
          the Microphone list there, or run: tccutil reset Microphone org.itsatlas.pm",
     );
 }
+
+/// Where onnxruntime's 1DS telemetry client keeps its device id (`deviceid`) and its queue of
+/// unsent events (`onnxruntime.db`), one folder for both (onnxruntime 1.31.1 `device_id.h`,
+/// `posix/device_id.cc` `GetStorageDirectory`, `posix/telemetry_1ds.cc`). On macOS that is
+/// `~/Library/Application Support/Microsoft/DeveloperTools/.onnxruntime`, and `XDG_CACHE_HOME` plays
+/// no part. Pure.
+#[cfg(target_os = "macos")]
+fn onnxruntime_telemetry_store(
+    home: &std::path::Path,
+    _xdg_cache_home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join(ONNXRUNTIME_TELEMETRY_DIR)
+}
+
+/// Where onnxruntime's 1DS telemetry client keeps its device id (`deviceid`) and its queue of
+/// unsent events (`onnxruntime.db`), one folder for both (onnxruntime 1.31.1 `device_id.h`,
+/// `posix/device_id.cc` `GetStorageDirectory`, `posix/telemetry_1ds.cc`). On Linux that is under
+/// `$XDG_CACHE_HOME` when it is an absolute path, else under `~/.cache`: onnxruntime ignores an empty
+/// or relative value, as the XDG spec says to, rather than write below the working directory. Pure.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn onnxruntime_telemetry_store(
+    home: &std::path::Path,
+    xdg_cache_home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    xdg_cache_home
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".cache"))
+        .join(ONNXRUNTIME_TELEMETRY_DIR)
+}
+
+/// onnxruntime's own folder under the per-platform base (`DeviceId::kDeviceIdDir`).
+#[cfg(not(windows))]
+const ONNXRUNTIME_TELEMETRY_DIR: &str = "Microsoft/DeveloperTools/.onnxruntime";
 
 /// The summary label for the preferences class, given how many OS-written leftovers the backend
 /// itself removed.
@@ -1548,6 +1601,41 @@ pub async fn confirm_wipe_identity(window: tauri::WebviewWindow) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux: an absolute `XDG_CACHE_HOME` moves the folder; unset, empty or relative, onnxruntime
+    /// uses `~/.cache`, so the erase names that.
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn onnxruntimes_telemetry_store_follows_an_absolute_xdg_cache_home() {
+        let home = std::path::Path::new("/home/u");
+        let default =
+            std::path::PathBuf::from("/home/u/.cache/Microsoft/DeveloperTools/.onnxruntime");
+        assert_eq!(onnxruntime_telemetry_store(home, None), default);
+        assert_eq!(onnxruntime_telemetry_store(home, Some("".into())), default);
+        assert_eq!(
+            onnxruntime_telemetry_store(home, Some("relative/cache".into())),
+            default
+        );
+        assert_eq!(
+            onnxruntime_telemetry_store(home, Some("/x/cache".into())),
+            std::path::PathBuf::from("/x/cache/Microsoft/DeveloperTools/.onnxruntime")
+        );
+    }
+
+    /// macOS: always under Application Support; onnxruntime never reads `XDG_CACHE_HOME` there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onnxruntimes_telemetry_store_is_in_application_support_on_macos() {
+        let home = std::path::Path::new("/Users/u");
+        let store = std::path::PathBuf::from(
+            "/Users/u/Library/Application Support/Microsoft/DeveloperTools/.onnxruntime",
+        );
+        assert_eq!(onnxruntime_telemetry_store(home, None), store);
+        assert_eq!(
+            onnxruntime_telemetry_store(home, Some("/x/cache".into())),
+            store
+        );
+    }
     use rusqlite::Connection;
 
     #[test]

@@ -19,8 +19,10 @@ skipped when fastembed is unavailable (it never downloads).
 Run: `python sidecar/test_pm_sidecar.py` (or `just sidecar-test`).
 """
 
+import builtins
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -1283,6 +1285,152 @@ class SpreadsheetTest(unittest.TestCase):
             "s", [["Note"], ["y" * 5000]], S._TextBudget(S.SPREADSHEET_TEXT_BUDGET)
         )
         self.assertEqual(len(sheet["rows"][0][0]), S.SPREADSHEET_CELL_CHARS)
+
+
+class TelemetryAndCacheLayoutTests(unittest.TestCase):
+    """Every telemetry client in the venv and huggingface-hub's shared blob store are off on every
+    run, set at import before any of those libraries loads, and an inherited value doesn't win
+    (sidecar.rs sets the same values as PYTHON_ENV_SETS)."""
+
+    WANT = {
+        "ORT_DISABLE_TELEMETRY": "1",
+        # onnxruntime's Windows ETW provider is never registered (see pm_sidecar.py).
+        "ORT_RUNNING_UNIT_TESTS": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "HF_XET_TELEMETRY_ENABLED": "0",
+        "DO_NOT_TRACK": "1",
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
+        "HF_HUB_DISABLE_SHARED_BLOBS": "1",
+    }
+    # Inherited Hugging Face credentials, which must not survive the import.
+    GONE = (
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HF_TOKEN_PATH",
+        "HF_OIDC_RESOURCE",
+        "HF_OIDC_ID_TOKEN",
+    )
+
+    def _import_fresh(self, extra):
+        code = (
+            "import os, json\n"
+            "import pm_sidecar\n"
+            f"out = {{k: os.environ.get(k) for k in {tuple(self.WANT) + self.GONE!r}}}\n"
+            "try:\n"
+            "    from huggingface_hub import constants\n"
+            "    out['hub_sees'] = constants.HF_HUB_DISABLE_SHARED_BLOBS\n"
+            "except ImportError:\n"
+            "    out['hub_sees'] = None\n"
+            "print(json.dumps(out))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        env.update(extra)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_an_inherited_value_does_not_turn_any_back_on(self):
+        out = self._import_fresh({k: "inherited" for k in (*self.WANT, *self.GONE)})
+        for key, want in self.WANT.items():
+            self.assertEqual(out[key], want, key)
+        for key in self.GONE:
+            self.assertIsNone(out[key], key)
+
+    @_needs_fastembed("huggingface_hub comes with fastembed")
+    def test_huggingface_hub_reads_the_shared_blob_store_as_off(self):
+        out = self._import_fresh({"HF_HUB_DISABLE_SHARED_BLOBS": "0"})
+        self.assertIs(out["hub_sees"], True)
+
+    def test_onnxruntime_events_are_switched_off_before_every_model_load(self):
+        # The wall behind the environment: disable_telemetry_events() only clears a flag, and on
+        # Windows an ETW session can set it again, so it is not a once-per-process call.
+        fake = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"onnxruntime": fake}):
+            S._load_model(lambda: "model")
+            S._load_model(lambda: "model")
+        self.assertEqual(fake.disable_telemetry_events.call_count, 2)
+
+    def test_every_request_switches_them_off_again_once_onnxruntime_is_loaded(self):
+        fake = mock.MagicMock()
+        lines = "".join(json.dumps({"id": i, "method": "noop"}) + "\n" for i in (1, 2, 3))
+        with (
+            mock.patch.dict(sys.modules, {"onnxruntime": fake}),
+            mock.patch.dict(S.HANDLERS, {"noop": lambda params: {}}),
+            mock.patch.object(S, "_lower_own_priority"),
+            mock.patch.object(sys, "stdin", io.StringIO(lines)),
+            mock.patch.object(sys, "stdout", io.StringIO()),
+        ):
+            S.main()
+        self.assertEqual(fake.disable_telemetry_events.call_count, 3)
+
+    def test_a_request_never_imports_onnxruntime_just_to_switch_it_off(self):
+        # A spreadsheet or a photo without OCR has no use for onnxruntime; importing it would load
+        # the library (and, on Windows, write the very ProcessInfo event this is about).
+        tried = []
+        real_import = builtins.__import__
+
+        def spy(name, *args, **kwargs):
+            if name == "onnxruntime":
+                tried.append(name)
+                raise ImportError("not loaded in this test")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("onnxruntime", None)
+            with mock.patch("builtins.__import__", spy):
+                S._quiet_onnxruntime(load=False)
+                self.assertEqual(tried, [])
+                S._quiet_onnxruntime()  # before a model build it does import it
+        self.assertEqual(tried, ["onnxruntime"])
+
+    def test_a_build_without_the_switch_does_not_break_a_load(self):
+        fake = mock.MagicMock()
+        fake.disable_telemetry_events.side_effect = AttributeError("old build")
+        with mock.patch.dict(sys.modules, {"onnxruntime": fake}):
+            self.assertEqual(S._load_model(lambda: "model"), "model")
+            S._quiet_onnxruntime(load=False)
+
+
+class RapidocrSeedTests(unittest.TestCase):
+    """rapidocr's own bundled models are copied into PM's model dir, so it never downloads them from
+    its host (www.modelscope.cn)."""
+
+    def _fake_package(self, root):
+        pkg = os.path.join(root, "site", "rapidocr")
+        os.makedirs(os.path.join(pkg, "models"))
+        for name, body in (("det.onnx", b"det"), ("rec.onnx", b"rec"), (".gitkeep", b"")):
+            with open(os.path.join(pkg, "models", name), "wb") as f:
+                f.write(body)
+        spec = mock.Mock(submodule_search_locations=[pkg])
+        return mock.patch("importlib.util.find_spec", return_value=spec)
+
+    def test_bundled_models_are_copied_and_a_present_one_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as root:
+            dest = os.path.join(root, "models", "rapidocr")
+            os.makedirs(dest)
+            with open(os.path.join(dest, "rec.onnx"), "wb") as f:
+                f.write(b"already here")
+            with self._fake_package(root):
+                S._seed_rapidocr_models(dest)
+            self.assertEqual(sorted(os.listdir(dest)), ["det.onnx", "rec.onnx"])
+            with open(os.path.join(dest, "det.onnx"), "rb") as f:
+                self.assertEqual(f.read(), b"det")
+            with open(os.path.join(dest, "rec.onnx"), "rb") as f:
+                self.assertEqual(f.read(), b"already here")
+
+    def test_no_model_dir_or_no_package_does_nothing(self):
+        S._seed_rapidocr_models(None)
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("importlib.util.find_spec", return_value=None):
+                S._seed_rapidocr_models(os.path.join(root, "m"))
+            self.assertFalse(os.path.exists(os.path.join(root, "m")))
 
 
 # --- the protocol loop itself (driven as a real subprocess) ---------------
