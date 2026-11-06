@@ -80,6 +80,8 @@ mod lock_session;
 mod microsoft;
 mod milestones;
 mod model_gateway;
+// Mods (spec docs/mods-spec-2026-11-04.md): so far the sealed webview engine every window is built with.
+mod mods;
 mod oauth_loopback;
 mod onedrive;
 mod openai_compat;
@@ -1350,8 +1352,20 @@ pub fn run() {
         // quitting ONLY when the tray is on (see tray.rs). The pop-out Calendar (popout.rs) closes
         // like any window: it's destroyed.
         .on_window_event(tray::on_window_event)
+        // Every mod is served from this one scheme (Mods spec §1.4): only to the main window, only
+        // files a verified package lists, and a page only through a one-time entry URL.
+        .register_asynchronous_uri_scheme_protocol(mods::SCHEME, mods::handle_scheme_request)
         .setup(|app| {
             let handle = app.handle();
+            // The sealed webview engine (Mods spec §1.4) before anything else. Its sinkhole has to be
+            // listening before any window exists, because WebView2's browser args carry its port and
+            // every PM window must be built with the same args. Then the main window, which Tauri used
+            // to build from tauri.conf.json just before calling this hook: it's built here now, from
+            // that same entry, with the navigation guard, the init scripts and the download refusal.
+            // The mod runtime goes in before the window too: its guard and the scheme handler ask it.
+            app.manage(mods::EngineState::start_for(handle));
+            app.manage(mods::start_runtime(handle));
+            mods::build_main_window(handle)?;
             // One-time: move the Google Calendar token from the legacy shared keychain key to its
             // per-service key (the move to per-service connectors). Keychain-only, no vault needed;
             // idempotent and best-effort, so a keychain hiccup never blocks startup.
@@ -2060,6 +2074,11 @@ pub fn run() {
             commands::prune_own_backups,
             commands::smart_app_control_state,
             commands::package_managed_linux,
+            // Mods (spec §1.4): a frame's one-time entry URL and session, and the bridge's relay.
+            // Main window only.
+            mods::mod_frame_open,
+            mods::mod_frame_close,
+            mods::mod_call,
             // Developer mode (issue #78) — read-only inspection. Always registered (the
             // commands are harmless reads); only the UI is gated by the runtime `devMode`.
             commands_dev::dev_system_info,

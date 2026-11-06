@@ -32,7 +32,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { openUrl } from "../../../lib/ipc";
+import { openLink } from "../../../lib/linkFailure";
 import { IS_MAC } from "../../../lib/setupGuide";
 import {
   docsEqual,
@@ -421,7 +421,8 @@ export function DescriptionEditor({
   }
 
   /** A link in the box never navigates PM's window, editable or not; Ctrl+click (⌘ on a Mac) opens a
-   *  web or email address the link rule takes (critique C2-H3). */
+   *  web or email address the link rule takes (critique C2-H3). A web link that didn't open says so
+   *  in the link notice; a mail link, on the description's own line (`onMail`). */
   function onLinkClick(e: ReactMouseEvent<HTMLDivElement>) {
     const link = linkAround(e.target as Node, e.currentTarget);
     if (link === null) return;
@@ -430,7 +431,7 @@ export function DescriptionEditor({
     const address = linkTarget(link.getAttribute("href") ?? "");
     if (address === null) return;
     if (/^mailto:/i.test(address)) onMail(address);
-    else void openUrl(address).catch(() => {});
+    else openLink(address);
   }
 
   /** ←, →, Home and End move along the toolbar, its one Tab stop. */

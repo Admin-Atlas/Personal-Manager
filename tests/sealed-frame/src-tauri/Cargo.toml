@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Bobby Yu
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The sealed-frame regression app (Mods spec §1.4, "What PR-1 ships from this", item 4): a hostile
+# probe in a sealed mod frame, in a window built by PM's own engine.rs and served with PM's own
+# headers.rs. Never shipped: CI builds and runs it (.github/workflows/sealed-frame.yml).
+#
+# Its own crate and lock, outside PM's, so nothing here reaches PM's build. build.rs refuses to build
+# unless the lock's Tauri, wry and engine crates are exactly PM's and the CSP is PM's.
+
+[package]
+name = "pm-sealed-frame"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+serde_json = "1"
+
+[dependencies]
+# `custom-protocol` is what `tauri build` turns on for a release: PM's page from Tauri's own scheme, and
+# `tauri::is_dev()` false.
+tauri = { version = "2", features = ["custom-protocol"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2", features = ["v2_40"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# engine.rs's content rule list completion handler, as in PM.
+block2 = "0.6"

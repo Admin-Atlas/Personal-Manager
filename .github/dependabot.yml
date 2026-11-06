@@ -8,6 +8,9 @@
 version: 2
 updates:
   # --- Rust backend (src-tauri/Cargo.toml + Cargo.lock) ---
+  # tests/sealed-frame/src-tauri is deliberately not listed: that app's lock must match this one's
+  # engine crates exactly (its build.rs refuses anything else), so it moves when this one does, by
+  # hand, and a bump of it alone could only fail.
   - package-ecosystem: "cargo"
     directory: "/src-tauri"
     schedule:

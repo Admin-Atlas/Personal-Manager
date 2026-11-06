@@ -6,15 +6,16 @@
 // signed in to the right account, so these pin that a strip offers that page's link to copy and to
 // open again for exactly as long as the backend waits on it; that every sign-in waiting gets its own
 // strip, named for what it signs in to, and one ending never hides another's; that a browser which
-// wouldn't open is said plainly, even when the backend says so after first showing the page, and
-// stops being said once it opens from here; that focus on a strip that goes stays in the strip's
+// wouldn't open is said plainly, even when the backend says so after first showing the page or when
+// a press here didn't open it, and stops being said once it opens from here; that focus on a strip that goes stays in the strip's
 // place rather than falling out of the Settings dialog; that the strip draws wherever it's placed
 // from the one feed App follows (App's place, or Settings' own, since Settings' scrim covers App's);
 // and that the link itself, which carries the sign-in's one-time state, is never written out.
 
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { dismissLinkFailure, showLinkFailure, useLinkFailure } from "../lib/linkFailure";
 import type { SignInPage } from "../lib/types";
 
 let opened: ((page: SignInPage) => void) | null = null;
@@ -101,6 +102,7 @@ afterEach(() => {
   cleanup();
   // The feed is the module's, so what one test left waiting would show in the next.
   for (const id of [1, 2, 3]) signInClosed(id);
+  dismissLinkFailure();
   vi.clearAllMocks();
   Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
 });
@@ -255,14 +257,38 @@ describe("SignInStrip", () => {
     expect(screen.getByRole("status").textContent).toContain("Google Drive");
   });
 
-  it("a failed reopen stays quiet", async () => {
-    openUrl.mockRejectedValue(new Error("no browser"));
-    await mount();
+  // It was silent: a press that did nothing. Said in the strip's own words, never the error's, which
+  // could hold the link.
+  it("a failed reopen says the browser couldn't open, until a press opens it", async () => {
+    openUrl.mockRejectedValue(new Error(`no browser for ${DRIVE.url}`));
+    const { container } = await mount();
     open(DRIVE);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: againName("Google Drive") }));
     });
-    expect(screen.getByRole("status").textContent).toContain("Google Drive");
+    expect(screen.getByRole("status").textContent).toContain(
+      "Google Drive: PM couldn't open your browser to sign in to Google.",
+    );
+    expect(container.innerHTML).not.toContain("accounts.google.com");
+    openUrl.mockResolvedValue(undefined);
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Try opening it: the Google Drive sign-in" }),
+      );
+    });
+    expect(screen.getByRole("status").textContent).toContain("finish signing in to Google");
+  });
+
+  it("takes down an earlier link's notice when pressed", async () => {
+    await mount();
+    const notice = renderHook(() => useLinkFailure());
+    open(DRIVE);
+    act(() => showLinkFailure("PM couldn't open your mail app. The address is ann@example.com."));
+    expect(notice.result.current).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: againName("Google Drive") }));
+    });
+    expect(notice.result.current).toBeNull();
   });
 
   it("draws wherever it's placed, from the one feed", async () => {

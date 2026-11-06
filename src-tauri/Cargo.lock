@@ -3069,11 +3069,13 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "3.171.0-alpha"
+version = "3.172.0-alpha"
 dependencies = [
  "argon2",
  "base64 0.23.1",
+ "blake2",
  "blake3",
+ "block2",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -3084,14 +3086,19 @@ dependencies = [
  "keyring",
  "landlock",
  "libc",
+ "minisign-verify",
  "notify",
  "notify-debouncer-full",
+ "objc2",
  "objc2-core-foundation",
  "objc2-io-kit",
  "open",
+ "regex",
  "reqwest 0.12.28",
+ "ring",
  "rrule",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3107,6 +3114,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+ "webkit2gtk",
  "windows 0.61.3",
  "windows-future 0.2.1",
  "zeroize",

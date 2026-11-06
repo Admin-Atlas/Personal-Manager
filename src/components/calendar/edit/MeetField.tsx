@@ -13,6 +13,7 @@
 import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { CallForEdit } from "../../../lib/types";
 import { openUrl } from "../../../lib/ipc";
+import { dismissLinkFailure } from "../../../lib/linkFailure";
 import { JOIN_FAILED } from "../../../lib/calendarEdit/editReasons";
 import { Button, CopyLinkButton } from "../../ui";
 
@@ -94,10 +95,12 @@ function MeetRow({ call, value, offered, disabled = false, onChange, note }: Pro
     pressed.current = true;
     onChange(meet);
   };
-  // Join pressed and the browser didn't open: said under the row, Copy link being beside it.
+  // Join pressed and the browser didn't open: said under the row, Copy link being beside it, with an
+  // earlier link's notice taken down (lib/linkFailure.ts).
   const [joinFailed, setJoinFailed] = useState(false);
   const openCall = (link: string) => {
     setJoinFailed(false);
+    dismissLinkFailure();
     openUrl(link).catch(() => setJoinFailed(true));
   };
 

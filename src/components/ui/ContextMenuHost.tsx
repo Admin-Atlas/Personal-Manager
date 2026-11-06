@@ -6,7 +6,7 @@
 //
 // The fallback listens on the document in the bubble phase, so it runs after React has delivered the
 // event to every surface: a surface that opened its own menu has called preventDefault by then, and
-// is left alone.
+// is left alone. Its Open link says in the link notice when the link didn't open (lib/linkFailure).
 
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
@@ -19,7 +19,7 @@ import {
   useContextMenu,
   type MenuItem,
 } from "../../lib/contextMenu";
-import { openUrl } from "../../lib/ipc";
+import { openLink } from "../../lib/linkFailure";
 
 /** A shortcut as the menu shows it ("Ctrl+Z", "⌘⇧Z") in the form `aria-keyshortcuts` reads
  *  ("Control+Z", "Meta+Shift+Z"). */
@@ -35,7 +35,7 @@ export function ContextMenuHost() {
     const onMenu = (e: MouseEvent) => {
       if (e.defaultPrevented || e.shiftKey || inEditable(e.target)) return;
       const items = fallbackItems(e.target, window.getSelection()?.toString() ?? "", {
-        openUrl: (url) => void openUrl(url).catch(() => {}),
+        openUrl: openLink,
         copy,
       });
       // With nothing to offer, still no system menu: its Back and Reload would reset PM.

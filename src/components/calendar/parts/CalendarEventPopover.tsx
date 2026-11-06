@@ -55,6 +55,7 @@ import {
 import { responseLabel, type Reply } from "../../../lib/calendarEdit/guests";
 import { linkTarget, parseDescription } from "../../../lib/calendarEdit/descriptionHtml";
 import { eventFlags, openUrl } from "../../../lib/ipc";
+import { dismissLinkFailure } from "../../../lib/linkFailure";
 import { useRestoreFocus } from "../../../lib/useRestoreFocus";
 import { useDepth } from "../../../theme";
 import { eventColour } from "../../../theme/eventPalette";
@@ -404,10 +405,12 @@ export function CalendarEventPopover({
   }, [google, event.description]);
   const mail = useMailLink(event.id);
   // Join the call pressed and the browser didn't open: said under it, for this event only (a
-  // re-pointed pop-up never shows another's), Copy link being beside it.
+  // re-pointed pop-up never shows another's), Copy link being beside it. An earlier link's notice
+  // goes first (lib/linkFailure.ts), so it never shows beside this line.
   const [joinFailed, setJoinFailed] = useState<string | null>(null);
   const joinCall = (link: string) => {
     setJoinFailed(null);
+    dismissLinkFailure();
     const on = event.id;
     openUrl(link).catch(() => setJoinFailed(on));
   };
@@ -415,6 +418,7 @@ export function CalendarEventPopover({
   const [openFailed, setOpenFailed] = useState<string | null>(null);
   const openSource = (link: string) => {
     setOpenFailed(null);
+    dismissLinkFailure();
     const on = event.id;
     openUrl(link).catch(() => setOpenFailed(on));
   };

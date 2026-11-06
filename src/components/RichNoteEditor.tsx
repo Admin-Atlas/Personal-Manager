@@ -61,7 +61,7 @@ import {
 } from "../lib/pinboard/richNote";
 import { isRomanToken } from "../lib/pinboard/notesMarkdown";
 import { TABLE_ACTIONS, type Align, type TableAction } from "../lib/pinboard/noteTables";
-import { openUrl } from "../lib/ipc";
+import { openLink } from "../lib/linkFailure";
 import { openContextMenu, type MenuItem } from "../lib/contextMenu";
 
 export type RichFormat = "bold" | "italic" | "heading" | "bullet" | "number" | "checkbox";
@@ -752,7 +752,7 @@ export const RichNoteEditor = memo(
                 },
                 contextmenu: tableMenu,
                 // A link opens with Ctrl/Cmd+click, or a plain click while the note isn't being
-                // edited. Web addresses only.
+                // edited. Web addresses only. One that didn't open says so in the link notice.
                 mousedown: (view, e) => {
                   const href = (e.target as Element)
                     .closest?.("[data-href]")
@@ -760,7 +760,7 @@ export const RichNoteEditor = memo(
                   if (!href || !/^https?:\/\//i.test(href)) return clickUnderTable(view, e);
                   if (!(e.metaKey || e.ctrlKey) && view.hasFocus()) return false;
                   e.preventDefault();
-                  void openUrl(href).catch(() => {});
+                  openLink(href);
                   return true;
                 },
               },

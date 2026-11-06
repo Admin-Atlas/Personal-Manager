@@ -76,6 +76,7 @@ use tauri::{
 
 use crate::db;
 use crate::error::{Error, Result};
+use crate::mods;
 
 /// `tauri::Error` isn't one of the kinds `error::Error` converts from, and widening that enum
 /// for one module would be the tail wagging the dog — fold it to the string variant here.
@@ -119,7 +120,7 @@ pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
     if app.get_webview_window(BRIEFING_LABEL).is_some() {
         return Ok(());
     }
-    WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         BRIEFING_LABEL,
         WebviewUrl::App("index.html?window=briefing".into()),
@@ -132,9 +133,10 @@ pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
     .decorations(false)
     .always_on_top(true)
     .skip_taskbar(true)
-    .visible(false)
-    .build()
-    .map_err(tauri_err)?;
+    .visible(false);
+    // Sealed like the main window, though it hosts no mods: on Windows it must carry the same
+    // browser args or WebView2 refuses to create it.
+    mods::build_window(builder, app, mods::Role::NoMods)?;
     Ok(())
 }
 

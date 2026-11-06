@@ -5,23 +5,13 @@
 // message, through the backend's guarded opener (reader.rs's `link_to_open`, which drops a link's
 // subject, body and other fields). When nothing opens, the description says so on a line under it,
 // with the address, so it can still be copied. The one way PM opens a description's mail links: the
-// formatted view's and the Markdown view's alike.
+// formatted view's and the Markdown view's alike. The words are lib/linkFailure.ts's, which the
+// app-wide link handler shows too; a click here takes down that handler's notice first, so a notice
+// left by an earlier link never shows beside this line.
 
 import { useCallback, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { openUrl } from "../../../lib/ipc";
-
-/** What the backend refuses a mail link the mail app didn't open with (reader.rs's
- *  `MAIL_APP_FAILED`): matched exactly, to add the address. */
-export const MAIL_APP_FAILED = "PM couldn't open your mail app.";
-
-/** The line under a description when a mail link didn't open: the backend's own words for a link it
- *  refused, or that the mail app didn't open, with the address. */
-export function mailFailureText(error: unknown, target: string): string {
-  if (typeof error === "string" && error !== MAIL_APP_FAILED) return error;
-  // The address alone, as the backend sends it: the part before any "?" or "#".
-  const address = target.slice("mailto:".length).split(/[?#]/)[0];
-  return `${MAIL_APP_FAILED} The address is ${address}.`;
-}
+import { dismissLinkFailure, mailFailureText, openLink } from "../../../lib/linkFailure";
 
 /** Opens a description's mail links, and the line to show when one didn't open. `on` names what
  *  the description belongs to (the event's id): a line from one event never shows on the next one a
@@ -34,6 +24,7 @@ export function useMailLink(on: string): {
   const open = useCallback(
     (target: string) => {
       setSaid(null);
+      dismissLinkFailure();
       void openUrl(target).catch((e: unknown) => setSaid({ on, text: mailFailureText(e, target) }));
     },
     [on],
@@ -42,13 +33,14 @@ export function useMailLink(on: string): {
 }
 
 /** A middle-click (any button but the first) on a description's link. The engine sends it as
- *  `auxclick`, never `click`, and its default loads the address in PM's own window, which has no
- *  navigation guard: WebKitGTK replaced the app with an error page for a mail link (C19 critique
- *  C2-H3, the details' links too; review 1), so a link that isn't a web link does nothing. A web link
+ *  `auxclick`, never `click`, and its default loads the address in PM's own window: before PM's windows
+ *  had a navigation guard (mods/mod.rs), WebKitGTK replaced the app with an error page for a mail link
+ *  (C19 critique C2-H3, the details' links too; review 1). The guard now refuses that navigation, and
+ *  this stays the first wall, so a link that isn't a web link does nothing. A web link
  *  opening in the browser opens there on the middle button, as Google Calendar's page opens a new tab:
  *  no webview does so by itself, and `useExternalLinks` hears only the first button (review 2). Its
- *  failure says nothing, as that click's does. Two of these can hear one click, the formatted view's
- *  and the details' around it: the first to act stops the second. */
+ *  failure shows in the link notice, as that click's does. Two of these can hear one click, the
+ *  formatted view's and the details' around it: the first to act stops the second. */
 export function stopLinkAuxClick(e: ReactMouseEvent): void {
   if (e.defaultPrevented) return;
   const at = e.target instanceof Element ? e.target : null;
@@ -58,7 +50,7 @@ export function stopLinkAuxClick(e: ReactMouseEvent): void {
   if (link.getAttribute("target") === "_blank" && /^https?:\/\//i.test(href)) {
     if (e.button !== 1) return;
     e.preventDefault();
-    void openUrl(href).catch(() => {});
+    openLink(href);
     return;
   }
   e.preventDefault();

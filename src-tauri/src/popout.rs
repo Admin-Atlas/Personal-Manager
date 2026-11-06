@@ -37,7 +37,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::error::{Error, Result};
-use crate::{settings, tray, AppState};
+use crate::{mods, settings, tray, AppState};
 
 /// The pop-out Calendar's window label. Also named in `capabilities/calendar.json`.
 pub const CALENDAR_LABEL: &str = "calendar";
@@ -78,7 +78,7 @@ pub fn open(app: &AppHandle) -> Result<()> {
         let _ = win.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         CALENDAR_LABEL,
         WebviewUrl::App("index.html?window=calendar".into()),
@@ -89,9 +89,10 @@ pub fn open(app: &AppHandle) -> Result<()> {
     // take over below its breakpoints.
     .min_inner_size(480.0, 400.0)
     // PM's own title bar, as in the main window.
-    .decorations(false)
-    .build()
-    .map_err(|e| Error::Other(e.to_string()))?;
+    .decorations(false);
+    // Sealed like the main window, though it hosts no mods: on Windows it must carry the same
+    // browser args or WebView2 refuses to create it.
+    mods::build_window(builder, app, mods::Role::NoMods)?;
     Ok(())
 }
 

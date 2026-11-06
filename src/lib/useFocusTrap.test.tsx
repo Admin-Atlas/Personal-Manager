@@ -10,7 +10,7 @@
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { afterEach, describe, expect, it } from "vitest";
-import { useFocusTrap } from "./useFocusTrap";
+import { claimFocusReturn, useFocusTrap } from "./useFocusTrap";
 
 // This repo registers no global testing-library cleanup (vitest.config has no setup file), so
 // unmount between tests here — otherwise repeated renders pile identical test-ids into document.body.
@@ -66,6 +66,17 @@ describe("useFocusTrap", () => {
     const first = getByTestId("first");
     first.focus();
     fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(getByTestId("last"));
+  });
+
+  // The dialog itself holds focus after a click on its background, or when the link notice's ×
+  // hands focus back to it. The engine's own Shift+Tab from there would leave the dialog.
+  it("wraps Shift+Tab from the container itself to the last element", () => {
+    const { getByTestId } = render(<Harness />);
+    openDialog(getByTestId);
+    const dialog = getByTestId("dialog");
+    dialog.focus();
+    expect(fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true })).toBe(false);
     expect(document.activeElement).toBe(getByTestId("last"));
   });
 
@@ -167,6 +178,134 @@ describe("useFocusTrap with a nested dialog", () => {
     outerFirst.focus();
     fireEvent.keyDown(outerFirst, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(getByTestId("inner-last"));
+  });
+});
+
+// The opener can be gone by the time a dialog closes (a row that re-rendered away, or the link
+// notice's ×, remade when it moves into the dialog). Focus then goes to the dialog underneath, not
+// to the body outside its trap. The link notice's own hand-on is tested in linkFailure.test.tsx.
+
+/** A dialog whose opener, a row, is gone while a confirmation opened from it is up. With
+ *  `focusKeep`, the confirmation's Yes puts focus on Keep itself as it closes. */
+function GoneOpenerHarness({ focusKeep = false }: { focusKeep?: boolean }) {
+  const [confirming, setConfirming] = useState(false);
+  const outer = useRef<HTMLDivElement>(null);
+  const inner = useRef<HTMLDivElement>(null);
+  const keep = useRef<HTMLButtonElement>(null);
+  useFocusTrap(true, outer);
+  useFocusTrap(confirming, inner);
+  return (
+    <div ref={outer} role="dialog" aria-modal="true" tabIndex={-1} data-testid="outer">
+      <button ref={keep} data-testid="keep">
+        keep
+      </button>
+      {!confirming && (
+        <button data-testid="row" onClick={() => setConfirming(true)}>
+          delete row
+        </button>
+      )}
+      {confirming && (
+        <div ref={inner} role="dialog" aria-modal="true" tabIndex={-1} data-testid="inner">
+          <button
+            data-testid="yes"
+            onClick={() => {
+              if (focusKeep) keep.current?.focus();
+              setConfirming(false);
+            }}
+          >
+            yes
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A dialog opened from a button marked `data-focus-return`, gone while the dialog is up, and the
+ *  element that may claim its name. */
+function MarkedOpenerHarness() {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useFocusTrap(open, ref);
+  return (
+    <>
+      {!open && (
+        <button data-testid="opener" data-focus-return="stand-in" onClick={() => setOpen(true)}>
+          open
+        </button>
+      )}
+      {open && (
+        <div ref={ref} tabIndex={-1} data-testid="dialog">
+          <button data-testid="close" onClick={() => setOpen(false)}>
+            close
+          </button>
+        </div>
+      )}
+      <button data-testid="stand-in">stand in</button>
+      <button data-testid="elsewhere">elsewhere</button>
+    </>
+  );
+}
+
+/** Open the harness's dialog from its marked opener and close it again. */
+function openAndCloseFromMarked(getByTestId: (id: string) => HTMLElement): void {
+  const opener = getByTestId("opener");
+  opener.focus();
+  fireEvent.click(opener);
+  fireEvent.click(getByTestId("close"));
+  expect(document.activeElement).toBe(document.body);
+}
+
+describe("useFocusTrap when the opener is gone", () => {
+  it("hands a marked opener's focus on to the element that claims its name", () => {
+    const { getByTestId } = render(<MarkedOpenerHarness />);
+    openAndCloseFromMarked(getByTestId);
+    const standIn = getByTestId("stand-in");
+    claimFocusReturn("another", standIn);
+    expect(document.activeElement).toBe(document.body);
+    claimFocusReturn("stand-in", standIn);
+    expect(document.activeElement).toBe(standIn);
+    // Once only.
+    getByTestId("elsewhere").focus();
+    getByTestId("elsewhere").blur();
+    claimFocusReturn("stand-in", standIn);
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("doesn't take focus that something else moved since", () => {
+    const { getByTestId } = render(<MarkedOpenerHarness />);
+    openAndCloseFromMarked(getByTestId);
+    getByTestId("elsewhere").focus();
+    claimFocusReturn("stand-in", getByTestId("stand-in"));
+    expect(document.activeElement).toBe(getByTestId("elsewhere"));
+  });
+
+  it("lets a hand-on nobody claimed lapse", async () => {
+    const { getByTestId } = render(<MarkedOpenerHarness />);
+    openAndCloseFromMarked(getByTestId);
+    await Promise.resolve();
+    claimFocusReturn("stand-in", getByTestId("stand-in"));
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("hands focus to the dialog underneath", () => {
+    const { getByTestId, queryByTestId } = render(<GoneOpenerHarness />);
+    const row = getByTestId("row");
+    row.focus();
+    fireEvent.click(row);
+    expect(document.activeElement).toBe(getByTestId("yes"));
+    fireEvent.click(getByTestId("yes"));
+    expect(queryByTestId("inner")).toBeNull();
+    expect(document.activeElement).toBe(getByTestId("outer"));
+  });
+
+  it("leaves focus that was put somewhere as the dialog closed", () => {
+    const { getByTestId } = render(<GoneOpenerHarness focusKeep />);
+    const row = getByTestId("row");
+    row.focus();
+    fireEvent.click(row);
+    fireEvent.click(getByTestId("yes"));
+    expect(document.activeElement).toBe(getByTestId("keep"));
   });
 });
 

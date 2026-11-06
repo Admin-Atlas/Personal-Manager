@@ -403,6 +403,89 @@ an address `descriptionHtml.ts`'s `linkTarget` takes (absolute http, https or ma
 link survives a save, and its click guard never opens one. Neither ever draws a string the user is
 still typing.
 
+### I-24 · A mod frame is `<iframe sandbox="allow-scripts" allow="">` in `ModFrame.tsx`, and no frame is anywhere else — **Enforced**
+
+The only `<iframe>` in `src/` is the one in `src/components/mods/ModFrame.tsx`, written with the literal
+attributes `sandbox="allow-scripts"` and `allow=""`, no spread, and nothing beyond `key`, `ref`, `src`,
+`title`, `className`, `style` and `onLoad`. Nothing in the page makes a frame another way (`createElement`,
+`jsx`, a tag name held in a string, `<object>`, `<embed>`, `<frame>`, `<portal>`, `<fencedframe>`), and
+nothing reads or writes a frame's `sandbox`, `allow`, `allowfullscreen` or `credentialless`. The
+`no-restricted-syntax` rule in `eslint.config.js` (`FRAME_SINKS`, `NO_IFRAME_ELEMENT`, `NO_IFRAME_NAME`,
+`MOD_FRAME_SHAPE`) fails the lint on each, in TypeScript and in plain JavaScript under `src/`; only tests
+are exempt, and the description tokenizer may name "iframe" as data. `src/lib/frameFence.test.ts` lints
+each form through ESLint's own API. Over the frame's bridge, nothing a mod sends becomes an attribute, a
+class, a style string or markup: a height request is a number `modBridge.ts` clamps, and a call runs under
+the session PM opened for that frame, never one a message names.
+
+**Why.** PM's commands have no per-window ACL, and Tauri counts the `pmmod` scheme as local (Mods spec
+§1.4). The sandbox is what makes a mod's frame an opaque origin: on WebView2 a frame that lost it sends
+`Origin: http://pmmod.localhost`, which Tauri treats as local, and reaches every command. Main's CSP frames
+any mod path, so an unsandboxed frame written anywhere in the page is the hole. Anything in `allow` hands
+the frame a permission the scheme's Permissions-Policy then has to take back.
+
+**Co-signers.** A surface that shows a mod renders `ModFrame`, never a frame of its own. A change to the
+frame's shape (a new attribute, a wider sandbox) changes this entry, `MOD_FRAME_SHAPE` and the fence test
+together, and the sealed-frame regression job (`tests/sealed-frame`, `.github/workflows/sealed-frame.yml`)
+re-measures it. Its harness (`frontend/harness.js`) mounts the probe from its own copy of the frame's
+`sandbox` and `allow` values, and the app's `build.rs` refuses to build unless those equal the literals on
+ModFrame's `<iframe>`, so the job can't measure a different shape from the one that ships. It speaks the
+same bridge, and fails on any IPC escape or network leak on all three engines. What it doesn't run is
+`mods/runtime.rs`'s serve decision (which file, and which as a document): its scheme is a small mirror of
+that, and runtime.rs's unit tests are what hold it.
+
+### I-25 · No mod ships in the installer — **Forward**
+
+A mod reaches a user only as a signed `.pmmod` release asset, installed through the Mods tab (Mods
+spec §1.1, §1.3). First-party mod source lives under `mods/` in this repo and is built into its own
+`.pmmod` files: nothing under `mods/` is in any `bundle.resources`, and nothing in `src/` imports
+`mods/`.
+
+**Why.** An installed mod is one the ledger recorded after the verifier accepted it, under the
+switches, the blacklist and the user's own uninstall. A mod inside the installer would skip every one
+of those, and would ship to every user with each PM release.
+
+**Co-signers.** The first mod (the Map, spec §3) lands with `check-mods.mjs` (spec §7), which fails on
+a `mods/` path in a bundle's resources or a `src/` import of `mods/`; this entry is **Enforced** from
+then on.
+
+### I-26 · Every PM window is built through `mods::build_window` — **Held**
+
+The main window (`tauri.conf.json` says `"create": false`, and `setup()` builds it), the briefing
+panel (`tray.rs`) and the pop-out Calendar (`popout.rs`) are each built by `mods::build_window`
+(`src-tauri/src/mods/mod.rs`). It adds the navigation guard, the download refusal, the top-frame and
+WebRTC init scripts, WebView2's browser args (which point at PM's sinkhole proxy), and the engine
+switches (Mods spec §1.4). A test in that file fails if the config entry is created by Tauri again.
+
+**Why.** WebView2 refuses a second webview in the same user-data folder with different browser args,
+and every PM window shares one. So on Windows a window built with a bare `WebviewWindowBuilder::build`
+fails to open beside a sealed one. Everywhere else, it opens without the guard, which is the wall that
+keeps a mod's page from becoming a top document holding Tauri's invoke key.
+
+**Co-signers.** A new window goes through `build_window` with `Role::NoMods`. Only the main window is
+`Role::Main`, the one that may load a mod frame and whose switches decide whether the engine is sealed.
+
+### I-27 · A mod reaches the webview only as verified bytes, and its id only as a `ModId` — **Held**
+
+Mod files are served by one handler, the `pmmod` scheme (`src-tauri/src/mods/runtime.rs`), and only
+files of a package `mods::package::verify` accepted, registered through `InstalledMod::from_package`
+and still matching their verified sha256 on disk. A mod's page renders only as a one-time entry URL
+minted by `mod_frame_open`; every other HTML, XML or SVG response is an attachment, which WebKitGTK and
+WebView2 turn into a refused download. WKWebView renders it all the same (wry's response delegate reads
+no `Content-Disposition`), so on macOS the navigation guard alone keeps a non-entry page out of a frame.
+A mod id is checked once, by `mods::ids::ModId::parse`, before it reaches a path, a header, a URL, a
+`source_id` or a table row.
+
+**Why.** PM's commands have no per-window ACL, and Tauri treats the `pmmod` scheme as local, so the
+handler, the sealed frame and the navigation guard (I-26) are the only walls between a mod and every
+command. A second way to put mod bytes in a webview (an `asset:` protocol, a blob URL from PM's page, a
+file written outside the verified set) skips all of them, and an id that wasn't parsed can carry `..`,
+a `;` into the CSP, or a Windows device name into a path.
+
+**Co-signers.** The install path (Mods PR-1 slice 3) writes exactly a `VerifiedPackage`'s bytes, runs
+the checks the verifier can't (index, blacklist, newer version, publisher pin, API range) and calls
+`ids::check_tier`; storage, the dispatcher and the MCP server take a `ModId`, never a bare string; and
+nothing else registers a scheme, protocol or URL that serves mod files.
+
 ---
 
 ## 6. Build tooling and dependencies

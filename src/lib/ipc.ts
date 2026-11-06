@@ -2198,3 +2198,24 @@ export const deleteOrphanFiles = (paths: string[]) =>
 
 /** "Not now" — the banner does not come back. */
 export const dismissOrphanSweep = () => invoke<void>("dismiss_orphan_sweep");
+
+// --- Mods: the sealed frame (Mods spec §1.4) --------------------------------
+// Main window only: the backend refuses these from any other window.
+
+/** What a mod's frame needs: the one-time URL its iframe loads (a second load of it, or any other
+ *  page, is refused), and the session its bridge calls under. */
+export interface ModFrameOpened {
+  entryUrl: string;
+  session: string;
+}
+
+/** Mint a mod frame's entry URL and session. The URL is good for one load, within a minute. */
+export const modFrameOpen = (modId: string) => invoke<ModFrameOpened>("mod_frame_open", { modId });
+
+/** End a frame's session: on unmount, and when the frame navigates (its second `load`). Closing an
+ *  ended session is fine. */
+export const modFrameClose = (session: string) => invoke<void>("mod_frame_close", { session });
+
+/** Relay one bridge call. The backend resolves the session to its mod; the frame never names one. */
+export const modCall = (session: string, method: string, args: unknown) =>
+  invoke<unknown>("mod_call", { session, method, args: args ?? null });
