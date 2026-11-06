@@ -19,7 +19,7 @@
 //! - calls that reached the `canary` command (an escape into IPC);
 //! - TCP connections and UDP datagrams that reached the loopback listeners (a network leak: fetch,
 //!   images, preconnect, WebSocket, WebRTC's STUN probe, a navigation);
-//! - connections PM's sinkhole absorbed (attempts the dead proxy stopped: not leaks), also noted as
+//! - connections PM's sinkhole absorbed (attempts the sinkhole stopped: not leaks), also noted as
 //!   each frame opens and at two marks the `relaxed` frame asks for around its plain loads
 //!   (`harness_mark`: the frame fires no load until the harness has had the first noted), so the
 //!   report shows how many those loads sent there;
@@ -39,6 +39,29 @@
 //! earlier load could too), so it proves the proxy was reached, not that every load reached it.
 //! Anything else, the watchdog included, is a non-zero exit. The report goes to
 //! `PM_SEALED_FRAME_OUT` (default `sealed-frame-report.json`).
+//!
+//! **The dead-port run** (`PM_SEALED_FRAME_DEAD_PORT=1`; Linux and Windows, as macOS has no proxy
+//! and refuses it) measures PM's fallback for a sinkhole it couldn't bind. The run binds none: the
+//! bind fails through PM's own `bind_retrying` and `sinkhole_unbound`, and the window's proxy is
+//! `proxy_port`'s with no sinkhole, `127.0.0.1:1` (`DEAD_PROXY_PORT`), where nothing listens. That
+//! an engine doesn't connect directly when its proxy refuses is the engines' documented behaviour,
+//! and this run is what measures it (engine.rs `DEAD_PROXY_PORT`). Everything above still holds,
+//! with three changes:
+//! - the `sinkhole` switch must have failed, once, with exactly `sinkhole_unbound`'s report, and
+//!   every other expected switch must have taken; the engine then reads as unsealed, as it must;
+//! - a connection to the dead port must be refused, before the window opens and again at the end,
+//!   or the run would measure whatever listens there;
+//! - on Linux, the connections owed between the marks are the kernel's failed TCP connections
+//!   (`AttemptFails` in `/proc/net/snmp`, which a refused connection adds one to), not the
+//!   sinkhole's. That count is system-wide: it counts a failed connection to any port from any
+//!   process, retries included. So a shortfall means something stopped some loads before the dead
+//!   port, and a pass shows only that at least that many TCP connections failed while the loads
+//!   ran, which fits the loads meeting the refusing port; the leak listener's count, which no frame
+//!   can fake, is what says none got out. On Windows, as in the default run, whether the loads
+//!   reached the proxy is unmeasured.
+//!
+//! The variable unset is the default run; any value but `1` is refused. A dead-port report says
+//! `"deadPortRun": true`.
 //!
 //! What can't be observed here: a DNS lookup. `dns-prefetch` and preconnect to a name are stopped by
 //! the proxy where there is one (it is handed the name instead of resolving it; a regression in it
@@ -82,8 +105,8 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -146,6 +169,12 @@ const OPEN_LOADS: [&str; 12] = [
 const OPEN_MARKS: [&str; 2] = ["open-begin", "open-end"];
 /// Where the sinkhole's port is remembered between runs on Windows, as PM remembers its own.
 const PORT_FILE: &str = "pm-sealed-frame-sinkhole-port";
+/// `1` for the dead-port run (see the header): no sinkhole, and the proxy on
+/// [`engine::DEAD_PROXY_PORT`].
+const DEAD_PORT_ENV: &str = "PM_SEALED_FRAME_DEAD_PORT";
+/// What a dead-port run waits for a connection to the dead port to be answered. Windows can take a
+/// couple of seconds to report a refused loopback connection.
+const DEAD_PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PROBE_HTML: &str = include_str!("../../probe/index.html");
 const PROBE_JS: &str = include_str!("../../probe/probe.js");
@@ -160,6 +189,13 @@ struct Shared {
     tcp_port: u16,
     udp_port: u16,
     sinkhole: Option<Sinkhole>,
+    /// Whether this is the dead-port run.
+    dead_port: bool,
+    /// Where the window's proxy points (`engine::proxy_port`).
+    proxy_port: Option<u16>,
+    /// The dead-port run's [`dead_port_answer`] before the window opened (`None` in the default
+    /// run).
+    dead_port_before: Option<String>,
     outcomes: Mutex<Vec<SwitchOutcome>>,
     /// Entry tokens not yet used, each bound to its frame's mod id.
     tickets: Mutex<HashMap<String, &'static str>>,
@@ -404,10 +440,11 @@ fn harness_mark(variant: String, mark: String) -> Result<(), String> {
         return Err("no such mark".into());
     }
     let absorbed = shared().sinkhole.as_ref().map(Sinkhole::attempts);
-    record(
-        "mark",
-        json!({ "variant": variant, "mark": mark, "sinkholeAbsorbedSoFar": absorbed }),
-    );
+    let mut detail = json!({ "variant": variant, "mark": mark, "sinkholeAbsorbedSoFar": absorbed });
+    if shared().dead_port {
+        detail["failedConnectsSoFar"] = json!(failed_connects());
+    }
+    record("mark", detail);
     Ok(())
 }
 
@@ -439,21 +476,57 @@ fn starts_with(v: Option<&Value>, prefix: &str) -> bool {
         .is_some_and(|s| s.starts_with(prefix))
 }
 
-/// Every reason the run fails; empty when it passes.
+/// Every reason the run fails; empty when it passes. `dead_port_after` is the dead-port run's
+/// [`dead_port_answer`] at the end (`None` in the default run).
 fn judge(
     outcome: &str,
     harness: &Value,
     events: &[Value],
-    verdict: &engine::Verdict,
+    outcomes: &[SwitchOutcome],
+    dead_port_after: Option<&str>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    let count = |kind: &str| events.iter().filter(|e| e["kind"] == kind).count();
     if outcome != "reported" {
         failures.push(format!("the harness never reported ({outcome})"));
     }
     if let Some(e) = harness["harnessError"].as_str() {
         failures.push(format!("the harness failed: {e}"));
     }
+    // The same in both runs: no mode changes what counts as an escape or a leak.
+    failures.extend(hit_failures(events));
+    let s = shared();
+    failures.extend(judge_switches(
+        s.dead_port,
+        Platform::current().expected_switches(),
+        outcomes,
+    ));
+    if s.dead_port {
+        failures.extend(judge_dead_port(
+            s.proxy_port,
+            s.dead_port_before.as_deref(),
+            dead_port_after,
+        ));
+    }
+    let served = lock(&shared().served).clone();
+    for (variant, id) in VARIANTS {
+        let children = served.get(&(id, "probe-child.js")).copied().unwrap_or(0);
+        if children > 0 {
+            failures.push(format!(
+                "{variant}: a data: or blob: document ran a script in a sealed frame {children} \
+                 time(s): main's frame-src should have refused the navigation"
+            ));
+        }
+    }
+    judge_navigations(harness, &served, &mut failures);
+    judge_frames(harness, events, &served, s.dead_port, &mut failures);
+    failures
+}
+
+/// Escapes and leaks: any call that reached the canary command, and any TCP connection or UDP
+/// datagram that reached the loopback listeners. Judged the same in every run.
+fn hit_failures(events: &[Value]) -> Vec<String> {
+    let mut failures = Vec::new();
+    let count = |kind: &str| events.iter().filter(|e| e["kind"] == kind).count();
     for (kind, what) in [
         (
             "CANARY",
@@ -470,25 +543,105 @@ fn judge(
             failures.push(format!("{n} {what}"));
         }
     }
-    for reason in &verdict.reasons {
-        failures.push(format!("the engine isn't sealed: {reason}"));
+    failures
+}
+
+/// The engine switches. The default run: every expected switch took. The dead-port run: the
+/// sinkhole's switch failed, once, exactly as PM reports a sinkhole it couldn't bind
+/// ([`engine::sinkhole_unbound`] of [`dead_port_bind_error`]), every other expected switch took,
+/// and the engine reads as unsealed.
+fn judge_switches(dead_port: bool, expected: &[&str], outcomes: &[SwitchOutcome]) -> Vec<String> {
+    let verdict = engine::verdict(expected, outcomes);
+    if !dead_port {
+        return verdict
+            .reasons
+            .iter()
+            .map(|reason| format!("the engine isn't sealed: {reason}"))
+            .collect();
     }
-    let served = lock(&shared().served).clone();
-    for (variant, id) in VARIANTS {
-        let children = served.get(&(id, "probe-child.js")).copied().unwrap_or(0);
-        if children > 0 {
+    let mut failures = Vec::new();
+    let want = engine::sinkhole_unbound(&dead_port_bind_error());
+    let sinkhole: Vec<&SwitchOutcome> = outcomes
+        .iter()
+        .filter(|o| o.name == engine::SINKHOLE)
+        .collect();
+    if sinkhole != [&want] {
+        let got: Vec<String> = sinkhole
+            .iter()
+            .map(|o| {
+                let took = if o.took { "took" } else { "failed" };
+                format!("{took}: {}", o.detail)
+            })
+            .collect();
+        failures.push(format!(
+            "the sinkhole switch should have failed once, as PM reports a sinkhole it couldn't \
+             bind (\"{}\"), but it reported {got:?}: this run didn't measure the dead port",
+            want.detail
+        ));
+    }
+    let others: Vec<&str> = expected
+        .iter()
+        .copied()
+        .filter(|name| *name != engine::SINKHOLE)
+        .collect();
+    let rest: Vec<SwitchOutcome> = outcomes
+        .iter()
+        .filter(|o| o.name != engine::SINKHOLE)
+        .cloned()
+        .collect();
+    for reason in engine::verdict(&others, &rest).reasons {
+        failures.push(format!(
+            "the engine isn't sealed but for the sinkhole: {reason}"
+        ));
+    }
+    if verdict.sealed {
+        failures.push("the engine reads as sealed with no sinkhole bound".to_owned());
+    }
+    failures
+}
+
+/// The dead-port run's own conditions: the window's proxy is [`engine::DEAD_PROXY_PORT`], and a
+/// connection to it was refused before the window opened and again at the end, so nothing listened
+/// there to take the loads.
+fn judge_dead_port(
+    proxy_port: Option<u16>,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if proxy_port != Some(engine::DEAD_PROXY_PORT) {
+        failures.push(format!(
+            "the window's proxy port is {proxy_port:?}, not the dead port ({})",
+            engine::DEAD_PROXY_PORT
+        ));
+    }
+    for (when, answer) in [("before the window opened", before), ("at the end", after)] {
+        if answer != Some("refused") {
             failures.push(format!(
-                "{variant}: a data: or blob: document ran a script in a sealed frame {children} \
-                 time(s): main's frame-src should have refused the navigation"
+                "a connection to 127.0.0.1:{} {when} wasn't refused ({}): the run measures an \
+                 engine whose proxy refuses, so nothing may listen there",
+                engine::DEAD_PROXY_PORT,
+                answer.unwrap_or("not tried")
             ));
         }
     }
-    judge_navigations(harness, &served, &mut failures);
+    failures
+}
+
+/// The probe frames, `strict` and `relaxed`: each rendered and ran once, looks sealed, and (for
+/// `relaxed`) ran its plain loads against the network wall.
+fn judge_frames(
+    harness: &Value,
+    events: &[Value],
+    served: &HashMap<(&'static str, &'static str), u32>,
+    dead_port: bool,
+    failures: &mut Vec<String>,
+) {
     for (variant, id) in VARIANTS {
         if id == NAV_ID {
             continue;
         }
-        let fail = &mut failures;
+        let fail = &mut *failures;
         let mut expect = |ok: bool, what: &str| {
             if !ok {
                 fail.push(format!("{variant}: {what}"));
@@ -571,7 +724,34 @@ fn judge(
             // count, which it can't fake, is what says none got through. Reported, not judged,
             // elsewhere: macOS has no sinkhole, and whether WebView2 sends a sandboxed frame's
             // loopback loads to the proxy is unmeasured.
-            if Platform::current() == Platform::Linux {
+            //
+            // The dead-port run has no sinkhole to count at, so there each load is owed one TCP
+            // connection the kernel saw fail before it was established (a refusal by the dead
+            // port is one). The count is system-wide: a failed connection to any port from any
+            // process adds to it, retries included. So a shortfall means something stopped some
+            // loads before the dead port, and a pass shows only that at least that many TCP
+            // connections failed while the loads ran, which fits the loads meeting the refusing
+            // port; the leak listener's TCP count, which no frame can fake, is what says none got
+            // out.
+            if Platform::current() == Platform::Linux && dead_port {
+                match failed_connects_by_open_loads(events) {
+                    Some(failed) => expect(
+                        failed >= owed,
+                        &format!(
+                            "only {failed} TCP connection(s) failed between its marks (the \
+                             kernel's AttemptFails), not one per open load to a host the engine \
+                             parsed ({owed} of {}): something stopped them before the dead port",
+                            OPEN_LOADS.len()
+                        ),
+                    ),
+                    None => expect(
+                        false,
+                        "its open loads weren't bracketed by failed-connection counts: no \
+                         open-begin mark followed by an open-end one, or /proc/net/snmp \
+                         unreadable at one",
+                    ),
+                }
+            } else if Platform::current() == Platform::Linux {
                 match absorbed_by_open_loads(events) {
                     Some(absorbed) => expect(
                         absorbed >= owed,
@@ -650,7 +830,6 @@ fn judge(
             "WebRTC is reachable through a nested frame",
         );
     }
-    failures
 }
 
 /// How many of `OPEN_LOADS` go to a host the engine's URL parser took (probe.js `open-parse`): each
@@ -671,6 +850,19 @@ fn owed_by_open_loads(parsed: Option<&Value>) -> u64 {
 /// first `open-end` after it: its plain loads, and nothing it ran before them. `None` without a
 /// sinkhole, or if either mark is missing.
 fn absorbed_by_open_loads(events: &[Value]) -> Option<u64> {
+    counted_by_open_loads(events, "sinkholeAbsorbedSoFar")
+}
+
+/// The dead-port run's [`absorbed_by_open_loads`]: TCP connections that failed before they were
+/// established ([`failed_connects`]) between the same two marks. `None` off Linux, or if either
+/// mark is missing or has no count.
+fn failed_connects_by_open_loads(events: &[Value]) -> Option<u64> {
+    counted_by_open_loads(events, "failedConnectsSoFar")
+}
+
+/// How far the count each mark noted as `field` rose between the `relaxed` frame's first
+/// `open-begin` mark and the first `open-end` after it.
+fn counted_by_open_loads(events: &[Value], field: &str) -> Option<u64> {
     let [begin, end] = OPEN_MARKS;
     let marks: Vec<&Value> = events
         .iter()
@@ -678,7 +870,7 @@ fn absorbed_by_open_loads(events: &[Value]) -> Option<u64> {
         .collect();
     let at = marks.iter().position(|e| e["detail"]["mark"] == begin)?;
     let to = marks[at..].iter().find(|e| e["detail"]["mark"] == end)?;
-    let so_far = |e: &Value| e["detail"]["sinkholeAbsorbedSoFar"].as_u64();
+    let so_far = |e: &Value| e["detail"][field].as_u64();
     Some(so_far(to)?.saturating_sub(so_far(marks[at])?))
 }
 
@@ -734,11 +926,18 @@ fn finish(harness: Value, outcome: &str) -> i32 {
     let events = lock(&s.events).clone();
     let outcomes = lock(&s.outcomes).clone();
     let verdict = engine::verdict(Platform::current().expected_switches(), &outcomes);
-    let failures = judge(outcome, &harness, &events, &verdict);
+    let dead_port_after = s.dead_port.then(dead_port_answer);
+    let failures = judge(
+        outcome,
+        &harness,
+        &events,
+        &outcomes,
+        dead_port_after.as_deref(),
+    );
     let count = |kind: &str| events.iter().filter(|e| e["kind"] == kind).count();
     let absorbed = s.sinkhole.as_ref().map_or(0, Sinkhole::attempts);
     let passed = failures.is_empty();
-    let report = json!({
+    let mut report = json!({
         "verdict": if passed { "pass" } else { "fail" },
         "failures": failures,
         "outcome": outcome,
@@ -760,6 +959,13 @@ fn finish(harness: Value, outcome: &str) -> i32 {
         "events": events,
         "harness": harness,
     });
+    if s.dead_port {
+        report["deadPortRun"] = json!(true);
+        report["proxyPort"] = json!(s.proxy_port);
+        report["deadPortBefore"] = json!(s.dead_port_before);
+        report["deadPortAfter"] = json!(dead_port_after);
+        report["failedConnectsByOpenLoads"] = json!(failed_connects_by_open_loads(&events));
+    }
     let path =
         std::env::var("PM_SEALED_FRAME_OUT").unwrap_or_else(|_| "sealed-frame-report.json".into());
     let written = serde_json::to_vec_pretty(&report)
@@ -794,6 +1000,17 @@ fn summarise(report: &Value) {
         report["sinkholeAbsorbedByOpenLoads"],
         report["engineSealed"],
     );
+    if report["deadPortRun"] == true {
+        eprintln!(
+            "  dead-port run: proxy port {}, a connection to it {} before and {} at the end; {} \
+             TCP connection(s) failed between the relaxed frame's marks (Linux only), {} owed",
+            report["proxyPort"],
+            report["deadPortBefore"],
+            report["deadPortAfter"],
+            report["failedConnectsByOpenLoads"],
+            report["sinkholeOwedByOpenLoads"],
+        );
+    }
     let harness = &report["harness"];
     eprintln!(
         "  page origin {}; {}",
@@ -886,44 +1103,124 @@ fn stun_listener(socket: UdpSocket) {
     });
 }
 
+// ---- The dead-port run -------------------------------------------------------------------------
+
+/// Whether this is the dead-port run, from [`DEAD_PORT_ENV`]'s value: unset is the default run, `1`
+/// the dead-port run, and anything else is refused rather than guessed at, so a typo can't turn a
+/// dead-port run into a default one under the dead-port report's name.
+fn dead_port_run(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(v) if v == "1" => Ok(true),
+        Some(v) => Err(format!(
+            "{DEAD_PORT_ENV} is {v:?}: set it to 1 for the dead-port run, or leave it unset"
+        )),
+    }
+}
+
+/// What every try at binding the sinkhole fails with in the dead-port run, and so what
+/// [`engine::sinkhole_unbound`] reports. Made the same each time, so the verdict can expect it.
+fn dead_port_bind_error() -> std::io::Error {
+    std::io::Error::other(format!(
+        "{DEAD_PORT_ENV} is set, so the sealed-frame app binds no sinkhole"
+    ))
+}
+
+/// How a TCP connection to [`engine::DEAD_PROXY_PORT`] on loopback is answered: `refused` is the
+/// only answer under which the dead-port run measures what it says, an engine whose proxy refuses.
+fn dead_port_answer() -> String {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, engine::DEAD_PROXY_PORT));
+    match TcpStream::connect_timeout(&addr, DEAD_PORT_PROBE_TIMEOUT) {
+        Ok(_) => "accepted".to_owned(),
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => "refused".to_owned(),
+        Err(e) => format!("{e} ({:?})", e.kind()),
+    }
+}
+
+/// TCP connections the kernel has seen fail before they were established, for the whole system
+/// (`AttemptFails` in `/proc/net/snmp`; a connection refused by the dead port adds one). Linux
+/// only: `None` elsewhere, or if the file can't be read.
+fn failed_connects() -> Option<u64> {
+    if Platform::current() != Platform::Linux {
+        return None;
+    }
+    attempt_fails(&std::fs::read_to_string("/proc/net/snmp").ok()?)
+}
+
+/// `AttemptFails` from `/proc/net/snmp`'s text: its first `Tcp:` line names the columns, the second
+/// holds the values.
+fn attempt_fails(snmp: &str) -> Option<u64> {
+    let mut tcp = snmp.lines().filter(|line| line.starts_with("Tcp:"));
+    let (names, values) = (tcp.next()?, tcp.next()?);
+    let at = names
+        .split_whitespace()
+        .position(|name| name == "AttemptFails")?;
+    values.split_whitespace().nth(at)?.parse().ok()
+}
+
 fn main() {
+    let platform = Platform::current();
+    let dead_port = match dead_port_run(std::env::var_os(DEAD_PORT_ENV).as_deref()) {
+        Ok(dead_port) => dead_port,
+        Err(why) => {
+            eprintln!("sealed-frame: {why}");
+            std::process::exit(2);
+        }
+    };
+    if dead_port && !platform.uses_sinkhole() {
+        eprintln!(
+            "sealed-frame: {DEAD_PORT_ENV} is set, but this engine has no proxy, so there is no \
+             dead-port run on it"
+        );
+        std::process::exit(2);
+    }
     let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("the leak listener");
     let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the STUN listener");
     // The sinkhole exactly as PM's EngineState::start binds it, where the platform has one: on
     // Windows on the port the last run used when that is free, so a run started right after another
-    // usually gets the same WebView2 args (the workflow runs it twice back to back there).
-    let platform = Platform::current();
+    // usually gets the same WebView2 args (the workflow runs it twice back to back there). A bind
+    // that still fails after its tries fails closed as PM's does: the sinkhole switch reports
+    // failed (so a default run fails), nothing is remembered, and the window's proxy is the dead
+    // port. The dead-port run takes that path on purpose: every try fails, so nothing is bound.
     let port_file = (platform == Platform::Windows).then(|| std::env::temp_dir().join(PORT_FILE));
     let remembered = port_file
         .as_ref()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| engine::parse_remembered_port(&text));
+    let bind = || {
+        if dead_port {
+            Err(dead_port_bind_error())
+        } else {
+            Sinkhole::bind_preferring(remembered)
+        }
+    };
     let (sinkhole, sinkhole_outcome) = if platform.uses_sinkhole() {
-        match Sinkhole::bind_preferring(remembered) {
+        match engine::bind_retrying(bind, std::thread::sleep) {
             Ok(s) => {
                 if let Some(path) = &port_file {
                     let _ = std::fs::write(path, s.port().to_string());
                 }
                 (Some(s), Some(SwitchOutcome::took(engine::SINKHOLE)))
             }
-            Err(e) => (
-                None,
-                Some(SwitchOutcome::failed(
-                    engine::SINKHOLE,
-                    format!("couldn't listen on loopback: {e}"),
-                )),
-            ),
+            Err(e) => (None, Some(engine::sinkhole_unbound(&e))),
         }
     } else {
         (None, None)
     };
-    let sinkhole_port = sinkhole.as_ref().map(Sinkhole::port);
+    // Where the window's proxy points, as in PM: the sinkhole's port, or the dead one. None only on
+    // macOS, which has no proxy.
+    let proxy_port = engine::proxy_port(platform, sinkhole.as_ref().map(Sinkhole::port));
+    // Before any window: nothing may be listening on the dead port (judged at the end).
+    let dead_port_before = dead_port.then(dead_port_answer);
     let shared_state = Shared {
         start: Instant::now(),
         events: Mutex::new(Vec::new()),
         tcp_port: tcp.local_addr().expect("a bound port").port(),
         udp_port: udp.local_addr().expect("a bound port").port(),
         sinkhole,
+        dead_port,
+        proxy_port,
+        dead_port_before,
         outcomes: Mutex::new(sinkhole_outcome.into_iter().collect()),
         tickets: Mutex::new(HashMap::new()),
         served: Mutex::new(HashMap::new()),
@@ -940,8 +1237,8 @@ fn main() {
         std::process::exit(3);
     });
 
-    // PM's WebView2 args: identical in every PM window, and carrying the sinkhole's port.
-    let browser_args = engine::windows_browser_args(sinkhole_port, IS_DEV);
+    // PM's WebView2 args: identical in every PM window, and carrying the proxy's port.
+    let browser_args = engine::windows_browser_args(proxy_port, IS_DEV);
     tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol("pmmod", |ctx, req, responder| {
             let label = ctx.webview_label().to_owned();
@@ -974,7 +1271,7 @@ fn main() {
                 },
                 std::thread::sleep,
             )?;
-            engine::apply_switches(&window, sinkhole_port, IS_DEV, |outcomes| {
+            engine::apply_switches(&window, proxy_port, IS_DEV, |outcomes| {
                 lock(&shared().outcomes).extend(outcomes);
             })?;
             if show {
@@ -984,4 +1281,396 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("the sealed-frame app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every expected switch of `platform` but the sinkhole, taken.
+    fn others_took(expected: &[&'static str]) -> Vec<SwitchOutcome> {
+        expected
+            .iter()
+            .copied()
+            .filter(|name| *name != engine::SINKHOLE)
+            .map(SwitchOutcome::took)
+            .collect()
+    }
+
+    fn with(first: SwitchOutcome, rest: Vec<SwitchOutcome>) -> Vec<SwitchOutcome> {
+        let mut all = vec![first];
+        all.extend(rest);
+        all
+    }
+
+    #[test]
+    fn the_default_run_judges_the_switches_as_before() {
+        for platform in [Platform::Linux, Platform::Windows, Platform::MacOs] {
+            let expected = platform.expected_switches();
+            let all: Vec<_> = expected.iter().copied().map(SwitchOutcome::took).collect();
+            assert!(
+                judge_switches(false, expected, &all).is_empty(),
+                "{platform:?}"
+            );
+            // One that didn't take is the verdict's reason, as the run has always reported it.
+            let mut one_failed = all.clone();
+            one_failed[0] = SwitchOutcome::failed(expected[0], "no");
+            assert_eq!(
+                judge_switches(false, expected, &one_failed),
+                engine::verdict(expected, &one_failed)
+                    .reasons
+                    .iter()
+                    .map(|r| format!("the engine isn't sealed: {r}"))
+                    .collect::<Vec<_>>(),
+                "{platform:?}"
+            );
+            assert_eq!(judge_switches(false, expected, &one_failed).len(), 1);
+        }
+        // A sinkhole that couldn't be bound fails a default run.
+        let expected = Platform::Linux.expected_switches();
+        let unbound = with(
+            engine::sinkhole_unbound(&dead_port_bind_error()),
+            others_took(expected),
+        );
+        assert_eq!(judge_switches(false, expected, &unbound).len(), 1);
+    }
+
+    #[test]
+    fn the_dead_port_run_wants_the_sinkhole_failed_as_pm_reports_it_and_the_rest_taken() {
+        for platform in [Platform::Linux, Platform::Windows] {
+            let expected = platform.expected_switches();
+            let unbound = engine::sinkhole_unbound(&dead_port_bind_error());
+            let good = with(unbound.clone(), others_took(expected));
+            assert!(
+                judge_switches(true, expected, &good).is_empty(),
+                "{platform:?}: {:?}",
+                judge_switches(true, expected, &good)
+            );
+            // The engine reads as unsealed then, as PM must report it.
+            assert!(!engine::verdict(expected, &good).sealed);
+
+            // A sinkhole that took: the run measured the sinkhole, not the dead port.
+            let took = with(SwitchOutcome::took(engine::SINKHOLE), others_took(expected));
+            let failures = judge_switches(true, expected, &took);
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| f.starts_with("the sinkhole switch should have failed once")),
+                "{failures:?}"
+            );
+            assert!(failures
+                .iter()
+                .any(|f| f == "the engine reads as sealed with no sinkhole bound"));
+
+            // Failed, but not as PM reports a sinkhole it couldn't bind.
+            let other = with(
+                SwitchOutcome::failed(engine::SINKHOLE, "couldn't listen on loopback: other"),
+                others_took(expected),
+            );
+            assert_eq!(judge_switches(true, expected, &other).len(), 1);
+
+            // Never reported, or reported twice.
+            assert_eq!(
+                judge_switches(true, expected, &others_took(expected)).len(),
+                1
+            );
+            let twice = with(unbound.clone(), good.clone());
+            assert_eq!(judge_switches(true, expected, &twice).len(), 1);
+
+            // Any other switch that didn't take, or never reported, still fails it.
+            for (i, name) in others_took(expected).iter().map(|o| o.name).enumerate() {
+                let mut failed = others_took(expected);
+                failed[i] = SwitchOutcome::failed(name, "no");
+                let failures = judge_switches(true, expected, &with(unbound.clone(), failed));
+                assert_eq!(
+                    failures,
+                    [format!(
+                        "the engine isn't sealed but for the sinkhole: {name} didn't take: no"
+                    )],
+                    "{platform:?}"
+                );
+                let mut missing = others_took(expected);
+                missing.remove(i);
+                assert_eq!(
+                    judge_switches(true, expected, &with(unbound.clone(), missing)).len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hit_fails_any_run() {
+        assert!(hit_failures(&[]).is_empty());
+        let others = [
+            json!({ "kind": "mark", "detail": {} }),
+            json!({ "kind": "pmmod-request", "detail": {} }),
+        ];
+        assert!(hit_failures(&others).is_empty());
+        for (kind, said) in [
+            (
+                "tcp",
+                "1 TCP connection(s) reached the loopback leak listener",
+            ),
+            (
+                "udp",
+                "1 UDP datagram(s) reached the loopback STUN listener",
+            ),
+            (
+                "CANARY",
+                "1 call(s) from a frame reached Tauri's IPC (the canary command)",
+            ),
+        ] {
+            assert_eq!(
+                hit_failures(&[json!({ "kind": kind, "detail": {} })]),
+                [said]
+            );
+        }
+    }
+
+    #[test]
+    fn the_dead_port_must_be_the_proxy_and_refuse_before_and_after() {
+        let dead = Some(engine::DEAD_PROXY_PORT);
+        assert!(judge_dead_port(dead, Some("refused"), Some("refused")).is_empty());
+        assert_eq!(
+            judge_dead_port(Some(4321), Some("refused"), Some("refused")).len(),
+            1
+        );
+        assert_eq!(
+            judge_dead_port(None, Some("refused"), Some("refused")).len(),
+            1
+        );
+        for answer in [Some("accepted"), Some("timed out (TimedOut)"), None] {
+            assert_eq!(judge_dead_port(dead, answer, Some("refused")).len(), 1);
+            assert_eq!(judge_dead_port(dead, Some("refused"), answer).len(), 1);
+        }
+    }
+
+    #[test]
+    fn only_1_starts_a_dead_port_run() {
+        use std::ffi::OsStr;
+        assert_eq!(dead_port_run(None), Ok(false));
+        assert_eq!(dead_port_run(Some(OsStr::new("1"))), Ok(true));
+        for refused in ["", "0", "true", "yes", " 1", "1 "] {
+            assert!(
+                dead_port_run(Some(OsStr::new(refused))).is_err(),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_fails_is_read_from_the_tcp_lines() {
+        // Linux 7.2's layout, from this machine.
+        let snmp = "Ip: Forwarding DefaultTTL\nIp: 1 64\n\
+            Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails \
+            EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n\
+            Tcp: 1 200 120000 -1 52937 3008 142 3801 31 2847853 2675960 2699 3 11732 0\n\
+            Udp: InDatagrams NoPorts\nUdp: 5 6\n";
+        assert_eq!(attempt_fails(snmp), Some(142));
+        assert_eq!(attempt_fails("Tcp: ActiveOpens AttemptFails\n"), None);
+        assert_eq!(attempt_fails("Tcp: ActiveOpens\nTcp: 4\n"), None);
+        assert_eq!(attempt_fails("Tcp: AttemptFails\nTcp: x\n"), None);
+        assert_eq!(attempt_fails(""), None);
+        if Platform::current() == Platform::Linux {
+            assert!(failed_connects().is_some());
+        } else {
+            assert_eq!(failed_connects(), None);
+        }
+    }
+
+    fn mark(variant: &str, name: &str, field: &str, n: Option<u64>) -> Value {
+        json!({ "kind": "mark", "detail": { "variant": variant, "mark": name, field: n } })
+    }
+
+    #[test]
+    fn the_failed_connects_are_counted_between_the_relaxed_frames_marks() {
+        let f = "failedConnectsSoFar";
+        let events = [
+            mark("relaxed", "open-end", f, Some(1)),
+            mark("strict", "open-begin", f, Some(2)),
+            mark("relaxed", "open-begin", f, Some(10)),
+            mark("relaxed", "open-end", f, Some(17)),
+            mark("relaxed", "open-end", f, Some(30)),
+        ];
+        assert_eq!(failed_connects_by_open_loads(&events), Some(7));
+        // The default run's count is a different field: none of it is read here.
+        assert_eq!(absorbed_by_open_loads(&events), None);
+        // A mark that couldn't read the count, or a missing mark, is no count.
+        let unread = [
+            mark("relaxed", "open-begin", f, None),
+            mark("relaxed", "open-end", f, Some(17)),
+        ];
+        assert_eq!(failed_connects_by_open_loads(&unread), None);
+        assert_eq!(
+            failed_connects_by_open_loads(&[mark("relaxed", "open-begin", f, Some(1))]),
+            None
+        );
+    }
+
+    /// The dead-port run's one check, on Linux, that the `relaxed` frame's open loads met the dead
+    /// port, through `judge_frames` itself: between its marks the kernel's failed TCP connections
+    /// must have risen by one per open load to a host the engine parsed, and a mark without the
+    /// count fails it. The harness holds only a `relaxed` run that passes everything else, and
+    /// nothing was served, so every case shares the same other failures and only this check's
+    /// differ.
+    #[test]
+    fn a_dead_port_run_owes_a_failed_connection_per_open_load_between_the_marks() {
+        if Platform::current() != Platform::Linux {
+            return;
+        }
+        let mut results: Vec<Value> = OPEN_LOADS
+            .iter()
+            .map(|name| json!({ "name": name, "out": "error" }))
+            .collect();
+        results.extend([
+            // Loopback parsed and the IDNA host didn't, as on ubuntu-latest: 6 of the 12 are owed.
+            json!({ "name": "open-parse", "out": { "loopback": true, "idna": false } }),
+            json!({ "name": "open-csp", "out": [] }),
+            // What a sealed frame shows, so the run fails nothing else of its own.
+            json!({ "name": "origin", "out": { "origin": "null" } }),
+            json!({ "name": "globals", "out": { "pmPreamble": true } }),
+            json!({ "name": "parent-dom", "out": "blocked: SecurityError" }),
+            json!({ "name": "parent-tauri", "out": "blocked: undefined" }),
+        ]);
+        let harness = json!({ "runs": [{
+            "variant": "relaxed",
+            "connected": true,
+            "probeFinished": true,
+            "results": results,
+        }] });
+        assert_eq!(
+            owed_by_open_loads(out(&harness["runs"][0], "open-parse")),
+            6
+        );
+        // A mark as `harness_mark` records one in a dead-port run: no sinkhole to count at, and
+        // the kernel's count, or null where /proc/net/snmp couldn't be read.
+        let mark = |ms: u64, name: &str, failed: Option<u64>| {
+            json!({ "ms": ms, "kind": "mark", "detail": {
+                "variant": "relaxed",
+                "mark": name,
+                "sinkholeAbsorbedSoFar": null,
+                "failedConnectsSoFar": failed,
+            } })
+        };
+        let judged = |events: &[Value]| {
+            let mut failures = Vec::new();
+            judge_frames(&harness, events, &HashMap::new(), true, &mut failures);
+            failures
+        };
+        let served_none = |variant: &str| {
+            [
+                format!("{variant}: its entry page rendered 0 times, not once"),
+                format!(
+                    "{variant}: its page's scripts were fetched 0 times, not once (a page without \
+                     its token rendered)"
+                ),
+            ]
+        };
+        let mut others: Vec<String> = served_none("strict").into();
+        others.push("strict: the harness has no run for it".to_owned());
+        others.extend(served_none("relaxed"));
+
+        // Risen by exactly what is owed: nothing from this check.
+        let met = [
+            mark(10, "open-begin", Some(100)),
+            mark(20, "open-end", Some(106)),
+        ];
+        assert_eq!(judged(&met), others);
+
+        // One short.
+        let short = [
+            mark(10, "open-begin", Some(100)),
+            mark(20, "open-end", Some(105)),
+        ];
+        let mut want = others.clone();
+        want.push(
+            "relaxed: only 5 TCP connection(s) failed between its marks (the kernel's \
+             AttemptFails), not one per open load to a host the engine parsed (6 of 12): \
+             something stopped them before the dead port"
+                .to_owned(),
+        );
+        assert_eq!(judged(&short), want);
+
+        // A mark without the count, or no open-end mark at all.
+        let bracket = "relaxed: its open loads weren't bracketed by failed-connection counts: no \
+                       open-begin mark followed by an open-end one, or /proc/net/snmp unreadable \
+                       at one";
+        let mut want = others.clone();
+        want.push(bracket.to_owned());
+        for events in [
+            vec![
+                mark(10, "open-begin", None),
+                mark(20, "open-end", Some(106)),
+            ],
+            vec![
+                mark(10, "open-begin", Some(100)),
+                mark(20, "open-end", None),
+            ],
+            vec![mark(10, "open-begin", Some(100))],
+        ] {
+            assert_eq!(judged(&events), want, "{events:?}");
+        }
+    }
+
+    /// The whole verdict of a dead-port run, through `judge` itself: a leak fails it, and so does a
+    /// sinkhole that took, while neither failure is there without its cause. The harness's report
+    /// is empty, so the run fails for that too; only these failures are looked for.
+    #[test]
+    fn a_dead_port_run_fails_on_a_leak_and_on_a_sinkhole_that_took() {
+        let platform = Platform::current();
+        if !platform.uses_sinkhole() {
+            return;
+        }
+        let state = Shared {
+            start: Instant::now(),
+            events: Mutex::new(Vec::new()),
+            tcp_port: 0,
+            udp_port: 0,
+            sinkhole: None,
+            dead_port: true,
+            proxy_port: engine::proxy_port(platform, None),
+            dead_port_before: Some("refused".to_owned()),
+            outcomes: Mutex::new(Vec::new()),
+            tickets: Mutex::new(HashMap::new()),
+            served: Mutex::new(HashMap::new()),
+            finished: AtomicBool::new(false),
+        };
+        assert!(SHARED.set(state).is_ok(), "only this test sets SHARED");
+        let expected = platform.expected_switches();
+        let unbound = with(
+            engine::sinkhole_unbound(&dead_port_bind_error()),
+            others_took(expected),
+        );
+        let took = with(SwitchOutcome::took(engine::SINKHOLE), others_took(expected));
+        let leak = [json!({ "ms": 1, "kind": "tcp", "detail": {} })];
+        let harness = json!({});
+        let ours = |f: &String| {
+            f.contains("leak listener")
+                || f.contains("sinkhole switch")
+                || f.contains("reads as sealed")
+                || f.contains("but for the sinkhole")
+                || f.contains("wasn't refused")
+                || f.contains("proxy port")
+        };
+
+        let clean = judge("reported", &harness, &[], &unbound, Some("refused"));
+        assert!(!clean.iter().any(ours), "{clean:?}");
+        assert!(!clean.is_empty(), "the empty harness report fails it");
+
+        let leaked = judge("reported", &harness, &leak, &unbound, Some("refused"));
+        assert!(leaked
+            .iter()
+            .any(|f| f == "1 TCP connection(s) reached the loopback leak listener"));
+
+        let sinkhole_took = judge("reported", &harness, &[], &took, Some("refused"));
+        assert!(sinkhole_took
+            .iter()
+            .any(|f| f.starts_with("the sinkhole switch should have failed once")));
+
+        let answered = judge("reported", &harness, &[], &unbound, Some("accepted"));
+        assert!(answered
+            .iter()
+            .any(|f| f.contains("at the end wasn't refused")));
+    }
 }

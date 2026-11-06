@@ -453,8 +453,9 @@ then on.
 The main window (`tauri.conf.json` says `"create": false`, and `setup()` builds it), the briefing
 panel (`tray.rs`) and the pop-out Calendar (`popout.rs`) are each built by `mods::build_window`
 (`src-tauri/src/mods/mod.rs`). It adds the navigation guard, the download refusal, the top-frame and
-WebRTC init scripts, WebView2's browser args (which point at PM's sinkhole proxy), and the engine
-switches (Mods spec §1.4). A test in that file fails if the config entry is created by Tauri again.
+WebRTC init scripts, WebView2's browser args (which point at PM's sinkhole proxy, or at a dead port
+when the sinkhole couldn't be bound), and the engine switches (Mods spec §1.4). A test in that file
+fails if the config entry is created by Tauri again.
 
 **Why.** WebView2 refuses a second webview in the same user-data folder with different browser args,
 and every PM window shares one. So on Windows a window built with a bare `WebviewWindowBuilder::build`
