@@ -3,11 +3,13 @@
 
 //! The sealed engine (Mods spec §1.4, "What PR-1 ships from this"): what keeps a mod's sandboxed
 //! frame off the network, and any document that isn't PM's out of a PM window's top frame. Every
-//! mitigation here but the dead-port fallback was measured closing its leak on all three engines by
-//! the step 0 spike; the ones that measured ineffective (macOS `proxyConfigurations`, Windows
-//! `--force-webrtc-ip-handling-policy`) are left out. The fallback ([`DEAD_PROXY_PORT`]) rests on
-//! what the engines document, and the sealed-frame job's dead-port run on Linux and Windows is what
-//! measures it.
+//! mitigation here but two was measured closing its leak on all three engines by the step 0 spike;
+//! the ones that measured ineffective (macOS `proxyConfigurations`, Windows
+//! `--force-webrtc-ip-handling-policy`) are left out. The two exceptions: the dead-port fallback
+//! ([`DEAD_PROXY_PORT`]) rests on what the engines document, and the sealed-frame job's dead-port run
+//! on Linux and Windows is what measures it; the fraudulent-website warning switch
+//! ([`MACOS_FRAUD_WARNING_OFF`]) is held only by its read-back, which is all the sealed-frame job can
+//! check, since no job sees a Safe Browsing lookup.
 //!
 //! This file names nothing in PM's crate, so the sealed-frame regression app (`tests/sealed-frame`)
 //! can include it with `#[path]` and measure exactly what ships. PM's wiring (its state, its window
@@ -120,6 +122,7 @@ impl Platform {
             Self::Windows => &[SINKHOLE, WINDOWS_PROXY_ARGS],
             Self::MacOs => &[
                 MACOS_PEER_CONNECTION_OFF,
+                MACOS_FRAUD_WARNING_OFF,
                 MACOS_FEATURES[0],
                 MACOS_FEATURES[1],
                 MACOS_FEATURES[2],
@@ -145,6 +148,16 @@ pub const LINUX_WEBRTC_OFF: &str = "webkitgtk.enable-webrtc-off";
 pub const WINDOWS_PROXY_ARGS: &str = "webview2.proxy-args";
 /// WKWebView: `-[WKPreferences _setPeerConnectionEnabled:NO]` (SPI).
 pub const MACOS_PEER_CONNECTION_OFF: &str = "wkwebview.peer-connection-off";
+/// WKWebView: `-[WKPreferences setFraudulentWebsiteWarningEnabled:NO]`, public API since macOS
+/// 10.15, PM's minimum. The warning is on by default, and for it WebKit checks each address a
+/// webview is sent to against Apple's Safe Browsing list, which it keeps on the device; when an
+/// address matches, it may send information calculated from that address (a hash prefix) to Google
+/// (through Apple's proxy since macOS 11.3), or to Tencent in some regions. PM's pages are `tauri` and its mods
+/// `pmmod`: the navigation guard refuses every other navigation and [`MACOS_NETWORK_RULES`] blocks
+/// every web load, so a check could start only on a navigation to the web that PM refuses, and
+/// whether WebKit starts one before PM's navigation delegate has refused it is unmeasured. So the
+/// warning is switched off, and counts only if it reads back off ([`fraud_warning_outcome`]).
+pub const MACOS_FRAUD_WARNING_OFF: &str = "wkwebview.fraudulent-website-warning-off";
 /// WKWebView: the preference features switched off through `-[WKPreferences _setEnabled:forFeature:]`
 /// (SPI), by the keys `+[WKPreferences _features]` lists them under. These four closed preconnect.
 pub const MACOS_FEATURES: [&str; 4] = [
@@ -273,6 +286,42 @@ impl SwitchOutcome {
             took: false,
             detail: detail.into(),
         }
+    }
+}
+
+/// What switching WKWebView's fraudulent-website warning off found (see
+/// [`MACOS_FRAUD_WARNING_OFF`]).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FraudWarningRead {
+    /// WebKit has no `-[WKPreferences setFraudulentWebsiteWarningEnabled:]`.
+    NoSetter,
+    /// It has the setter (switched off all the same) but no `isFraudulentWebsiteWarningEnabled` to
+    /// read it back.
+    NoGetter,
+    /// The getter read on after the warning was switched off.
+    StillOn,
+    /// The getter read off.
+    Off,
+}
+
+/// The fraudulent-website-warning switch: taken only if the warning reads back off. Setter and
+/// getter are public API in every macOS PM runs on, so a WebKit without either is one PM doesn't
+/// know, and nothing says the warning is off there: unlike the peer-connection switch, a missing
+/// getter doesn't count.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub fn fraud_warning_outcome(read: FraudWarningRead) -> SwitchOutcome {
+    let failed = |why: &str| SwitchOutcome::failed(MACOS_FRAUD_WARNING_OFF, why);
+    match read {
+        FraudWarningRead::Off => SwitchOutcome::took(MACOS_FRAUD_WARNING_OFF),
+        FraudWarningRead::StillOn => failed("still on after switching it off"),
+        FraudWarningRead::NoSetter => {
+            failed("WebKit has no -[WKPreferences setFraudulentWebsiteWarningEnabled:]")
+        }
+        FraudWarningRead::NoGetter => failed(
+            "switched off, but WebKit has no -[WKPreferences isFraudulentWebsiteWarningEnabled] to \
+             read it back",
+        ),
     }
 }
 
@@ -1019,6 +1068,20 @@ pub mod webkitgtk {
     /// fail. The spike measured preconnect leaking with it off anyway; the proxy is what stops that.
     /// A mod's documents also carry `X-DNS-Prefetch-Control: off` (headers.rs), but the WebKit
     /// change behind the deprecation stopped reading it (see [`super::MACOS_DNS_PREFETCHING`]).
+    ///
+    /// Nothing else here asks anyone anything on PM's behalf, so there is nothing else to switch:
+    /// - no Safe Browsing: WebKit builds it for Apple's platforms only, so WebKitGTK has no
+    ///   fraudulent-website check to send addresses to (WKWebView's is switched off, see
+    ///   [`super::MACOS_FRAUD_WARNING_OFF`]);
+    /// - no crash reports of its own: a crashed web process is only the `web-process-terminated`
+    ///   signal, and what the system's own crash reporter does with it is the system's setting;
+    /// - no permission granted that could tell anything: PM sets no permission handler, so wry
+    ///   connects none to `permission-request`, and WebKitGTK denies every request nobody handles
+    ///   (location, camera, microphone, screen, notifications, clipboard, device info), all but
+    ///   pointer lock's;
+    /// - hyperlink auditing (`<a ping>`) is left on: a ping is an ordinary web request, which meets
+    ///   the proxy as every other load does (a DNS prefetch is a lookup, not a load); and
+    ///   `enable-hyperlink-auditing` has been deprecated since 2.50.
     pub fn seal(
         webview: &webkit2gtk::WebView,
         proxy_uri: Option<&str>,
@@ -1067,15 +1130,20 @@ pub mod webkitgtk {
     }
 }
 
-/// WKWebView. Every call is SPI, so each is made only after `respondsToSelector:` says the selector
-/// exists, and a switch whose selector is missing is reported as not taken. Read back where WebKit has
-/// a getter.
+/// WKWebView. Most of the switches are SPI. Each switch's own setter and getter, public API's too,
+/// and `+[WKPreferences _features]`, the rule list store's compile and the controller's
+/// `addContentRuleList:` are sent only after `respondsToSelector:` says the selector exists, and a
+/// switch whose selector is missing is reported as not taken; read back where WebKit has a getter.
+/// The plain accessors on the way to them (`configuration`, `preferences`, `userContentController`,
+/// `+defaultStore`, the feature list's `count` and `objectAtIndex:`, and `_WKFeature`'s `key`) are
+/// sent unchecked.
 #[cfg(target_os = "macos")]
 pub mod wkwebview {
     use super::{
-        content_rules_json, macos_feature_outcomes, names_dns_or_prefetch, DnsPrefetchSpi,
-        FeatureRead, ListedFeatures, SwitchOutcome, CONTENT_RULE_LIST_ID, MACOS_FEATURES,
-        MACOS_LINK_DNS_PREFETCH, MACOS_NETWORK_RULES, MACOS_PEER_CONNECTION_OFF,
+        content_rules_json, fraud_warning_outcome, macos_feature_outcomes, names_dns_or_prefetch,
+        DnsPrefetchSpi, FeatureRead, FraudWarningRead, ListedFeatures, SwitchOutcome,
+        CONTENT_RULE_LIST_ID, MACOS_FEATURES, MACOS_FRAUD_WARNING_OFF, MACOS_LINK_DNS_PREFETCH,
+        MACOS_NETWORK_RULES, MACOS_PEER_CONNECTION_OFF,
     };
     use block2::RcBlock;
     use objc2::rc::Retained;
@@ -1087,10 +1155,10 @@ pub mod wkwebview {
     /// Where the outcomes go once every switch has reported.
     pub type Done = Box<dyn FnOnce(Vec<SwitchOutcome>) + Send>;
 
-    /// Switch off WebRTC's peer connections and the four preconnect and prefetch features in this
-    /// webview's preferences, then add the content rule list that blocks its network. `done` gets
-    /// every outcome once the rule list has compiled (or failed to); if WebKit never calls back, it
-    /// never runs, and the engine stays unsealed.
+    /// Switch off WebRTC's peer connections, the fraudulent-website warning and the four preconnect
+    /// and prefetch features in this webview's preferences, then add the content rule list that
+    /// blocks its network. `done` gets every outcome once the rule list has compiled (or failed
+    /// to); if WebKit never calls back, it never runs, and the engine stays unsealed.
     ///
     /// # Safety
     ///
@@ -1110,7 +1178,10 @@ pub mod wkwebview {
         };
         let mut out = if prefs.is_null() {
             let why = "the webview has no preferences";
-            let mut out = vec![SwitchOutcome::failed(MACOS_PEER_CONNECTION_OFF, why)];
+            let mut out = vec![
+                SwitchOutcome::failed(MACOS_PEER_CONNECTION_OFF, why),
+                SwitchOutcome::failed(MACOS_FRAUD_WARNING_OFF, why),
+            ];
             out.extend(
                 MACOS_FEATURES
                     .iter()
@@ -1119,6 +1190,7 @@ pub mod wkwebview {
             out
         } else {
             let mut out = vec![unsafe { peer_connection_off(prefs) }];
+            out.push(unsafe { fraud_warning_off(prefs) });
             out.extend(unsafe { features_off(prefs) });
             out
         };
@@ -1275,6 +1347,29 @@ pub mod wkwebview {
             }
         }
         SwitchOutcome::took(MACOS_PEER_CONNECTION_OFF)
+    }
+
+    /// The fraudulent-website warning, switched off and read back (see
+    /// [`super::MACOS_FRAUD_WARNING_OFF`]).
+    unsafe fn fraud_warning_off(prefs: *mut AnyObject) -> SwitchOutcome {
+        let read = unsafe {
+            if !responds(prefs, sel!(setFraudulentWebsiteWarningEnabled:)) {
+                FraudWarningRead::NoSetter
+            } else {
+                let _: () = msg_send![prefs, setFraudulentWebsiteWarningEnabled: Bool::NO];
+                if !responds(prefs, sel!(isFraudulentWebsiteWarningEnabled)) {
+                    FraudWarningRead::NoGetter
+                } else {
+                    let on: Bool = msg_send![prefs, isFraudulentWebsiteWarningEnabled];
+                    if on.as_bool() {
+                        FraudWarningRead::StillOn
+                    } else {
+                        FraudWarningRead::Off
+                    }
+                }
+            }
+        };
+        fraud_warning_outcome(read)
     }
 
     /// The four features, by the `_features` route, with DNS prefetching's own setter where that
@@ -1752,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn each_engine_expects_the_switches_the_spike_measured() {
+    fn each_engine_expects_its_switches() {
         // WebKitGTK's DNS-prefetching setting isn't one: since 2.48 its read-back can't fail.
         assert_eq!(
             Platform::Linux.expected_switches(),
@@ -1762,10 +1857,13 @@ mod tests {
             Platform::Windows.expected_switches(),
             [SINKHOLE, WINDOWS_PROXY_ARGS]
         );
+        // The fraudulent-website warning isn't a network wall the spike measured, but a lookup
+        // service PM's windows have no use for (see MACOS_FRAUD_WARNING_OFF).
         assert_eq!(
             Platform::MacOs.expected_switches(),
             [
                 MACOS_PEER_CONNECTION_OFF,
+                "wkwebview.fraudulent-website-warning-off",
                 "LinkPreconnect",
                 "LinkPreconnectEarlyHintsEnabled",
                 "LinkPrefetchEnabled",
@@ -1777,6 +1875,91 @@ mod tests {
         // network wall is the content rule list.
         assert!(!Platform::MacOs.uses_sinkhole());
         assert!(Platform::Linux.uses_sinkhole() && Platform::Windows.uses_sinkhole());
+    }
+
+    #[test]
+    fn every_expected_switch_has_a_name_of_its_own() {
+        // The verdict goes by name: two switches sharing one would let either's report stand for
+        // both.
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            let expected = platform.expected_switches();
+            let names: std::collections::HashSet<_> = expected.iter().collect();
+            assert_eq!(names.len(), expected.len(), "{platform:?}: {expected:?}");
+        }
+    }
+
+    /// A macOS report as `wkwebview::seal` makes it: the peer-connection and fraudulent-website
+    /// switches taken, then `features` (MACOS_FEATURES' four) and the rule list's `rules`, last.
+    fn macos_report(
+        features: impl IntoIterator<Item = SwitchOutcome>,
+        rules: SwitchOutcome,
+    ) -> Vec<SwitchOutcome> {
+        let mut all = vec![
+            SwitchOutcome::took(MACOS_PEER_CONNECTION_OFF),
+            SwitchOutcome::took(MACOS_FRAUD_WARNING_OFF),
+        ];
+        all.extend(features);
+        all.push(rules);
+        all
+    }
+
+    #[test]
+    fn a_macos_report_names_every_expected_switch_in_order() {
+        let all = macos_report(
+            MACOS_FEATURES.map(SwitchOutcome::took),
+            SwitchOutcome::took(MACOS_NETWORK_RULES),
+        );
+        let names: Vec<_> = all.iter().map(|o| o.name).collect();
+        assert_eq!(names, Platform::MacOs.expected_switches());
+        assert!(verdict(Platform::MacOs.expected_switches(), &all).sealed);
+    }
+
+    #[test]
+    fn the_fraudulent_website_warning_counts_only_if_it_reads_back_off() {
+        assert_eq!(
+            fraud_warning_outcome(FraudWarningRead::Off),
+            SwitchOutcome::took(MACOS_FRAUD_WARNING_OFF)
+        );
+        // Public API in every macOS PM runs on, so a missing getter doesn't count either.
+        for (read, detail) in [
+            (FraudWarningRead::StillOn, "still on after switching it off"),
+            (
+                FraudWarningRead::NoSetter,
+                "WebKit has no -[WKPreferences setFraudulentWebsiteWarningEnabled:]",
+            ),
+            (
+                FraudWarningRead::NoGetter,
+                "switched off, but WebKit has no -[WKPreferences \
+                 isFraudulentWebsiteWarningEnabled] to read it back",
+            ),
+        ] {
+            let outcome = fraud_warning_outcome(read);
+            assert_eq!(
+                outcome,
+                SwitchOutcome::failed(MACOS_FRAUD_WARNING_OFF, detail),
+                "{read:?}"
+            );
+            // Everything else took: this alone unseals the engine, and says why.
+            let mut all = all_took(Platform::MacOs);
+            all.retain(|o| o.name != MACOS_FRAUD_WARNING_OFF);
+            all.push(outcome);
+            let v = verdict(Platform::MacOs.expected_switches(), &all);
+            assert!(!v.sealed, "{read:?}");
+            assert_eq!(
+                v.reasons,
+                [format!(
+                    "wkwebview.fraudulent-website-warning-off didn't take: {detail}"
+                )],
+                "{read:?}"
+            );
+        }
+        // Never reported (a seal that forgot it): unsealed too.
+        let mut all = all_took(Platform::MacOs);
+        all.retain(|o| o.name != MACOS_FRAUD_WARNING_OFF);
+        assert_eq!(
+            verdict(Platform::MacOs.expected_switches(), &all).reasons,
+            ["wkwebview.fraudulent-website-warning-off was never applied"]
+        );
     }
 
     #[test]
@@ -1866,13 +2049,21 @@ mod tests {
                  features to go by, LinkDNSPrefetchEnabled may still be there to switch off"
             )
         );
-        // The engine stays unsealed unless the switch took.
-        let mut all = vec![SwitchOutcome::took(MACOS_PEER_CONNECTION_OFF)];
-        all.extend(macos_feature_outcomes(Ok(listed(false, &[])), || {
-            DnsPrefetchSpi::NoSetter
-        }));
-        all.push(SwitchOutcome::took(MACOS_NETWORK_RULES));
-        assert!(!verdict(Platform::MacOs.expected_switches(), &all).sealed);
+        // The engine stays unsealed unless the switch took, and that switch is the one reason.
+        let all = macos_report(
+            macos_feature_outcomes(Ok(listed(false, &[])), || DnsPrefetchSpi::NoSetter),
+            SwitchOutcome::took(MACOS_NETWORK_RULES),
+        );
+        let v = verdict(Platform::MacOs.expected_switches(), &all);
+        assert!(!v.sealed);
+        assert_eq!(
+            v.reasons,
+            [
+                "DNSPrefetchingEnabled didn't take: WebKit lists no such feature; WebKit has no \
+                 -[WKPreferences _setDNSPrefetchingEnabled:]; no listed feature mentions DNS or \
+                 prefetch"
+            ]
+        );
     }
 
     /// Where the preference is gone, DNS prefetching is left to the content rule list: sealed with
@@ -1881,9 +2072,10 @@ mod tests {
     #[test]
     fn a_removed_dns_prefetching_preference_leaves_the_seal_to_the_rule_list() {
         let macos = |dns: DnsPrefetchSpi, rules: SwitchOutcome| {
-            let mut all = vec![SwitchOutcome::took(MACOS_PEER_CONNECTION_OFF)];
-            all.extend(macos_feature_outcomes(Ok(listed(false, &[])), || dns));
-            all.push(rules);
+            let all = macos_report(
+                macos_feature_outcomes(Ok(listed(false, &[])), || dns),
+                rules,
+            );
             verdict(Platform::MacOs.expected_switches(), &all)
         };
         let v = macos(
@@ -1964,9 +2156,10 @@ mod tests {
         assert!(both(dns_took, FeatureRead::Off).took);
         // The seal: taken with the rule list, unsealed when it reads on.
         let macos = |read: FeatureRead| {
-            let mut all = vec![SwitchOutcome::took(MACOS_PEER_CONNECTION_OFF)];
-            all.extend(macos_feature_outcomes(Ok(with_link(read)), never));
-            all.push(SwitchOutcome::took(MACOS_NETWORK_RULES));
+            let all = macos_report(
+                macos_feature_outcomes(Ok(with_link(read)), never),
+                SwitchOutcome::took(MACOS_NETWORK_RULES),
+            );
             verdict(Platform::MacOs.expected_switches(), &all)
         };
         assert!(macos(FeatureRead::Off).sealed);
