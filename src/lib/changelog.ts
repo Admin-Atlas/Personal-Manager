@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.175.1-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "On Windows, the keys PM saves for the first time (an API key you add where none was saved, an account you connect for the first time, the database key of a new install) stay on this computer. Before, on a work or school PC with a roaming profile, Windows could copy them to every other computer you sign in to. A key saved before keeps the setting it had, even when you replace it or reconnect the account, so nothing changes for it. There's nothing to do, and nothing needs reconnecting.",
+    ],
+  },
+  {
     version: "3.175.0-alpha",
     date: "2026-11-06",
     highlights: [

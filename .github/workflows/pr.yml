@@ -108,7 +108,10 @@ jobs:
   # a PR instead of a release. It also runs the `vault::` test subset (only), so the
   # shared-folder ACL logic — icacls lockdown, effective-access probes, the verify-then-
   # commit relocate — is exercised on a real NTFS + icacls host, the one place those tests
-  # mean anything (the Linux job's tempfs can't reproduce a Windows DACL lockout).
+  # mean anything (the Linux job's tempfs can't reproduce a Windows DACL lockout). The
+  # `secrets::` subset likewise runs against the real Credential Manager: a credential PM
+  # writes new stays on this computer, and one already saved keeps its persistence (each
+  # test uses a service of its own, so it never touches PM's real entries).
   #
   # NB: we invoke cargo DIRECTLY, not through `just`. The justfile forces `bash -c`,
   # and Git-Bash's MSYS perl shadows Strawberry Perl, breaking the vendored-OpenSSL
@@ -144,6 +147,8 @@ jobs:
         run: "cargo test --lib --manifest-path src-tauri/Cargo.toml vault::"
       - name: "cargo test (mods:: — the install ledger's folders, renames and sweep on real NTFS)"
         run: "cargo test --lib --manifest-path src-tauri/Cargo.toml mods::"
+      - name: "cargo test (secrets:: — Credential Manager writes: new ones stay on this computer)"
+        run: "cargo test --lib --manifest-path src-tauri/Cargo.toml secrets::"
 
   # --- backend on macOS: the shipped-OS compile/lint gate for the mac arm ---
   # Both the Linux `rust` and Windows `rust-windows` jobs compile out every

@@ -29,10 +29,12 @@ fn dev_override(var: &str) -> Option<std::ffi::OsString> {
 /// We resolve the *machine-local* base (`%LOCALAPPDATA%` on Windows,
 /// `~/Library/Application Support` on macOS) and join a human-readable
 /// `"Personal Manager"` ourselves, rather than using `app_data_dir()`. Two reasons:
-/// the data is large and machine-specific (the store + Python venv) and its
-/// decryption key lives in the non-roaming OS keychain, so the local base is the
-/// correct home; and the friendly name is far easier for the user to find and back
-/// up. The folder name is deliberately decoupled from the bundle identifier
+/// the data is large and machine-specific (the store + Python venv) and the
+/// decryption key PM saves for it stays in this computer's OS keychain (on
+/// Windows PM writes a new credential to stay local rather than roam with the
+/// user's profile, and leaves one an older PM saved to roam as it was:
+/// `secrets/wincred.rs`), so the local base is the correct home; and the
+/// friendly name is far easier for the user to find and back up. The folder name is deliberately decoupled from the bundle identifier
 /// (`org.itsatlas.pm`) — the identifier stays fixed because the keychain service is
 /// keyed to it (`secrets.rs`), so it must never be renamed.
 pub fn data_dir(app: &AppHandle) -> Result<PathBuf> {

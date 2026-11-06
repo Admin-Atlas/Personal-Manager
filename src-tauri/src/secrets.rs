@@ -15,6 +15,8 @@ use zeroize::Zeroizing;
 use crate::error::{Error, Result};
 use crate::secret::Secret;
 
+mod wincred;
+
 // Reverse-DNS to match the Tauri bundle identifier (`tauri.conf.json`). Keep the
 // two in step: renaming this orphans every existing keychain entry (including the
 // DB key, which makes the old encrypted store unreadable).
@@ -100,7 +102,27 @@ fn kc_get(name: &str) -> Result<Option<String>> {
 }
 
 fn kc_set(name: &str, value: &str) -> Result<()> {
-    entry(name)?.set_password(value).map_err(Error::from)
+    kc_set_from(name, value, None)
+}
+
+/// [`kc_set`], for a value that the item `moved_from` held until now (the bundle being adopted).
+fn kc_set_from(name: &str, value: &str, moved_from: Option<&str>) -> Result<()> {
+    let item = entry(name)?;
+    // Windows: in keyring's exact shape, but a new credential stays on this computer instead of
+    // roaming with the user's profile, which keyring's own write can't be told. One already saved
+    // keeps the persistence it has, and a new one that takes over `moved_from`'s value takes that
+    // one's, so a secret saved to roam keeps roaming (see `wincred`).
+    #[cfg(windows)]
+    let written = {
+        let from = moved_from.map(entry).transpose()?;
+        wincred::set_password(&item, value, from.as_ref())
+    };
+    #[cfg(not(windows))]
+    let written = {
+        let _ = moved_from;
+        item.set_password(value)
+    };
+    written.map_err(Error::from)
 }
 
 /// Remove a keychain item; absent is success (so cleanup/disconnect is idempotent).
@@ -166,7 +188,9 @@ fn decode_bundle(raw: &str) -> Option<HashMap<String, Secret>> {
 /// is by definition the newer of the two — the bundle is only ever a leftover. Each write is read
 /// back before it counts, and the caller drops the bundle only on a clean sweep, so a keychain that
 /// fails mid-migration simply keeps the bundle to retry at next launch. No secret — the DB key above
-/// all — can be orphaned by an interrupted run.
+/// all — can be orphaned by an interrupted run. On Windows each new item is saved the way the bundle
+/// was (`kc_set_from`): a bundle that roamed with the user's profile is another computer's copy too,
+/// and dropping it once its values sat only on this computer would take them off that one.
 fn adopt_bundle(bundled: &HashMap<String, Secret>) -> bool {
     let mut all_recovered = true;
     for (name, value) in bundled {
@@ -178,7 +202,9 @@ fn adopt_bundle(bundled: &HashMap<String, Secret>) -> bool {
                 continue;
             }
         }
-        if kc_set(name, value.expose()).is_err() || !matches!(kc_get(name), Ok(Some(_))) {
+        if kc_set_from(name, value.expose(), Some(BUNDLE_KEY)).is_err()
+            || !matches!(kc_get(name), Ok(Some(_)))
+        {
             all_recovered = false;
         }
     }

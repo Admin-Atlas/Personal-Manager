@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.175.0-alpha"
+version = "3.175.1-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -160,6 +160,11 @@ semver = "1"
 # encryption buys nothing against the actual threat model.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# PM's own Credential Manager writes (src/secrets/wincred.rs), so a new credential stays on this
+# computer: keyring 3 hard-codes CRED_PERSIST_ENTERPRISE, which roams with a domain roaming
+# profile. The windows-sys version and the two features keyring itself builds, so no new package,
+# feature or licence.
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 # Windows Hello for the optional, opt-in app-lock (a soft UI gate — see applock.rs).
 # Microsoft-maintained bindings; windows-future supplies the `IAsyncOperation::get()` we block on.
 # Held on 0.61 / windows-future 0.2. Since Tauri 2.12 the Tauri stack resolves windows 0.62, and
