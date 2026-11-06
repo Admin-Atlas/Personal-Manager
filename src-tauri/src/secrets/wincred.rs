@@ -87,14 +87,14 @@ fn persistence(found: Found, moved_from: Option<Found>) -> Result<u32, String> {
 
 /// A password as keyring stores it on Windows: UTF-16, little-endian, with no terminator. `None` when
 /// it is over Credential Manager's blob limit, the same check keyring refuses a write with.
-fn utf16le(password: &str) -> Option<Zeroizing<Vec<u8>>> {
-    let units = password.encode_utf16().count();
+fn utf16le(text: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let units = text.encode_utf16().count();
     if units * 2 > MAX_BLOB as usize {
         return None;
     }
     // Sized up front, so the buffer never reallocates and leaves a partial copy behind.
     let mut bytes = Zeroizing::new(Vec::with_capacity(units * 2));
-    bytes.extend(password.encode_utf16().flat_map(u16::to_le_bytes));
+    bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
     Some(bytes)
 }
 
