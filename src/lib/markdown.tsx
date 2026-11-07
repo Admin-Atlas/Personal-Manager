@@ -17,8 +17,9 @@
 //      dropped rather than parsed (react-markdown's default).
 //   2. `rehype-sanitize` runs LAST with a GitHub-flavoured allowlist schema — it strips any unsafe
 //      element/attribute/URL protocol that slipped through, including `javascript:`/`data:` hrefs.
-//   3. `urlTransform` (`safeUrl`) gates every link/image URL to an http/https/mailto allowlist as the
-//      hast tree is turned into React elements — i.e. AFTER layer 2, not before it.
+//   3. `urlTransform` (`safeUrl`) gates every link URL to an http/https/mailto allowlist as the
+//      hast tree is turned into React elements — i.e. AFTER layer 2, not before it — and gives an
+//      image no source at all, which `MarkdownImage` then renders as its alt text.
 //
 // Rendered links carry `target="_blank"`, and the shared `useExternalLinks` hook — mounted by BOTH
 // webview roots (App and PopoverRoot) — routes their clicks to the OS browser through the
@@ -73,8 +74,16 @@ export const SCHEMA = {
 // Relative/in-page targets are safe; absolute URLs must match the protocol allowlist or are dropped.
 // Exported for the T-07 unit test — this is the pure function that neutralises a hostile `javascript:`
 // (or any non-allowlisted) href to an empty string.
+//
+// `key` is the attribute react-markdown is filling. A `src` (an image's) is always emptied: Markdown
+// that PM renders is other people's — an ingested document, a model's answer, a calendar feed's
+// description — and a remote image in it is a read receipt and an IP beacon each time it is shown,
+// which a prompt-injected answer can also use to carry text out in its URL. The CSP's
+// `img-src 'self' data: blob:` refuses that request today; this keeps PM from depending on the CSP
+// for it.
 const ABSOLUTE_ALLOWED = /^(https?:|mailto:)/i;
-export function safeUrl(url: string): string {
+export function safeUrl(url: string, key?: string): string {
+  if (key === "src") return "";
   // A protocol-relative target carries no scheme, so neither the allowlist below nor the sanitizer's
   // protocol check (which bails out "allowed" when there is no colon) ever sees one — yet the browser
   // resolves it against the PAGE's protocol, i.e. straight off-origin: `//evil.example/x` from
@@ -114,6 +123,17 @@ export const REMARK_PLUGINS_WITH_DASH_LISTS: RemarkPlugins = [remarkGfm, remarkD
 export const REMARK_PLUGINS_PLAIN_LINES: RemarkPlugins = [remarkGfm, remarkPlainLines];
 
 /**
+ * An image in rendered Markdown, which never has a source (`safeUrl`): it shows as its alt text in
+ * brackets, as `[chart]`, so the reader knows something was there, and as nothing when it has none,
+ * rather than as a broken-image box.
+ */
+function MarkdownImage({ alt }: { alt?: string }) {
+  return alt ? <span className="pm-markdown-image">[{alt}]</span> : null;
+}
+
+const COMPONENTS = { img: MarkdownImage };
+
+/**
  * Render user-authored Markdown through the app's single sanitizing boundary. Element styling lives in
  * the `.pm-markdown` block in `src/index.css` (bound to design tokens — no typography plugin), so this
  * component stays purely about the parse+sanitize pipeline.
@@ -143,6 +163,7 @@ export function Markdown({
         }
         rehypePlugins={REHYPE_PLUGINS}
         urlTransform={safeUrl}
+        components={COMPONENTS}
       >
         {children}
       </ReactMarkdown>

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Bobby Yu
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { formatWhen } from "../../lib/format";
 import {
@@ -136,13 +136,14 @@ export function AiModelsSettings({
     };
   }, []);
 
-  // Cost summary loads on its own (its first read may trigger a daily pricing fetch), so it never
-  // blocks the keys/models from showing.
-  useEffect(() => {
+  // Cost summary loads on its own (its first read may trigger a daily pricing fetch, which the backend
+  // makes only with an OpenRouter key stored), so it never blocks the keys/models from showing.
+  const loadCost = useCallback(() => {
     costSummary()
       .then(setCost)
       .catch(() => {});
   }, []);
+  useEffect(loadCost, [loadCost]);
 
   // The green "Saved" confirmations fade a couple of seconds after a key is stored.
   useEffect(() => {
@@ -165,6 +166,8 @@ export function AiModelsSettings({
     setError(null);
     try {
       await setOpenRouterKey(trimmed);
+      // The first key saved here is what lets the price refresh run (`ensure_pricing_fresh`).
+      loadCost();
       setKey("");
       setKeyAlreadySet(true);
       setKeySaved(true);
@@ -178,6 +181,8 @@ export function AiModelsSettings({
     setError(null);
     try {
       await setOpenRouterBackgroundKey(trimmed);
+      // The first key saved here is what lets the price refresh run (`ensure_pricing_fresh`).
+      loadCost();
       setBgKey("");
       setBgKeyAlreadySet(true);
       setBgKeySaved(true);
@@ -575,8 +580,11 @@ export function AiModelsSettings({
             </p>
             <p>
               Each model reply reports the tokens it used (your prompt + its reply). PM logs those
-              per call. It fetches OpenRouter&apos;s public price list about once a day and caches
-              it — no extra model call, and your API key is never used for it.
+              per call. Once an OpenRouter key is saved, it fetches OpenRouter&apos;s public price
+              list about once a day and caches it — no extra model call, and your API key is never
+              used for it. Without a key it updates these prices only when you press Refresh prices
+              (opening the model list to add a model still loads OpenRouter&apos;s public
+              catalogue).
             </p>
             <p>
               Where OpenRouter reports a call&apos;s actual cost (reflecting any prompt-cache

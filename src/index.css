@@ -596,10 +596,8 @@ body {
   padding: 0;
   font-size: 0.75rem;
 }
-.pm-markdown img {
-  max-width: 100%;
-  border-radius: var(--radius-sm);
-  margin: 0.5rem 0;
+.pm-markdown-image {
+  color: var(--ink3);
 }
 .pm-markdown table {
   display: block;

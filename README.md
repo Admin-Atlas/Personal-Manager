@@ -299,8 +299,16 @@ and Python dependencies (your local model runner, if you use one, fetches model 
 PM does not); and — only if you turn them on — a calendar fetch (plus the event changes you make,
 if you turn on editing for a Google account), a read-only sync of the cloud accounts you connect
 (Google Drive, Google Sheets, OneDrive), and encrypted backups to your
-chosen cloud (Proton Drive or Google Drive). Nothing else leaves the machine: there is no
-telemetry, analytics, or crash reporting. The repo holds code only — see
+chosen cloud (Proton Drive or Google Drive). Nothing else leaves the machine from PM itself: it
+has no telemetry, analytics, or crash reporting, and it switches off the usage reporting of the
+libraries in its document engine. Two pieces PM relies on do reporting of their own. On Windows,
+PM's windows are drawn by Microsoft's Edge WebView2 Runtime, part of Windows, which sends Microsoft
+its required diagnostic data whatever Windows' settings say (no app can turn that off), more when
+Windows' optional diagnostic data is on, and a crash report if one of its processes crashes. And Proton Drive's command-line tool, once installed, reports to Proton if your
+Proton account's "Collect usage diagnostics" was on when the tool last signed in, and can send a
+crash report if it fails while starting up, before it has read that setting. Settings → Backup
+says where to turn the setting off; then disconnect and reconnect Proton Drive there, since the tool
+reads it only when it signs in. The repo holds code only — see
 [`SECURITY.md`](SECURITY.md) for the security policy and how to report an issue privately.
 
 ## Contributing & releasing

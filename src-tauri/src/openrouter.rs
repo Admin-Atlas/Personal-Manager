@@ -27,6 +27,12 @@ const ZDR_ENDPOINT: &str = "https://openrouter.ai/api/v1/endpoints/zdr";
 /// deadline is deliberately NOT here: it differs per call (30 s catalogue, 120 s `complete`, and none
 /// for a healthy stream — see `stream_chat`), so each site sets its own `.timeout()` on the request
 /// builder. Building a client that only sets timeouts is effectively infallible, hence `expect`.
+///
+/// No request carries OpenRouter's app-attribution headers (`HTTP-Referer`, `X-Title`, or any
+/// `X-OpenRouter-*`): OpenRouter uses them to put an app in its public usage rankings and to keep
+/// per-app analytics, so they would publish how much PM's users use which models. PM sets no
+/// `User-Agent` either, and reqwest sends none of its own. `no_request_carries_app_attribution`
+/// keeps it that way.
 static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -262,11 +268,6 @@ pub async fn fetch_catalogue() -> Result<Vec<ModelDetail>> {
     let response = HTTP
         .get(MODELS_ENDPOINT)
         .timeout(std::time::Duration::from_secs(30))
-        .header(
-            "HTTP-Referer",
-            "https://github.com/itsAtlas-org/Personal-Manager",
-        )
-        .header("X-Title", "PM")
         .send()
         .await?;
 
@@ -340,11 +341,6 @@ async fn fetch_zdr_model_ids() -> Result<HashSet<String>> {
     let response = HTTP
         .get(ZDR_ENDPOINT)
         .timeout(std::time::Duration::from_secs(30))
-        .header(
-            "HTTP-Referer",
-            "https://github.com/itsAtlas-org/Personal-Manager",
-        )
-        .header("X-Title", "PM")
         .send()
         .await?;
 
@@ -553,12 +549,6 @@ where
     let response = HTTP
         .post(ENDPOINT)
         .bearer_auth(api_key)
-        // Optional attribution headers OpenRouter recognises.
-        .header(
-            "HTTP-Referer",
-            "https://github.com/itsAtlas-org/Personal-Manager",
-        )
-        .header("X-Title", "PM")
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .json(&body)
         .send()
@@ -694,11 +684,6 @@ pub async fn complete(
         // A total deadline fits here (unlike `stream_chat`): the whole answer arrives at once.
         .timeout(std::time::Duration::from_secs(120))
         .bearer_auth(api_key)
-        .header(
-            "HTTP-Referer",
-            "https://github.com/itsAtlas-org/Personal-Manager",
-        )
-        .header("X-Title", "PM")
         .json(&body)
         .send()
         .await?;
@@ -727,6 +712,26 @@ pub async fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenRouter's app-attribution headers put an app in its public rankings and per-app analytics,
+    /// so none may come back (see [`HTTP`]). Read case-insensitively from this file, the only one
+    /// that builds OpenRouter requests, with the names built from parts so the test can't match
+    /// itself.
+    #[test]
+    fn no_request_carries_app_attribution() {
+        let src = include_str!("openrouter.rs").to_ascii_lowercase();
+        for header in [
+            concat!("http-", "referer"),
+            concat!("x-", "title"),
+            concat!("x-open", "router-"),
+            concat!("user-", "agent"),
+        ] {
+            assert!(!src.contains(&format!("\"{header}")), "{header} is back");
+        }
+        assert!(!src.contains(concat!("header::", "referer")));
+        assert!(!src.contains(concat!("header::", "user_agent")));
+        assert!(!src.contains(concat!(".user_", "agent(")));
+    }
 
     fn completion(text: &str, truncated: bool) -> Completion {
         Completion {

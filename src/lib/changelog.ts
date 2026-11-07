@@ -24,6 +24,15 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.174.2-alpha",
+    date: "2026-11-06",
+    highlights: [
+      'PM no longer tells OpenRouter it is the app making your requests. Every request used to name PM, which OpenRouter uses to rank apps publicly by how much they are used and to keep usage statistics per app. Opening Settings → AI & Models also no longer contacts OpenRouter for its prices unless you have an OpenRouter key; "Refresh prices" still does when you press it.',
+      "Pictures in documents, chat answers and the briefing now show as their description in brackets, like [chart], instead of as a broken image. PM never loads a picture from the internet there: it would tell its sender when you looked, and from where.",
+      "Backing up to Proton Drive: Proton's command-line tool no longer writes a detailed record of every session to its log, though it still records each transfer there, which PM can't turn off. What it reports to Proton (usage statistics, and crash and error reports) follows your Proton account's Collect usage diagnostics setting as it was when the tool last signed in, apart from a crash while it starts up, and PM can't switch it off. Settings → Backup now says where to turn that setting off, and to disconnect and reconnect Proton Drive afterwards.",
+    ],
+  },
+  {
     version: "3.174.1-alpha",
     date: "2026-11-06",
     highlights: [
