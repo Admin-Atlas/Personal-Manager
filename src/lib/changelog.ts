@@ -24,6 +24,14 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.175.0-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "On a Mac, PM now checks that an update can run on your version of macOS before it downloads it. If it can't, PM downloads nothing, keeps working on the version you have and tells you which macOS the update needs, instead of installing a version that macOS wouldn't open.",
+      "This is groundwork for a coming version that will need an Apple Silicon Mac (M1 or later) with macOS 14 or newer: the engine that runs PM's search and photo models no longer supports older Macs. If your Mac has Apple Silicon and macOS 13 or older, you can update macOS now (System Settings → General → Software Update, or on macOS 12 or older, Apple menu → System Preferences → Software Update), and every Apple Silicon Mac can run macOS 14. Intel Macs will keep receiving updates until then, and then stay on the last version released before it. Windows and Linux are unchanged.",
+    ],
+  },
+  {
     version: "3.174.3-alpha",
     date: "2026-11-06",
     highlights: [

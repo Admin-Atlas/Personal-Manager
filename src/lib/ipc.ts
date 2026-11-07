@@ -246,6 +246,10 @@ export const smartAppControlState = () => invoke<SmartAppControlState>("smart_ap
  *  Linux AppImage. */
 export const packageManagedLinux = () => invoke<boolean>("package_managed_linux");
 
+/** The running macOS version (e.g. "14.5"), so the updater holds back an update that needs a newer
+ *  macOS than this Mac has (see `macosUpdateBlock`). Null off macOS, or when it can't be read. */
+export const macosVersion = () => invoke<string | null>("macos_version");
+
 /** Turn query-time reranking on/off (a cross-encoder re-scores search hits). Stateless — never
  *  triggers a Rebuild; the effect lands on the next query. */
 export const setReranking = (enabled: boolean) => invoke<void>("set_reranking", { enabled });

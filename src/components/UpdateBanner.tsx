@@ -17,6 +17,9 @@ import { Button } from "./ui";
  * apply, we point the user at a manual download. A throw on Windows can't be retried in the
  * same session — the plugin cleared the staged update before the launch failed — so that banner
  * says to reopen PM instead of offering "Try again".
+ *
+ * An update that needs a newer macOS than this Mac has is never downloaded (see `useUpdater`); the
+ * banner says which macOS it needs instead.
  */
 export function UpdateBanner({
   update,
@@ -41,6 +44,37 @@ export function UpdateBanner({
   }
 
   const label = update.version ? `Version ${update.version}` : "An update";
+
+  // The update needs a newer macOS than this Mac has, so nothing was downloaded: macOS wouldn't
+  // open it, and installing it would replace the PM that works. Say which macOS it needs and how to
+  // get it. There is nothing to restart into, so no restart is offered.
+  if (update.macosBlock) {
+    const { required, running } = update.macosBlock;
+    if (update.dismissed) {
+      return (
+        <div className="flex items-center justify-end gap-2 border-b border-border bg-accent-soft px-4 py-1 text-xs text-ink3">
+          <span>
+            {label} needs macOS {required} or newer
+          </span>
+        </div>
+      );
+    }
+    return (
+      <div className={shell}>
+        <span>
+          {label} needs macOS {required} or newer, and this Mac has macOS {running}. PM keeps
+          working on the version you have. To get the update, update macOS first (System Settings →
+          General → Software Update, or on macOS 12 or older, Apple menu → System Preferences →
+          Software Update), then reopen PM.
+        </span>
+        <span className={actions}>
+          <Button variant="tertiary" size="sm" onClick={update.dismiss}>
+            Later
+          </Button>
+        </span>
+      </div>
+    );
+  }
 
   // A Linux package install (rpm/deb) can't be updated in place — Tauri's updater only swaps an
   // AppImage. So we never downloaded one; invite a reinstall from the releases page instead of a

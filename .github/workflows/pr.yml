@@ -182,6 +182,8 @@ jobs:
         run: cargo check --all-targets --tests --manifest-path src-tauri/Cargo.toml
       - name: "cargo test (sidecar:: — compiles + exercises the mac arm's unit tests)"
         run: "cargo test --lib --manifest-path src-tauri/Cargo.toml sidecar::"
+      - name: "cargo test (update_delivery:: — the macOS version the updater compares)"
+        run: "cargo test --lib --manifest-path src-tauri/Cargo.toml update_delivery::"
 
   # --- sidecar: lint + format (Python) ------------------------------------
   python:
