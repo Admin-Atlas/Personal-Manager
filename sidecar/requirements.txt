@@ -50,8 +50,16 @@
 #     to lift that cap. That file is empty now; the lock still installs with `--no-deps`.
 #   defusedxml — hardens the stdlib XML parser (openpyxl's fallback) against entity-expansion / XXE
 #     from a malicious .xlsx (H-1 subset). Pure-Python; applied once at sidecar import.
+#   python-dateutil — a HOLD, not a dependency of PM's own code: pandas (via markitdown[xlsx])
+#     needs it, and pandas 3.1.0 tests only against dateutil <3 (its pyproject's
+#     `test-requires = ["python-dateutil<3"]`), while its runtime bound is open. dateutil 3.0
+#     rewrote tzfile, and pandas' dateutil time-zone code keys on a `_trans_list` attribute 3.0
+#     removed. PM's path never builds a dateutil time zone, but an untested pairing in the process
+#     that parses untrusted files isn't worth taking for nothing. Drop this pin once a pandas
+#     release tests dateutil 3 or newer.
 markitdown[pdf,docx,pptx,xlsx,outlook]==0.1.9
 fastembed==0.9.1
 openpyxl==3.1.5
 pillow==13.0.0
 defusedxml==0.7.1
+python-dateutil==2.9.0.post0

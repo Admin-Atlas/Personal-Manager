@@ -3072,6 +3072,8 @@ mod tests {
         for retryable in [
             "sidecar convert IO error: broken pipe",
             "document engine is not installed yet — run setup first",
+            // The worker refused while the venv is being updated: the file converts afterwards.
+            crate::sidecar::ENGINE_UPDATING,
             "sidecar convert failed [unconvertible]: PermissionError: [Errno 13] Permission denied",
             "sidecar convert failed: No module named 'markitdown'",
             "sidecar convert failed: cannot import name 'MarkItDown' from partially initialized module",

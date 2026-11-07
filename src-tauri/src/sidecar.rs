@@ -23,7 +23,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -578,6 +578,9 @@ struct OptionalComponent {
     /// end up owning one folder, and removing either later deletes the files the other still
     /// claims.
     superseded: &'static [&'static str],
+    /// The folder under `runtime/models` holding the model weights only this component uses, which
+    /// its removal deletes along with its packages (see [`SidecarManager::uninstall_optional`]).
+    weights: Option<&'static str>,
 }
 
 const OPTIONAL_TSNE_COMPONENT: OptionalComponent = OptionalComponent {
@@ -586,24 +589,45 @@ const OPTIONAL_TSNE_COMPONENT: OptionalComponent = OptionalComponent {
     pins: &[OPTIONAL_TSNE_PIN],
     uninstall: &["openTSNE"],
     superseded: &[],
+    weights: None,
 };
 
 const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     marker: SidecarPaths::ocr_marker,
     lock: "requirements-ocr.lock",
     pins: OPTIONAL_OCR_PINS,
-    // `pillow-heif` is still listed although nothing installs it any more: a user who added photo
-    // OCR before the pi-heif swap has it in their venv, and "remove photo OCR" should take it with
-    // them rather than strand 28 MB (and the GPL-2.0 x265 inside it) forever. `pip uninstall -y`
-    // skips a package that isn't installed, so this costs the common case nothing.
-    uninstall: &["rapidocr", "pi-heif", "pillow-heif"],
+    // rapidocr and pi-heif, the pins, plus omegaconf and colorlog, which only rapidocr brings and
+    // which the Storage row counts, so removal frees what the row showed. The heavy image libraries
+    // (opencv, shapely, pyclipper) stay for the Storage tab's cascade. `the_ocr_component_removes_
+    // what_only_it_brings` reads the locks to keep this exact.
+    //
+    // Two are retired, listed although nothing installs them any more: `pillow-heif` (before the
+    // pi-heif swap; 28 MB, with the GPL-2.0 x265 inside it) and `antlr4-python3-runtime` (omegaconf
+    // 2.4 vendors ANTLR itself). pip never prunes, so a venv that had them keeps them, and "remove
+    // photo OCR" should take them. `pip uninstall -y` skips a package that isn't installed, so this
+    // costs the common case nothing.
+    uninstall: &[
+        "rapidocr",
+        "pi-heif",
+        "omegaconf",
+        "colorlog",
+        "pillow-heif",
+        "antlr4-python3-runtime",
+    ],
     // rapidocr 3.10 depends on `opencv-python-headless` where 3.9 depended on `opencv-python`; both
     // install `cv2/`. On an upgrade pip would add the headless build BESIDE the old one, and the
     // Storage tab's "remove OpenCV" (or any later uninstall of one of them) would then delete the
     // shared `cv2/` while the other's dist-info stayed: the next OCR install is a pip no-op,
     // `import cv2` fails, and photos silently fall back to date and location only.
     superseded: &["opencv-python"],
+    // rapidocr's three ONNX models (~31 MB), which pm_sidecar.py copies into `runtime/models/
+    // rapidocr` from rapidocr's own wheel the first time OCR runs (`_rapidocr_model_dir`).
+    weights: Some(OCR_WEIGHTS_DIR),
 };
+
+/// The photo-OCR weights' folder under `runtime/models` (pm_sidecar.py `_rapidocr_model_dir`).
+/// Shared with the Storage tab, which counts it on the OCR row.
+pub(crate) const OCR_WEIGHTS_DIR: &str = "rapidocr";
 
 /// Every optional component, so a caller that must treat them all alike can't miss one. `provision`
 /// is the reason this exists: a venv rebuild removes their markers along with the venv, and each new
@@ -1137,6 +1161,30 @@ use crate::sidecar_sandbox_linux::Sandbox;
 #[cfg(target_os = "macos")]
 use crate::sidecar_sandbox_macos::Sandbox;
 
+/// What a request gets while `provision` is changing the venv: a worker started then would load
+/// a mix of old and new libraries. Every caller treats it as a passing failure: ingest and the
+/// syncs wait in `ensure_installed` before asking, and a sync account that does meet it is
+/// retried, not skipped (`cloud_sync::is_permanently_unindexable` does not match it).
+pub(crate) const ENGINE_UPDATING: &str = "the document engine is updating — try again in a moment";
+
+/// Holds [`SidecarManager::provisioning`] set for as long as it lives, and clears it on every way
+/// out of `provision`, an early `?` or a panic included, so a failed update never leaves the worker
+/// refused for the rest of the session.
+struct Provisioning<'a>(&'a AtomicBool);
+
+impl<'a> Provisioning<'a> {
+    fn begin(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for Provisioning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct SidecarManager {
     paths: SidecarPaths,
     proc: Mutex<Option<Process>>,
@@ -1144,6 +1192,12 @@ pub struct SidecarManager {
     /// Serializes provisioning so two concurrent first-run callers can't both
     /// create the venv / pip-install into the same directory.
     install: Mutex<()>,
+    /// Set while `provision` is changing the venv (see [`Provisioning`]). The install lock alone
+    /// cannot keep a worker off a half-updated venv: a request never takes that lock, and its
+    /// spawn needs only `proc`, so one arriving mid-pip would start a worker on whatever pip had
+    /// replaced so far. An atomic, not a lock, so a spawn checks it without ever waiting on the
+    /// install (lock order is install then proc; a request holds proc).
+    provisioning: AtomicBool,
     /// Monotonic request id, kept on the manager (not the `Process`) so it keeps
     /// climbing across respawns — a stale line from a dead child can never match
     /// a fresh request's id.
@@ -1182,6 +1236,7 @@ impl SidecarManager {
             proc: Mutex::new(None),
             status: Mutex::new(SidecarStatus::NotInstalled),
             install: Mutex::new(()),
+            provisioning: AtomicBool::new(false),
             req_seq: AtomicU64::new(0),
             #[cfg(any(
                 windows,
@@ -1419,6 +1474,10 @@ impl SidecarManager {
                 )
             })
             .collect();
+        // From the first change to the venv until the marker is stamped, no worker may start: a
+        // request arriving mid-pip would otherwise start one on a venv half old, half new (see
+        // `provisioning`). Every way out of this function clears it again.
+        let _provisioning = Provisioning::begin(&self.provisioning);
         if rebuild {
             // Drop any live child first: on Windows it would hold a lock on the
             // venv's python.exe and block removal.
@@ -1471,7 +1530,14 @@ impl SidecarManager {
         // pinned and hash-checked; what pip no longer does is notice a dependency MISSING from the
         // lock, which only a hand-edited lock could produce. The optional installs and CI's
         // installs of the lock (pr.yml, release.yml) take the same flag.
-        pip.args(["-m", "pip", "install"])
+        // A worker started on the old venv (the launch-time map layout can start one seconds
+        // earlier) holds numpy's and onnxruntime's native libraries open, and on Windows pip then
+        // can't replace them, leaving `~`-prefixed leftovers. `_provisioning` keeps a new one from
+        // starting until the update is done; the first request after it starts a fresh worker on
+        // the updated venv.
+        self.stop_worker();
+        pip.args(PIP_LAUNCH)
+            .arg("install")
             .args(LOCK_INSTALL_FLAGS)
             .arg("-r")
             .arg(&lock);
@@ -1508,6 +1574,10 @@ impl SidecarManager {
         // Whisper model and the rest outside the venv go here all the same.
         self.retire_voice_locked();
 
+        // Once more before the marker says the venv is current: no worker can have started since
+        // the first stop (`_provisioning`), but one that did would be running libraries from part
+        // way through the update, and the marker is what tells every caller it can trust the venv.
+        self.stop_worker();
         // Stamp the marker with the lock's hash so we can skip next time.
         let hash = self.lock_hash().map_err(unknown)?;
         std::fs::write(self.paths.ready_marker(), hash).map_err(unknown)?;
@@ -1833,10 +1903,12 @@ impl SidecarManager {
     /// Analyse one image for photo ingestion: EXIF capture metadata (always) + OCR text (only when
     /// `run_ocr`). The caller sets `run_ocr` from [`optional_ocr_ready`](Self::optional_ocr_ready),
     /// so a user who declined the optional OCR component still gets dimensions + EXIF for the photo's
-    /// metadata chunk. The first OCR call reports a cold cache, [`Self::request`] runs the
-    /// network-allowed `--fetch` helper to download rapidocr's small models, and the retry is slow;
-    /// later calls are fast and fully local. Blocking, like every sidecar call. EXIF/OCR output is
-    /// untrusted data — scored/indexed, never executed.
+    /// metadata chunk. The first OCR call copies the three models rapidocr ships inside its own
+    /// wheel into `runtime/models/rapidocr`: a confined worker may only read that folder, so it
+    /// reports a cold cache and [`Self::request`] runs the network-allowed `--fetch` helper to make
+    /// the copy, which downloads only a model that is missing there or does not match the checksum
+    /// rapidocr expects. That first call is slow; later calls are fast and fully local. Blocking,
+    /// like every sidecar call. EXIF/OCR output is untrusted data — scored/indexed, never executed.
     ///
     /// `ocr_ran` is the reply's only signal that OCR was asked for and did not happen. Read it —
     /// `ocr_text` alone cannot tell "the component broke" from "this image holds no text".
@@ -1957,10 +2029,11 @@ impl SidecarManager {
     }
 
     /// Remove the OPTIONAL photo-OCR component (the "delete" action) — the shared
-    /// [`Self::uninstall_optional`] flow. Only rapidocr + pi-heif are removed: the heavier
-    /// transitive image deps (opencv / shapely / pyclipper) are LEFT in place here; the Storage
-    /// manager (components.rs) does the guarded cascade that reclaims them. Once the marker is gone,
-    /// future photos ingest EXIF-only.
+    /// [`Self::uninstall_optional`] flow. rapidocr, pi-heif and their small OCR-only dependencies
+    /// (omegaconf, colorlog) are removed, and so are the OCR models in `runtime/models/rapidocr`:
+    /// the heavier transitive image deps (opencv / shapely / pyclipper) are LEFT in place here; the
+    /// Storage manager (components.rs) does the guarded cascade that reclaims them. Once the marker
+    /// is gone, future photos ingest EXIF-only.
     pub fn uninstall_optional_ocr(&self) -> Result<()> {
         self.uninstall_optional(&OPTIONAL_OCR_COMPONENT)
     }
@@ -2176,6 +2249,17 @@ impl SidecarManager {
         mut on_progress: impl FnMut(f32),
     ) -> Result<()> {
         let py = self.paths.venv_python();
+        // A first install leaves the worker running. The component's lock is compiled against the
+        // base lock (`--constraint`, scripts/regen-sidecar-locks.mjs), so every package it shares
+        // with the base venv is pinned at the version already installed, which pip leaves alone,
+        // and the rest is new to the venv: nothing the running worker has loaded changes, and
+        // stopping it would only interrupt a search. Reinstalling over an earlier copy (its
+        // marker is there, stale) is different: the worker loads pi-heif's native library for
+        // every photo, OCR on or off, and on Windows pip cannot replace a DLL a running process
+        // has mapped. (Inside `provision` the worker is already stopped and kept from starting.)
+        if (component.marker)(&self.paths).exists() {
+            self.stop_worker();
+        }
         // `--progress-bar off` so pip emits clean newline-terminated phase lines (no carriage-return
         // byte bar) we can parse; the side-thread stderr drain in run_pip_streaming avoids a deadlock.
         let mut downloads = 0u32;
@@ -2249,14 +2333,23 @@ impl SidecarManager {
     /// something else holds open, on Windows), and the person who asked for the space back has to
     /// be told some of it is still taken. What is left stays on disk, measured on its Storage row
     /// with its own Remove.
+    ///
+    /// The component's own model weights (its `weights` folder, photo OCR's 31 MB) go too, whatever
+    /// pip did: nothing else reads them, and they are counted on the same Storage row, so removing
+    /// the component frees what the row showed. A reinstall copies them back from the wheel on the
+    /// first photo, with no download.
     fn uninstall_optional(&self, component: &OptionalComponent) -> Result<()> {
         let _install = self.install.lock().unwrap();
         let _ = std::fs::remove_file((component.marker)(&self.paths));
+        // Before the packages and the weights: a worker that has run OCR has both loaded.
+        self.stop_worker();
+        let weights = component
+            .weights
+            .map_or(Ok(()), |dir| self.remove_component_weights(dir));
         let py = self.paths.venv_python();
         if !py.exists() {
-            return Ok(());
+            return weights;
         }
-        self.stop_worker();
         let mut pip = Command::new(&py);
         pip.args([
             "-m",
@@ -2271,7 +2364,27 @@ impl SidecarManager {
         run_command(
             &mut pip,
             &format!("pip uninstall {}", component.uninstall.join(" ")),
-        )
+        )?;
+        weights
+    }
+
+    /// Delete `runtime/models/<dir>`, an optional component's own weights. Only a real folder in a
+    /// real `models` folder ([`real_dir`]), as in the voice clean-up: a link or a junction there
+    /// leads somewhere PM doesn't own, so it is left as it is, and so is what it points to.
+    fn remove_component_weights(&self, dir: &str) -> Result<()> {
+        let Some(models) = self.paths.models_dir() else {
+            return Ok(());
+        };
+        let weights = models.join(dir);
+        if !real_dir(&models) || !real_dir(&weights) {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&weights).map_err(|e| {
+            Error::Other(format!(
+                "couldn't remove the model files in {} ({e})",
+                weights.display()
+            ))
+        })
     }
 
     /// `pip uninstall -y` the given packages from the managed venv — the Storage manager's guarded
@@ -2417,6 +2530,13 @@ impl SidecarManager {
     }
 
     fn spawn(&self) -> Result<Process> {
+        // First, before the interpreter check: mid-rebuild the venv is gone, and "updating" is
+        // what is true then too. Read without waiting: the caller holds `proc`, and `provision`
+        // holds the install lock and takes `proc` to stop the worker, so waiting here on anything
+        // the install holds would deadlock the two.
+        if self.provisioning.load(Ordering::SeqCst) {
+            return Err(Error::Other(ENGINE_UPDATING.into()));
+        }
         let py = self.paths.venv_python();
         if !py.exists() {
             return Err(Error::Other(
@@ -2494,7 +2614,6 @@ impl SidecarManager {
             ("PM_SIDECAR_OFFLINE".to_string(), "1".to_string()),
             ("HF_HUB_OFFLINE".to_string(), "1".to_string()),
             ("TRANSFORMERS_OFFLINE".to_string(), "1".to_string()),
-            ("HF_HUB_DISABLE_TELEMETRY".to_string(), "1".to_string()),
             (
                 "HF_HUB_DISABLE_SYMLINKS_WARNING".to_string(),
                 "1".to_string(),
@@ -2519,6 +2638,11 @@ impl SidecarManager {
                 dir.to_string_lossy().into_owned(),
             ));
         }
+        envs.extend(
+            PYTHON_ENV_SETS
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
         envs
     }
 
@@ -2899,11 +3023,11 @@ impl SidecarManager {
             .arg("--fetch")
             // The one child that MAY reach the network: it only ever downloads a model named by
             // Rust and never touches untrusted file bytes. Force offline OFF (drop any inherited
-            // flag) so it can always fetch; keep the download quiet/private like the worker.
+            // flag) so it can always fetch; `clean_python_env` below switches every telemetry
+            // client off, as for the worker.
             .env_remove("PM_SIDECAR_OFFLINE")
             .env_remove("HF_HUB_OFFLINE")
             .env_remove("TRANSFORMERS_OFFLINE")
-            .env("HF_HUB_DISABLE_TELEMETRY", "1")
             .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -3149,12 +3273,22 @@ fn request_timeout(method: &str) -> std::time::Duration {
 }
 
 /// The flags every pip install of a lock passes, the base venv's and each optional component's.
-/// `--require-hashes` and `--no-deps` are the two that carry weight; `provision` says why each.
-const LOCK_INSTALL_FLAGS: [&str; 4] = [
+/// `--require-hashes` and `--no-deps` carry the weight; `provision` says why each.
+/// `--only-binary=:all:` means pip never builds a package from its source archive: a build runs that
+/// package's own `setup.py` or build backend, which can start a pip of its own (build isolation
+/// installs the build requirements that way), and that pip has neither [`PIP_SHIM`] nor PM's flags.
+/// It costs nothing today: every version in the three locks publishes a wheel for CPython
+/// 3.11 to 3.14 on win_amd64, macOS arm64 and manylinux x86_64 (checked against PyPI in the
+/// 2026-11-06 refresh), so pip never had a reason to build. (An Intel Mac could not install the
+/// base lock with or without it: onnxruntime publishes no macOS x86_64 wheel, and no source.) A
+/// future pin without a wheel fails to install instead of building, and the refresh that brings it
+/// must find another version.
+const LOCK_INSTALL_FLAGS: [&str; 5] = [
     "--disable-pip-version-check",
     "--no-cache-dir",
     "--require-hashes",
     "--no-deps",
+    "--only-binary=:all:",
 ];
 
 /// pillow 13 (pinned in requirements.txt: the first release with the decoder fixes
@@ -3166,12 +3300,21 @@ const LOCK_INSTALL_FLAGS: [&str; 4] = [
 /// value as the floor the locks resolve from.
 const MIN_PYTHON: (u32, u32) = (3, 11);
 
-/// Highest `python3.N` minor we probe by versioned name. Gives headroom past
-/// today's releases; anything newer is still found via the bare `python3` name.
-const MAX_PROBE_MINOR: u32 = 16;
+/// The newest Python the locks install on. markitdown 0.1.9 declares `Requires-Python <3.15` and
+/// onnxruntime ships no cp315 wheels, so a 3.15 venv fails its base install; before this ceiling the
+/// probe, newest first, picked a Homebrew python3.15 over the pinned 3.12 download on a Mac and
+/// provisioning could never succeed there. Raise it in the dependency refresh that first resolves
+/// every lock on the next minor.
+const MAX_PYTHON: (u32, u32) = (3, 14);
 
+/// Highest `python3.N` minor we probe by versioned name: the ceiling itself, so a newer
+/// interpreter is never preferred over a supported one.
+const MAX_PROBE_MINOR: u32 = MAX_PYTHON.1;
+
+/// Whether an interpreter's version is one the locks support: at least [`MIN_PYTHON`] and at most
+/// [`MAX_PYTHON`].
 fn meets_min(v: (u32, u32)) -> bool {
-    v >= MIN_PYTHON
+    (MIN_PYTHON..=MAX_PYTHON).contains(&v)
 }
 
 /// Whether to delete and rebuild the venv before provisioning. Pure, so it's
@@ -3243,15 +3386,17 @@ enum BaseProbe {
     None,
 }
 
-/// Probe `path`; accept it if it meets the minimum, else note it was too old.
+/// Probe `path`; accept it if the locks support its version, else note whether it was too old (a
+/// too-new one is just skipped, so the caller falls through to the next candidate or, on macOS,
+/// the pinned download).
 fn consider_candidate(path: &Path, saw_too_old: &mut bool) -> Option<PathBuf> {
     match detect_python_version(path) {
         Some(v) if meets_min(v) => Some(path.to_path_buf()),
-        Some(_) => {
+        Some(v) if v < MIN_PYTHON => {
             *saw_too_old = true;
             None
         }
-        None => None,
+        Some(_) | None => None,
     }
 }
 
@@ -3330,8 +3475,8 @@ fn macos_python_candidates() -> Vec<PathBuf> {
     out
 }
 
-/// From `Python.framework/Versions` directory names, the ones that parse as
-/// `MAJOR.MINOR >= MIN_PYTHON`, newest-first (skips `Current` and junk).
+/// From `Python.framework/Versions` directory names, the ones that parse as a supported
+/// `MAJOR.MINOR` (see [`meets_min`]), newest-first (skips `Current` and junk).
 fn pick_framework_versions(names: &[String]) -> Vec<(u32, u32)> {
     let mut vers: Vec<(u32, u32)> = names
         .iter()
@@ -3395,16 +3540,64 @@ fn too_old_message() -> String {
     m
 }
 
-/// Give a spawned Python a clean, predictable environment. Drops the `PYTHON*`
-/// overrides that could point the interpreter at the wrong stdlib (so a poisoned
-/// environment can't break the bundled interpreter or the venv), and forces UTF-8
-/// mode so a non-UTF-8 OEM codepage can't fail interpreter init. Applied to every
-/// Python process PM launches.
-/// Environment keys stripped from any Python child PM launches: the `PYTHON*` overrides that could
-/// point the interpreter at the wrong stdlib (so a poisoned environment can't break the bundled
-/// interpreter or the venv). Shared by [`clean_python_env`] and the worker spawn so the confined and
-/// unconfined paths strip exactly the same set.
-const PYTHON_ENV_REMOVES: &[&str] = &["PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"];
+/// Environment keys stripped from any Python child PM launches. The `PYTHON*` overrides could point
+/// the interpreter at the wrong stdlib (so a poisoned environment can't break the bundled
+/// interpreter or the venv). The Hugging Face credentials would make huggingface_hub send the
+/// user's own HF account token with every model download (`--fetch`), tying which models PM fetched,
+/// and when, to that account; PM's models are public and need none. `PIP_PYTHON` is pip's
+/// `--python`: pip re-runs itself under that interpreter, as a new process that never loads
+/// [`PIP_SHIM`], so it would send the machine profile the shim exists to withhold. Shared by
+/// [`clean_python_env`] and the worker spawn so the confined and unconfined paths strip exactly the
+/// same set.
+const PYTHON_ENV_REMOVES: &[&str] = &[
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN_PATH",
+    "HF_OIDC_RESOURCE",
+    "HF_OIDC_ID_TOKEN",
+    "PIP_PYTHON",
+];
+
+/// Environment set on every Python child PM launches, the worker included: what the libraries in
+/// the venv must never do, whatever the user's shell says. pm_sidecar.py also hard-assigns each at
+/// import, so a raw run is covered too; these are the second wall. PM sends no telemetry.
+///
+/// - `ORT_DISABLE_TELEMETRY`: onnxruntime's Linux and macOS wheels embed Microsoft's 1DS telemetry
+///   client, which keeps a persistent device id and queues usage events in its own folder
+///   (`~/.cache/Microsoft/DeveloperTools/.onnxruntime` on Linux, or under `$XDG_CACHE_HOME` when
+///   that is an absolute path; `~/Library/Application Support/Microsoft/DeveloperTools/.onnxruntime`
+///   on macOS) and uploads them from any process with network access, the `--fetch` helper among
+///   them. Read when onnxruntime is imported, and it latches the client off for the process.
+/// - `ORT_RUNNING_UNIT_TESTS`: the Windows wheel has no 1DS client (so no device id either: no
+///   registry key, no folder) and ignores the variable above. It reports through ETW to the
+///   Microsoft Telemetry provider group instead, and writes its first event, `ProcessInfo`, while
+///   `import onnxruntime` runs, before any Python can switch it off. This variable is onnxruntime's
+///   internal test-harness signal, not a user-facing opt-out: with it set, the Windows provider is
+///   never registered (so no event is written, and no ETW session can switch events back on), and
+///   the 1DS client latches off as it does for the variable above. Checked against the whole
+///   onnxruntime 1.31.1 source: one function reads it, and only those two telemetry constructors
+///   call that function, so it changes no kernel, execution provider or result. Check that again on
+///   every onnxruntime bump. pm_sidecar.py's `_quiet_onnxruntime` is a further wall behind it.
+/// - `HF_HUB_DISABLE_TELEMETRY`, `HF_XET_TELEMETRY_ENABLED`, `DO_NOT_TRACK`: huggingface_hub's
+///   telemetry, and hf_xet's transfer telemetry (a summary per download plus heartbeats, from 1.7),
+///   which honours all three.
+/// - `HF_HUB_DISABLE_IMPLICIT_TOKEN`: never send a Hugging Face token PM didn't pass explicitly (it
+///   passes none); the token variables themselves are in [`PYTHON_ENV_REMOVES`].
+/// - `HF_HUB_DISABLE_SHARED_BLOBS`: huggingface-hub 1.32+ moves a fresh download's files into one
+///   shared `<cache>/blobs/` store and leaves each repo folder as symlinks, so a model's bytes would
+///   leave the folder Storage measures and removes. This keeps the per-repo layout PM relies on.
+const PYTHON_ENV_SETS: &[(&str, &str)] = &[
+    ("ORT_DISABLE_TELEMETRY", "1"),
+    ("ORT_RUNNING_UNIT_TESTS", "1"),
+    ("HF_HUB_DISABLE_TELEMETRY", "1"),
+    ("HF_XET_TELEMETRY_ENABLED", "0"),
+    ("DO_NOT_TRACK", "1"),
+    ("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1"),
+    ("HF_HUB_DISABLE_SHARED_BLOBS", "1"),
+];
 
 /// How many threads any ONE of the sidecar's native pools may use.
 ///
@@ -3425,11 +3618,18 @@ fn sidecar_thread_budget(cores: Option<usize>) -> usize {
     (cores.unwrap_or(4) / 2).clamp(2, 8)
 }
 
+/// Give a spawned Python a clean, predictable environment: drops [`PYTHON_ENV_REMOVES`], forces
+/// UTF-8 mode so a non-UTF-8 OEM codepage can't fail interpreter init, and sets
+/// [`PYTHON_ENV_SETS`]. Applied to every Python process PM launches; the worker gets the same
+/// lists through [`SidecarManager::worker_env`] and its spawn.
 fn clean_python_env(command: &mut Command) {
     for k in PYTHON_ENV_REMOVES {
         command.env_remove(k);
     }
     command.env("PYTHONUTF8", "1");
+    for (k, v) in PYTHON_ENV_SETS {
+        command.env(k, v);
+    }
 }
 
 /// Bridge the confined worker's process control to the generic [`ChildControl`] the request loop drives.
@@ -3537,12 +3737,46 @@ fn preflight_interpreter(py: &Path) -> std::result::Result<(), ProvisionError> {
     Ok(())
 }
 
-/// Run `python -m pip <pip_args>` in the venv, streaming stdout line-by-line to `on_line` so the
+/// How PM starts pip for anything that downloads (the base install and the optional components'
+/// installs): `python -P -c <PIP_SHIM>` rather than `python -m pip`. pip's default User-Agent is
+/// `pip/<v> {json}` with the OS, distro, kernel release, libc, CPU, OpenSSL, setuptools and rustc
+/// versions (it runs `rustc --version` to find out), and PyPI writes one row per downloaded file,
+/// with that profile and the country, into a public BigQuery dataset. Since PM's exact pins are its
+/// own, every PM install and update could be picked out and counted there. The shim replaces the
+/// User-Agent with a bare `pip`, and refuses to run a pip whose internals moved rather than fall
+/// back to the profile. `-P` keeps the working directory off `sys.path`, as `-m` would not. The
+/// `pip uninstall` calls download nothing and stay on `-m pip`.
+const PIP_LAUNCH: [&str; 3] = ["-P", "-c", PIP_SHIM];
+
+/// The launcher [`PIP_LAUNCH`] runs. pip's `PipSession` reads the module-level `user_agent` when it
+/// is built, so replacing it before `main()` covers every request pip makes. Then it checks the
+/// result rather than trusting the patch: a session built after it must carry the bare `pip`, or a
+/// pip that bound `user_agent` some other way would send the profile with nothing to show for it.
+/// Last, it refuses a pip that `--python` would re-run under another interpreter: that run is a new
+/// process without this shim. [`PYTHON_ENV_REMOVES`] strips `PIP_PYTHON`, but a pip config file can
+/// set it too, and pip's own option parser is what sees both. Each refusal exits non-zero, so the
+/// install fails and says why rather than going ahead with the profile.
+const PIP_SHIM: &str = concat!(
+    "import sys\n",
+    "import pip._internal.network.session as s\n",
+    "if not callable(getattr(s, 'user_agent', None)) or not hasattr(s, 'PipSession'): ",
+    "sys.exit('PM will not run this pip: it cannot replace its User-Agent')\n",
+    "s.user_agent = lambda: 'pip'\n",
+    "if s.PipSession().headers.get('User-Agent') != 'pip': ",
+    "sys.exit('PM will not run this pip: its User-Agent did not change')\n",
+    "from pip._internal.cli.main_parser import create_main_parser\n",
+    "if getattr(create_main_parser().parse_args(sys.argv[1:])[0], 'python', None): ",
+    "sys.exit('PM will not run this pip: --python would run another pip without this shim')\n",
+    "from pip._internal.cli.main import main\n",
+    "sys.exit(main())\n",
+);
+
+/// Run `python -P -c <PIP_SHIM> <pip_args>` in the venv, streaming stdout line-by-line to `on_line` so the
 /// caller can turn pip's phase markers into progress. stderr is drained on a side thread (a full
 /// stderr pipe could otherwise block our stdout reads) and surfaced in the error on failure.
 fn run_pip_streaming(py: &Path, pip_args: &[&str], mut on_line: impl FnMut(&str)) -> Result<()> {
     let mut cmd = Command::new(py);
-    cmd.arg("-m").arg("pip").args(pip_args);
+    cmd.args(PIP_LAUNCH).args(pip_args);
     clean_python_env(&mut cmd);
     no_window(&mut cmd);
     cmd.stdin(Stdio::null())
@@ -3652,8 +3886,320 @@ fn no_window(command: &mut Command) {
 fn no_window(_command: &mut Command) {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Every pip run that downloads goes through the User-Agent shim, and the shim replaces the
+    /// User-Agent with a bare `pip` or refuses to run.
+    #[test]
+    fn pip_downloads_never_send_the_machine_profile() {
+        assert_eq!(PIP_LAUNCH[..2], ["-P", "-c"]);
+        assert!(PIP_SHIM.contains("s.user_agent = lambda: 'pip'"));
+        assert!(PIP_SHIM.contains("sys.exit('PM will not run this pip"));
+        assert!(PIP_SHIM.ends_with("sys.exit(main())\n"));
+        // pip never builds from source, where a build could start a pip without the shim.
+        assert!(LOCK_INSTALL_FLAGS.contains(&"--only-binary=:all:"));
+        let src = include_str!("sidecar.rs");
+        // Built from parts so this test doesn't match itself.
+        for launch in [
+            concat!("[\"-m\", \"pip\", \"", "install\"]"),
+            concat!(".arg(\"-m\").arg(\"", "pip\")"),
+        ] {
+            assert!(!src.contains(launch), "{launch} bypasses the shim");
+        }
+    }
+
+    /// The worker and every other Python child (the `--fetch` helper, pip, the probes) run with every
+    /// telemetry client off and huggingface-hub's shared blob store off, whatever the user's shell
+    /// inherited: an inherited value there must not win.
+    #[test]
+    fn every_python_child_runs_with_telemetry_and_shared_blobs_off() {
+        for pair in [
+            ("ORT_DISABLE_TELEMETRY", "1"),
+            // onnxruntime's Windows ETW provider is never registered (see PYTHON_ENV_SETS).
+            ("ORT_RUNNING_UNIT_TESTS", "1"),
+            ("HF_HUB_DISABLE_TELEMETRY", "1"),
+            ("HF_XET_TELEMETRY_ENABLED", "0"),
+            ("DO_NOT_TRACK", "1"),
+            ("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1"),
+            ("HF_HUB_DISABLE_SHARED_BLOBS", "1"),
+        ] {
+            assert!(PYTHON_ENV_SETS.contains(&pair), "{pair:?}");
+        }
+        // An inherited Hugging Face credential never reaches a Python child, and neither does a
+        // `PIP_PYTHON` that would have pip re-run itself without the User-Agent shim.
+        for key in [
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "HF_TOKEN_PATH",
+            "HF_OIDC_ID_TOKEN",
+            "PIP_PYTHON",
+        ] {
+            assert!(PYTHON_ENV_REMOVES.contains(&key), "{key}");
+        }
+
+        let mut command = Command::new("python");
+        for (key, _) in PYTHON_ENV_SETS {
+            command.env(key, "inherited");
+        }
+        command.env("PIP_PYTHON", "/elsewhere/bin/python3");
+        clean_python_env(&mut command);
+        let set: std::collections::HashMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for (key, value) in PYTHON_ENV_SETS {
+            assert_eq!(set.get(*key), Some(&Some(value.to_string())), "{key}");
+        }
+        for key in PYTHON_ENV_REMOVES {
+            assert_eq!(set.get(*key), Some(&None), "{key} is removed");
+        }
+        assert_eq!(
+            set.get("PIP_PYTHON"),
+            Some(&None),
+            "an inherited PIP_PYTHON"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("src"),
+            venv_dir: dir.path().join("runtime").join("venv"),
+        });
+        let worker = mgr.worker_env();
+        for (key, value) in PYTHON_ENV_SETS {
+            let found: Vec<&String> = worker
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(found, vec![&value.to_string()], "{key}");
+        }
+    }
+
+    /// A Python on PATH new enough for `-P` (3.11), for the one test that runs [`PIP_SHIM`] in a
+    /// real interpreter, or None, and that test then says it skipped.
+    fn python_for_the_shim() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|python| {
+            Command::new(python)
+                .args(["-c", "import sys; sys.exit(sys.version_info < (3, 11))"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    /// A stand-in `pip` package in a fresh folder, to run [`PIP_SHIM`] against: `main()` prints
+    /// `ran` and succeeds, its option parser takes `--python` and defaults it, as a pip config file
+    /// would, from `FAKE_PIP_CONFIG_PYTHON`, and `session` is the source of its network session.
+    fn fake_pip(session: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in [
+            ("pip/__init__.py", ""),
+            ("pip/_internal/__init__.py", ""),
+            ("pip/_internal/network/__init__.py", ""),
+            ("pip/_internal/network/session.py", session),
+            ("pip/_internal/cli/__init__.py", ""),
+            (
+                "pip/_internal/cli/main.py",
+                "def main():\n    print('ran')\n    return 0\n",
+            ),
+            (
+                "pip/_internal/cli/main_parser.py",
+                "import optparse\nimport os\n\n\ndef create_main_parser():\n    \
+                 parser = optparse.OptionParser()\n    parser.disable_interspersed_args()\n    \
+                 parser.add_option('--python', default=os.environ.get('FAKE_PIP_CONFIG_PYTHON'))\n    \
+                 return parser\n",
+            ),
+        ] {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        dir
+    }
+
+    /// The shim in a real interpreter: it runs pip only once a session it builds really carries the
+    /// bare `pip`, and never a pip that `--python` (from the command line or a config file) would
+    /// re-run without it. Each refusal exits non-zero, so the install fails rather than sending the
+    /// profile.
+    #[test]
+    fn the_pip_shim_runs_pip_only_with_the_bare_user_agent_and_never_re_run() {
+        let Some(python) = python_for_the_shim() else {
+            eprintln!("skipped: no Python 3.11+ on PATH to run the pip shim in");
+            return;
+        };
+        const PROFILE: &str = "def user_agent():\n    return 'pip/99 {\"distro\": \"this one\"}'\n";
+        // pip as it is: the session reads the module's `user_agent` when it is built.
+        let late = format!(
+            "{PROFILE}\n\nclass PipSession:\n    def __init__(self):\n        \
+             self.headers = {{'User-Agent': user_agent()}}\n"
+        );
+        // A pip that bound the function before the shim could replace it.
+        let bound = format!(
+            "{PROFILE}\n\n_profile = user_agent\n\n\nclass PipSession:\n    def __init__(self):\n        \
+             self.headers = {{'User-Agent': _profile()}}\n"
+        );
+        let run = |session: &str, args: &[&str], config_python: Option<&str>| {
+            let pip = fake_pip(session);
+            let mut command = Command::new(python);
+            command
+                .args(PIP_LAUNCH)
+                .args(args)
+                .env("PYTHONPATH", pip.path())
+                .env_remove("PYTHONHOME")
+                .env_remove("FAKE_PIP_CONFIG_PYTHON");
+            if let Some(config_python) = config_python {
+                command.env("FAKE_PIP_CONFIG_PYTHON", config_python);
+            }
+            let out = command.output().unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+
+        let (ok, stdout, stderr) = run(&late, &["install", "x"], None);
+        assert!(ok && stdout.trim() == "ran", "{stdout} {stderr}");
+
+        let (ok, stdout, stderr) = run(&bound, &["install", "x"], None);
+        assert!(!ok && !stdout.contains("ran"), "{stdout}");
+        assert!(stderr.contains("its User-Agent did not change"), "{stderr}");
+
+        for (args, config_python) in [
+            (&["--python", "/usr/bin/python3", "install", "x"][..], None),
+            (&["install", "x"][..], Some("/usr/bin/python3")),
+        ] {
+            let (ok, stdout, stderr) = run(&late, args, config_python);
+            assert!(!ok && !stdout.contains("ran"), "{args:?}: {stdout}");
+            assert!(
+                stderr.contains("--python would run another pip"),
+                "{stderr}"
+            );
+        }
+
+        let (ok, _, stderr) = run("class PipSession:\n    pass\n", &["install", "x"], None);
+        assert!(
+            !ok && stderr.contains("cannot replace its User-Agent"),
+            "{stderr}"
+        );
+    }
+
+    /// While the venv is being updated a request gets [`ENGINE_UPDATING`] and no worker starts:
+    /// one would load a venv half old, half new. The flag is cleared when its holder goes.
+    #[cfg(unix)]
+    #[test]
+    fn no_worker_starts_while_the_venv_is_updating() {
+        let dir = tempfile::tempdir().unwrap();
+        let venv = dir.path().join("runtime").join("venv");
+        let log = dir.path().join("python.log");
+        fake_python(&venv, &log, 12);
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: venv,
+        });
+        {
+            let _updating = Provisioning::begin(&mgr.provisioning);
+            let err = mgr.reduce(&[vec![0.0, 1.0]], "pca").unwrap_err();
+            assert!(err.to_string().contains(ENGINE_UPDATING), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                "",
+                "nothing was started"
+            );
+        }
+        assert!(!mgr.provisioning.load(Ordering::SeqCst));
+    }
+
+    /// A venv `provision` updates in place (its marker is stale), on interpreters that are shell
+    /// scripts: the bundled base answers its version and checks, and the venv's pip, on `install`,
+    /// touches `started`, then waits for `release` and fails if `fail` is there. Returns the
+    /// manager and those three paths.
+    #[cfg(unix)]
+    fn venv_to_update(dir: &Path) -> (SidecarManager, PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let source_dir = dir.join("sidecar");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join("requirements.lock"),
+            b"base==1 \\\n    --hash=sha256:aaa\n",
+        )
+        .unwrap();
+        let (started, release, fail) = (dir.join("started"), dir.join("release"), dir.join("fail"));
+        let script = |path: &Path, body: String| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let version = "if [ \"$1\" = \"--version\" ]; then echo 'Python 3.12.0'; exit 0; fi\n";
+        script(
+            &dir.join("python").join("bin").join("python3"),
+            format!("#!/bin/sh\n{version}exit 0\n"),
+        );
+        let venv = dir.join("runtime").join("venv");
+        script(
+            &venv.join("bin").join("python"),
+            format!(
+                "#!/bin/sh\n{version}case \"$*\" in *\" install \"*)\n    : > '{started}'\n    \
+                 i=0\n    while [ ! -e '{release}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n    \
+                 [ -e '{fail}' ] && exit 1\n    ;;\nesac\nexit 0\n",
+                started = started.display(),
+                release = release.display(),
+                fail = fail.display(),
+            ),
+        );
+        std::fs::write(venv.join(".pm-ready"), b"an older lock").unwrap();
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir,
+            venv_dir: venv,
+        });
+        (mgr, started, release, fail)
+    }
+
+    /// The real update path: while pip is replacing the venv's packages a request is refused
+    /// rather than starting a worker on them, and the first one after the update may start one.
+    #[cfg(unix)]
+    #[test]
+    fn provision_keeps_the_worker_off_the_venv_until_the_update_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, started, release, _) = venv_to_update(dir.path());
+        std::thread::scope(|s| {
+            let update = s.spawn(|| mgr.ensure_installed());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !started.exists() {
+                assert!(Instant::now() < deadline, "pip never started");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let err = mgr.reduce(&[vec![0.0, 1.0]], "pca").unwrap_err();
+            assert!(err.to_string().contains(ENGINE_UPDATING), "{err}");
+            std::fs::write(&release, b"").unwrap();
+            update.join().unwrap().unwrap();
+        });
+        assert!(!mgr.provisioning.load(Ordering::SeqCst));
+        assert!(mgr.is_ready());
+    }
+
+    /// An update that fails part way clears the flag too, so the engine is not refused for the
+    /// rest of the session: the status reports the failure, and the next `ensure_installed` tries
+    /// again.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_update_does_not_keep_the_worker_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, _, release, fail) = venv_to_update(dir.path());
+        std::fs::write(&release, b"").unwrap();
+        std::fs::write(&fail, b"").unwrap();
+        assert!(mgr.ensure_installed().is_err());
+        assert!(!mgr.provisioning.load(Ordering::SeqCst));
+        assert!(matches!(mgr.status(), SidecarStatus::Error { .. }));
+    }
+
     use std::io::Cursor;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4275,8 +4821,9 @@ mod tests {
     }
 
     /// The package names a committed lock pins, PEP 503-normalised (uv writes `opentsne`, a pin may
-    /// say `openTSNE`; `faster_whisper` and `faster-whisper` are one package).
-    fn locked_names(lock: &str) -> std::collections::BTreeSet<String> {
+    /// say `openTSNE`; `faster_whisper` and `faster-whisper` are one package). Shared with the
+    /// Storage tab's tests (components.rs).
+    pub(crate) fn locked_names(lock: &str) -> std::collections::BTreeSet<String> {
         let path = format!("{}/../sidecar/{lock}", env!("CARGO_MANIFEST_DIR"));
         std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("{lock} is checked in"))
@@ -4287,8 +4834,52 @@ mod tests {
             .collect()
     }
 
-    fn normalised(name: &str) -> String {
+    pub(crate) fn normalised(name: &str) -> String {
         name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
+    }
+
+    /// Every package the base lock and the OTHER optional components' locks install: what removing
+    /// `component` must never take.
+    pub(crate) fn locked_elsewhere(component_lock: &str) -> std::collections::BTreeSet<String> {
+        let mut names = locked_names("requirements.lock");
+        for c in ALL_OPTIONAL_COMPONENTS {
+            if c.lock != component_lock {
+                names.extend(locked_names(c.lock));
+            }
+        }
+        names
+    }
+
+    /// Photo OCR removes exactly its pins and the small packages only it brings (the heavy image
+    /// libraries stay for the Storage cascade), plus the retired ones, which no lock may install.
+    #[test]
+    fn the_ocr_component_removes_what_only_it_brings() {
+        const CASCADE: &[&str] = &["opencv-python-headless", "shapely", "pyclipper"];
+        const RETIRED: &[&str] = &["pillow-heif", "antlr4-python3-runtime"];
+        let elsewhere = locked_elsewhere(OPTIONAL_OCR_COMPONENT.lock);
+        let only_ocr: std::collections::BTreeSet<String> =
+            locked_names(OPTIONAL_OCR_COMPONENT.lock)
+                .difference(&elsewhere)
+                .filter(|n| !CASCADE.contains(&n.as_str()))
+                .cloned()
+                .collect();
+        let mut every_lock = elsewhere.clone();
+        every_lock.extend(locked_names(OPTIONAL_OCR_COMPONENT.lock));
+        for name in RETIRED {
+            assert!(!every_lock.contains(*name), "{name} is locked again");
+        }
+        let removed: std::collections::BTreeSet<String> = OPTIONAL_OCR_COMPONENT
+            .uninstall
+            .iter()
+            .copied()
+            .map(normalised)
+            .collect();
+        let expected: std::collections::BTreeSet<String> = only_ocr
+            .into_iter()
+            .chain(RETIRED.iter().map(|n| n.to_string()))
+            .collect();
+        assert_eq!(removed, expected);
+        assert_eq!(OPTIONAL_OCR_COMPONENT.uninstall[0], "rapidocr");
     }
 
     /// The voice clean-up uninstalls its four packages from every venv that has an engine piece,
@@ -5166,16 +5757,11 @@ done
         assert_gone_for_good(&mgr, dir.path(), &log);
     }
 
-    /// The shared optional-component flow end to end, on photo OCR and [`fake_python`]. An install
-    /// over a current base venv first removes what the component's lock superseded, then installs
-    /// the lock with the flags every lock install takes, and stamps the marker; a second install
-    /// finds it current and runs nothing; a removal drops the marker and uninstalls exactly the
-    /// component's own packages.
+    /// A current base venv on [`fake_python`] with photo OCR's lock beside it, for the optional
+    /// component tests. Returns the manager, the venv, the pip log and the OCR lock.
     #[cfg(unix)]
-    #[test]
-    fn an_optional_component_installs_once_and_removes_its_own_packages() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_dir = dir.path().join("sidecar");
+    fn venv_for_ocr(dir: &Path) -> (SidecarManager, PathBuf, PathBuf, PathBuf) {
+        let source_dir = dir.join("sidecar");
         std::fs::create_dir_all(&source_dir).unwrap();
         // Only their existence and hashes matter here.
         std::fs::write(
@@ -5185,8 +5771,8 @@ done
         .unwrap();
         let ocr_lock = source_dir.join(OPTIONAL_OCR_COMPONENT.lock);
         std::fs::write(&ocr_lock, b"rapidocr==0 \\\n    --hash=sha256:bbb\n").unwrap();
-        let venv = dir.path().join("runtime").join("venv");
-        let log = dir.path().join("pip.log");
+        let venv = dir.join("runtime").join("venv");
+        let log = dir.join("pip.log");
         fake_python(&venv, &log, 12);
         // The base venv as provision leaves it: its marker holds the base lock's hash.
         let base = crate::ingest::hex_digest(
@@ -5197,12 +5783,46 @@ done
             source_dir,
             venv_dir: venv.clone(),
         });
+        (mgr, venv, log, ocr_lock)
+    }
+
+    /// A worker that records being stopped, put where a running one would be.
+    #[cfg(unix)]
+    fn plant_worker(mgr: &SidecarManager) -> Arc<Mutex<Vec<&'static str>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        *mgr.proc.lock().unwrap() = Some(Process {
+            stdin: Box::new(std::io::sink()),
+            stdout: Box::new(std::io::empty()),
+            control: Box::new(RecordingControl::new(&log, 0)),
+        });
+        log
+    }
+
+    /// The shared optional-component flow end to end, on photo OCR and [`fake_python`]. An install
+    /// over a current base venv first removes what the component's lock superseded, then installs
+    /// the lock with the flags every lock install takes, and stamps the marker, leaving a running
+    /// worker alone; a second install finds it current and runs nothing; a removal drops the
+    /// marker, uninstalls exactly the component's own packages and deletes its model weights.
+    #[cfg(unix)]
+    #[test]
+    fn an_optional_component_installs_once_and_removes_its_own_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, venv, log, ocr_lock) = venv_for_ocr(dir.path());
         let logged = || std::fs::read_to_string(&log).unwrap_or_default();
+        let worker = plant_worker(&mgr);
 
         assert!(!mgr.optional_ocr_ready());
         mgr.install_optional_ocr(|_| {}).unwrap();
+        // Nothing the worker has loaded changed: the lock adds packages and moves none.
+        assert!(
+            worker.lock().unwrap().is_empty(),
+            "a first install stops no worker"
+        );
+        assert!(mgr.proc.lock().unwrap().is_some());
         let lock_arg = ocr_lock.to_string_lossy().into_owned();
-        let mut install = vec!["-m", "pip", "install"];
+        // Installs go through the User-Agent shim (PIP_LAUNCH); uninstalls download nothing.
+        let mut install: Vec<&str> = PIP_LAUNCH.to_vec();
+        install.push("install");
         install.extend(LOCK_INSTALL_FLAGS);
         install.extend(["--progress-bar", "off", "-r", &lock_arg]);
         assert_eq!(
@@ -5219,6 +5839,13 @@ done
         mgr.install_optional_ocr(|_| {}).unwrap();
         assert_eq!(logged(), "", "a current component installs nothing");
 
+        // What the first photo leaves: rapidocr's models copied beside the search model.
+        let models = dir.path().join("runtime").join("models");
+        put(
+            models.join(OCR_WEIGHTS_DIR).join("PP-OCRv6_det_small.onnx"),
+            10,
+        );
+        put(models.join("fastembed").join("model.onnx"), 10);
         mgr.uninstall_optional_ocr().unwrap();
         assert!(!venv.join(".pm-ocr").exists());
         assert!(!mgr.optional_ocr_ready());
@@ -5229,6 +5856,41 @@ done
                 OPTIONAL_OCR_COMPONENT.uninstall.join(" ")
             )
         );
+        assert!(!models.join(OCR_WEIGHTS_DIR).exists(), "the OCR models go");
+        assert!(models.join("fastembed").join("model.onnx").exists());
+        assert_eq!(&*worker.lock().unwrap(), &["kill", "try_reap"]);
+    }
+
+    /// Reinstalling over an earlier copy of a component (its marker stale) stops the worker first:
+    /// it loads pi-heif for every photo, and on Windows pip cannot replace a DLL in use.
+    #[cfg(unix)]
+    #[test]
+    fn reinstalling_over_an_earlier_copy_stops_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, venv, _log, _) = venv_for_ocr(dir.path());
+        std::fs::write(venv.join(".pm-ocr"), b"an older lock").unwrap();
+        let worker = plant_worker(&mgr);
+        mgr.install_optional_ocr(|_| {}).unwrap();
+        assert_eq!(&*worker.lock().unwrap(), &["kill", "try_reap"]);
+        assert!(mgr.proc.lock().unwrap().is_none());
+        assert!(mgr.optional_ocr_ready());
+    }
+
+    /// The OCR models are removed only from a real folder: a link in their place leads somewhere
+    /// PM doesn't own, so the link and what it points to stay.
+    #[cfg(unix)]
+    #[test]
+    fn removing_photo_ocr_leaves_a_linked_model_folder_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, _, _, _) = venv_for_ocr(dir.path());
+        let elsewhere = dir.path().join("elsewhere");
+        put(elsewhere.join("PP-OCRv6_det_small.onnx"), 10);
+        let models = dir.path().join("runtime").join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, models.join(OCR_WEIGHTS_DIR)).unwrap();
+        mgr.uninstall_optional_ocr().unwrap();
+        assert!(std::fs::symlink_metadata(models.join(OCR_WEIGHTS_DIR)).is_ok());
+        assert!(elsewhere.join("PP-OCRv6_det_small.onnx").exists());
     }
 
     /// A computer that never had voice, or a fresh install with no venv yet: nothing is there, so
@@ -5636,14 +6298,33 @@ done
     }
 
     #[test]
-    fn enforces_minimum_python() {
+    fn enforces_the_supported_python_range() {
         assert!(meets_min((3, 11)));
+        assert!(meets_min((3, 12)));
         assert!(meets_min((3, 14)));
-        assert!(meets_min((4, 0)));
         // pillow 13 has no 3.10 wheels and no 3.10 in its Requires-Python.
         assert!(!meets_min((3, 10)));
         assert!(!meets_min((3, 9)));
         assert!(!meets_min((2, 7)));
+        // markitdown 0.1.9 says `<3.15` and onnxruntime has no cp315 wheel.
+        assert!(!meets_min((3, 15)));
+        assert!(!meets_min((4, 0)));
+        // A venv on a too-new interpreter is rebuilt, like one on a too-old one.
+        assert!(should_rebuild_venv(true, true, Some((3, 15))));
+        assert!(!should_rebuild_venv(true, true, Some((3, 12))));
+    }
+
+    /// The framework versions a Mac lists are filtered to the supported range, newest first.
+    #[test]
+    fn framework_versions_skip_unsupported_interpreters() {
+        let names: Vec<String> = ["3.9", "3.11", "3.12", "3.15", "Current", "3.14"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            pick_framework_versions(&names),
+            vec![(3, 14), (3, 12), (3, 11)]
+        );
     }
 
     #[test]

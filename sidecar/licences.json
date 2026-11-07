@@ -10,29 +10,24 @@
     "project's own LICENSE file (or, where a project ships none, from the wheel PM installs) and",
     "the `note` records what was read.",
     "",
+    "`licence` records the wheel AS INSTALLED. For a compiled package that is its own code AND",
+    "everything its win_amd64, macOS and manylinux x86_64 wheels bundle: auditwheel's <pkg>.libs/,",
+    "delocate's .dylibs/, delvewheel's DLLs, and code linked in statically. Read it from the wheels",
+    "whose hashes are in the locks, not from the project's metadata or its LICENSE alone.",
+    "",
     "When upstream's metadata moves, the stamp changes and the generator BLANKS `licence` rather",
-    "than carrying the old answer forward. `just sidecar-licences` then fails until a human looks.",
+    "than carrying the old answer forward; it keeps the old answer and its note in `previous`, to",
+    "compare the new wheels against. `just sidecar-licences` then fails until a human looks.",
     "",
     "PM does not ship these packages — pip fetches them onto the user's machine on first run — so",
     "they are deliberately not in THIRD-PARTY-NOTICES.txt, which covers what the installer conveys."
   ],
   "version": 1,
   "packages": {
-    "antlr4-python3-runtime": {
-      "versions": ["4.9.3"],
-      "licence": "BSD-3-Clause",
-      "stamp": "46ba327584d282edc4c707bbbc43ee4e",
-      "evidence": {
-        "expression": null,
-        "license": "BSD",
-        "classifiers": []
-      },
-      "note": "`license: \"BSD\"` does not say how many clauses. ANTLR's LICENSE.txt is the three-clause text (\"Neither name of copyright holders nor the names of its contributors...\")."
-    },
     "anyio": {
-      "versions": ["4.14.2"],
+      "versions": ["4.15.1"],
       "licence": "MIT",
-      "stamp": "a41517ef0af8f8e02b79334ab2d499d6",
+      "stamp": "56845dbca70f1cb4581cf786da74586f",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -50,9 +45,9 @@
       }
     },
     "certifi": {
-      "versions": ["2026.10.19"],
+      "versions": ["2026.10.23"],
       "licence": "MPL-2.0",
-      "stamp": "65106fb9319caba4c9e02c330622e097",
+      "stamp": "ed237ce2a0c1a4192b4f279f4c876f9a",
       "evidence": {
         "expression": null,
         "license": "MPL-2.0",
@@ -61,18 +56,19 @@
     },
     "cffi": {
       "versions": ["2.1.1"],
-      "licence": "MIT-0",
+      "licence": "MIT-0 AND MIT",
       "stamp": "5dbd1b13c6116040446b19fa9961d834",
       "evidence": {
         "expression": "MIT-0",
         "license": null,
         "classifiers": []
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). cffi is MIT-0; its wheels bundle libffi (MIT)."
     },
     "charset-normalizer": {
-      "versions": ["3.5.1"],
+      "versions": ["3.5.2"],
       "licence": "MIT",
-      "stamp": "ed521e8e1e0661b23228ffeced5db664",
+      "stamp": "bd8cbb0c8b48b921ae534e2104fd278c",
       "evidence": {
         "expression": null,
         "license": "MIT",
@@ -80,14 +76,25 @@
       }
     },
     "click": {
-      "versions": ["8.4.2"],
+      "versions": ["8.5.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "676b8dca54bdd36ef3ff701281764b2f",
+      "stamp": "1c59e6dbff41dee87dcee39e490f815e",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
         "classifiers": []
       }
+    },
+    "cloudpickle": {
+      "versions": ["3.1.2"],
+      "licence": "BSD-3-Clause",
+      "stamp": "dd63e7ec2551b24222bf1ac0e9994aa9",
+      "evidence": {
+        "expression": null,
+        "license": "BSD-3-Clause",
+        "classifiers": ["License :: OSI Approved :: BSD License"]
+      },
+      "note": "Declares `license: \"BSD-3-Clause\"` with the BSD classifier; the project's LICENSE is the three-clause text. New in the t-SNE lock: joblib 1.6.0 requires it."
     },
     "cobble": {
       "versions": ["0.1.4"],
@@ -122,14 +129,15 @@
       }
     },
     "cryptography": {
-      "versions": ["50.0.1"],
-      "licence": "Apache-2.0 OR BSD-3-Clause",
-      "stamp": "7e32e7c7576a97d2205933b28e57ee31",
+      "versions": ["50.0.2"],
+      "licence": "BSD-3-Clause AND Apache-2.0 AND MIT",
+      "stamp": "6033e0f7b7e6a47f60e0b879e784248b",
       "evidence": {
         "expression": "Apache-2.0 OR BSD-3-Clause",
         "license": null,
         "classifiers": []
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). cryptography's own code is Apache-2.0 OR BSD-3-Clause (BSD-3-Clause taken); the wheels link OpenSSL 3 (Apache-2.0) and Rust crates (MIT, Apache-2.0) statically."
     },
     "defusedxml": {
       "versions": ["0.7.1"],
@@ -184,15 +192,14 @@
       "note": "`license: \"Apache 2.0\"` — the same licence, written informally."
     },
     "fsspec": {
-      "versions": ["2026.7.0"],
+      "versions": ["2026.9.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "ad60b8117cca7a90757a76c3ecc9e31b",
+      "stamp": "0f39618947e4db42f9965e9f1d2a9136",
       "evidence": {
-        "expression": null,
+        "expression": "BSD-3-Clause",
         "license": null,
         "classifiers": []
-      },
-      "note": "Declares no licence and carries no classifier. The project's LICENSE is the three-clause text."
+      }
     },
     "h11": {
       "versions": ["0.16.0"],
@@ -205,14 +212,15 @@
       }
     },
     "hf-xet": {
-      "versions": ["1.6.0"],
-      "licence": "Apache-2.0",
-      "stamp": "c4ec81b24b8c09b2bb6e122d85d4263b",
+      "versions": ["1.7.1"],
+      "licence": "Apache-2.0 AND MIT AND ISC AND BSD-2-Clause AND BSD-3-Clause AND Zlib AND MPL-2.0 AND Unicode-3.0",
+      "stamp": "67dd1ddce8b347769fbe78b0f46aef9a",
       "evidence": {
         "expression": "Apache-2.0",
         "license": null,
         "classifiers": ["License :: OSI Approved :: Apache Software License"]
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). hf-xet is Apache-2.0; its single extension links ~230 Rust crates (per its SBOM) and AWS-LC (ISC, Apache-2.0, MIT, BSD-3-Clause) statically. Its transfer telemetry is off in PM (HF_XET_TELEMETRY_ENABLED=0, HF_HUB_DISABLE_TELEMETRY=1)."
     },
     "httpcore": {
       "versions": ["1.0.9"],
@@ -235,9 +243,9 @@
       }
     },
     "huggingface-hub": {
-      "versions": ["1.28.0"],
+      "versions": ["1.33.0"],
       "licence": "Apache-2.0",
-      "stamp": "a8aa8d62f0785c3af2ce81344f7229ec",
+      "stamp": "9eb0721ecd0d8233786f3fc0a2c97ce4",
       "evidence": {
         "expression": null,
         "license": "Apache-2.0",
@@ -245,9 +253,9 @@
       }
     },
     "idna": {
-      "versions": ["3.19"],
+      "versions": ["3.20"],
       "licence": "BSD-3-Clause",
-      "stamp": "bd02afba345d6f54df6b06e01715cf2b",
+      "stamp": "4210235f07cbd432e0caaac95a63842a",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
@@ -255,9 +263,9 @@
       }
     },
     "joblib": {
-      "versions": ["1.5.3"],
+      "versions": ["1.6.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "970774316aa74c030216863fbb6c30fd",
+      "stamp": "4ecdcb658ae410fbceaf847fdc41e114",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
@@ -276,24 +284,26 @@
       "note": "Classifier only; the project's LICENSE is the MIT text."
     },
     "lxml": {
-      "versions": ["6.1.2"],
-      "licence": "BSD-3-Clause",
-      "stamp": "62ffd0b3688681f778e817d6afd83404",
+      "versions": ["6.1.3"],
+      "licence": "BSD-3-Clause AND PSF-2.0 AND MIT AND Zlib AND LGPL-2.1-or-later AND MIT-CMU",
+      "stamp": "ee3aef7a94e4b7165a17ae22aad99c21",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause",
         "classifiers": []
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). lxml is BSD-3-Clause, with PSF-2.0 parts (code from CPython's xml.etree and difflib) and MIT-CMU parts: lxml/_elementpath.py (shipped beside its compiled module) derives from ElementTree, whose licence (lxml's doc/licenses/elementtree.txt, the Secret Labs text) is MIT-CMU. Every wheel links libxml2 and libxslt (MIT), zlib, and GNU libiconv 1.18 (LGPL-2.1-or-later) statically. A static LGPL link puts the relinking duty (LGPL-2.1 section 6) on whoever distributes the wheel, which is PyPI, not PM. lxml/isoschematron/resources, data files PM never loads, carry their own terms: four of the XSLT 1.0 Schematron stylesheets are Zlib and iso_abstract_expand.xsl is MIT (Rick Jelliffe and Academia Sinica); iso-schematron.rng is ISO/IEC's own schema notice (free to use, copy, modify and distribute for software based on the schema, a modified copy marked as such), which has no SPDX id; RNG2Schtrn.xsl and XSD2Schtrn.xsl carry no licence at all, which lxml's LICENSES.txt calls 'unlicensed and copyright the respective authors'."
     },
     "magika": {
-      "versions": ["0.6.2", "0.6.3"],
-      "licence": "Apache-2.0",
-      "stamp": "e4607b5fa00fb587a0bb900973ea177c",
+      "versions": ["1.0.3"],
+      "licence": "Apache-2.0 AND MIT AND MPL-2.0 AND Unicode-3.0 AND BSD-3-Clause AND BSD-2-Clause AND BSL-1.0 AND ISC",
+      "stamp": "ab244c35ed36a4f629059c4aa0017619",
       "evidence": {
         "expression": null,
         "license": "Apache-2.0",
         "classifiers": ["License :: OSI Approved :: Apache Software License"]
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). The Python package is Apache-2.0 with its .onnx model. The platform wheels also ship magika-cli, a Rust executable PM never runs, that links ~95 crates (MIT OR Apache-2.0: MIT taken; MPL-2.0, Unicode-3.0, ISC) and ONNX Runtime 1.24 statically (MIT, Apache-2.0, BSD, MPL-2.0, BSL-1.0). The py3-none-any wheel (Intel Macs) is Apache-2.0 alone."
     },
     "mammoth": {
       "versions": ["1.13.0"],
@@ -327,9 +337,9 @@
       }
     },
     "mmh3": {
-      "versions": ["5.3.0"],
+      "versions": ["5.3.1"],
       "licence": "MIT",
-      "stamp": "7356083020b51f7592d1ab4b7b080eaf",
+      "stamp": "acfb903983e23d90b854d24c8a42cf43",
       "evidence": {
         "expression": null,
         "license": "MIT License Copyright (c) 2011-2026 Hajime Senuma Permission is hereby granted, free of charge, to any person obtaini...",
@@ -338,9 +348,9 @@
       "note": "`license` is the entire MIT text pasted into the one-line field."
     },
     "narwhals": {
-      "versions": ["2.25.0"],
+      "versions": ["2.28.0"],
       "licence": "MIT",
-      "stamp": "db104591e80e74d4e56a19f7287dc85e",
+      "stamp": "a80bc4d1e95a4de5db590019b8751f44",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -348,15 +358,15 @@
       }
     },
     "numpy": {
-      "versions": ["2.4.6", "2.5.2"],
-      "licence": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
-      "stamp": "f8e3aa1fc386934e02a8c0fc40167240",
+      "versions": ["2.4.6", "2.5.4"],
+      "licence": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 AND BSD-3-Clause-Open-MPI AND GPL-3.0-or-later WITH GCC-exception-3.1 AND LGPL-2.1-or-later AND LicenseRef-Microsoft-VC-Redistributable",
+      "stamp": "b7d881dff99b010b79e8248ee3b93b06",
       "evidence": {
         "expression": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
         "license": null,
         "classifiers": []
       },
-      "note": "Both pinned versions declare the full expression, which names the licences of the code numpy vendors (0BSD, MIT, Zlib, CC0-1.0) alongside its own BSD-3-Clause. (2.2.6, which pasted only the BSD-3-Clause text, left the lock with Python 3.10.)"
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). numpy's own code and what it vendors (highway, pocketfft, libdivide, x86-simd-sort, svml) is the declared BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0. The wheels add OpenBLAS (BSD-3-Clause, with LAPACK's BSD-3-Clause-Open-MPI), the GCC runtime libgfortran and libgcc_s (GPL-3.0-or-later WITH GCC-exception-3.1; static inside the Windows OpenBLAS DLL) and libquadmath (LGPL-2.1-or-later; Linux and the older macOS wheels), and on Windows Microsoft's msvcp140. The macosx_14_0 wheels bundle nothing: they link Apple's Accelerate."
     },
     "olefile": {
       "versions": ["0.47"],
@@ -370,36 +380,37 @@
       "note": "`license: \"BSD\"`. LICENSE.txt has two clauses and no \"neither the name\" clause — genuinely 2-clause, unlike most of the others here."
     },
     "omegaconf": {
-      "versions": ["2.3.1"],
+      "versions": ["2.4.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "92c5b29efffce05c531747b5843f372a",
+      "stamp": "d0e74720acdf841f9e08805d5164282b",
       "evidence": {
         "expression": null,
         "license": null,
         "classifiers": ["License :: OSI Approved :: BSD License"]
       },
-      "note": "Classifier only; the project's LICENSE is the three-clause text."
+      "note": "Classifier only; the project's LICENSE is the three-clause text. From 2.4.0 the wheel vendors the ANTLR 4.11.1 runtime (BSD-3-Clause, ATTRIBUTION/LICENSE-antlr4), which used to be the separate antlr4-python3-runtime package."
     },
     "onnxruntime": {
-      "versions": ["1.29.0"],
-      "licence": "MIT",
-      "stamp": "0871ccf3fe3dfbda712227de8ff73e63",
+      "versions": ["1.31.1"],
+      "licence": "MIT AND Apache-2.0 AND BSD-3-Clause AND BSD-2-Clause AND MPL-2.0 AND BSL-1.0 AND Zlib AND curl AND blessing AND GPL-3.0-or-later WITH GCC-exception-3.1",
+      "stamp": "a1faac5cf71504c438d5399328c427e8",
       "evidence": {
         "expression": null,
         "license": "MIT License",
         "classifiers": ["License :: OSI Approved :: MIT License"]
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). ONNX Runtime is MIT; it links protobuf, onnx, abseil, re2, flatbuffers, Eigen, Boost, XNNPACK and others statically (Apache-2.0, BSD, MPL-2.0, BSL-1.0, MIT). The Linux wheel also links libcurl (curl), Mbed TLS (Apache-2.0 OR GPL-2.0-or-later: Apache-2.0 taken, as the wheel's ThirdPartyNotices.txt says it is), SQLite 3.53.1 (blessing), zlib and libstdc++_nonshared (GCC runtime exception) for Microsoft's 1DS telemetry uploader. The macOS wheel carries the 1DS client too, on the system's NSURLSession and /usr/lib/libsqlite3.dylib, so it bundles nothing more for it. The Windows wheel has no 1DS client; its telemetry is an ETW provider. PM switches both off (ORT_DISABLE_TELEMETRY; ORT_RUNNING_UNIT_TESTS, and disable_telemetry_events() per request, for the ETW provider)."
     },
     "opencv-python-headless": {
       "versions": ["5.0.0.93"],
-      "licence": "Apache-2.0 AND MIT",
+      "licence": "Apache-2.0 AND MIT AND LGPL-2.1-or-later AND GPL-3.0-or-later AND GPL-2.0-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1 AND OpenSSL AND LicenseRef-Intel-ISSL AND BSD-3-Clause AND BSD-2-Clause AND libpng-2.0 AND IJG AND libtiff AND Zlib AND ISC AND BSD-2-Clause-Patent AND LGPL-3.0-or-later AND LGPL-2.0-or-later AND MPL-2.0 AND FTL AND WTFPL AND BSD-3-Clause-Clear AND MIT-Modern-Variant AND X11 AND MIT-open-group AND 0BSD AND BSD-3-Clause-Open-MPI AND OFL-1.1",
       "stamp": "8b60ee0c8a3b993b6e99e2a003e4039e",
       "evidence": {
         "expression": null,
         "license": "Apache 2.0",
         "classifiers": ["License :: OSI Approved :: Apache Software License"]
       },
-      "note": "Two licences in one wheel: OpenCV itself — the library in the binary — is Apache-2.0, which is what `license` reports; the opencv-python packaging project that builds the wheel (this is its headless build, the one rapidocr 3.10 depends on) is MIT. Same evidence stamp as the opencv-python entry it replaces."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). OpenCV is Apache-2.0 and the opencv-python packaging MIT. Every wheel compiles in OpenCV 5's built-in fonts: Rubik and Rubik Italic (OFL-1.1, OpenCV's modules/imgproc/fonts/Rubik_OFL.txt) and WenQuanYi Micro Hei (Apache-2.0, as its own name table says); what else each wheel bundles differs. macOS arm64: Homebrew's FFmpeg 7.1 built with --enable-gpl and --enable-version3 (GPL-3.0-or-later) with x264, x265, rubberband and vidstab (GPL-2.0-or-later), plus a long LGPL/MPL/permissive tail: nettle, gmp, libunistring, libidn2 and graphite2 offer LGPL or GPL (the LGPL side taken); gnutls is LGPL-2.1-or-later only; mbedcrypto Apache-2.0 taken; zstd BSD-3-Clause taken (over GPL-2.0-only); libb2 Apache-2.0 taken (over CC0-1.0 and OpenSSL); highway Apache-2.0 taken (over BSD-3-Clause); FreeType FTL taken; HarfBuzz MIT-Modern-Variant; libX11 MIT AND X11, libxcb X11, libXau and libXdmcp MIT-open-group (their COPYING files, as Fedora's SPDX review reads them); liblzma from xz 5.8 0BSD; zimg WTFPL; libvmaf BSD-2-Clause-Patent. Every x86_64 wheel links Intel IPP ICV statically (LicenseRef-Intel-ISSL: binary-only terms). Linux: FFmpeg (LGPL-2.1-or-later), OpenSSL 1.1.1k (OpenSSL; end-of-life upstream, unreachable from PM), OpenBLAS with its LAPACK (BSD-3-Clause, BSD-3-Clause-Open-MPI), libgfortran and libquadmath. Windows: an FFmpeg DLL (LGPL-2.1-or-later) and OpenCV's built-in CLAPACK (BSD-3-Clause-Open-MPI; 'Lapack: YES (Built-In libclapack)' in cv2's build information). PM uses OpenCV only through rapidocr for pixel work. The GPL, Intel and OpenSSL parts are allowed for this package alone (PACKAGE_EXCEPTIONS in scripts/check-sidecar-licences.mjs, Bobby 2026-11-06: accept now, look for a swap). The fonts' OFL-1.1 is on the general allow-list (Bobby 2026-11-06)."
     },
     "openpyxl": {
       "versions": ["3.1.5"],
@@ -413,13 +424,14 @@
     },
     "opentsne": {
       "versions": ["1.0.4"],
-      "licence": "BSD-3-Clause",
+      "licence": "BSD-3-Clause AND Apache-2.0 AND MIT AND GPL-3.0-or-later WITH GCC-exception-3.1",
       "stamp": "2a0f8b257e7ba440a39336de13a2d663",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause",
         "classifiers": ["License :: OSI Approved"]
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). openTSNE is BSD-3-Clause and compiles in Spotify's Annoy (Apache-2.0) and, on Windows, mman-win32 (MIT). The Linux wheel bundles libgomp (GCC runtime exception); the macOS universal2 wheel bundles nothing."
     },
     "packaging": {
       "versions": ["26.3"],
@@ -432,15 +444,15 @@
       }
     },
     "pandas": {
-      "versions": ["3.0.5"],
-      "licence": "BSD-3-Clause",
-      "stamp": "9c95aeca723365bb75ebab485d8733c0",
+      "versions": ["3.1.0"],
+      "licence": "BSD-3-Clause AND BSD-2-Clause AND MIT AND TCL AND Apache-2.0 AND PSF-2.0 AND LicenseRef-Microsoft-VC-Redistributable",
+      "stamp": "74929ac5d36cd4b3aa55701ec6905a27",
       "evidence": {
-        "expression": null,
-        "license": "BSD 3-Clause License Copyright (c) 2008-2011, AQR Capital Management, LLC, Lambda Foundry, Inc. and PyData Developmen...",
-        "classifiers": ["License :: OSI Approved :: BSD License"]
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
       },
-      "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). pandas is BSD-3-Clause; compiled in are ujson (BSD-3-Clause AND TCL), klib, musl-derived code, xsimd and fast_float 8.2.10 (Apache-2.0 OR BSL-1.0 OR MIT: MIT taken); its pure-Python borrowings add Apache-2.0, BSD-2-Clause and PSF-2.0. Windows adds msvcp140; Linux and macOS bundle no libraries."
     },
     "pdfminer-six": {
       "versions": ["20260107"],
@@ -465,36 +477,36 @@
     },
     "pi-heif": {
       "versions": ["1.4.0"],
-      "licence": "BSD-3-Clause AND LGPL-3.0-only",
+      "licence": "BSD-3-Clause AND LGPL-3.0-or-later AND GPL-3.0-or-later WITH GCC-exception-3.1 AND MIT",
       "stamp": "2c3ec3d9e79c6a22bb24fbf9aac3af07",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause",
         "classifiers": ["License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)"]
       },
-      "note": "The bindings are BSD-3-Clause (`license`), but the wheel is not only the bindings. Its own dist-info/licenses/LICENSES_bundled.txt states: \"License for pi-heif binary wheels: LGPLv3, due to base library licenses\" — libheif and libde265, both LGPLv3, shipped as DLLs/shared objects alongside the Python code. That is what the LGPLv3 classifier is about, and why the compound expression is the honest record. Recorded as -only rather than -or-later because upstream writes \"LGPLv3\" without stating \"or later\", and the stricter reading is the safe one. This is also why PM pins pi-heif and not pillow-heif: same author, same repository, same API, but pillow-heif's wheels add the x265 HEVC encoder and are GPLv2 as a whole."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). The bindings are BSD-3-Clause. Every wheel bundles libheif 1.23.0 and libde265 1.1.0 as shared libraries; upstream licenses both LGPL-3.0-or-later (the wheel's own dist-info/licenses/LICENSES_bundled.txt: \"License for pi-heif binary wheels: LGPLv3, due to base library licenses\"; an earlier review recorded -only, which was stricter than what upstream grants). Windows adds the MinGW runtime libstdc++ and libgcc_s (GCC runtime exception) and libwinpthread (MIT AND BSD-3-Clause: BSD-3-Clause is in the expression already)."
     },
     "pillow": {
       "versions": ["13.0.0"],
-      "licence": "MIT-CMU",
+      "licence": "MIT-CMU AND MIT AND FTL AND MIT-Modern-Variant AND BSD-2-Clause AND BSD-3-Clause AND IJG AND Zlib AND libpng-2.0 AND libtiff AND 0BSD AND TCL AND MIT-open-group AND X11 AND bzip2-1.0.6",
       "stamp": "e971bc4ca21449fdd2f778c70d99be28",
       "evidence": {
         "expression": "MIT-CMU",
         "license": null,
         "classifiers": []
       },
-      "note": "Read in the 13.0.0 wheels (cp312 Linux x86_64, macOS arm64, Windows amd64): dist-info/licenses/LICENSE is Pillow's MIT-CMU text followed by the licences of the native libraries the wheel bundles, all permissive. FreeType offers its own FTL or GPL-2.0-or-later, the FTL being the permissive choice; liblzma is public domain. The Linux and macOS files are byte-identical to 12.3.0's; the Windows one differs only in the harfbuzz and libjpeg-turbo versions and libjpeg-turbo's note on the libspng code its cjpeg/djpeg tools use (BSD-2-Clause and libpng-2.0, subsumed by its IJG and BSD-3-Clause terms)."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). Pillow is MIT-CMU; its wheels bundle FreeType (FTL OR GPL-2.0-or-later: FTL taken), HarfBuzz (MIT-Modern-Variant), libjpeg-turbo (IJG AND BSD-3-Clause AND Zlib), libpng, libtiff, liblzma (0BSD), libavif/libaom/dav1d, libwebp, OpenJPEG, brotli, lcms2, zlib-ng, raqm (BSD and MIT), libzstd on Linux (BSD-3-Clause OR GPL-2.0-only: BSD-3-Clause taken), libXau and libxcb (MIT-open-group, X11), and the Tcl/Tk stubs (TCL). FriBiDi is only dlopen()ed from the system, never bundled. The Linux wheel's FreeType links bzip2 1.0.8 statically (its BZ2_ symbols and version string are in pillow.libs/libfreetype, which needs no libbz2): bzip2-1.0.6 is SPDX's id for that licence text. The macOS FreeType loads the system's /usr/lib/libbz2.1.0.dylib instead, and the Windows build has no bzip2."
     },
     "protobuf": {
-      "versions": ["7.36.0"],
-      "licence": "BSD-3-Clause",
-      "stamp": "8db267b733d3e8408933cf409d0b5b18",
+      "versions": ["7.36.2"],
+      "licence": "BSD-3-Clause AND MIT",
+      "stamp": "ba6509470e3543c68f47e695650e4641",
       "evidence": {
         "expression": null,
         "license": "3-Clause BSD License",
         "classifiers": []
       },
-      "note": "`license: \"3-Clause BSD License\"` — the same licence, written informally."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). protobuf is BSD-3-Clause; its upb extension carries utf8_range (MIT)."
     },
     "py-rust-stemmers": {
       "versions": ["0.1.8"],
@@ -509,18 +521,19 @@
     },
     "pyclipper": {
       "versions": ["1.4.0"],
-      "licence": "MIT",
+      "licence": "MIT AND BSL-1.0",
       "stamp": "1e0ca581823af20439e1e2931c50438e",
       "evidence": {
         "expression": null,
         "license": "MIT",
         "classifiers": ["License :: OSI Approved", "License :: OSI Approved :: MIT License"]
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). pyclipper is MIT; ClipperLib 6.4.2 (BSL-1.0) is compiled into its extension."
     },
     "pycparser": {
-      "versions": ["3.0"],
+      "versions": ["3.12"],
       "licence": "BSD-3-Clause",
-      "stamp": "0b59f9dcc4b05cf87a596c757be8a828",
+      "stamp": "b5d9aa0f7db3b896e0a105a0c44a9456",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
@@ -528,19 +541,19 @@
       }
     },
     "pypdfium2": {
-      "versions": ["5.13.0"],
-      "licence": "Apache-2.0 OR BSD-3-Clause",
-      "stamp": "30ae3ea4938a37568119ebfda68f0765",
+      "versions": ["5.14.0"],
+      "licence": "BSD-3-Clause AND Apache-2.0 AND MIT AND FTL AND Unicode-3.0 AND ICU AND Apache-2.0 WITH LLVM-exception AND LicenseRef-AGG-2.3 AND IJG AND Zlib AND libpng-2.0 AND BSD-2-Clause AND CC-BY-4.0 AND LicenseRef-Microsoft-VC-Redistributable",
+      "stamp": "841c4cc7e86ddd7ff89c0ddf5e3578dc",
       "evidence": {
         "expression": null,
         "license": "BSD-3-Clause, Apache-2.0, dependency licenses",
         "classifiers": []
       },
-      "note": "`license` reads \"BSD-3-Clause, Apache-2.0, dependency licenses\" — the bindings are dual-licensed (either satisfies), and the bundled PDFium is itself BSD-3-Clause."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). The bindings are Apache-2.0 OR BSD-3-Clause (BSD-3-Clause taken) with CC-BY-4.0 documentation. The one bundled library, PDFium (BSD-3-Clause AND Apache-2.0), links statically FreeType (FTL), ICU (Unicode-3.0 AND ICU), libc++ (Apache-2.0 WITH LLVM-exception), Anti-Grain Geometry 2.3, libjpeg-turbo, libpng, OpenJPEG, abseil, lcms2, fast_float, simdutf and zlib, plus the Microsoft static C/C++ runtime on Windows. The same 15 licence files ship for every platform."
     },
     "python-dateutil": {
       "versions": ["2.9.0.post0"],
-      "licence": "Apache-2.0 OR BSD-3-Clause",
+      "licence": "Apache-2.0 AND BSD-3-Clause",
       "stamp": "7b88e055c464a215b50ecbd0f91a3557",
       "evidence": {
         "expression": null,
@@ -550,17 +563,7 @@
           "License :: OSI Approved :: BSD License"
         ]
       },
-      "note": "`license: \"Dual License\"`, and the two classifiers name Apache and BSD without saying which applies. The LICENSE file carries both texts and lets the user pick."
-    },
-    "python-dotenv": {
-      "versions": ["1.2.3"],
-      "licence": "BSD-3-Clause",
-      "stamp": "bd0c5abda52da9c90ca892dbf5a7e1d2",
-      "evidence": {
-        "expression": null,
-        "license": "BSD-3-Clause",
-        "classifiers": []
-      }
+      "note": "`license: \"Dual License\"`, and the two classifiers name Apache and BSD without saying which applies. The LICENSE file (read in the py3 wheel) applies both rather than offering a choice: Apache-2.0 to every contribution after 2017-12-01 and to the code its authors re-licensed, and BSD-3-Clause to all the code, 'even that also covered by Apache 2.0'."
     },
     "python-pptx": {
       "versions": ["1.0.2"],
@@ -603,18 +606,19 @@
       }
     },
     "scikit-learn": {
-      "versions": ["1.9.0"],
-      "licence": "BSD-3-Clause",
-      "stamp": "57e96c78232c9c9eac4fc44f3047aa31",
+      "versions": ["1.9.1"],
+      "licence": "BSD-3-Clause AND MIT AND GPL-3.0-or-later WITH GCC-exception-3.1 AND Apache-2.0 WITH LLVM-exception AND NCSA AND LicenseRef-Microsoft-VC-Redistributable",
+      "stamp": "a5c74b6068d3300f31edce34039f9216",
       "evidence": {
         "expression": "BSD-3-Clause",
         "license": null,
         "classifiers": []
-      }
+      },
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). scikit-learn is BSD-3-Clause (libsvm and liblinear inside, BSD-3-Clause; vendored array-api code, MIT). Its OpenMP runtime differs by platform: GCC's libgomp on Linux (GCC runtime exception), LLVM's libomp on macOS (Apache-2.0 WITH LLVM-exception AND NCSA), Microsoft's msvcp140 and vcomp140 on Windows."
     },
     "scipy": {
       "versions": ["1.17.1", "1.18.1"],
-      "licence": "BSD-3-Clause",
+      "licence": "BSD-3-Clause AND BSD-2-Clause AND MIT AND BSL-1.0 AND Qhull AND BSD-3-Clause-LBNL AND Apache-2.0 WITH LLVM-exception AND BSD-3-Clause-Open-MPI AND GPL-3.0-or-later WITH GCC-exception-3.1 AND LGPL-2.1-or-later",
       "stamp": "daed36ea6c2fb70ef7b9f5d9641cfc51",
       "evidence": {
         "1.17.1": {
@@ -628,18 +632,18 @@
           "classifiers": ["License :: OSI Approved :: BSD License"]
         }
       },
-      "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). SciPy is BSD-3-Clause and compiles in Qhull, Boost.Math and ryu (BSL-1.0), xsf (BSD-3-Clause, MIT, BSD-3-Clause-LBNL, Apache-2.0 WITH LLVM-exception), HiGHS, SuperLU, ARPACK and others (BSD, MIT). The wheels bundle OpenBLAS with LAPACK (BSD-3-Clause, BSD-3-Clause-Open-MPI), libgfortran and libgcc_s (GCC runtime exception) and libquadmath (LGPL-2.1-or-later, not on Windows). The macosx_14_0 wheels link Apple's Accelerate instead of OpenBLAS."
     },
     "shapely": {
-      "versions": ["2.1.2"],
-      "licence": "BSD-3-Clause",
-      "stamp": "e5740e231a54c57c0df07ab578e87a20",
+      "versions": ["2.2.0"],
+      "licence": "BSD-3-Clause AND LGPL-2.1-only AND LicenseRef-Microsoft-VC-Redistributable",
+      "stamp": "158b96fc71a4a96adb0bb55953d017ba",
       "evidence": {
-        "expression": null,
-        "license": "BSD 3-Clause",
-        "classifiers": ["License :: OSI Approved :: BSD License"]
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
       },
-      "note": "`license: \"BSD 3-Clause\"` — the same licence, written informally."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). shapely is BSD-3-Clause; every wheel bundles GEOS 3.14.1 (libgeos, libgeos_c) as shared libraries under LGPL-2.1 (dist-info/licenses/LICENSE_GEOS; GEOS's COPYING is LGPL 2.1 and its headers name no later version, so -only is the honest reading). Windows adds msvcp140."
     },
     "six": {
       "versions": ["1.17.0"],
@@ -652,9 +656,9 @@
       }
     },
     "soupsieve": {
-      "versions": ["2.9.2"],
+      "versions": ["2.10", "3.0.4"],
       "licence": "MIT",
-      "stamp": "42d23bf7b2291b0d0d8ea8b13e58d2af",
+      "stamp": "2702c392b509edace536e5f3eb2af9f2",
       "evidence": {
         "expression": "MIT",
         "license": null,
@@ -662,30 +666,30 @@
       }
     },
     "threadpoolctl": {
-      "versions": ["3.6.0"],
+      "versions": ["3.7.0"],
       "licence": "BSD-3-Clause",
-      "stamp": "20f9c9f1cfdb9b0baf7f2126c29e7763",
+      "stamp": "1ac46f015c4b68520ad35dcae7946e3d",
       "evidence": {
-        "expression": null,
-        "license": "BSD-3-Clause",
-        "classifiers": ["License :: OSI Approved :: BSD License"]
+        "expression": "BSD-3-Clause",
+        "license": null,
+        "classifiers": []
       }
     },
     "tokenizers": {
-      "versions": ["0.23.1"],
-      "licence": "Apache-2.0",
-      "stamp": "42b61e2fa16321ab42df8ff2c77e2467",
+      "versions": ["0.23.3"],
+      "licence": "Apache-2.0 AND MIT AND BSD-2-Clause",
+      "stamp": "cb0f24aee20f392111794021ca448a38",
       "evidence": {
         "expression": null,
         "license": null,
         "classifiers": ["License :: OSI Approved :: Apache Software License"]
       },
-      "note": "Classifier only; the project's LICENSE is the Apache-2.0 text."
+      "note": "Bundled natives read 2026-11-06 in the win_amd64, macOS and manylinux x86_64 wheels (hashes checked against the locks). tokenizers is Apache-2.0; its one extension links ~130 Rust crates (Apache-2.0, MIT), Oniguruma (BSD-2-Clause) and esaxx/sais (MIT) statically, and bundles no shared libraries."
     },
     "tqdm": {
-      "versions": ["4.70.0"],
+      "versions": ["4.70.1"],
       "licence": "MPL-2.0 AND MIT",
-      "stamp": "075bbb3d647918eebab16c6f7a7fd066",
+      "stamp": "a5e041f0957e90039bcf621515365287",
       "evidence": {
         "expression": null,
         "license": "MPL-2.0 AND MIT",
@@ -704,9 +708,9 @@
       }
     },
     "tzdata": {
-      "versions": ["2026.3"],
+      "versions": ["2026.6"],
       "licence": "Apache-2.0",
-      "stamp": "b25b348e9ab0f51fadaca9f2d6876591",
+      "stamp": "ae09667b048cbbd146acdb599f30bae6",
       "evidence": {
         "expression": null,
         "license": "Apache-2.0",
@@ -724,9 +728,9 @@
       }
     },
     "win32-setctime": {
-      "versions": ["1.2.0"],
+      "versions": ["1.2.1"],
       "licence": "MIT",
-      "stamp": "de3fc317b11253a29568772d999d4b4d",
+      "stamp": "de7175a67529d6fcaa0f2155112e3f57",
       "evidence": {
         "expression": null,
         "license": "MIT license",
@@ -735,13 +739,13 @@
       "note": "`license: \"MIT license\"` — the same licence, written informally."
     },
     "xlsxwriter": {
-      "versions": ["3.2.9"],
+      "versions": ["3.3.1"],
       "licence": "BSD-2-Clause",
-      "stamp": "138134804ae768dc3271e2d71d492abf",
+      "stamp": "787d44b518780b4124bf8f6051083386",
       "evidence": {
-        "expression": null,
-        "license": "BSD-2-Clause",
-        "classifiers": ["License :: OSI Approved :: BSD License"]
+        "expression": "BSD-2-Clause",
+        "license": null,
+        "classifiers": []
       }
     }
   }

@@ -39,26 +39,60 @@ export const LOCKS = [
 ];
 
 /**
- * Licences accepted for the sidecar venv. Same permissive posture as deny.toml and the npm gate,
- * with the Python ecosystem's own long tail added deliberately:
+ * Licences accepted for the sidecar venv: the permissive base deny.toml and the npm gate share, plus,
+ * deliberately, the weak copyleft below (MPL-2.0 and the LGPL family) and the Python ecosystem's own
+ * permissive long tail. An entry in sidecar/licences.json
+ * records the wheel AS INSTALLED: the package's own code AND every native library its wheels bundle
+ * on Windows, macOS and Linux (auditwheel's `<pkg>.libs/`, delocate's `.dylibs/`, delvewheel's DLLs,
+ * and code linked in statically), because that is what lands on a user's machine. Where a bundled
+ * library offers a choice (`A OR B`), the entry records the side PM relies on and its note says so.
  *
- *   MIT-0 / MIT-CMU  cffi and pillow — MIT variants, both more permissive than MIT itself.
+ *   MIT-0 / MIT-CMU  cffi, pillow, and lxml's ElementTree-derived code — MIT variants, both more
+ *                    permissive than MIT itself.
  *   PSF-2.0          typing-extensions, defusedxml, parts of exceptiongroup — the Python licence.
  *   MPL-2.0          certifi (via requests) and half of tqdm. File-level copyleft: modifying an
  *                    MPL file obliges you to publish that file, which PM does not do — it installs
  *                    these unmodified. MPL-2.0 is also explicitly compatible with the GPL family
  *                    unless a file is marked "Incompatible With Secondary Licenses", and none here
  *                    is. Accepted knowingly, not by omission.
- *   LGPL-3.0-only    the libheif and libde265 shared libraries inside the pi-heif wheel, which is
- *                    how the optional photo-OCR component decodes an iPhone HEIC. Weak copyleft
- *                    reached through dynamic linking, unmodified, and — like everything else here —
- *                    not conveyed by PM. LGPL-3.0 is compatible with AGPL-3.0-or-later, which
- *                    GPL-2.0-only is NOT: that difference is exactly why the pin is pi-heif rather
- *                    than pillow-heif (see OPTIONAL_OCR_PINS in sidecar.rs).
+ *   LGPL-2.1-only, LGPL-2.1-or-later, LGPL-2.0-or-later, LGPL-3.0-only, LGPL-3.0-or-later
+ *                    weak copyleft in libraries the wheels bundle: GEOS in shapely (2.1 only),
+ *                    libquadmath in numpy and scipy, GNU libiconv linked statically into lxml,
+ *                    libheif and libde265 in pi-heif, FFmpeg and LAME in OpenCV. All unmodified and
+ *                    never conveyed by PM: pip fetches the wheels from PyPI onto the user's machine,
+ *                    so the distribution duties (source, licence text, relinking for a static link)
+ *                    sit with the wheel's publisher. LGPL-2.1 section 3 lets anyone apply GPL-2.0
+ *                    or any later GPL instead, and LGPL-3.0 is GPL-3.0 plus permissions, so both are
+ *                    compatible with AGPL-3.0-or-later. GPL-2.0-only is NOT: that difference is
+ *                    exactly why the pin is pi-heif rather than pillow-heif (see OPTIONAL_OCR_PINS
+ *                    in sidecar.rs). Accepted 2026-11-06 (Bobby: "souds godo for lgpl, you can add
+ *                    it. should we use the new version as well? i dont mind").
+ *   GPL-3.0-or-later WITH GCC-exception-3.1
+ *                    the GCC runtime (libgfortran, libgcc_s, libgomp, libstdc++) that numpy, scipy,
+ *                    scikit-learn, openTSNE, onnxruntime and pi-heif ship because they were compiled
+ *                    with GCC. The exception exists so that any program, under any licence, may
+ *                    use it: it is not GPL's copyleft.
+ *   the permissive long tail, in bundled libraries: BSL-1.0 (Boost), Unicode-3.0 and ICU (ICU and
+ *                    Unicode data), IJG (libjpeg), libpng-2.0, libtiff, FTL (FreeType, taken over its
+ *                    GPL-2.0 alternative), TCL (Tcl/Tk stubs, ujson), curl, blessing (SQLite),
+ *                    MIT-Modern-Variant, MIT-open-group and X11 (HarfBuzz, X.org), NCSA (LLVM's
+ *                    OpenMP), Qhull, BSD-3-Clause-Open-MPI (LAPACK), BSD-3-Clause-LBNL,
+ *                    BSD-3-Clause-Clear (SVT-AV1), BSD-2-Clause-Patent (libvmaf), Apache-2.0 WITH
+ *                    LLVM-exception (libc++), CC-BY-4.0 (pypdfium2's documentation), WTFPL (zimg),
+ *                    LicenseRef-AGG-2.3 (Anti-Grain Geometry 2.3: copy, use, modify, sell and
+ *                    distribute, keeping the notice), bzip2-1.0.6 (bzip2, linked statically into
+ *                    the FreeType in pillow's Linux wheel: BSD-style, with an altered version to be
+ *                    marked as such), OFL-1.1 (the SIL Open Font License, for fonts: OpenCV 5 compiles
+ *                    its Rubik font into cv2, for putText, which PM never calls. A font under it may
+ *                    be used, embedded and redistributed with any software; what it forbids is selling
+ *                    the font on its own, and releasing a modified font under another licence.
+ *                    Allowed for every package, Bobby 2026-11-06).
  *
  * Adding an entry is a decision: it means PM is prepared to put that licence on a user's machine.
- * Note what is deliberately absent — no GPL of any version, and no non-commercial or
- * source-unavailable terms. A package that needs one of those is a conversation, not an edit.
+ * Note what is deliberately absent — no GPL of any version outside the GCC runtime's exception, and
+ * no non-commercial or source-unavailable terms. A package that needs one of those is a
+ * conversation, not an edit, and if the answer is yes it goes in PACKAGE_EXCEPTIONS for that one
+ * package, with the reason, never in this set.
  */
 const ALLOWED = new Set([
   "MIT",
@@ -72,10 +106,72 @@ const ALLOWED = new Set([
   "Zlib",
   "PSF-2.0",
   "MPL-2.0",
+  "LGPL-2.0-or-later",
+  "LGPL-2.1-only",
+  "LGPL-2.1-or-later",
   "LGPL-3.0-only",
+  "LGPL-3.0-or-later",
+  "GPL-3.0-or-later WITH GCC-exception-3.1",
   "Unlicense",
   "CC0-1.0",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "ICU",
+  "IJG",
+  "libpng-2.0",
+  "libtiff",
+  "FTL",
+  "TCL",
+  "curl",
+  "blessing",
+  "MIT-Modern-Variant",
+  "MIT-open-group",
+  "X11",
+  "NCSA",
+  "Qhull",
+  "BSD-3-Clause-Open-MPI",
+  "BSD-3-Clause-LBNL",
+  "BSD-3-Clause-Clear",
+  "BSD-2-Clause-Patent",
+  "Apache-2.0 WITH LLVM-exception",
+  "CC-BY-4.0",
+  "WTFPL",
+  "LicenseRef-AGG-2.3",
+  "bzip2-1.0.6",
+  "OFL-1.1",
 ]);
+
+/**
+ * Operating-system runtimes a wheel carries so it runs on a machine that lacks them: accepted for
+ * every package. Closed-source but freely redistributable, and part of the platform rather than of
+ * any library: Microsoft's Visual C++ runtime. CPython itself is built against it and loads its C
+ * part, vcruntime140, which python.org's Windows builds ship, and PM's Windows build depends on it
+ * already; the msvcp140 and vcomp140 the wheels carry are the same redistributable's C++ and OpenMP
+ * parts, under the same terms. Accepted 2026-11-06 (Bobby chose "Accept as system runtime").
+ * Nothing that is a library in its own right belongs here.
+ */
+const SYSTEM_RUNTIMES = new Set(["LicenseRef-Microsoft-VC-Redistributable"]);
+
+/**
+ * Licences accepted for ONE package only, each a decision with its reason. The gate fails an
+ * exception its package no longer needs, so none outlives the reason it was granted.
+ */
+export const PACKAGE_EXCEPTIONS = {
+  // Photo OCR's image library, reached only through rapidocr for pixel work (colour conversion,
+  // resizing, contours): none of the video, network or GUI code below is reachable from PM. Its
+  // macOS arm64 wheel bundles Homebrew's FFmpeg built with --enable-gpl, with x264, x265,
+  // rubberband and vidstab (GPL-2.0-or-later; GPL-3.0-or-later as a whole); every x86_64 wheel
+  // links Intel's IPP ICV statically (binary-only terms); the Linux wheel carries OpenSSL 1.1.1
+  // (the old OpenSSL licence, and end-of-life upstream). Accepted for now, 2026-11-06 (Bobby chose
+  // "Accept now, look for a swap"); a board card looks for photo OCR without OpenCV. (Its fonts'
+  // OFL-1.1 is on the general list above, not here: it is a permissive font licence.)
+  "opencv-python-headless": [
+    "GPL-3.0-or-later",
+    "GPL-2.0-or-later",
+    "LicenseRef-Intel-ISSL",
+    "OpenSSL",
+  ],
+};
 
 /** Fewest packages the three locks can plausibly resolve to; below this the parse broke. */
 const PACKAGE_FLOOR = 60;
@@ -139,7 +235,7 @@ export function lockedPackages(root, locks = LOCKS) {
   return packages;
 }
 
-export function scan(root) {
+export function scan(root, exceptions = PACKAGE_EXCEPTIONS) {
   const locked = lockedPackages(root);
   const problems = [...locked.conflicts];
   const recorded = JSON.parse(readFileSync(join(root, LICENCES_FILE), "utf8")).packages ?? {};
@@ -167,16 +263,56 @@ export function scan(root) {
     if (!entry.licence) {
       problems.push(
         `${name} (${at}) has no reviewed licence in ${LICENCES_FILE} — it is new, or its upstream ` +
-          `metadata changed and the old answer was withdrawn; read its \`evidence\` and fill ` +
-          `\`licence\` in`,
+          `metadata changed and the old answer was withdrawn (its \`previous\` keeps it). Read ` +
+          `its \`evidence\` and the project's LICENSE; for a compiled package the licence must ` +
+          `also cover what its win_amd64, macOS and manylinux x86_64 wheels bundle (auditwheel's ` +
+          `.libs/, delocate's .dylibs/, delvewheel's DLLs, static links), read from the wheels ` +
+          `whose hashes are in the locks and compared against \`previous\`. Then fill \`licence\` ` +
+          `and \`note\` in`,
       );
       continue;
     }
-    if (!acceptable(entry.licence, ALLOWED)) {
+    const here = new Set([...ALLOWED, ...SYSTEM_RUNTIMES, ...(exceptions[name] ?? [])]);
+    if (!acceptable(entry.licence, here)) {
       problems.push(
         `${name} (${at}) is ${entry.licence}, which is not in this file's accepted set — add it ` +
           `deliberately, or drop the dependency`,
       );
+    }
+  }
+
+  // An exception outlives its reason the day the package drops the library that needed it.
+  for (const [name, licences] of Object.entries(exceptions)) {
+    const entry = recorded[name];
+    if (!locked.some((p) => p.name === name)) {
+      problems.push(`PACKAGE_EXCEPTIONS lists ${name}, which no lock installs any more — drop it`);
+      continue;
+    }
+    if (!entry) {
+      // The package is still installed, so the exception may well still be needed: what is
+      // missing is the row it qualifies, which the loop above has already reported.
+      problems.push(
+        `PACKAGE_EXCEPTIONS lists ${name}, which the locks still install but ${LICENCES_FILE} ` +
+          `has no row for — restore its row rather than dropping the exception`,
+      );
+      continue;
+    }
+    // A blank licence is waiting for review (reported above); it names nothing yet, so it cannot
+    // say an exception is no longer needed.
+    if (!entry.licence) continue;
+    const parts = new Set(
+      (entry.licence ?? "")
+        .replace(/[()]/g, " ")
+        .split(/\bAND\b|\bOR\b/)
+        .map((p) => p.trim()),
+    );
+    for (const licence of licences) {
+      if (!parts.has(licence)) {
+        problems.push(
+          `PACKAGE_EXCEPTIONS lets ${name} use ${licence}, which its licence no longer names — ` +
+            `drop the exception`,
+        );
+      }
     }
   }
 

@@ -348,13 +348,14 @@ jobs:
   # interpreter is a prebuilt binary, so the build runners still need no Python
   # toolchain to compile.)
   #
-  # Installs exactly as the app does — `--require-hashes --no-deps -r
+  # Installs exactly as the app does — `--require-hashes --no-deps --only-binary=:all: -r
   # sidecar/requirements.lock` — so this is also the proof that the universal lock's
   # markers select correctly on all three platforms, and that every artifact each one
-  # needs is covered by a hash. It used to install requirements.txt, which left the
-  # shipped resolution untested. `--no-deps` because an override can resolve the
+  # needs is covered by a hash and published as a wheel. It used to install requirements.txt,
+  # which left the shipped resolution untested. `--no-deps` because an override can resolve the
   # lock past a dependency's bound (sidecar.rs `provision` says why); it also means pip no longer reports a
-  # dependency the markers failed to select, so the import line is what catches one.
+  # dependency the markers failed to select, so the import line is what catches one. Wheels only
+  # because a source build could run a pip PM never started (sidecar.rs LOCK_INSTALL_FLAGS).
   python-smoke:
     needs: guards
     strategy:
@@ -382,7 +383,7 @@ jobs:
             source .smoke-venv/bin/activate
           fi
           python -m pip install --upgrade pip
-          pip install --require-hashes --no-deps -r sidecar/requirements.lock
+          pip install --require-hashes --no-deps --only-binary=:all: -r sidecar/requirements.lock
           python -c "import markitdown, fastembed; print('sidecar deps import OK')"
 
   publish:

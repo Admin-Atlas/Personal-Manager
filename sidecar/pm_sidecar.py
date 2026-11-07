@@ -87,6 +87,57 @@ if _MODELS_DIR:
     # the Windows sandbox's filesystem allow-set assumes.
     os.environ["HF_XET_CACHE"] = os.path.join(_MODELS_DIR, "hf", "xet")
 
+# Telemetry and cache layout, hard-assigned on every run (the worker AND the --fetch helper) before
+# any loader imports onnxruntime, huggingface_hub or hf_xet, which read these as they load. Rust
+# sets the same values on every Python child (sidecar.rs PYTHON_ENV_SETS); this covers a raw run
+# too, and an inherited "0" must not win. PM sends no telemetry, so none of this is optional.
+#
+# onnxruntime's Linux and macOS wheels embed Microsoft's 1DS telemetry client. Left on, it keeps a
+# persistent device id and queues usage events outside PM's data dir, in
+# ~/.cache/Microsoft/DeveloperTools/.onnxruntime on Linux (under $XDG_CACHE_HOME instead, when that
+# is an absolute path) and ~/Library/Application Support/Microsoft/DeveloperTools/.onnxruntime on
+# macOS, and uploads them from any process with network access: the --fetch helper builds sessions.
+# Found in the 2026-11-06 refresh (the queued events on the dev machine came from test runs). The
+# variable is read when onnxruntime is imported, and latches the client off for the process.
+os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+# The Windows wheel has no 1DS client (and keeps no device id) and ignores the variable above. It
+# reports through ETW to Microsoft's telemetry provider group, and writes its first event,
+# ProcessInfo (CPU model, core count, memory, the names of services in this process), while
+# `import onnxruntime` itself runs, before any code here could call disable_telemetry_events(); an
+# ETW session that enables the provider later switches events back on. This is onnxruntime's
+# internal test-harness signal, not a user-facing switch: set, the Windows provider is never
+# registered at all, so nothing is written and nothing can re-enable it, and the 1DS client latches
+# off as for the variable above. In onnxruntime 1.31.1 it is read by one function, called only by
+# those two telemetry constructors: it changes no kernel, provider or result. It is an internal
+# name, so check that again on every onnxruntime bump. `_quiet_onnxruntime` below stays as the
+# next wall.
+os.environ["ORT_RUNNING_UNIT_TESTS"] = "1"
+# huggingface_hub's own telemetry, and hf_xet's transfer telemetry (from 1.7: a summary document
+# per download, plus heartbeats, POSTed to the CAS server's /v1/telemetry). hf_xet honours
+# HF_HUB_DISABLE_TELEMETRY, DO_NOT_TRACK and its own HF_XET_TELEMETRY_ENABLED; all three are set
+# so a rename of one leaves the others standing.
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_XET_TELEMETRY_ENABLED"] = "0"
+os.environ["DO_NOT_TRACK"] = "1"
+# Never send the user's own Hugging Face account token with PM's model downloads: PM's models are
+# public, and a token would tie which models were fetched, and when, to that account. Rust strips
+# the token variables too (sidecar.rs PYTHON_ENV_REMOVES).
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+for _token_var in (
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN_PATH",
+    "HF_OIDC_RESOURCE",
+    "HF_OIDC_ID_TOKEN",
+):
+    os.environ.pop(_token_var, None)
+# huggingface-hub 1.32 added a shared blob store: a fresh download puts the files under
+# <cache>/blobs/ and leaves each repo folder as symlinks into it. The Storage tab measures and
+# removes each model by its repo folder, so the bytes would move out of every row and Remove would
+# free nothing, and fastembed's two-file models (e5-large) would rely on a hardlink step at first
+# load. This keeps the per-repo layout PM is built on.
+os.environ["HF_HUB_DISABLE_SHARED_BLOBS"] = "1"
+
 
 # Resource posture. This is a background helper on someone's own laptop, not a server, and it must
 # never be the reason the machine stops feeling responsive. Everything here is set at IMPORT time
@@ -291,8 +342,12 @@ logging.getLogger("pdfminer").setLevel(logging.ERROR)
 # H-1 subset: harden the stdlib XML parser against entity-expansion / XXE before any parser that
 # might use it (openpyxl's stdlib fallback when reading an .xlsx). Best-effort — a partial venv
 # without defusedxml proceeds rather than breaking ingest. This patches the STDLIB parser only; when
-# lxml is present openpyxl may use it instead, but lxml resolves no external entities and caps
-# entity expansion by default, so the .xlsx path stays safe either way.
+# lxml is present openpyxl may use it instead. lxml fetches nothing over the network and caps entity
+# expansion by default, but before 6.1.3 its default (`resolve_entities="internal"`) still allowed
+# external PARAMETER entities (lxml LP#2165901). MarkItDown parses a .docx's XML with lxml's
+# defaults, so that hole was in reach of a crafted file (not reproduced against PM's path: the
+# probes tried in the 2026-11-06 refresh were refused on both versions). The lock holds 6.1.3 or
+# newer for that reason: keep it there.
 try:
     import defusedxml
 
@@ -352,6 +407,7 @@ def _load_model(build):
     retry, which also self-heals a corrupt cache; if it still fails, `request()` fetches once then
     surfaces the real error. In the FETCHER itself (`_OFFLINE` False) this is a passthrough: a
     genuine download error must surface as-is."""
+    _quiet_onnxruntime()
     if not _OFFLINE:
         return build()
     try:
@@ -362,9 +418,41 @@ def _load_model(build):
         raise ModelNotCached(str(exc)) from exc
 
 
+def _quiet_onnxruntime(load=True):
+    """Switch onnxruntime's telemetry events off: before every model is built (`load`, which imports
+    onnxruntime if nothing has yet), and at the start of every request once onnxruntime is loaded
+    (`load=False`, from `main`), so no request runs a session with them on.
+
+    The environment set at import (above) is what keeps them off: ORT_DISABLE_TELEMETRY latches the
+    Linux and macOS wheels' 1DS client off, and ORT_RUNNING_UNIT_TESTS keeps the Windows wheel from
+    ever registering its ETW provider, whose events (session creation, model producer and weight
+    hashes, CPU and memory) go to the Microsoft Telemetry provider group, which Windows' own
+    diagnostic-data service collects and uploads from outside PM's sandbox when the user allows
+    optional diagnostic data. This call is the wall
+    behind them, should a later build stop honouring that internal variable. It cannot undo the
+    ProcessInfo event the import itself writes, and on Windows any ETW session that enables the
+    provider turns events back on, which is why it runs per request rather than once: it only
+    clears a flag, so that costs nothing. It exists on every platform's build, so it is called
+    everywhere. Best-effort: a build without it must not break a load or a request."""
+    ort = sys.modules.get("onnxruntime")
+    if ort is None:
+        if not load:
+            return
+        try:
+            import onnxruntime as ort
+        except Exception:
+            return
+    try:
+        ort.disable_telemetry_events()
+    except Exception:
+        pass
+
+
 def get_markitdown():
     global _markitdown
     if _markitdown is None:
+        # MarkItDown builds magika's onnxruntime session in its constructor.
+        _quiet_onnxruntime()
         from markitdown import MarkItDown
 
         _markitdown = MarkItDown()
@@ -1115,6 +1203,40 @@ def _build_ocr_engine(RapidOCR, params):
     return engine
 
 
+def _seed_rapidocr_models(model_dir):
+    """Copy the OCR models rapidocr ships inside its own wheel into PM's model dir, so it never has
+    to download them.
+
+    PM points rapidocr at `<PM models>/rapidocr` (see `_rapidocr_model_dir`), so it ignores the
+    three models in `<site-packages>/rapidocr/models` and fetches byte-identical copies from its
+    own host, www.modelscope.cn, which sees the user's IP address. A copy that is already there is
+    left alone: rapidocr checks every file against the SHA-256 it expects and downloads only on a
+    mismatch, so a copy from a different wheel version can never be used for the wrong model.
+    Best-effort: on any failure rapidocr simply downloads, as before."""
+    if not model_dir:
+        return
+    try:
+        import importlib.util
+        import shutil
+
+        spec = importlib.util.find_spec("rapidocr")
+        locations = list(spec.submodule_search_locations or []) if spec else []
+        if not locations:
+            return
+        bundled = os.path.join(locations[0], "models")
+        os.makedirs(model_dir, exist_ok=True)
+        for name in sorted(os.listdir(bundled)):
+            src = os.path.join(bundled, name)
+            dest = os.path.join(model_dir, name)
+            if not name.endswith(".onnx") or not os.path.isfile(src) or os.path.exists(dest):
+                continue
+            tmp = dest + ".pm-seed"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dest)
+    except Exception:
+        pass
+
+
 def get_ocr_engine():
     """The OPTIONAL on-device OCR engine (rapidocr), cached. Lazy-imported so the engine — and its
     image-processing deps (opencv/shapely/pyclipper) — only load when OCR is actually requested, and
@@ -1136,6 +1258,7 @@ def get_ocr_engine():
         if _OFFLINE:
             _forbid_rapidocr_downloads()
         model_dir = _rapidocr_model_dir()
+        _seed_rapidocr_models(model_dir)
         params = {"Global.model_root_dir": model_dir} if model_dir else None
         _ocr_engine = _load_model(lambda: _build_ocr_engine(RapidOCR, params))
     return _ocr_engine
@@ -1895,6 +2018,8 @@ def do_worker_selftest(_params):
     open."""
     import onnxruntime  # noqa: F401 — the import IS a test: a native lib load under the sandbox.
 
+    _quiet_onnxruntime()
+
     checked = ["onnxruntime"]
     models_dir = os.environ.get("PM_MODELS_DIR")
     if models_dir and os.path.isdir(models_dir):
@@ -1985,6 +2110,9 @@ def main():
             handler = HANDLERS.get(method)
             if handler is None:
                 raise ValueError(f"unknown method: {method!r}")
+            # Every request, not only the first: see `_quiet_onnxruntime`. Never imports
+            # onnxruntime itself, so a request that has no use for it doesn't load it.
+            _quiet_onnxruntime(load=False)
             with _quiet_stdout():
                 result = handler(req.get("params") or {})
             response = {"id": req_id, "ok": True, "result": result}

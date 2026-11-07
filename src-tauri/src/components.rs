@@ -49,8 +49,46 @@ enum Status {
 /// rapidocr 3.10.0 (OpenCV's headless build is the bulk; the old estimate of 150 MiB undercounted
 /// even the 239 MiB the full opencv-python build used). Shown on the not-yet-installed row so the
 /// cost is visible before choosing to install; never added to the on-disk total (nothing is on disk
-/// yet). The ~31 MB of OCR models download separately, on the first photo.
+/// yet). The first photo then copies rapidocr's ~31 MB of models out of its package into
+/// `runtime/models/rapidocr` (downloading only one that is missing or mismatched), which the
+/// installed row counts from then on and removing it deletes.
 const OCR_INSTALL_ESTIMATE_BYTES: u64 = 205 * 1024 * 1024;
+
+/// The size of the photo-OCR models in `runtime/models/rapidocr` (beside `venv`), or 0. A real
+/// folder only, as the removal requires: through a link they are somewhere PM doesn't own, and
+/// neither counted nor removed.
+fn ocr_weights_size(venv: &Path) -> u64 {
+    let Some(models) = venv.parent().map(|runtime| runtime.join("models")) else {
+        return 0;
+    };
+    let weights = models.join(crate::sidecar::OCR_WEIGHTS_DIR);
+    let real = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if real(&models) && real(&weights) {
+        dir_size(&weights)
+    } else {
+        0
+    }
+}
+
+/// What the Storage tab's scikit-learn row measures and removes: scikit-learn and the packages only
+/// it brings into the t-SNE lock (joblib, threadpoolctl, narwhals, and cloudpickle, which joblib 1.6
+/// added). `the_scikit_learn_row_removes_what_only_it_brings` checks this against the locks, so a
+/// dependency a new release adds can't be left behind uncounted.
+const SKLEARN_PACKAGES: &[&str] = &[
+    "scikit-learn",
+    "joblib",
+    "threadpoolctl",
+    "narwhals",
+    "cloudpickle",
+];
+const SKLEARN_GLOBS: &[&str] = &[
+    "sklearn",
+    "scikit_learn*",
+    "joblib*",
+    "threadpoolctl*",
+    "narwhals*",
+    "cloudpickle*",
+];
 
 /// A dependent that must be removed first; `anchor` is the component id to scroll to in this tab.
 #[derive(Serialize)]
@@ -294,12 +332,17 @@ fn ocr_row(present: bool, ready: bool, size: u64) -> Component {
 
 fn build_report(venv: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageReport {
     let site = site_packages_dir(venv);
-    let (tsne_present, tsne_size) = pkg(site.as_ref(), "openTSNE", &["openTSNE", "openTSNE-*"]);
-    let (sklearn_present, sklearn_size) = pkg(
+    // The dist-info is lower-case (`opentsne-1.0.4.dist-info`, and `opentsne.libs` on Linux); the
+    // import dir is `openTSNE`. Matching is case-sensitive.
+    let (tsne_present, tsne_size) = pkg(
         site.as_ref(),
-        "sklearn",
-        &["sklearn", "scikit_learn*", "joblib*", "threadpoolctl*"],
+        "openTSNE",
+        &["openTSNE", "openTSNE-*", "opentsne*"],
     );
+    let (sklearn_present, sklearn_size) = pkg(site.as_ref(), "sklearn", SKLEARN_GLOBS);
+    // Without scikit-learn there is no row, so what its globs still match (a narwhals the older
+    // removal left behind) stays in the Document engine row rather than in no row at all.
+    let sklearn_size = if sklearn_present { sklearn_size } else { 0 };
     let (scipy_present, scipy_size) = pkg(site.as_ref(), "scipy", &["scipy", "scipy*"]);
 
     // Optional photo-OCR stack. The top-level component bundles rapidocr + pi-heif (the two pins
@@ -323,12 +366,31 @@ fn build_report(venv: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageR
             "pillow_heif",
             "pillow_heif-*",
             "pillow_heif.libs",
+            "_pi_heif*",
+            "_pillow_heif*",
             "omegaconf",
             "omegaconf-*",
             "colorlog",
             "colorlog-*",
+            // Retired with omegaconf 2.4, which vendors ANTLR; an upgraded venv keeps the old copy
+            // until photo OCR is removed, which takes it.
+            "antlr4",
+            "antlr4_python3_runtime*",
         ],
     );
+    // Leftovers of a removed OCR component (the old removal kept omegaconf and colorlog) stay in
+    // the Document engine row rather than in no row at all.
+    let ocr_size = if ocr_present { ocr_size } else { 0 };
+    // The OCR models pm_sidecar.py copies out of rapidocr's wheel on the first photo live beside the
+    // search model in `runtime/models`, outside the venv. Removing photo OCR deletes them
+    // (`SidecarManager::uninstall_optional`), so its row counts them; models an older removal left
+    // behind go to the Document engine row, like the packages above.
+    let ocr_weights = ocr_weights_size(venv);
+    let (ocr_row_weights, leftover_weights) = if ocr_present {
+        (ocr_weights, 0)
+    } else {
+        (0, ocr_weights)
+    };
     let (cv2_present, cv2_size) = pkg(site.as_ref(), "cv2", &["cv2", "opencv*", "opencv_python*"]);
     let (shapely_present, shapely_size) = pkg(
         site.as_ref(),
@@ -343,7 +405,7 @@ fn build_report(venv: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageR
     // total never double-counts them.
     let optional_size =
         tsne_size + sklearn_size + scipy_size + ocr_size + cv2_size + shapely_size + pyclipper_size;
-    let base = venv_total.saturating_sub(optional_size);
+    let base = venv_total.saturating_sub(optional_size) + leftover_weights;
 
     let embedder_size = embedder_estimate_bytes(embedder.id);
 
@@ -417,7 +479,7 @@ fn build_report(venv: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageR
             &mut components,
             "scikit-learn",
             "scikit-learn",
-            "Used by the enhanced layout. Includes joblib and threadpoolctl.",
+            "Used by the enhanced layout. Includes joblib, threadpoolctl, narwhals and cloudpickle.",
             sklearn_size,
         );
     }
@@ -431,7 +493,7 @@ fn build_report(venv: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageR
         );
     }
 
-    components.push(ocr_row(ocr_present, ocr_ready, ocr_size));
+    components.push(ocr_row(ocr_present, ocr_ready, ocr_size + ocr_row_weights));
     if cv2_present {
         lib(
             &mut components,
@@ -476,7 +538,7 @@ fn build_report(venv: &Path, embedder: &ModelEntry, ocr_ready: bool) -> StorageR
         note: Some("Stored in a shared model cache; can't be removed here.".into()),
     });
 
-    let total = base + optional_size + embedder_size;
+    let total = base + optional_size + ocr_row_weights + embedder_size;
     StorageReport {
         total_bytes: total,
         components,
@@ -502,7 +564,7 @@ fn do_remove(app: &AppHandle, id: &str, venv: &Path) -> Result<()> {
     let sidecar = &state.sidecar;
     match id {
         "openTSNE" => sidecar.uninstall_optional_tsne()?,
-        "scikit-learn" => sidecar.pip_uninstall(&["scikit-learn", "joblib", "threadpoolctl"])?,
+        "scikit-learn" => sidecar.pip_uninstall(SKLEARN_PACKAGES)?,
         "scipy" => sidecar.pip_uninstall(&["scipy"])?,
         "ocr" => sidecar.uninstall_optional_ocr()?,
         // The row keeps its old id (the frontend keys on it), but what is installed changed name:
@@ -563,6 +625,34 @@ pub async fn remove_storage_component(app: AppHandle, id: String) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scikit-learn row removes scikit-learn and every package only it brings into the t-SNE
+    /// lock: not openTSNE or scipy (their own rows), and nothing the base lock or another
+    /// component's lock also installs.
+    #[test]
+    fn the_scikit_learn_row_removes_what_only_it_brings() {
+        use crate::sidecar::tests::{locked_elsewhere, locked_names};
+        let elsewhere = locked_elsewhere("requirements-tsne.lock");
+        let expected: std::collections::BTreeSet<String> = locked_names("requirements-tsne.lock")
+            .into_iter()
+            .filter(|n| !elsewhere.contains(n) && n != "opentsne" && n != "scipy")
+            .collect();
+        let removed: std::collections::BTreeSet<String> =
+            SKLEARN_PACKAGES.iter().map(|n| n.to_string()).collect();
+        assert_eq!(removed, expected);
+        for name in SKLEARN_PACKAGES {
+            let import = name.replace('-', "_");
+            let import = if import == "scikit_learn" {
+                "sklearn".to_string()
+            } else {
+                import
+            };
+            assert!(
+                SKLEARN_GLOBS.iter().any(|g| match_pat(&import, g)),
+                "{name} is removed but not measured"
+            );
+        }
+    }
 
     #[test]
     fn cascade_blocks_then_unblocks_in_order() {
@@ -650,6 +740,13 @@ mod tests {
         // pyclipper installs a single extension module and no import dir, so its dist-info is
         // what says it is there.
         put(site.join("pyclipper-1.3.0.dist-info").join("RECORD"), 640);
+        // The OCR models, outside the venv, beside the search model's (which the estimate covers).
+        let models = dir.path().join("runtime").join("models");
+        put(
+            models.join("rapidocr").join("PP-OCRv6_det_small.onnx"),
+            1280,
+        );
+        put(models.join("fastembed").join("model.onnx"), 2560);
 
         let embedder = crate::registry::active_embedder();
         let estimate = embedder_estimate_bytes(embedder.id);
@@ -694,7 +791,11 @@ mod tests {
         assert_eq!(blocked_by("scikit-learn"), ["openTSNE"]);
         assert_eq!(row("scipy").size_bytes, 40);
         assert_eq!(blocked_by("scipy"), ["openTSNE"]);
-        assert_eq!(row("ocr").size_bytes, 80);
+        assert_eq!(
+            row("ocr").size_bytes,
+            80 + 1280,
+            "its packages and the models its removal deletes"
+        );
         assert!(matches!(row("ocr").status, Status::Removable));
         assert_eq!(row("opencv-python").size_bytes, 160);
         assert_eq!(blocked_by("opencv-python"), ["ocr"]);
@@ -706,10 +807,52 @@ mod tests {
         assert_eq!((model.size_bytes, model.approximate), (estimate, true));
         assert!(matches!(model.status, Status::InUse));
 
-        // The rows split the venv between them, so the total is the venv once, plus the
-        // embedder's estimate once.
+        // The rows split the venv between them, so the total is the venv once, the OCR models
+        // once, and the embedder's estimate once.
         assert_eq!(dir_size(&venv), 1005 + 11 + 20 + 40 + 80 + 160 + 320 + 640);
-        assert_eq!(report.total_bytes, dir_size(&venv) + estimate);
+        assert_eq!(report.total_bytes, dir_size(&venv) + 1280 + estimate);
+    }
+
+    /// OCR models an older removal left behind (no rapidocr in the venv) are counted on the
+    /// Document engine row rather than on none; a link in their place is not counted at all.
+    #[cfg(unix)]
+    #[test]
+    fn leftover_ocr_models_stay_counted_and_a_linked_folder_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let venv = dir.path().join("runtime").join("venv");
+        let put = |path: PathBuf, bytes: usize| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![0u8; bytes]).unwrap();
+        };
+        put(venv.join("pyvenv.cfg"), 5);
+        let models = dir.path().join("runtime").join("models");
+        put(
+            models.join("rapidocr").join("PP-OCRv6_det_small.onnx"),
+            1280,
+        );
+        let embedder = crate::registry::active_embedder();
+        let estimate = embedder_estimate_bytes(embedder.id);
+
+        let report = build_report(&venv, &embedder, false);
+        let row = |report: &StorageReport, id: &str| {
+            report
+                .components
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.size_bytes)
+                .unwrap()
+        };
+        assert_eq!(row(&report, "venv"), 5 + 1280);
+        assert_eq!(row(&report, "ocr"), OCR_INSTALL_ESTIMATE_BYTES);
+        assert_eq!(report.total_bytes, 5 + 1280 + estimate);
+
+        let elsewhere = dir.path().join("elsewhere");
+        put(elsewhere.join("PP-OCRv6_det_small.onnx"), 1280);
+        std::fs::remove_dir_all(models.join("rapidocr")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, models.join("rapidocr")).unwrap();
+        let report = build_report(&venv, &embedder, false);
+        assert_eq!(row(&report, "venv"), 5);
+        assert_eq!(report.total_bytes, 5 + estimate);
     }
 
     #[test]
@@ -717,7 +860,10 @@ mod tests {
         assert!(match_pat("scikit_learn.libs", "scikit_learn*"));
         assert!(match_pat("scipy", "scipy"));
         assert!(!match_pat("scipython", "scipy"));
-        assert!(match_pat("openTSNE-1.0.4.dist-info", "openTSNE-*"));
+        // The names openTSNE 1.0.4 really installs (its dist-info is lower-case).
+        assert!(match_pat("opentsne-1.0.4.dist-info", "opentsne*"));
+        assert!(match_pat("opentsne.libs", "opentsne*"));
+        assert!(!match_pat("opentsne-1.0.4.dist-info", "openTSNE-*"));
         assert!(match_pat("pyclipper-1.3.0.dist-info", "pyclipper*"));
         assert!(match_pat(
             "opencv_python-4.10.0.84.dist-info",

@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { lockedPackages, scan, LOCKS, LICENCES_FILE } from "./check-sidecar-licences.mjs";
+import { entryFor, evidenceOf, stampOf } from "./regen-sidecar-licences.mjs";
 
 /** A lock body with the pins given as `[name, version, marker?]`. */
 function lock(pins) {
@@ -138,7 +139,7 @@ describe("scan", () => {
   it("fails a package that is locked but absent from the licence file", () => {
     const { pins, packages } = filler(70);
     const root = fixture({ base: [...pins, ["newthing", "1.0.0"]], packages });
-    expect(scan(root).problems.join(" ")).toMatch(
+    expect(scan(root, {}).problems.join(" ")).toMatch(
       /newthing \(1\.0\.0\) is in the locks but not in/,
     );
   });
@@ -151,7 +152,7 @@ describe("scan", () => {
       base: [...pins, ["numpy", "2.4.6"], ["numpy", "2.5.1"]],
       packages: { ...packages, numpy: { versions: ["2.4.6"], licence: "BSD-3-Clause" } },
     });
-    expect(scan(root).problems.join(" ")).toMatch(/2\.5\.1 carries no reviewed licence/);
+    expect(scan(root, {}).problems.join(" ")).toMatch(/2\.5\.1 carries no reviewed licence/);
   });
 
   it("fails a package whose licence is still blank", () => {
@@ -160,7 +161,9 @@ describe("scan", () => {
       base: [...pins, ["mystery", "1.0.0"]],
       packages: { ...packages, mystery: { versions: ["1.0.0"], licence: null } },
     });
-    expect(scan(root).problems.join(" ")).toMatch(/mystery \(1\.0\.0\) has no reviewed licence/);
+    expect(scan(root, {}).problems.join(" ")).toMatch(
+      /mystery \(1\.0\.0\) has no reviewed licence/,
+    );
   });
 
   it("fails a licence outside the accepted set", () => {
@@ -171,7 +174,7 @@ describe("scan", () => {
       base: [...pins, ["copyleft", "1.0.0"]],
       packages: { ...packages, copyleft: { versions: ["1.0.0"], licence: "GPL-2.0-only" } },
     });
-    expect(scan(root).problems.join(" ")).toMatch(
+    expect(scan(root, {}).problems.join(" ")).toMatch(
       /copyleft \(1\.0\.0\) is GPL-2\.0-only, which is not in this file's accepted set/,
     );
   });
@@ -185,7 +188,7 @@ describe("scan", () => {
         numpyish: { versions: ["1.0.0"], licence: "BSD-3-Clause AND 0BSD AND MIT AND Zlib" },
       },
     });
-    expect(scan(ok).problems).toEqual([]);
+    expect(scan(ok, {}).problems).toEqual([]);
 
     const bad = fixture({
       base: [...pins, ["numpyish", "1.0.0"]],
@@ -194,7 +197,121 @@ describe("scan", () => {
         numpyish: { versions: ["1.0.0"], licence: "BSD-3-Clause AND GPL-3.0-only" },
       },
     });
-    expect(scan(bad).problems.join(" ")).toMatch(/is not in this file's accepted set/);
+    expect(scan(bad, {}).problems.join(" ")).toMatch(/is not in this file's accepted set/);
+  });
+
+  it("accepts the operating-system runtime on any package", () => {
+    const { pins, packages } = filler(70);
+    const root = fixture({
+      base: [...pins, ["winwheel", "1.0.0"]],
+      packages: {
+        ...packages,
+        winwheel: {
+          versions: ["1.0.0"],
+          licence: "BSD-3-Clause AND LicenseRef-Microsoft-VC-Redistributable",
+        },
+      },
+    });
+    expect(scan(root, {}).problems).toEqual([]);
+  });
+
+  it("lets a named exception through for its own package and no other", () => {
+    const { pins, packages } = filler(70);
+    const licence = "Apache-2.0 AND GPL-2.0-or-later";
+    const root = fixture({
+      base: [...pins, ["excepted", "1.0.0"], ["other", "1.0.0"]],
+      packages: {
+        ...packages,
+        excepted: { versions: ["1.0.0"], licence },
+        other: { versions: ["1.0.0"], licence },
+      },
+    });
+    const problems = scan(root, { excepted: ["GPL-2.0-or-later"] }).problems.join(" ");
+    expect(problems).not.toMatch(/excepted \(1\.0\.0\)/);
+    expect(problems).toMatch(
+      /other \(1\.0\.0\) is Apache-2\.0 AND GPL-2\.0-or-later, which is not/,
+    );
+  });
+
+  it("fails an exception its package no longer needs, or a package no lock installs", () => {
+    const { pins, packages } = filler(70);
+    const root = fixture({
+      base: [...pins, ["excepted", "1.0.0"]],
+      packages: { ...packages, excepted: { versions: ["1.0.0"], licence: "MIT" } },
+    });
+    const problems = scan(root, {
+      excepted: ["GPL-2.0-or-later"],
+      gone: ["OpenSSL"],
+    }).problems.join(" ");
+    expect(problems).toMatch(
+      /lets excepted use GPL-2\.0-or-later, which its licence no longer names/,
+    );
+    expect(problems).toMatch(/PACKAGE_EXCEPTIONS lists gone, which no lock installs any more/);
+  });
+
+  it("tells an exception whose row went missing from one whose package left the locks", () => {
+    // The package is still installed, so the exception is still needed: the fix is the row, and
+    // "drop it" would have sent the next person to delete the one thing that is right.
+    const { pins, packages } = filler(70);
+    const root = fixture({ base: [...pins, ["excepted", "1.0.0"]], packages });
+    const problems = scan(root, { excepted: ["GPL-2.0-or-later"] }).problems.join(" ");
+    expect(problems).toMatch(
+      /PACKAGE_EXCEPTIONS lists excepted, which the locks still install but .* has no row for — restore its row/,
+    );
+    expect(problems).not.toMatch(/excepted, which no lock installs/);
+  });
+
+  it("does not call an exception unneeded while its package's licence waits for review", () => {
+    const { pins, packages } = filler(70);
+    const root = fixture({
+      base: [...pins, ["excepted", "1.0.0"]],
+      packages: { ...packages, excepted: { versions: ["1.0.0"], licence: null } },
+    });
+    const problems = scan(root, { excepted: ["GPL-2.0-or-later"] }).problems.join(" ");
+    expect(problems).toMatch(/excepted \(1\.0\.0\) has no reviewed licence/);
+    expect(problems).not.toMatch(/drop the exception/);
+  });
+
+  it("sends a blank licence's reviewer to the wheels as installed, against `previous`", () => {
+    const { pins, packages } = filler(70);
+    const root = fixture({
+      base: [...pins, ["compiled", "2.0.0"]],
+      packages: { ...packages, compiled: { versions: ["2.0.0"], licence: null } },
+    });
+    const problems = scan(root, {}).problems.join(" ");
+    expect(problems).toMatch(/win_amd64, macOS and manylinux x86_64 wheels bundle/);
+    expect(problems).toMatch(/whose hashes are in the locks and compared against `previous`/);
+  });
+
+  it("accepts bzip2's licence, which pillow's Linux FreeType links in", () => {
+    const { pins, packages } = filler(70);
+    const root = fixture({
+      base: [...pins, ["imaging", "1.0.0"]],
+      packages: {
+        ...packages,
+        imaging: { versions: ["1.0.0"], licence: "MIT-CMU AND FTL AND bzip2-1.0.6" },
+      },
+    });
+    expect(scan(root, {}).problems).toEqual([]);
+  });
+
+  it("keeps plain GPL out of the shared set: the GCC runtime exception is not the GPL", () => {
+    const { pins, packages } = filler(70);
+    const gcc = fixture({
+      base: [...pins, ["gccrt", "1.0.0"]],
+      packages: {
+        ...packages,
+        gccrt: { versions: ["1.0.0"], licence: "MIT AND GPL-3.0-or-later WITH GCC-exception-3.1" },
+      },
+    });
+    expect(scan(gcc, {}).problems).toEqual([]);
+    for (const gpl of ["GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only", "GPL-3.0-or-later"]) {
+      const bad = fixture({
+        base: [...pins, ["gpl", "1.0.0"]],
+        packages: { ...packages, gpl: { versions: ["1.0.0"], licence: `MIT AND ${gpl}` } },
+      });
+      expect(scan(bad, {}).problems.join(" ")).toMatch(/is not in this file's accepted set/);
+    }
   });
 
   it("fails an entry left behind after its package leaves the locks", () => {
@@ -203,13 +320,71 @@ describe("scan", () => {
       base: pins,
       packages: { ...packages, "pillow-heif": { versions: ["1.5.0"], licence: "BSD-3-Clause" } },
     });
-    expect(scan(root).problems.join(" ")).toMatch(
+    expect(scan(root, {}).problems.join(" ")).toMatch(
       /still lists pillow-heif, which no longer appears in any lock/,
     );
   });
 
   it("fails a truncated set of locks rather than reporting a clean scan of nothing", () => {
     const root = fixture({ base: [["only", "1.0.0"]], packages: {} });
-    expect(scan(root).problems.join(" ")).toMatch(/a lock is truncated, or the parser has stopped/);
+    expect(scan(root, {}).problems.join(" ")).toMatch(
+      /a lock is truncated, or the parser has stopped/,
+    );
+  });
+});
+
+// The refresh (scripts/regen-sidecar-licences.mjs) that writes the file this gate reads: what it
+// carries forward from the reviewed entry, and what it blanks.
+describe("the licence refresh's entryFor", () => {
+  const evidence = (expression) => evidenceOf({ license_expression: expression, classifiers: [] });
+  const reviewed = (version, expression) => ({
+    versions: [version],
+    licence: "MIT AND bzip2-1.0.6",
+    stamp: stampOf([{ version, evidence: evidence(expression) }]),
+    note: "Bundled natives read in the three wheels: bzip2 in the Linux FreeType.",
+  });
+
+  it("keeps a reviewed licence and its note while the versions and evidence stand", () => {
+    const old = reviewed("1.0.0", "MIT");
+    const entry = entryFor(["1.0.0"], [{ version: "1.0.0", evidence: evidence("MIT") }], old);
+    expect(entry.licence).toBe(old.licence);
+    expect(entry.note).toBe(old.note);
+    expect(entry.previous).toBeUndefined();
+  });
+
+  it("blanks it when a version moves, keeping the licence AND the note to compare against", () => {
+    // The note is where the bundled natives were written down: without it the reviewer of the
+    // new wheels starts from PyPI's metadata, which is exactly what the note corrected.
+    const old = reviewed("1.0.0", "MIT");
+    const entry = entryFor(["1.1.0"], [{ version: "1.1.0", evidence: evidence("MIT") }], old);
+    expect(entry.licence).toBeNull();
+    expect(entry.note).toBeUndefined();
+    expect(entry.previous).toEqual({
+      versions: ["1.0.0"],
+      licence: old.licence,
+      note: old.note,
+    });
+  });
+
+  it("blanks it when upstream's metadata moves at the same version", () => {
+    const old = reviewed("1.0.0", "MIT");
+    const entry = entryFor(["1.0.0"], [{ version: "1.0.0", evidence: evidence("BSD") }], old);
+    expect(entry.licence).toBeNull();
+    expect(entry.previous.licence).toBe(old.licence);
+  });
+
+  it("keeps the last reviewed answer through a second run before anyone reviews it", () => {
+    const old = reviewed("1.0.0", "MIT");
+    const now = [{ version: "1.1.0", evidence: evidence("MIT") }];
+    const once = entryFor(["1.1.0"], now, old);
+    expect(entryFor(["1.1.0"], now, once).previous).toEqual(once.previous);
+    const later = [{ version: "1.2.0", evidence: evidence("MIT") }];
+    expect(entryFor(["1.2.0"], later, once).previous).toEqual(once.previous);
+  });
+
+  it("writes a new package blank, with nothing previous", () => {
+    const entry = entryFor(["1.0.0"], [{ version: "1.0.0", evidence: evidence("MIT") }]);
+    expect(entry.licence).toBeNull();
+    expect(entry.previous).toBeUndefined();
   });
 });
