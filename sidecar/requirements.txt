@@ -62,4 +62,4 @@ fastembed==0.9.1
 openpyxl==3.1.5
 pillow==13.0.0
 defusedxml==0.7.1
-python-dateutil==2.9.0.post0
+python-dateutil==4.0.0
