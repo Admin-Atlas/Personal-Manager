@@ -164,7 +164,7 @@ keyring = { version = "3", features = ["windows-native"] }
 # computer: keyring 3 hard-codes CRED_PERSIST_ENTERPRISE, which roams with a domain roaming
 # profile. The windows-sys version and the two features keyring itself builds, so no new package,
 # feature or licence.
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 # Windows Hello for the optional, opt-in app-lock (a soft UI gate — see applock.rs).
 # Microsoft-maintained bindings; windows-future supplies the `IAsyncOperation::get()` we block on.
 # Held on 0.61 / windows-future 0.2. Since Tauri 2.12 the Tauri stack resolves windows 0.62, and
