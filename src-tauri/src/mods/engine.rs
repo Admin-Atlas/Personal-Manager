@@ -25,15 +25,20 @@
 //!   than going out directly, which is what the engines document and what the sealed-frame job's
 //!   dead-port run measures.
 //! - [`windows_browser_args`]: WebView2's args pointing at that proxy, with wry's defaults kept.
-//! - [`webkitgtk::seal`], [`wkwebview::seal`] and [`webview2::reputation_checking_off`]: the engine
-//!   switches, each reporting whether it took. On macOS that includes [`content_rules_json`], a
+//! - [`shared_environment_for`] and [`build_main_retrying`]: on Windows, the one WebView2
+//!   environment PM creates itself, which carries those args, keeps WebView2's crash reports on
+//!   this computer ([`WINDOWS_CRASH_UPLOAD_OFF`]), and every PM window is built with; and the main
+//!   window's build with it, falling back to wry's own environments when it can't be had.
+//! - [`webkitgtk::seal`], [`wkwebview::seal`], [`webview2::reputation_checking_off`] and
+//!   [`webview2::crash_reports_local`]: the engine switches, each reporting whether it took. On macOS that includes [`content_rules_json`], a
 //!   content rule list that blocks every http, https, ws and wss load: WKWebView has no sinkhole, and
 //!   this is its network wall.
 //! - [`allow_navigation`]: the navigation guard's decision.
 //! - [`top_frame_script`] and [`WEBRTC_OFF_SCRIPT`]: the two init scripts.
 //! - [`seal_builder`] and [`apply_switches`]: the wiring that puts all of the above on a window,
-//!   before and after it is built. PM's `mods::build_window` and the regression app both call them,
-//!   so the app measures the wiring that ships too.
+//!   before and after it is built. PM's `mods::build_window` and the regression app both call them
+//!   (and [`build_main_retrying`] for the main window), so the app measures the wiring that ships
+//!   too.
 //! - [`verdict`]: whether every switch took. If one didn't, the engine counts as unsealed.
 //!   [`unreported`] says whether it is final yet.
 //! - [`build_retrying`] and [`Sinkhole::bind_preferring`]: what keeps a relaunch on Windows from
@@ -58,7 +63,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::utils::config::WindowConfig;
+use tauri::utils::config::{ScrollBarStyle, WindowConfig};
 use tauri::webview::DownloadEvent;
 use tauri::{AppHandle, Url, WebviewWindow, WebviewWindowBuilder, Wry};
 
@@ -121,7 +126,12 @@ impl Platform {
     pub const fn expected_switches(self) -> &'static [&'static str] {
         match self {
             Self::Linux => &[SINKHOLE, LINUX_PROXY, LINUX_WEBRTC_OFF],
-            Self::Windows => &[SINKHOLE, WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF],
+            Self::Windows => &[
+                SINKHOLE,
+                WINDOWS_PROXY_ARGS,
+                WINDOWS_REPUTATION_OFF,
+                WINDOWS_CRASH_UPLOAD_OFF,
+            ],
             Self::MacOs => &[
                 MACOS_PEER_CONNECTION_OFF,
                 MACOS_FRAUD_WARNING_OFF,
@@ -137,11 +147,14 @@ impl Platform {
     /// The expected switches whose failure in any PM window unseals the engine, not only in the
     /// main window: those whose setting the engine shares between every webview in the user-data
     /// folder, which all PM's windows use, so that one window left at the default turns it back on
-    /// for all of them. Every other switch counts in the main window only, the one window that
-    /// holds mods (`mods::for_the_seal` in PM, where the choice is explained).
+    /// for all of them (SmartScreen's setting), or whose option holds for the one browser process
+    /// every webview in that folder runs in (crash reporting's), so that a window not on PM's
+    /// environment means PM's option may not be the one in force. Every other switch counts in the
+    /// main window only, the one window that holds mods (`mods::for_the_seal` in PM, where the
+    /// choice is explained).
     pub const fn folder_wide_switches(self) -> &'static [&'static str] {
         match self {
-            Self::Windows => &[WINDOWS_REPUTATION_OFF],
+            Self::Windows => &[WINDOWS_REPUTATION_OFF, WINDOWS_CRASH_UPLOAD_OFF],
             Self::Linux | Self::MacOs => &[],
         }
     }
@@ -184,6 +197,44 @@ pub const WINDOWS_PROXY_ARGS: &str = "webview2.proxy-args";
 /// old to have `ICoreWebView2Settings8` (stable since WebView2 SDK 1.0.1722.45) can't switch it at
 /// all: the switch fails there, and the flag is all there is.
 pub const WINDOWS_REPUTATION_OFF: &str = "webview2.reputation-checking-off";
+/// WebView2: crash reports stay on this computer. When a WebView2 process behind a PM window
+/// crashes (its browser process, a renderer, the GPU process), WebView2 writes a minidump, and by
+/// default leaves it to Windows' own consent setting whether that goes to Microsoft
+/// (`IsCustomCrashReportingEnabled`'s default, `FALSE`: "WebView will respect OS consent"). A
+/// minidump holds part of the crashed process's memory, so it can hold fragments of what the window
+/// was showing. With `ICoreWebView2EnvironmentOptions3::put_IsCustomCrashReportingEnabled(TRUE)`
+/// "Windows won't send crash data to Microsoft endpoint", and the dumps stay in WebView2's crash
+/// folder on this computer (the one `ICoreWebView2Environment11::get_FailureReportFolderPath`
+/// names), which PM never reads or sends. WebView2's required diagnostic data still goes to
+/// Microsoft: no app can turn that off.
+///
+/// It is an option of the environment a webview is created in, not a setting of the webview, and
+/// wry creates an environment for each window, without it. So PM creates one environment itself,
+/// with the option on and otherwise the options wry would have used ([`environment_options`],
+/// [`shared_environment_for`]), and builds every window with it ([`seal_builder`]). It has to be
+/// every window: they all share one user-data folder, so one browser process, and WebView2 refuses
+/// a webview whose environment options don't match those of the webviews already running in it
+/// (`ERROR_INVALID_STATE`).
+///
+/// It counts as taken only if each part reads back ([`crash_reports_read`]): the environment was
+/// created with PM's options, which read the option back on through the getter WebView2 itself
+/// calls; this window's webview runs on that environment (by COM identity); and the WebView2
+/// Runtime has the option at all (it has `ICoreWebView2Environment11`, which came with it in
+/// WebView2 SDK 1.0.1518.46). What isn't read back: WebView2 has no getter for whether a running
+/// environment applied the option, and no job sees a report go to Microsoft or not. Nor does
+/// Microsoft say which options it compares when a new environment joins a browser process that is
+/// still running: if it didn't compare this one, a window built while the previous version's
+/// WebView2 was still winding down (the first launch after the update that brings this) could join
+/// that browser process, which has the option off, while this switch reads as taken, until PM is
+/// next started. The option holds for the whole browser process, so like SmartScreen's setting it
+/// counts in every window ([`Platform::folder_wide_switches`]).
+///
+/// When PM's environment couldn't be had (no local data folder, a WebView2 that refused it, or a
+/// main window that still wouldn't build with it after [`build_retrying`]'s tries, as while the
+/// previous version's WebView2 lingers with the option off), the windows are built with wry's own
+/// environments instead ([`build_main_retrying`]): PM still opens, crash reports follow Windows'
+/// setting, and this switch fails, so the engine is unsealed for that run.
+pub const WINDOWS_CRASH_UPLOAD_OFF: &str = "webview2.custom-crash-reporting";
 /// WKWebView: `-[WKPreferences _setPeerConnectionEnabled:NO]` (SPI).
 pub const MACOS_PEER_CONNECTION_OFF: &str = "wkwebview.peer-connection-off";
 /// WKWebView: `-[WKPreferences setFraudulentWebsiteWarningEnabled:NO]`, public API since macOS
@@ -404,12 +455,92 @@ pub fn reputation_outcome(read: ReputationRead) -> SwitchOutcome {
     }
 }
 
+/// What a window's webview says about [`WINDOWS_CRASH_UPLOAD_OFF`] ([`crash_reports_read`]). Each
+/// error is WebView2's, as text.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrashReportsRead {
+    /// The window was built without PM's environment, so with one wry created, which leaves the
+    /// option off: why PM had none to give it.
+    NotShared(String),
+    /// The window was given PM's environment, but its webview isn't on it (or which environment
+    /// it is on couldn't be read): what was found.
+    OtherEnvironment(String),
+    /// The webview's environment isn't an `ICoreWebView2Environment11`: the WebView2 Runtime
+    /// predates the option.
+    TooOld(String),
+    /// On PM's environment, on a runtime that has the option.
+    Local,
+}
+
+/// Whether a window's webview has PM's crash option: `shared` is the COM identity of PM's
+/// environment the window was built with, or why it was built without one; `webview` the identity
+/// of the environment its webview actually runs on, as WebView2 hands it back; `environment11`
+/// whether that environment is an `ICoreWebView2Environment11`. Identities are compared, not
+/// trusted: two references to one COM object have the same `IUnknown` pointer, and PM's
+/// environment is held for the life of the process, so its pointer can't be reused by another.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn crash_reports_read(
+    shared: Result<usize, &str>,
+    webview: Result<usize, String>,
+    environment11: Result<(), String>,
+) -> CrashReportsRead {
+    let shared = match shared {
+        Ok(identity) => identity,
+        Err(why) => return CrashReportsRead::NotShared(why.to_owned()),
+    };
+    match webview {
+        Ok(identity) if identity == shared => {}
+        Ok(_) => {
+            return CrashReportsRead::OtherEnvironment(
+                "its webview runs on another environment".into(),
+            )
+        }
+        Err(e) => {
+            return CrashReportsRead::OtherEnvironment(format!(
+                "couldn't tell which environment its webview runs on: {e}"
+            ))
+        }
+    }
+    match environment11 {
+        Ok(()) => CrashReportsRead::Local,
+        Err(e) => CrashReportsRead::TooOld(e),
+    }
+}
+
+/// The crash-reporting switch: taken only on PM's environment and a runtime that has the option.
+/// Anything short of that is a failure, since then nothing says WebView2's crash reports stay on
+/// this computer.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn crash_reports_outcome(read: CrashReportsRead) -> SwitchOutcome {
+    let failed = |why: String| SwitchOutcome::failed(WINDOWS_CRASH_UPLOAD_OFF, why);
+    match read {
+        CrashReportsRead::Local => SwitchOutcome::took(WINDOWS_CRASH_UPLOAD_OFF),
+        CrashReportsRead::NotShared(why) => failed(format!(
+            "built without PM's own WebView2 environment, so WebView2's crash reports follow \
+             Windows' setting: {why}"
+        )),
+        CrashReportsRead::OtherEnvironment(why) => {
+            failed(format!("not on PM's own WebView2 environment: {why}"))
+        }
+        CrashReportsRead::TooOld(e) => failed(format!(
+            "this WebView2 Runtime is too old to have ICoreWebView2Environment11 (stable since \
+             WebView2 SDK 1.0.1518.46, with the crash-reporting option), so it may not keep crash \
+             reports on this computer: {e}"
+        )),
+    }
+}
+
 /// A WebView2 window's report, in [`Platform::Windows`]'s expected order after the sinkhole (which
 /// [`SINKHOLE`] reports once, before any window): the browser args' outcome
-/// ([`proxy_args_outcome`]), then SmartScreen's (`reputation`).
+/// ([`proxy_args_outcome`]), then SmartScreen's (`reputation`), then crash reporting's (`crash`).
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-pub fn webview2_report(proxy_port: Option<u16>, reputation: SwitchOutcome) -> Vec<SwitchOutcome> {
-    vec![proxy_args_outcome(proxy_port), reputation]
+pub fn webview2_report(
+    proxy_port: Option<u16>,
+    reputation: SwitchOutcome,
+    crash: SwitchOutcome,
+) -> Vec<SwitchOutcome> {
+    vec![proxy_args_outcome(proxy_port), reputation, crash]
 }
 
 /// What `+[WKPreferences _features]` gave (the macOS feature switches): an outcome for each of
@@ -974,6 +1105,202 @@ pub fn webview2_args_override(
     policy.map(|at| format!("a WebView2 policy sets the browser args ({at})"))
 }
 
+// ---- PM's WebView2 environment -----------------------------------------------------------------
+
+/// The options PM creates its WebView2 environment with ([`WINDOWS_CRASH_UPLOAD_OFF`]). When wry is
+/// handed an environment it creates none of its own, so it sets none of its options either: these
+/// are the ones wry's `create_environment` sets (wry 0.57.1, `webview2/mod.rs`), from what Tauri
+/// gives it for a PM window, plus the crash option. Everything else is left at
+/// `webview2_com::CoreWebView2EnvironmentOptions::default()`, which wry starts from too, and the
+/// scroll bars at the default style, which wry sets for Tauri's default (a window that asked for
+/// another, or for anything else wry reads, gets no shared environment:
+/// [`environment_config_conflict`]).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentOptions {
+    /// PM's browser args ([`windows_browser_args`]): wry passes the window's args, which
+    /// [`seal_builder`] sets to these.
+    pub additional_browser_arguments: String,
+    /// The user's Windows display language, as wry reads it (`webview2::user_language`).
+    pub language: String,
+    /// Off: wry passes Tauri's `browser_extensions_enabled`, false unless a window turns it on.
+    pub are_browser_extensions_enabled: bool,
+    /// On: the one option wry never sets.
+    pub is_custom_crash_reporting_enabled: bool,
+}
+
+/// [`EnvironmentOptions`] for `browser_args` (PM's, from [`windows_browser_args`]) and `language`.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn environment_options(browser_args: &str, language: String) -> EnvironmentOptions {
+    EnvironmentOptions {
+        additional_browser_arguments: browser_args.to_owned(),
+        language,
+        are_browser_extensions_enabled: false,
+        is_custom_crash_reporting_enabled: true,
+    }
+}
+
+/// Why a window built from `config` couldn't share PM's environment and keep what it has today, or
+/// `None` when it can. Tauri would give it a data folder of its own (`dataDirectory`), and wry would
+/// create its environment with extensions on or another scroll bar style: PM's environment does
+/// neither, so such a window would move its storage or change its options. PM's main window asks
+/// for none of them (a test in `mods/mod.rs` reads `tauri.conf.json`), and the other windows are
+/// made by builders that set none.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn environment_config_conflict(config: &WindowConfig) -> Option<&'static str> {
+    if config.data_directory.is_some() {
+        Some("the window's config names a data folder of its own")
+    } else if config.browser_extensions_enabled {
+        Some("the window's config turns browser extensions on")
+    } else if config.scroll_bar_style != ScrollBarStyle::Default {
+        Some("the window's config asks for another scroll bar style")
+    } else {
+        None
+    }
+}
+
+/// Why there is no shared environment on an engine other than WebView2.
+pub const NOT_WEBVIEW2: &str = "this engine isn't WebView2";
+
+/// PM's one WebView2 environment, created by [`shared_environment_for`] on Windows, which every PM
+/// window is built with there ([`seal_builder`], [`WINDOWS_CRASH_UPLOAD_OFF`]). Elsewhere there is
+/// none, and nothing makes one.
+///
+/// PM holds it for the life of the process (its `EngineState`), so its identity can't pass to
+/// another object while a window is checked against it, and every window opened later gets the
+/// same one. Cloning it only adds a reference: a pop-out's builder, made on an async thread,
+/// carries a clone to the main thread, where wry uses it.
+#[derive(Clone)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct SharedEnvironment {
+    #[cfg(windows)]
+    environment: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
+    /// Its COM identity: its `IUnknown` pointer, read on the main thread when it was created.
+    identity: usize,
+}
+
+// SAFETY: the environment is a WebView2 object, which may be called only on the thread that
+// created it, the main thread (`shared_environment_for` runs there, wry uses it there, and
+// `apply_switches` reads it there, from `with_webview`). Anywhere else PM only clones it, which is
+// `AddRef`, and drops a clone, which is `Release`; COM reference counts are safe to change from any
+// thread, and PM's `EngineState` keeps one reference until the process ends, so no drop elsewhere
+// is the last. Tauri moves the same interface from a builder on any thread to the main thread the
+// same way, marking `WebviewAttributes`, which carries it, Send and Sync (tauri-runtime 2.12.2,
+// `webview.rs`).
+#[cfg(windows)]
+unsafe impl Send for SharedEnvironment {}
+// SAFETY: as for Send: through a shared reference PM only clones it or reads its identity, a
+// plain number.
+#[cfg(windows)]
+unsafe impl Sync for SharedEnvironment {}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl SharedEnvironment {
+    /// Its COM identity, which a window's webview is checked against ([`crash_reports_read`]).
+    pub fn identity(&self) -> usize {
+        self.identity
+    }
+}
+
+/// Create PM's environment for the main window built from `config`: in the user-data folder
+/// Tauri gives every PM window (`app.path().app_local_data_dir()`, as tauri 2.12.5 sets it when a
+/// window names none, `manager/webview.rs`), so localStorage and everything else WebView2 keeps
+/// there stays where it is, with [`environment_options`] for `browser_args`. Main thread only, as
+/// `setup()` is: WebView2 objects belong to the thread that created them, and wry builds every
+/// window on the main thread.
+#[cfg(windows)]
+pub fn shared_environment_for(
+    app: &AppHandle,
+    config: &WindowConfig,
+    browser_args: &str,
+) -> Result<SharedEnvironment, String> {
+    use tauri::Manager;
+    if let Some(why) = environment_config_conflict(config) {
+        return Err(why.to_owned());
+    }
+    let folder = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("couldn't find the app's local data folder: {e}"))?;
+    // Tauri creates it before wry runs; it has to exist before the environment is created.
+    std::fs::create_dir_all(&folder)
+        .map_err(|e| format!("couldn't create the app's local data folder: {e}"))?;
+    let options = environment_options(browser_args, webview2::user_language());
+    webview2::create_environment(&folder, &options)
+}
+
+/// No WebView2, no environment.
+#[cfg(not(windows))]
+pub fn shared_environment_for(
+    _app: &AppHandle,
+    _config: &WindowConfig,
+    _browser_args: &str,
+) -> Result<SharedEnvironment, String> {
+    Err(NOT_WEBVIEW2.to_owned())
+}
+
+/// Why one try at the main window failed: PM's environment couldn't be created, or the window
+/// couldn't be built with it.
+enum MainTry<E> {
+    Environment(String),
+    Window(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for MainTry<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment(why) => {
+                write!(f, "PM's WebView2 environment couldn't be created: {why}")
+            }
+            Self::Window(e) => e.fmt(f),
+        }
+    }
+}
+
+/// Build the main window, with PM's environment on Windows ([`WINDOWS_CRASH_UPLOAD_OFF`]), and hand
+/// back the environment it was built with, or why it was built without one, for every later
+/// window. `create` makes the environment ([`shared_environment_for`]) and `build` the window with
+/// what it is given (`Err` is the reason it has no environment).
+///
+/// On Windows each of [`build_retrying`]'s tries creates a fresh environment and builds with it,
+/// dropping a failed try's environment before the next: while the previous run's WebView2 is still
+/// running with other options, WebView2 refuses the new environment's window, and a few seconds of
+/// tries see it gone. If every try fails, the window is built once more without PM's environment,
+/// so with wry's own, as before this existed: PM opens unsealed rather than not at all, and that
+/// try's error is the one returned if it fails too. Elsewhere `create` is never called, and the
+/// window is built as [`build_retrying`] builds it.
+pub fn build_main_retrying<Env, T, E: std::fmt::Display>(
+    platform: Platform,
+    mut create: impl FnMut() -> Result<Env, String>,
+    mut build: impl FnMut(Result<&Env, &str>) -> Result<T, E>,
+    wait: impl FnMut(Duration),
+) -> Result<(T, Result<Env, String>), E> {
+    if platform != Platform::Windows {
+        return build_retrying(platform, || build(Err(NOT_WEBVIEW2)), wait)
+            .map(|t| (t, Err(NOT_WEBVIEW2.to_owned())));
+    }
+    let tried: Result<(T, Env), MainTry<E>> = build_retrying(
+        platform,
+        || {
+            let environment = create().map_err(MainTry::Environment)?;
+            let built = build(Ok(&environment)).map_err(MainTry::Window)?;
+            Ok((built, environment))
+        },
+        wait,
+    );
+    match tried {
+        Ok((built, environment)) => Ok((built, Ok(environment))),
+        Err(e) => {
+            let why = format!("the main window couldn't be built with it ({e})");
+            eprintln!(
+                "webview: {why}, so it is built with WebView2's default environment instead: \
+                 WebView2's crash reports follow Windows' setting, and the engine is unsealed"
+            );
+            build(Err(&why)).map(|built| (built, Err(why)))
+        }
+    }
+}
+
 // ---- The navigation guard ----------------------------------------------------------------------
 
 /// Whether a PM window may navigate to `url`: PM's own origin, the dev server in a dev build, and a
@@ -1047,15 +1374,29 @@ pub fn top_frame_script(platform: Platform, is_dev: bool) -> String {
 
 // ---- The wiring --------------------------------------------------------------------------------
 
-/// Everything a sealed window gets before it is built: the browser args, the navigation guard, the
-/// download refusal and both init scripts. `is_pending_entry` is asked only about a mod URL, and only
-/// on an engine whose guard sees frames ([`allow_navigation_on`]).
+/// Everything a sealed window gets before it is built: the browser args, PM's WebView2 environment
+/// when there is one (`environment`, the same for every window: [`WINDOWS_CRASH_UPLOAD_OFF`]; `Err`
+/// says why there is none, and is ignored here), the navigation guard, the download refusal and
+/// both init scripts. `is_pending_entry` is asked only about a mod URL, and only on an engine whose
+/// guard sees frames ([`allow_navigation_on`]).
+///
+/// Given an environment, wry creates none, so it uses neither the browser args nor anything else
+/// it would have put in one: PM's environment carries them ([`environment_options`]). The args are
+/// still set, for a window built without it.
 pub fn seal_builder<'a>(
     builder: WebviewWindowBuilder<'a, Wry, AppHandle>,
     browser_args: &str,
     is_dev: bool,
+    environment: Result<&SharedEnvironment, &str>,
     is_pending_entry: impl Fn(&Url) -> bool + Send + 'static,
 ) -> WebviewWindowBuilder<'a, Wry, AppHandle> {
+    #[cfg(windows)]
+    let builder = match environment {
+        Ok(shared) => builder.with_environment(shared.environment.clone()),
+        Err(_) => builder,
+    };
+    #[cfg(not(windows))]
+    let _ = environment;
     builder
         .additional_browser_args(browser_args)
         .on_navigation(move |url| {
@@ -1084,12 +1425,14 @@ pub fn seal_builder<'a>(
 /// have all reported (on macOS, once the rule list has compiled). `Err` when the webview couldn't be
 /// reached, and if the window is gone before the event loop gets to it, `with_webview` drops the
 /// closure: either way `done` never runs, and a switch that never reports keeps the engine unsealed
-/// ([`verdict`]). `proxy_port` is [`proxy_port`]'s, the dead port included.
+/// ([`verdict`]). `proxy_port` is [`proxy_port`]'s, the dead port included, and `environment` what
+/// [`seal_builder`] was given (read on WebView2 only).
 #[cfg(target_os = "linux")]
 pub fn apply_switches(
     window: &WebviewWindow,
     proxy_port: Option<u16>,
     is_dev: bool,
+    _environment: Result<&SharedEnvironment, &str>,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
     let proxy = proxy_port.map(sinkhole_proxy_uri);
@@ -1110,6 +1453,7 @@ pub fn apply_switches(
     window: &WebviewWindow,
     _proxy_port: Option<u16>,
     is_dev: bool,
+    _environment: Result<&SharedEnvironment, &str>,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
     window.with_webview(move |webview| {
@@ -1120,19 +1464,29 @@ pub fn apply_switches(
 }
 
 /// See the Linux version. The browser args carried the proxy or didn't once the window is built
-/// ([`proxy_args_outcome`]), and SmartScreen's setting is switched on the webview itself, through
-/// its controller ([`webview2::reputation_checking_off`]), so `done` gets both from the main thread
+/// ([`proxy_args_outcome`]); SmartScreen's setting is switched on the webview itself, through its
+/// controller ([`webview2::reputation_checking_off`]); and whether the webview runs on PM's
+/// environment (`environment`, the one the window was given) is read from the environment wry
+/// hands back ([`webview2::crash_reports_local`]). So `done` gets all three from the main thread
 /// ([`webview2_report`]).
 #[cfg(windows)]
 pub fn apply_switches(
     window: &WebviewWindow,
     proxy_port: Option<u16>,
     _is_dev: bool,
+    environment: Result<&SharedEnvironment, &str>,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
+    let shared: Result<usize, String> = environment
+        .map(SharedEnvironment::identity)
+        .map_err(str::to_owned);
     window.with_webview(move |webview| {
         let reputation = webview2::reputation_checking_off(&webview.controller());
-        done(webview2_report(proxy_port, reputation));
+        let crash = webview2::crash_reports_local(
+            &webview.environment(),
+            shared.as_ref().copied().map_err(String::as_str),
+        );
+        done(webview2_report(proxy_port, reputation, crash));
     })
 }
 
@@ -1574,16 +1928,146 @@ pub mod wkwebview {
     }
 }
 
-/// WebView2. Called on the main thread, from `with_webview`. Its interfaces are webview2-com's, on
-/// windows-core 0.62, so they are cast with that crate's `Interface`: PM's own `windows` crate is
-/// 0.61, whose `Interface` is another trait and can't cast them.
+/// WebView2. Everything here runs on the main thread: PM's environment is created from `setup()`,
+/// and the switches from `with_webview`. Its interfaces are webview2-com's, on windows-core 0.62, so
+/// they are cast with that crate's `Interface`: PM's own `windows` crate is 0.61, whose `Interface`
+/// is another trait and can't cast them. The two Win32 calls that read the user's language and the
+/// one that sets up COM come from the `windows` crate (0.61 in PM, 0.62 in the sealed-frame app,
+/// where they are the same functions with the same signatures).
 #[cfg(windows)]
 pub mod webview2 {
-    use super::{reputation_outcome, ReputationRead, SwitchOutcome};
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Controller, ICoreWebView2Settings8,
+    use super::{
+        crash_reports_outcome, crash_reports_read, reputation_outcome, EnvironmentOptions,
+        ReputationRead, SharedEnvironment, SwitchOutcome,
     };
-    use windows_core::{Interface, BOOL};
+    use std::path::Path;
+    use std::sync::mpsc;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2Controller,
+        ICoreWebView2Environment, ICoreWebView2Environment11, ICoreWebView2EnvironmentOptions,
+        ICoreWebView2EnvironmentOptions3, ICoreWebView2Settings8,
+        COREWEBVIEW2_SCROLLBAR_STYLE_DEFAULT,
+    };
+    use webview2_com::{
+        CoreWebView2EnvironmentOptions, CreateCoreWebView2EnvironmentCompletedHandler,
+    };
+    use windows_core::{IUnknown, Interface, BOOL, HSTRING, PCWSTR};
+
+    /// The user's Windows display language, read exactly as wry 0.57.1 reads it for the
+    /// environment it creates (`webview2/mod.rs`, `create_environment`): the same two calls, the
+    /// same buffer, and the same conversion of the whole buffer, its trailing NULs included, so the
+    /// string WebView2 reads is the one it would have read from wry.
+    pub fn user_language() -> String {
+        use windows::Win32::Globalization::{
+            GetUserDefaultUILanguage, LCIDToLocaleName, LOCALE_ALLOW_NEUTRAL_NAMES, MAX_LOCALE_NAME,
+        };
+        // SAFETY: neither call takes a pointer but the buffer, which is a local that outlives it,
+        // passed with its own length; like wry, a failed lookup leaves it zeroed.
+        let lcid = unsafe { GetUserDefaultUILanguage() };
+        let mut lang = [0; MAX_LOCALE_NAME as usize];
+        unsafe { LCIDToLocaleName(lcid as u32, Some(&mut lang), LOCALE_ALLOW_NEUTRAL_NAMES) };
+        String::from_utf16_lossy(&lang)
+    }
+
+    /// Create PM's environment in `folder` with `options`, on the main thread, waiting for WebView2
+    /// as wry does (`webview2_com::wait_with_pump`, which keeps the thread's messages flowing).
+    /// The options are first read back through the getter WebView2 calls, so an environment is
+    /// created only with the crash option on.
+    pub fn create_environment(
+        folder: &Path,
+        options: &EnvironmentOptions,
+    ) -> Result<SharedEnvironment, String> {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        // WebView2 needs a single-threaded apartment, which wry asks for in the same words before
+        // each window; on a thread already in one this only says so. Never undone, like wry's: the
+        // main thread stays in it for the life of the process.
+        // SAFETY: no reserved pointer is passed.
+        let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if com.is_err() {
+            return Err(format!(
+                "this thread can't use WebView2: it isn't in a single-threaded COM apartment ({com:?})"
+            ));
+        }
+        let built = CoreWebView2EnvironmentOptions::default();
+        // SAFETY: each setter writes a field of `built`, which nothing else holds yet.
+        unsafe {
+            built.set_additional_browser_arguments(options.additional_browser_arguments.clone());
+            built.set_are_browser_extensions_enabled(options.are_browser_extensions_enabled);
+            built.set_language(options.language.clone());
+            built.set_scroll_bar_style(COREWEBVIEW2_SCROLLBAR_STYLE_DEFAULT);
+            built.set_is_custom_crash_reporting_enabled(options.is_custom_crash_reporting_enabled);
+        }
+        let built = ICoreWebView2EnvironmentOptions::from(built);
+        match crash_option(&built) {
+            Ok(true) => {}
+            Ok(false) => return Err("PM's options read the crash option back off".into()),
+            Err(e) => {
+                return Err(format!(
+                    "PM's options couldn't read the crash option back: {e}"
+                ))
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        // webview2-com hands the closure WebView2's HRESULT already as a `Result`.
+        let handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+            move |code: windows_core::Result<()>, environment: Option<ICoreWebView2Environment>| {
+                // Only this function waits on it; a closed receiver means nobody does.
+                let _ = tx.send((code, environment));
+                Ok(())
+            },
+        ));
+        let folder = HSTRING::from(folder);
+        // SAFETY: every argument outlives the call (WebView2 holds its own references to the
+        // options and the handler), and a null browser folder means the installed runtime, as in
+        // wry.
+        unsafe {
+            CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &folder, &built, &handler)
+        }
+        .map_err(|e| format!("WebView2 refused to create it: {e}"))?;
+        let (code, environment) = webview2_com::wait_with_pump(rx)
+            .map_err(|e| format!("waiting for WebView2 to create it failed: {e}"))?;
+        code.map_err(|e| format!("WebView2 couldn't create it: {e}"))?;
+        let environment =
+            environment.ok_or("WebView2 said it created it, but handed back no environment")?;
+        let identity = identity(&environment)?;
+        Ok(SharedEnvironment {
+            environment,
+            identity,
+        })
+    }
+
+    /// `IsCustomCrashReportingEnabled`, read through `ICoreWebView2EnvironmentOptions3`.
+    fn crash_option(options: &ICoreWebView2EnvironmentOptions) -> windows_core::Result<bool> {
+        let options = options.cast::<ICoreWebView2EnvironmentOptions3>()?;
+        // Starts off, so a getter that succeeded without writing reads as off, never as on.
+        let mut on = BOOL(0);
+        // SAFETY: a property read on an interface of PM's own options object, with an out pointer
+        // to a local that outlives it.
+        unsafe { options.IsCustomCrashReportingEnabled(&mut on) }?;
+        Ok(on.as_bool())
+    }
+
+    /// A WebView2 object's COM identity: its `IUnknown` pointer, the same for every reference to it.
+    fn identity(environment: &ICoreWebView2Environment) -> Result<usize, String> {
+        environment
+            .cast::<IUnknown>()
+            .map(|unknown| unknown.as_raw() as usize)
+            .map_err(|e| format!("couldn't read its COM identity: {e}"))
+    }
+
+    /// Whether this webview's environment (`webview`, as wry hands it back) is PM's (`shared`, the
+    /// identity of the one the window was given, or why it was given none), on a WebView2 Runtime
+    /// that has the crash option (see [`super::WINDOWS_CRASH_UPLOAD_OFF`]).
+    pub fn crash_reports_local(
+        webview: &ICoreWebView2Environment,
+        shared: Result<usize, &str>,
+    ) -> SwitchOutcome {
+        let environment11 = webview
+            .cast::<ICoreWebView2Environment11>()
+            .map(drop)
+            .map_err(|e| e.to_string());
+        crash_reports_outcome(crash_reports_read(shared, identity(webview), environment11))
+    }
 
     /// Switch SmartScreen off in this webview's settings and read it back (see
     /// [`super::WINDOWS_REPUTATION_OFF`]).
@@ -1628,6 +2112,7 @@ mod tests {
     use std::cell::RefCell;
     use std::io::Read;
     use std::net::TcpStream;
+    use std::rc::Rc;
     use std::time::Instant;
 
     fn url(s: &str) -> Url {
@@ -1931,6 +2416,7 @@ mod tests {
                 "sinkhole was never applied",
                 "webview2.proxy-args was never applied",
                 "webview2.reputation-checking-off was never applied",
+                "webview2.custom-crash-reporting was never applied",
             ]
         );
     }
@@ -2005,13 +2491,15 @@ mod tests {
             [SINKHOLE, LINUX_PROXY, LINUX_WEBRTC_OFF]
         );
         // SmartScreen, like the fraudulent-website warning, is a lookup service, not a network wall
-        // (see WINDOWS_REPUTATION_OFF).
+        // (see WINDOWS_REPUTATION_OFF), and crash reporting a report, not a load
+        // (WINDOWS_CRASH_UPLOAD_OFF).
         assert_eq!(
             Platform::Windows.expected_switches(),
             [
                 SINKHOLE,
                 WINDOWS_PROXY_ARGS,
-                "webview2.reputation-checking-off"
+                "webview2.reputation-checking-off",
+                "webview2.custom-crash-reporting",
             ]
         );
         // The fraudulent-website warning isn't a network wall the spike measured, but a lookup
@@ -2046,10 +2534,13 @@ mod tests {
     }
 
     #[test]
-    fn only_smartscreen_counts_in_every_window_and_only_on_windows() {
+    fn only_smartscreen_and_crash_reporting_count_in_every_window_and_only_on_windows() {
         assert_eq!(
             Platform::Windows.folder_wide_switches(),
-            ["webview2.reputation-checking-off"]
+            [
+                "webview2.reputation-checking-off",
+                "webview2.custom-crash-reporting"
+            ]
         );
         assert!(Platform::Linux.folder_wide_switches().is_empty());
         assert!(Platform::MacOs.folder_wide_switches().is_empty());
@@ -2071,18 +2562,22 @@ mod tests {
             all.extend(webview2_report(
                 Some(port),
                 reputation_outcome(ReputationRead::Off),
+                crash_reports_outcome(CrashReportsRead::Local),
             ));
             let names: Vec<_> = all.iter().map(|o| o.name).collect();
             assert_eq!(names, Platform::Windows.expected_switches(), "{port}");
             assert!(verdict(Platform::Windows.expected_switches(), &all).sealed);
         }
-        // Each outcome is its own: args with no proxy fail, SmartScreen's report is passed through.
+        // Each outcome is its own: args with no proxy fail, SmartScreen's and crash reporting's
+        // reports are passed through.
         let failed = reputation_outcome(ReputationRead::StillOn);
+        let crash = crash_reports_outcome(CrashReportsRead::NotShared("none".into()));
         assert_eq!(
-            webview2_report(None, failed.clone()),
+            webview2_report(None, failed.clone(), crash.clone()),
             [
                 SwitchOutcome::failed(WINDOWS_PROXY_ARGS, "the args carry no proxy"),
-                failed
+                failed,
+                crash
             ]
         );
     }
@@ -2649,6 +3144,347 @@ mod tests {
             Ok(1)
         );
         assert_eq!(waited, 0);
+    }
+
+    /// An environment that writes its creation and its drop to `log`, as `env <n>` and `drop <n>`.
+    struct FakeEnvironment {
+        n: u32,
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Drop for FakeEnvironment {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push(format!("drop {}", self.n));
+        }
+    }
+
+    /// What `main_build` got: the window, and the number of the environment it was built with or
+    /// why it had none; or the build's error.
+    type MainBuilt = Result<(String, Result<u32, String>), String>;
+
+    /// `build_main_retrying` on `platform` with environments that fail to be created on the tries
+    /// `env_fails` names and windows that fail to build on the tries `build_fails` names (each
+    /// counted from 1, a try being a call), and what happened, in order.
+    fn main_build(
+        platform: Platform,
+        env_fails: &dyn Fn(u32) -> bool,
+        build_fails: &dyn Fn(u32) -> bool,
+    ) -> (MainBuilt, Vec<String>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (mut creates, mut builds) = (0, 0);
+        let result = build_main_retrying(
+            platform,
+            || {
+                creates += 1;
+                if env_fails(creates) {
+                    log.borrow_mut().push(format!("env {creates} refused"));
+                    return Err(format!("refused {creates}"));
+                }
+                log.borrow_mut().push(format!("env {creates}"));
+                Ok(FakeEnvironment {
+                    n: creates,
+                    log: Rc::clone(&log),
+                })
+            },
+            |environment: Result<&FakeEnvironment, &str>| {
+                builds += 1;
+                let with = match environment {
+                    Ok(env) => format!("with env {}", env.n),
+                    Err(why) => format!("without: {why}"),
+                };
+                log.borrow_mut().push(format!("build {builds} {with}"));
+                if build_fails(builds) {
+                    Err(format!("window {builds} refused"))
+                } else {
+                    Ok(format!("window {builds}"))
+                }
+            },
+            |d| log.borrow_mut().push(format!("wait {}", d.as_millis())),
+        );
+        // Report the environment by number; dropping it here logs its drop after everything else.
+        let result = result.map(|(w, env)| {
+            let n = env.as_ref().map(|e| e.n).map_err(Clone::clone);
+            drop(env);
+            (w, n)
+        });
+        let events = log.borrow().clone();
+        (result, events)
+    }
+
+    #[test]
+    fn elsewhere_the_main_window_is_built_as_before_and_no_environment_is_made() {
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let (result, events) = main_build(platform, &|_| false, &|_| false);
+            assert_eq!(
+                result,
+                Ok(("window 1".into(), Err(NOT_WEBVIEW2.into()))),
+                "{platform:?}"
+            );
+            assert_eq!(events, [format!("build 1 without: {NOT_WEBVIEW2}")]);
+            // A failure is returned at once, with no environment and no second try.
+            let (result, events) = main_build(platform, &|_| false, &|_| true);
+            assert_eq!(result, Err("window 1 refused".into()));
+            assert_eq!(events, [format!("build 1 without: {NOT_WEBVIEW2}")]);
+        }
+    }
+
+    #[test]
+    fn on_windows_the_main_window_is_built_with_pms_environment_and_hands_it_on() {
+        let (result, events) = main_build(Platform::Windows, &|_| false, &|_| false);
+        assert_eq!(result, Ok(("window 1".into(), Ok(1))));
+        // Kept, not dropped, until the caller lets it go.
+        assert_eq!(events, ["env 1", "build 1 with env 1", "drop 1"]);
+    }
+
+    #[test]
+    fn each_try_gets_a_fresh_environment_and_a_failed_try_drops_its_own_first() {
+        // The previous run's WebView2 refuses the window for two tries, then is gone.
+        let (result, events) = main_build(Platform::Windows, &|_| false, &|n| n <= 2);
+        assert_eq!(result, Ok(("window 3".into(), Ok(3))));
+        assert_eq!(
+            events,
+            [
+                "env 1",
+                "build 1 with env 1",
+                "drop 1",
+                "wait 250",
+                "env 2",
+                "build 2 with env 2",
+                "drop 2",
+                "wait 500",
+                "env 3",
+                "build 3 with env 3",
+                "drop 3",
+            ]
+        );
+        // The environment itself refused twice: no window is built without it in the meantime.
+        let (result, events) = main_build(Platform::Windows, &|n| n <= 2, &|_| false);
+        assert_eq!(result, Ok(("window 1".into(), Ok(3))));
+        assert_eq!(
+            events,
+            [
+                "env 1 refused",
+                "wait 250",
+                "env 2 refused",
+                "wait 500",
+                "env 3",
+                "build 1 with env 3",
+                "drop 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn when_no_try_works_with_pms_environment_the_window_is_built_once_without_it() {
+        let tries = WINDOWS_RETRY_DELAYS.len() as u32 + 1;
+        // Every environment refused: every wait, then one build without, which says why.
+        let (result, events) = main_build(Platform::Windows, &|_| true, &|_| false);
+        let why = format!(
+            "the main window couldn't be built with it (PM's WebView2 environment couldn't be \
+             created: refused {tries})"
+        );
+        assert_eq!(result, Ok(("window 1".into(), Err(why.clone()))));
+        let mut want: Vec<String> = Vec::new();
+        for (i, d) in WINDOWS_RETRY_DELAYS.iter().enumerate() {
+            want.push(format!("env {} refused", i + 1));
+            want.push(format!("wait {}", d.as_millis()));
+        }
+        want.push(format!("env {tries} refused"));
+        want.push(format!("build 1 without: {why}"));
+        assert_eq!(events, want);
+
+        // Every window with it refused: each try's environment dropped, then one build without.
+        let (result, events) = main_build(Platform::Windows, &|_| false, &|n| n <= tries);
+        let why = format!("the main window couldn't be built with it (window {tries} refused)");
+        assert_eq!(
+            result,
+            Ok((format!("window {}", tries + 1), Err(why.clone())))
+        );
+        assert_eq!(
+            events.last(),
+            Some(&format!("build {} without: {why}", tries + 1))
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("env ")).count(),
+            tries as usize
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("drop ")).count(),
+            tries as usize
+        );
+        // No environment outlives its try: the build without one comes after every drop.
+        let last_drop = events.iter().rposition(|e| e.starts_with("drop ")).unwrap();
+        assert_eq!(last_drop, events.len() - 2);
+
+        // And when that fails too, its error is the one returned: PM can't open.
+        let (result, events) = main_build(Platform::Windows, &|_| true, &|_| true);
+        assert_eq!(result, Err("window 1 refused".into()));
+        assert_eq!(events.iter().filter(|e| e.starts_with("build ")).count(), 1);
+    }
+
+    #[test]
+    fn pms_environment_options_are_wrys_with_the_crash_option_on() {
+        for (port, dev) in [(4321, false), (4321, true), (DEAD_PROXY_PORT, false)] {
+            let args = windows_browser_args(Some(port), dev);
+            let options = environment_options(&args, "en-GB".into());
+            assert_eq!(
+                options,
+                EnvironmentOptions {
+                    additional_browser_arguments: args.clone(),
+                    language: "en-GB".into(),
+                    are_browser_extensions_enabled: false,
+                    is_custom_crash_reporting_enabled: true,
+                }
+            );
+            // wry's own args (SmartScreen's flag among them) and PM's proxy, which wry no longer
+            // passes once it is handed an environment.
+            assert!(options
+                .additional_browser_arguments
+                .starts_with(WRY_DEFAULT_BROWSER_ARGS));
+            assert!(options
+                .additional_browser_arguments
+                .contains("msSmartScreenProtection"));
+            assert!(options
+                .additional_browser_arguments
+                .contains(&format!("--proxy-server=http://127.0.0.1:{port}")));
+            assert_eq!(
+                options
+                    .additional_browser_arguments
+                    .contains("--proxy-bypass-list=<-loopback>"),
+                !dev
+            );
+        }
+        // The language is passed through as read, wry's trailing NULs and all.
+        let padded = String::from_utf16_lossy(&[0x65, 0x6e, 0x2d, 0x55, 0x53, 0, 0, 0]);
+        assert_eq!(environment_options("", padded.clone()).language, padded);
+    }
+
+    #[test]
+    fn a_window_config_that_would_move_its_storage_or_options_gets_no_shared_environment() {
+        let base: WindowConfig = serde_json::from_value(serde_json::json!({ "label": "main" }))
+            .expect("a window config");
+        assert_eq!(environment_config_conflict(&base), None);
+        let mut named = base.clone();
+        named.data_directory = Some("elsewhere".into());
+        assert_eq!(
+            environment_config_conflict(&named),
+            Some("the window's config names a data folder of its own")
+        );
+        let mut extensions = base.clone();
+        extensions.browser_extensions_enabled = true;
+        assert_eq!(
+            environment_config_conflict(&extensions),
+            Some("the window's config turns browser extensions on")
+        );
+        let mut overlay = base.clone();
+        overlay.scroll_bar_style = ScrollBarStyle::FluentOverlay;
+        assert_eq!(
+            environment_config_conflict(&overlay),
+            Some("the window's config asks for another scroll bar style")
+        );
+    }
+
+    #[test]
+    fn crash_reports_count_only_on_pms_environment_and_a_runtime_that_has_the_option() {
+        let pm = 0x1000;
+        assert_eq!(
+            crash_reports_read(Ok(pm), Ok(pm), Ok(())),
+            CrashReportsRead::Local
+        );
+        assert_eq!(
+            crash_reports_outcome(CrashReportsRead::Local),
+            SwitchOutcome::took(WINDOWS_CRASH_UPLOAD_OFF)
+        );
+        let e = || "No such interface supported (0x80004002)".to_owned();
+        for (shared, webview, env11, read, detail) in [
+            // Built without it: nothing else is asked.
+            (
+                Err("the main window couldn't be built with it (refused)"),
+                Ok(pm),
+                Ok(()),
+                CrashReportsRead::NotShared(
+                    "the main window couldn't be built with it (refused)".into(),
+                ),
+                "built without PM's own WebView2 environment, so WebView2's crash reports follow \
+                 Windows' setting: the main window couldn't be built with it (refused)"
+                    .to_owned(),
+            ),
+            // Given it, but the webview runs on another.
+            (
+                Ok(pm),
+                Ok(pm + 8),
+                Ok(()),
+                CrashReportsRead::OtherEnvironment(
+                    "its webview runs on another environment".into(),
+                ),
+                "not on PM's own WebView2 environment: its webview runs on another environment"
+                    .to_owned(),
+            ),
+            // Which one it runs on couldn't be read: not taken as PM's.
+            (
+                Ok(pm),
+                Err(e()),
+                Ok(()),
+                CrashReportsRead::OtherEnvironment(format!(
+                    "couldn't tell which environment its webview runs on: {}",
+                    e()
+                )),
+                format!(
+                    "not on PM's own WebView2 environment: couldn't tell which environment its \
+                     webview runs on: {}",
+                    e()
+                ),
+            ),
+            // On PM's, but a runtime without the option.
+            (
+                Ok(pm),
+                Ok(pm),
+                Err(e()),
+                CrashReportsRead::TooOld(e()),
+                format!(
+                    "this WebView2 Runtime is too old to have ICoreWebView2Environment11 (stable \
+                     since WebView2 SDK 1.0.1518.46, with the crash-reporting option), so it may \
+                     not keep crash reports on this computer: {}",
+                    e()
+                ),
+            ),
+        ] {
+            let got = crash_reports_read(shared, webview.clone(), env11.clone());
+            assert_eq!(got, read, "{shared:?} {webview:?} {env11:?}");
+            let outcome = crash_reports_outcome(got);
+            assert_eq!(
+                outcome,
+                SwitchOutcome::failed(WINDOWS_CRASH_UPLOAD_OFF, detail.clone())
+            );
+            // Everything else took: this alone unseals the engine, and says why.
+            let mut all = all_took(Platform::Windows);
+            all.retain(|o| o.name != WINDOWS_CRASH_UPLOAD_OFF);
+            all.push(outcome);
+            let v = verdict(Platform::Windows.expected_switches(), &all);
+            assert!(!v.sealed);
+            assert_eq!(
+                v.reasons,
+                [format!(
+                    "webview2.custom-crash-reporting didn't take: {detail}"
+                )]
+            );
+        }
+        // An old runtime is reported only once the environment is PM's: not on PM's comes first.
+        assert_eq!(
+            crash_reports_read(Ok(pm), Ok(pm + 8), Err(e())),
+            CrashReportsRead::OtherEnvironment("its webview runs on another environment".into())
+        );
+        assert!(matches!(
+            crash_reports_read(Err("none"), Err(e()), Err(e())),
+            CrashReportsRead::NotShared(_)
+        ));
+        // Never reported: unsealed too.
+        let mut all = all_took(Platform::Windows);
+        all.retain(|o| o.name != WINDOWS_CRASH_UPLOAD_OFF);
+        assert_eq!(
+            verdict(Platform::Windows.expected_switches(), &all).reasons,
+            ["webview2.custom-crash-reporting was never applied"]
+        );
     }
 
     #[test]

@@ -18,20 +18,27 @@
 //! This file wires them into PM:
 //! - [`EngineState`], managed from the first line of `setup()`: the sinkhole, the proxy port every
 //!   window is pointed at (the dead one when the sinkhole couldn't be bound), the one set of WebView2
-//!   args, and each switch's outcome, which say whether the engine is sealed.
+//!   args, PM's one WebView2 environment once the main window has created it, and each switch's
+//!   outcome, which say whether the engine is sealed.
 //! - [`build_window`], the one way a PM window is built. It adds the navigation guard, the download
-//!   refusal and both init scripts, passes the shared browser args, and applies the engine switches.
+//!   refusal and both init scripts, passes the shared browser args and, on Windows, PM's WebView2
+//!   environment, and applies the engine switches.
 //! - [`build_main_window`]: the main window, from its `tauri.conf.json` entry (`"create": false`, so
-//!   Tauri leaves it to `setup()`), which keeps every field it had when Tauri built it.
+//!   Tauri leaves it to `setup()`), which keeps every field it had when Tauri built it. On Windows it
+//!   first creates PM's WebView2 environment, which keeps WebView2's crash reports on this computer
+//!   (`engine::WINDOWS_CRASH_UPLOAD_OFF`).
 //!
 //! The main window is the only one that will ever hold a mod frame, so only its switches count
 //! towards the seal, but for one kind: a switch whose setting the engine shares between every
 //! webview in the user-data folder (WebView2's SmartScreen, `engine::WINDOWS_REPUTATION_OFF`)
 //! fails the seal from any window, since one window left at the default turns it back on in main
-//! too ([`for_the_seal`]). The briefing panel (tray.rs) and the pop-out Calendar (popout.rs) host
-//! no mods and get everything all the same, as defence in depth. On Windows they have to: WebView2
-//! refuses a second webview in the same user-data folder with different browser args, and every PM
-//! window shares one (Tauri gives each the app's local data folder).
+//! too ([`for_the_seal`]), and so does crash reporting's (`engine::WINDOWS_CRASH_UPLOAD_OFF`), an
+//! option of the one browser process every window runs in. The briefing panel (tray.rs) and the
+//! pop-out Calendar (popout.rs) host no mods and get everything all the same, as defence in depth.
+//! On Windows they have to: WebView2 refuses a second webview in the same user-data folder with
+//! different environment options (browser args included), and every PM window shares one (Tauri
+//! gives each the app's local data folder), so every window is built with PM's environment, or,
+//! when the main window couldn't be, every window without it.
 
 pub mod disk;
 pub mod engine;
@@ -80,11 +87,20 @@ pub struct EngineState {
     proxy_port: Option<u16>,
     /// Computed once, from `proxy_port`, so every window gets the same.
     browser_args: String,
+    /// PM's WebView2 environment, which every window after the main one is built with
+    /// (`engine::WINDOWS_CRASH_UPLOAD_OFF`), or why there is none: set once the main window is built
+    /// ([`build_main_window`]), and on other engines never anything but `Err`.
+    environment: Mutex<std::result::Result<engine::SharedEnvironment, String>>,
     outcomes: Mutex<Vec<SwitchOutcome>>,
     /// Whether the final verdict has been handed out (by [`EngineState::record`]), so it is logged
     /// once.
     verdict_told: AtomicBool,
 }
+
+/// Why a window has no shared environment before the main window, which creates it, is built.
+/// Nothing but the main window is built that early.
+const ENVIRONMENT_PENDING: &str =
+    "PM's WebView2 environment is created with the main window, which isn't built yet";
 
 /// The file in the app's local data folder that remembers the sinkhole's port between runs
 /// (Windows only): WebView2's browser args carry it, and keeping it from one run to the next keeps
@@ -181,6 +197,7 @@ impl EngineState {
             sinkhole,
             proxy_port,
             browser_args,
+            environment: Mutex::new(Err(ENVIRONMENT_PENDING.to_owned())),
             outcomes: Mutex::new(outcomes),
             verdict_told: AtomicBool::new(false),
         }
@@ -209,6 +226,19 @@ impl EngineState {
     /// included.
     fn proxy_port(&self) -> Option<u16> {
         self.proxy_port
+    }
+
+    /// PM's environment for a window being built now, or why there is none.
+    fn environment(&self) -> std::result::Result<engine::SharedEnvironment, String> {
+        self.environment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What the main window was built with, for every window after it.
+    fn set_environment(&self, environment: std::result::Result<engine::SharedEnvironment, String>) {
+        *self.environment.lock().unwrap_or_else(|e| e.into_inner()) = environment;
     }
 
     #[cfg(test)]
@@ -363,6 +393,12 @@ pub enum Role {
 /// web loads, and the grant check (spec §1.4 item 3, a later slice) is to read
 /// `EngineState::engine_sealed`, which says unsealed until the list reports.
 ///
+/// On Windows each try first creates PM's own WebView2 environment, the one every PM window is
+/// built with (`engine::build_main_retrying`, `engine::WINDOWS_CRASH_UPLOAD_OFF`), in the data
+/// folder Tauri gives every window. If no try works with it, the window is built once more with
+/// WebView2's default environment, as before PM had its own: PM opens unsealed rather than not at
+/// all. What the window was built with is kept for every window after it.
+///
 /// The verdict is logged by `settle` once every switch has reported, not here: macOS's rule list
 /// reports after `setup()` returns.
 pub fn build_main_window(app: &AppHandle) -> Result<WebviewWindow> {
@@ -373,16 +409,19 @@ pub fn build_main_window(app: &AppHandle) -> Result<WebviewWindow> {
         .iter()
         .find(|w| w.label == MAIN_LABEL)
         .ok_or_else(|| Error::Other("tauri.conf.json has no main window".into()))?;
+    let state = engine_state(app)?;
     let (hidden, show) = engine::hidden_until_built(config);
-    let window = engine::build_retrying(
+    let (window, environment) = engine::build_main_retrying(
         Platform::current(),
-        || {
+        || engine::shared_environment_for(app, config, &state.browser_args),
+        |environment| {
             let builder = WebviewWindowBuilder::from_config(app, &hidden)
                 .map_err(|e| Error::Other(e.to_string()))?;
-            build_window(builder, app, Role::Main)
+            build_window_with(builder, app, &state, Role::Main, environment)
         },
         std::thread::sleep,
     )?;
+    state.set_environment(environment);
     if show {
         window.show().map_err(|e| Error::Other(e.to_string()))?;
     }
@@ -390,15 +429,38 @@ pub fn build_main_window(app: &AppHandle) -> Result<WebviewWindow> {
 }
 
 /// Build a PM window, sealed. Every PM window goes through here (INVARIANTS.md I-26): the guard, the
-/// download refusal, both init scripts, the shared browser args and the engine switches.
+/// download refusal, both init scripts, the shared browser args, PM's WebView2 environment (the
+/// main window's, when it was built with one) and the engine switches. Safe from an async command:
+/// the builder carries the environment to the main thread, where the window is built.
 pub fn build_window(
     builder: WebviewWindowBuilder<'_, Wry, AppHandle>,
     app: &AppHandle,
     role: Role,
 ) -> Result<WebviewWindow> {
-    let state = app
-        .try_state::<EngineState>()
-        .ok_or_else(|| Error::Other("PM's webview engine isn't set up yet".into()))?;
+    let state = engine_state(app)?;
+    let environment = state.environment();
+    build_window_with(
+        builder,
+        app,
+        &state,
+        role,
+        environment.as_ref().map_err(String::as_str),
+    )
+}
+
+fn engine_state(app: &AppHandle) -> Result<State<'_, EngineState>> {
+    app.try_state::<EngineState>()
+        .ok_or_else(|| Error::Other("PM's webview engine isn't set up yet".into()))
+}
+
+/// [`build_window`] with the environment given (`Err` says why there is none).
+fn build_window_with(
+    builder: WebviewWindowBuilder<'_, Wry, AppHandle>,
+    app: &AppHandle,
+    state: &EngineState,
+    role: Role,
+    environment: std::result::Result<&engine::SharedEnvironment, &str>,
+) -> Result<WebviewWindow> {
     let builder = if role == Role::Main {
         let reload_app = app.clone();
         // A new page in main (a reload, the frozen-mod watchdog's or a dev one) unmounts every
@@ -418,12 +480,16 @@ pub fn build_window(
     };
     let guard_app = app.clone();
     // The wiring is engine.rs's, so the sealed-frame regression app builds its window the same way.
-    let window = engine::seal_builder(builder, &state.browser_args, state.is_dev, move |url| {
-        role == Role::Main && is_pending_entry(&guard_app, url)
-    })
+    let window = engine::seal_builder(
+        builder,
+        &state.browser_args,
+        state.is_dev,
+        environment,
+        move |url| role == Role::Main && is_pending_entry(&guard_app, url),
+    )
     .build()
     .map_err(|e| Error::Other(e.to_string()))?;
-    seal_webview(app, &window, &state, role);
+    seal_webview(app, &window, state, role, environment);
     Ok(window)
 }
 
@@ -548,16 +614,27 @@ pub fn mod_call(
 /// ([`EngineState::settle`]). A failure to reach the webview is logged, never fatal: PM still works.
 /// The main window's switches then never report, so the engine stays unsealed; another window's
 /// folder-wide switches count as failed ([`unreached`]).
-fn seal_webview(app: &AppHandle, window: &WebviewWindow, state: &EngineState, role: Role) {
+fn seal_webview(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    state: &EngineState,
+    role: Role,
+    environment: std::result::Result<&engine::SharedEnvironment, &str>,
+) {
     let label = window.label().to_owned();
     let settle_app = app.clone();
     let settle_label = label.clone();
-    let applied =
-        engine::apply_switches(window, state.proxy_port(), state.is_dev, move |outcomes| {
+    let applied = engine::apply_switches(
+        window,
+        state.proxy_port(),
+        state.is_dev,
+        environment,
+        move |outcomes| {
             if let Some(state) = settle_app.try_state::<EngineState>() {
                 state.settle(role, &settle_label, outcomes);
             }
-        });
+        },
+    );
     if let Err(e) = applied {
         let consequence = if role == Role::Main {
             ", so the engine stays unsealed"
@@ -888,19 +965,20 @@ mod tests {
     }
 
     /// An engine judged as `platform`'s, with a real sinkhole where it has one (so on Windows only
-    /// the two switches the main window reports are still owed).
+    /// the three switches the main window reports are still owed).
     fn engine_of(platform: Platform) -> EngineState {
         EngineState::start_with(platform, false, None, None, Sinkhole::bind_preferring)
     }
 
     #[test]
     fn a_window_without_mods_counts_only_where_it_failed_a_switch_webview2_shares() {
-        use engine::{WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF};
+        use engine::{WINDOWS_CRASH_UPLOAD_OFF, WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF};
         let took = SwitchOutcome::took;
         let failed = SwitchOutcome::failed;
         let report = vec![
             took(WINDOWS_PROXY_ARGS),
             failed(WINDOWS_REPUTATION_OFF, "refused"),
+            took(WINDOWS_CRASH_UPLOAD_OFF),
         ];
         // The main window's report all counts, as it is, wherever it is.
         for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
@@ -918,15 +996,40 @@ mod tests {
                     WINDOWS_REPUTATION_OFF,
                     "in the calendar window: refused"
                 )],
-                vec![took(WINDOWS_PROXY_ARGS)]
+                vec![took(WINDOWS_PROXY_ARGS), took(WINDOWS_CRASH_UPLOAD_OFF)]
+            )
+        );
+        // So does crash reporting's: a window not on PM's environment.
+        assert_eq!(
+            for_the_seal(
+                Platform::Windows,
+                Role::NoMods,
+                "briefing",
+                vec![
+                    took(WINDOWS_PROXY_ARGS),
+                    took(WINDOWS_REPUTATION_OFF),
+                    failed(WINDOWS_CRASH_UPLOAD_OFF, "not on PM's environment"),
+                ]
+            ),
+            (
+                vec![failed(
+                    WINDOWS_CRASH_UPLOAD_OFF,
+                    "in the briefing window: not on PM's environment"
+                )],
+                vec![took(WINDOWS_PROXY_ARGS), took(WINDOWS_REPUTATION_OFF)]
             )
         );
         // Its successes never count, nor does a failure of a switch each window holds on its own.
         for logged in [
-            vec![took(WINDOWS_PROXY_ARGS), took(WINDOWS_REPUTATION_OFF)],
+            vec![
+                took(WINDOWS_PROXY_ARGS),
+                took(WINDOWS_REPUTATION_OFF),
+                took(WINDOWS_CRASH_UPLOAD_OFF),
+            ],
             vec![
                 failed(WINDOWS_PROXY_ARGS, "the args carry no proxy"),
                 took(WINDOWS_REPUTATION_OFF),
+                took(WINDOWS_CRASH_UPLOAD_OFF),
             ],
         ] {
             assert_eq!(
@@ -948,14 +1051,21 @@ mod tests {
             );
             assert!(unreached(platform, Role::NoMods, "gone").is_empty());
         }
-        // A window that couldn't be reached is left at WebView2's default: SmartScreen on. The main
-        // window reports nothing then, so its switches stay never applied.
+        // A window that couldn't be reached is left at WebView2's default, SmartScreen on, and
+        // nothing says it is on PM's environment. The main window reports nothing then, so its
+        // switches stay never applied.
         assert_eq!(
             unreached(Platform::Windows, Role::NoMods, "the event loop is gone"),
-            [failed(
-                WINDOWS_REPUTATION_OFF,
-                "couldn't reach the webview: the event loop is gone"
-            )]
+            [
+                failed(
+                    WINDOWS_REPUTATION_OFF,
+                    "couldn't reach the webview: the event loop is gone"
+                ),
+                failed(
+                    WINDOWS_CRASH_UPLOAD_OFF,
+                    "couldn't reach the webview: the event loop is gone"
+                ),
+            ]
         );
         assert!(unreached(Platform::Windows, Role::Main, "gone").is_empty());
     }
@@ -963,10 +1073,16 @@ mod tests {
     /// Through the seal itself (`EngineState::settle`, `record`, the verdict), judged as Windows.
     #[test]
     fn on_windows_smartscreen_failing_in_any_window_unseals_the_engine() {
-        use engine::{WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF};
+        use engine::{WINDOWS_CRASH_UPLOAD_OFF, WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF};
         let took = SwitchOutcome::took;
         let failed = SwitchOutcome::failed;
-        let main_report = || vec![took(WINDOWS_PROXY_ARGS), took(WINDOWS_REPUTATION_OFF)];
+        let main_report = || {
+            vec![
+                took(WINDOWS_PROXY_ARGS),
+                took(WINDOWS_REPUTATION_OFF),
+                took(WINDOWS_CRASH_UPLOAD_OFF),
+            ]
+        };
 
         // Sealed by the main window's report, then unsealed by a pop-out's failure, which says where.
         let state = engine_of(Platform::Windows);
@@ -1002,6 +1118,8 @@ mod tests {
             told.reasons,
             [
                 "webview2.reputation-checking-off didn't take: in the briefing window: couldn't \
+                 reach the webview: the event loop is gone",
+                "webview2.custom-crash-reporting didn't take: in the briefing window: couldn't \
                  reach the webview: the event loop is gone"
             ]
         );
@@ -1013,7 +1131,8 @@ mod tests {
             state.unsealed_reasons(),
             [
                 "webview2.proxy-args was never applied",
-                "webview2.reputation-checking-off was never applied"
+                "webview2.reputation-checking-off was never applied",
+                "webview2.custom-crash-reporting was never applied"
             ]
         );
         // Nor can a main window that couldn't be reached report anything.
@@ -1022,7 +1141,7 @@ mod tests {
             MAIN_LABEL,
             unreached(Platform::Windows, Role::Main, "gone"),
         );
-        assert_eq!(state.unsealed_reasons().len(), 2);
+        assert_eq!(state.unsealed_reasons().len(), 3);
 
         // On Linux the pop-out's failures are its own: the engine stays sealed.
         let state = engine_of(Platform::Linux);
@@ -1040,8 +1159,112 @@ mod tests {
         assert!(state.engine_sealed(), "{:?}", state.unsealed_reasons());
     }
 
+    /// Crash reporting through the seal, judged as Windows: the main window built without PM's
+    /// environment (the fallback) unseals it, and so does any other window off PM's environment.
+    #[test]
+    fn on_windows_a_window_off_pms_environment_unseals_the_engine() {
+        use engine::{
+            crash_reports_outcome, CrashReportsRead, WINDOWS_CRASH_UPLOAD_OFF, WINDOWS_PROXY_ARGS,
+            WINDOWS_REPUTATION_OFF,
+        };
+        let took = SwitchOutcome::took;
+        let fallback = || {
+            crash_reports_outcome(CrashReportsRead::NotShared(
+                "the main window couldn't be built with it (refused)".into(),
+            ))
+        };
+
+        // The main window built with WebView2's default environment: PM runs, unsealed, and says
+        // why.
+        let state = engine_of(Platform::Windows);
+        let told = state
+            .record(vec![
+                took(WINDOWS_PROXY_ARGS),
+                took(WINDOWS_REPUTATION_OFF),
+                fallback(),
+            ])
+            .expect("every switch has reported");
+        assert!(!told.sealed);
+        assert_eq!(
+            told.reasons,
+            [
+                "webview2.custom-crash-reporting didn't take: built without PM's own WebView2 \
+                 environment, so WebView2's crash reports follow Windows' setting: the main \
+                 window couldn't be built with it (refused)"
+            ]
+        );
+
+        // Sealed by the main window, then unsealed by a pop-out off PM's environment.
+        let state = engine_of(Platform::Windows);
+        state.settle(
+            Role::Main,
+            MAIN_LABEL,
+            vec![
+                took(WINDOWS_PROXY_ARGS),
+                took(WINDOWS_REPUTATION_OFF),
+                took(WINDOWS_CRASH_UPLOAD_OFF),
+            ],
+        );
+        assert!(state.engine_sealed(), "{:?}", state.unsealed_reasons());
+        state.settle(
+            Role::NoMods,
+            "calendar",
+            vec![
+                took(WINDOWS_PROXY_ARGS),
+                took(WINDOWS_REPUTATION_OFF),
+                crash_reports_outcome(CrashReportsRead::OtherEnvironment(
+                    "its webview runs on another environment".into(),
+                )),
+            ],
+        );
+        assert!(!state.engine_sealed());
+        assert_eq!(
+            state.unsealed_reasons(),
+            [
+                "webview2.custom-crash-reporting didn't take: in the calendar window: not on PM's \
+                 own WebView2 environment: its webview runs on another environment"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_window_gets_the_main_windows_environment_and_none_before_it() {
+        let state = engine_of(Platform::Windows);
+        assert_eq!(
+            state.environment().err().as_deref(),
+            Some(ENVIRONMENT_PENDING)
+        );
+        state.set_environment(Err(
+            "the main window couldn't be built with it (refused)".into()
+        ));
+        assert_eq!(
+            state.environment().err().as_deref(),
+            Some("the main window couldn't be built with it (refused)")
+        );
+    }
+
     fn conf() -> serde_json::Value {
         serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap()
+    }
+
+    /// PM's WebView2 environment sits in the data folder Tauri gives a window that names none, with
+    /// extensions off and the default scroll bars: the main window's config asks for nothing else,
+    /// so sharing the environment moves neither its storage nor its options.
+    #[test]
+    fn tauri_conf_lets_the_main_window_share_pms_environment() {
+        let conf = conf();
+        let main = &conf["app"]["windows"][0];
+        assert_eq!(main["label"], MAIN_LABEL);
+        for key in [
+            "dataDirectory",
+            "browserExtensionsEnabled",
+            "scrollBarStyle",
+        ] {
+            assert!(main.get(key).is_none(), "{key}");
+        }
+        let config: tauri::utils::config::WindowConfig =
+            serde_json::from_value(main.clone()).unwrap();
+        assert_eq!(engine::environment_config_conflict(&config), None);
     }
 
     /// `setup()` builds the main window (sealed), so Tauri mustn't: a window Tauri built would have

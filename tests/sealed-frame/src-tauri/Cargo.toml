@@ -36,7 +36,12 @@ objc2 = "0.6"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-# engine.rs's SmartScreen switch (WebView2's ICoreWebView2Settings8), as in PM: the interfaces and the
-# windows-core 0.62 `Interface` that casts them, at the versions wry already locks.
+# engine.rs's SmartScreen switch (WebView2's ICoreWebView2Settings8) and the WebView2 environment PM
+# creates itself, as in PM: the interfaces and the windows-core 0.62 `Interface` that casts them, at
+# the versions wry already locks.
 webview2-com = "0.39"
 windows-core = "0.62"
+# engine.rs's two language calls and COM's apartment set-up for that environment. PM has them from
+# its `windows` 0.61; here they come from the 0.62 wry already locks, with features wry already turns
+# on, where they are the same functions with the same signatures.
+windows = { version = "0.62", features = ["Win32_Globalization", "Win32_System_Com"] }

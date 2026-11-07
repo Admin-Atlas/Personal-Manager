@@ -134,8 +134,9 @@ pub fn build_briefing_window(app: &AppHandle) -> Result<()> {
     .always_on_top(true)
     .skip_taskbar(true)
     .visible(false);
-    // Sealed like the main window, though it hosts no mods: on Windows it must carry the same
-    // browser args or WebView2 refuses to create it.
+    // Sealed like the main window, though it hosts no mods: on Windows it must be built with the
+    // same WebView2 environment (PM's, which carries the browser args and keeps crash reports on
+    // this computer) or WebView2 refuses to create it.
     mods::build_window(builder, app, mods::Role::NoMods)?;
     Ok(())
 }

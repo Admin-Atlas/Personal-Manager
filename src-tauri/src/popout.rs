@@ -90,8 +90,9 @@ pub fn open(app: &AppHandle) -> Result<()> {
     .min_inner_size(480.0, 400.0)
     // PM's own title bar, as in the main window.
     .decorations(false);
-    // Sealed like the main window, though it hosts no mods: on Windows it must carry the same
-    // browser args or WebView2 refuses to create it.
+    // Sealed like the main window, though it hosts no mods: on Windows it must be built with the
+    // same WebView2 environment (PM's, which carries the browser args and keeps crash reports on
+    // this computer) or WebView2 refuses to create it.
     mods::build_window(builder, app, mods::Role::NoMods)?;
     Ok(())
 }

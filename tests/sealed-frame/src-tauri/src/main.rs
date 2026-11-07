@@ -8,8 +8,9 @@
 //!
 //! It loads a hostile probe into `<iframe sandbox="allow-scripts" allow="">` the way ModFrame does,
 //! through a `pmmod` scheme, in a window built by PM's own code: `engine.rs` (the sinkhole, the
-//! browser args, the navigation guard, the download refusal, both init scripts and the engine
-//! switches, through the same `seal_builder` and `apply_switches` PM's `build_window` calls) and
+//! browser args, PM's own WebView2 environment on Windows, the navigation guard, the download
+//! refusal, both init scripts and the engine switches, through the same `build_main_retrying`,
+//! `seal_builder` and `apply_switches` PM's `build_main_window` calls) and
 //! `headers.rs` (every response header), both included from `src-tauri/src/mods/` by path, with every
 //! mitigation on, as in a release build. The scheme here mirrors PM's handler (`mods/runtime.rs`): the
 //! main window only, GET only, `pmmod://localhost` exactly, and a page rendered only once, for its
@@ -1259,21 +1260,38 @@ fn main() {
                 .find(|w| w.label == "main")
                 .ok_or("tauri.conf.json has no main window")?
                 .clone();
-            // As PM's build_main_window: on Windows a refused build is tried again while a previous
-            // run's WebView2 winds down, each try hidden, and the window shown once its switches are
-            // applied (on macOS, once the rule list's compile has started, before it is in place).
+            // As PM's build_main_window: on Windows each try creates PM's own WebView2 environment
+            // (the crash-reporting switch) in the data folder Tauri gives the window, and a refused
+            // try is tried again while a previous run's WebView2 winds down, each try hidden; if no
+            // try works with the environment, the window is built once without it, and the switch
+            // fails. The window is shown once its switches are applied (on macOS, once the rule
+            // list's compile has started, before it is in place).
             let (hidden, show) = engine::hidden_until_built(&config);
-            let window = engine::build_retrying(
+            let (window, environment) = engine::build_main_retrying(
                 platform,
-                || {
+                || engine::shared_environment_for(app.handle(), &config, &browser_args),
+                |environment| {
                     let builder = WebviewWindowBuilder::from_config(app.handle(), &hidden)?;
-                    engine::seal_builder(builder, &browser_args, IS_DEV, is_pending_entry).build()
+                    engine::seal_builder(
+                        builder,
+                        &browser_args,
+                        IS_DEV,
+                        environment,
+                        is_pending_entry,
+                    )
+                    .build()
                 },
                 std::thread::sleep,
             )?;
-            engine::apply_switches(&window, proxy_port, IS_DEV, |outcomes| {
-                lock(&shared().outcomes).extend(outcomes);
-            })?;
+            engine::apply_switches(
+                &window,
+                proxy_port,
+                IS_DEV,
+                environment.as_ref().map_err(String::as_str),
+                |outcomes| {
+                    lock(&shared().outcomes).extend(outcomes);
+                },
+            )?;
             if show {
                 window.show()?;
             }

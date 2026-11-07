@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.175.4-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "A privacy fix on Windows. The web engine PM's windows run on, Microsoft's WebView2, writes a crash report when one of its processes crashes, and Windows could send it to Microsoft. A crash report can hold pieces of what the window was showing. PM now starts WebView2 so that its crash reports stay on your computer and aren't sent to Microsoft. In a rare run where PM can't start it that way, it still opens, and for that run crash reports follow Windows' settings. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.175.3-alpha",
     date: "2026-11-06",
     highlights: [
