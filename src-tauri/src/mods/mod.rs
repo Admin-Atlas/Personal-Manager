@@ -16,7 +16,8 @@
 //!   `data_dir/mods` (§1.3, §6).
 //!
 //! This file wires them into PM:
-//! - [`EngineState`], managed from the first line of `setup()`: the sinkhole, the one set of WebView2
+//! - [`EngineState`], managed from the first line of `setup()`: the sinkhole, the proxy port every
+//!   window is pointed at (the dead one when the sinkhole couldn't be bound), the one set of WebView2
 //!   args, and each switch's outcome, which say whether the engine is sealed.
 //! - [`build_window`], the one way a PM window is built. It adds the navigation guard, the download
 //!   refusal and both init scripts, passes the shared browser args, and applies the engine switches.
@@ -68,7 +69,11 @@ pub struct EngineState {
     /// `None` when the platform needs none (macOS), or binding loopback failed (recorded as a
     /// switch that didn't take).
     sinkhole: Option<Sinkhole>,
-    /// Computed once, so every window gets the same.
+    /// Where every window's proxy points ([`engine::proxy_port`]): the sinkhole's port, or the dead
+    /// port when it couldn't be bound, so a failed bind never leaves a window a direct route out.
+    /// `None` only on macOS, which has no proxy.
+    proxy_port: Option<u16>,
+    /// Computed once, from `proxy_port`, so every window gets the same.
     browser_args: String,
     outcomes: Mutex<Vec<SwitchOutcome>>,
     /// Whether the final verdict has been handed out (by [`EngineState::record`]), so it is logged
@@ -109,7 +114,24 @@ impl EngineState {
     /// is free, and remember the one it got. Called before any window is built: the browser args
     /// carry its port. `args_overridden` says why WebView2 may not use PM's args at all; the proxy
     /// switch then counts as not taken.
+    ///
+    /// A bind that still fails after [`engine::bind_retrying`]'s tries fails closed: the sinkhole
+    /// switch reports failed, so the engine is unsealed, and every window's proxy is the dead port
+    /// instead, which is never remembered (the next run tries the remembered port again).
     pub fn start(is_dev: bool, port_file: Option<&Path>, args_overridden: Option<String>) -> Self {
+        Self::start_with(is_dev, port_file, args_overridden, |preferred| {
+            engine::bind_retrying(|| Sinkhole::bind_preferring(preferred), std::thread::sleep)
+        })
+    }
+
+    /// [`EngineState::start`], binding the sinkhole with `bind`, which is handed the remembered
+    /// port, so a test can make the bind fail.
+    fn start_with(
+        is_dev: bool,
+        port_file: Option<&Path>,
+        args_overridden: Option<String>,
+        bind: impl FnOnce(Option<u16>) -> std::io::Result<Sinkhole>,
+    ) -> Self {
         let platform = Platform::current();
         let mut outcomes = Vec::new();
         if let Some(why) = args_overridden {
@@ -121,7 +143,7 @@ impl EngineState {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| engine::parse_remembered_port(&text));
         let sinkhole = if platform.uses_sinkhole() {
-            match Sinkhole::bind_preferring(remembered) {
+            match bind(remembered) {
                 Ok(sinkhole) => {
                     outcomes.push(SwitchOutcome::took(engine::SINKHOLE));
                     if let Some(path) = port_file.filter(|_| remembered != Some(sinkhole.port())) {
@@ -130,10 +152,7 @@ impl EngineState {
                     Some(sinkhole)
                 }
                 Err(e) => {
-                    let failed = SwitchOutcome::failed(
-                        engine::SINKHOLE,
-                        format!("couldn't listen on loopback: {e}"),
-                    );
+                    let failed = engine::sinkhole_unbound(&e);
                     report_failure(&failed);
                     outcomes.push(failed);
                     None
@@ -142,11 +161,12 @@ impl EngineState {
         } else {
             None
         };
-        let browser_args =
-            engine::windows_browser_args(sinkhole.as_ref().map(Sinkhole::port), is_dev);
+        let proxy_port = engine::proxy_port(platform, sinkhole.as_ref().map(Sinkhole::port));
+        let browser_args = engine::windows_browser_args(proxy_port, is_dev);
         Self {
             is_dev,
             sinkhole,
+            proxy_port,
             browser_args,
             outcomes: Mutex::new(outcomes),
             verdict_told: AtomicBool::new(false),
@@ -172,6 +192,13 @@ impl EngineState {
         self.sinkhole.as_ref().map_or(0, Sinkhole::attempts)
     }
 
+    /// What every window's switches are applied with: [`engine::proxy_port`]'s port, the dead one
+    /// included.
+    fn proxy_port(&self) -> Option<u16> {
+        self.proxy_port
+    }
+
+    #[cfg(test)]
     fn sinkhole_port(&self) -> Option<u16> {
         self.sinkhole.as_ref().map(Sinkhole::port)
     }
@@ -485,12 +512,11 @@ pub fn mod_call(
 fn seal_webview(app: &AppHandle, window: &WebviewWindow, state: &EngineState, role: Role) {
     let record = role == Role::Main;
     let settle_app = app.clone();
-    if let Err(e) = engine::apply_switches(
-        window,
-        state.sinkhole_port(),
-        state.is_dev,
-        move |outcomes| settle(&settle_app, outcomes, record),
-    ) {
+    if let Err(e) =
+        engine::apply_switches(window, state.proxy_port(), state.is_dev, move |outcomes| {
+            settle(&settle_app, outcomes, record)
+        })
+    {
         let consequence = if record {
             ", so the engine stays unsealed"
         } else {
@@ -705,7 +731,83 @@ mod tests {
         let state = EngineState::start(true, None, None);
         let port = state.sinkhole_port();
         assert_eq!(Platform::current().uses_sinkhole(), port.is_some());
+        assert_eq!(state.proxy_port(), port);
         assert_eq!(state.browser_args, engine::windows_browser_args(port, true));
+    }
+
+    /// A sinkhole that can't be bound fails closed: every window's proxy is the dead port, in the
+    /// browser args and in what the switches are applied with, never nothing (a direct route out);
+    /// the engine is unsealed whatever else takes, and says where the traffic goes; and nothing is
+    /// remembered for the next run.
+    #[test]
+    fn a_sinkhole_that_cant_bind_leaves_every_window_on_the_dead_proxy_and_the_engine_unsealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("nested").join(SINKHOLE_PORT_FILE);
+        let kept = dir.path().join(SINKHOLE_PORT_FILE);
+        std::fs::write(&kept, "40000").unwrap();
+        let platform = Platform::current();
+        for (file, remembered) in [(&fresh, None), (&kept, Some(40000))] {
+            for is_dev in [false, true] {
+                let mut asked = Vec::new();
+                let state = EngineState::start_with(is_dev, Some(file), None, |preferred| {
+                    asked.push(preferred);
+                    Err(std::io::Error::other("refused by the test"))
+                });
+                assert!(!state.engine_sealed());
+                assert_eq!(state.sinkhole_attempts(), 0);
+                if !platform.uses_sinkhole() {
+                    // macOS: nothing to bind, and no proxy.
+                    assert!(asked.is_empty());
+                    assert_eq!(state.proxy_port(), None);
+                    assert_eq!(state.browser_args, engine::WRY_DEFAULT_BROWSER_ARGS);
+                    continue;
+                }
+                assert_eq!(asked, [remembered]);
+                assert_eq!(state.sinkhole_port(), None);
+                assert_eq!(state.proxy_port(), Some(engine::DEAD_PROXY_PORT));
+                assert_eq!(
+                    state.browser_args,
+                    engine::windows_browser_args(Some(engine::DEAD_PROXY_PORT), is_dev)
+                );
+                assert!(state
+                    .browser_args
+                    .contains(" --proxy-server=http://127.0.0.1:1"));
+                assert_eq!(state.browser_args.contains("<-loopback>"), !is_dev);
+                // What the switches get: WebKitGTK's proxy points at the dead port, and WebView2's
+                // args switch counts it as carried (the sinkhole's own switch is the one that fails).
+                assert_eq!(
+                    state
+                        .proxy_port()
+                        .map(engine::sinkhole_proxy_uri)
+                        .as_deref(),
+                    Some("http://127.0.0.1:1")
+                );
+                assert_eq!(
+                    engine::proxy_args_outcome(state.proxy_port()),
+                    SwitchOutcome::took(engine::WINDOWS_PROXY_ARGS)
+                );
+                let rest: Vec<_> = platform
+                    .expected_switches()
+                    .iter()
+                    .copied()
+                    .filter(|n| *n != engine::SINKHOLE)
+                    .map(SwitchOutcome::took)
+                    .collect();
+                let told = state.record(rest).expect("every switch reported");
+                assert!(!told.sealed);
+                assert_eq!(
+                    told.reasons,
+                    [
+                        "sinkhole didn't take: couldn't listen on loopback: refused by the test; \
+                         the windows' traffic goes to 127.0.0.1:1 instead, a dead port, so it \
+                         fails rather than going out directly"
+                    ]
+                );
+            }
+        }
+        // Nothing remembered: no file (nor its folder) made, and the remembered port kept as it was.
+        assert!(!fresh.parent().unwrap().exists());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "40000");
     }
 
     fn conf() -> serde_json::Value {

@@ -6,10 +6,14 @@
 # crates that includes PM's own src-tauri/src/mods/engine.rs and headers.rs, and runs a hostile probe
 # in a sealed frame on all three engines with every mitigation on. The app exits non-zero on any call
 # that reaches Tauri's IPC, any TCP or UDP that reaches its loopback listeners, an engine switch that
-# didn't take, or a frame that doesn't look sealed; this job fails with it. The app is never shipped:
-# nothing in release.yml or the bundle builds it. What it doesn't run is PM's serve decision
-# (src-tauri/src/mods/runtime.rs: which file goes out, and which as a document): its scheme mirrors
-# that, and runtime.rs's unit tests in pr.yml are what hold it.
+# didn't take, or a frame that doesn't look sealed; this job fails with it. On Linux and Windows the
+# last run has no sinkhole (PM_SEALED_FRAME_DEAD_PORT=1), the second run on Linux and the third on
+# Windows, after the relaunch run: PM's fallback when the sinkhole can't be bound, a proxy on
+# 127.0.0.1:1 where nothing listens, which must leak nothing either (that run expects the sinkhole
+# switch to fail, as PM reports it). The app is never shipped: nothing in release.yml or the bundle
+# builds it. What it doesn't run is PM's serve decision (src-tauri/src/mods/runtime.rs: which file
+# goes out, and which as a document): its scheme mirrors that, and runtime.rs's unit tests in pr.yml
+# are what hold it.
 #
 # WebView2 updates itself on users' machines and macOS ships WebKit with the OS, so an engine change
 # has to show up here as a red job, not as a leak: hence the weekly run on the latest runners, as well
@@ -69,6 +73,10 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libgtk-3-dev libssl-dev xvfb
       - name: Build (refuses any engine crate, CSP or frame shape that isn't PM's)
         run: cargo build --locked
+      - name: Unit tests (the verdict, and the engine.rs and headers.rs tests in this build)
+        # The verdict's logic is the same on every engine, so one OS runs it.
+        if: runner.os == 'Linux'
+        run: cargo test --locked
       - name: Map the probe's IDNA host to loopback
         # The probe's idna-host target: a host Rust's URL parser refuses, so where the engine
         # accepts it (WebView2, Fedora's WebKitGTK 2.54) Tauri's runtime lets the navigation past
@@ -120,6 +128,33 @@ jobs:
             # `build_retrying`, `Sinkhole::bind_preferring`).
             run_probe "../../../sealed-frame-out/report-$RUNNER_OS-relaunch.json"
           fi
+      - name: Run the probe with no sinkhole (fails unless PM's dead-port fallback leaks nothing)
+        # PM's fallback when the sinkhole can't be bound (engine.rs `proxy_port` and
+        # `sinkhole_unbound`): every window's proxy is 127.0.0.1:1, where nothing listens. Here the
+        # app binds no sinkhole, so it takes that path, and passes only if the sinkhole switch
+        # failed exactly as PM reports it, every other switch took, the dead port refused
+        # connections, and nothing reached its listeners. macOS has no proxy, so it has no such
+        # run. On Windows this follows the relaunch with different browser args, which PM's build
+        # retry has to ride out.
+        if: runner.os != 'macOS'
+        env:
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          PM_SEALED_FRAME_DEAD_PORT: "1"
+        run: |
+          mkdir -p ../../../sealed-frame-out
+          bin=target/debug/pm-sealed-frame
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          report="../../../sealed-frame-out/report-$RUNNER_OS-dead-port.json"
+          status=0
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            PM_SEALED_FRAME_OUT="$report" xvfb-run -a "$bin" || status=$?
+          else
+            PM_SEALED_FRAME_OUT="$report" "$bin" || status=$?
+          fi
+          echo "the app exited with $status"
+          # The exit code, the verdict the app wrote, and that it was the dead-port run.
+          [ "$status" -eq 0 ] && grep -q '"verdict": "pass"' "$report" \
+            && grep -q '"deadPortRun": true' "$report"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

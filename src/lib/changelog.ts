@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.174.3-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "A privacy fix on Windows and Linux. PM's windows send any web traffic to a small listener PM runs on your own computer, which drops it, so nothing in them can reach the internet. In the rare case that listener couldn't start, the windows were left with a direct route to the internet instead. Now their traffic is sent to an address on your computer where nothing answers. PM's own pages never load anything from the internet, so nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.174.2-alpha",
     date: "2026-11-06",
     highlights: [

@@ -3,9 +3,11 @@
 
 //! The sealed engine (Mods spec §1.4, "What PR-1 ships from this"): what keeps a mod's sandboxed
 //! frame off the network, and any document that isn't PM's out of a PM window's top frame. Every
-//! mitigation here was measured closing its leak on all three engines by the step 0 spike; the ones
-//! that measured ineffective (macOS `proxyConfigurations`, Windows `--force-webrtc-ip-handling-policy`)
-//! are left out.
+//! mitigation here but the dead-port fallback was measured closing its leak on all three engines by
+//! the step 0 spike; the ones that measured ineffective (macOS `proxyConfigurations`, Windows
+//! `--force-webrtc-ip-handling-policy`) are left out. The fallback ([`DEAD_PROXY_PORT`]) rests on
+//! what the engines document, and the sealed-frame job's dead-port run on Linux and Windows is what
+//! measures it.
 //!
 //! This file names nothing in PM's crate, so the sealed-frame regression app (`tests/sealed-frame`)
 //! can include it with `#[path]` and measure exactly what ships. PM's wiring (its state, its window
@@ -14,8 +16,12 @@
 //! - [`Sinkhole`]: a loopback listener PM's webviews use as their proxy, which drops every
 //!   connection. `<link rel=preconnect>` opens TCP to any host despite the CSP, and the proxy is what
 //!   stopped it (Linux, Windows). PM's own page makes no network requests (everything goes through
-//!   Rust or the `tauri`, `ipc` and `pmmod` schemes), so a dead proxy costs it nothing.
-//! - [`windows_browser_args`]: WebView2's args pointing at the sinkhole, with wry's defaults kept.
+//!   Rust or the `tauri`, `ipc` and `pmmod` schemes), so a dead proxy costs it nothing. When the
+//!   sinkhole can't be bound, the proxy is [`DEAD_PROXY_PORT`] instead ([`proxy_port`]), so the
+//!   engine is meant to fail closed: unsealed, its loads failing at a port that refuses them rather
+//!   than going out directly, which is what the engines document and what the sealed-frame job's
+//!   dead-port run measures.
+//! - [`windows_browser_args`]: WebView2's args pointing at that proxy, with wry's defaults kept.
 //! - [`webkitgtk::seal`] and [`wkwebview::seal`]: the engine switches, each reporting whether it took.
 //!   On macOS that includes [`content_rules_json`], a content rule list that blocks every http, https,
 //!   ws and wss load: WKWebView has no sinkhole, and this is its network wall.
@@ -28,7 +34,8 @@
 //!   [`unreported`] says whether it is final yet.
 //! - [`build_retrying`] and [`Sinkhole::bind_preferring`]: what keeps a relaunch on Windows from
 //!   failing on browser args that differ from the ones the previous run's WebView2 is still using,
-//!   and [`hidden_until_built`], which keeps a refused try off the screen.
+//!   and [`hidden_until_built`], which keeps a refused try off the screen. [`bind_retrying`] gives
+//!   a failed bind of the sinkhole two more tries.
 //!
 //! **The guard fails open on a URL Rust can't parse.** tauri-runtime-wry 2.12 calls the guard only
 //! after `url.parse()`, and allows the navigation when that fails (`.unwrap_or(true)`). Some
@@ -127,12 +134,14 @@ impl Platform {
 
 /// The sinkhole is listening.
 pub const SINKHOLE: &str = "sinkhole";
-/// WebKitGTK: the webview's network proxy points at the sinkhole.
+/// WebKitGTK: the webview's network proxy points at PM's proxy ([`proxy_port`]: the sinkhole, or
+/// the dead port when the sinkhole couldn't be bound, which [`SINKHOLE`] reports).
 pub const LINUX_PROXY: &str = "webkitgtk.proxy";
 /// WebKitGTK: `enable-webrtc` is off. Fedora's and Ubuntu's builds have no WebRTC at all; this
 /// keeps it off on a build that has.
 pub const LINUX_WEBRTC_OFF: &str = "webkitgtk.enable-webrtc-off";
-/// WebView2: the browser args carry the sinkhole proxy, and nothing outside PM overrides them.
+/// WebView2: the browser args carry PM's proxy (as [`LINUX_PROXY`]), and nothing outside PM
+/// overrides them.
 pub const WINDOWS_PROXY_ARGS: &str = "webview2.proxy-args";
 /// WKWebView: `-[WKPreferences _setPeerConnectionEnabled:NO]` (SPI).
 pub const MACOS_PEER_CONNECTION_OFF: &str = "wkwebview.peer-connection-off";
@@ -556,9 +565,90 @@ impl Sinkhole {
     }
 }
 
-/// The proxy URL that points an engine at the sinkhole.
+/// The proxy URL that points an engine at a loopback port: the sinkhole's, or [`DEAD_PROXY_PORT`].
 pub fn sinkhole_proxy_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
+}
+
+/// Where the windows' proxy points when the sinkhole couldn't be bound: TCP port 1 on loopback, a
+/// valid port that nothing normally listens on (tcpmux, long out of use), so a connection to it is
+/// refused. Without a proxy, the loads would go out directly. With this one they should fail there,
+/// because neither engine connects directly when the one proxy it was given can't be reached. That
+/// is what the engines document, not what PM has measured:
+/// - Chromium, WebView2's engine, documents that `--proxy-server="http://foo:8080"` alone sends
+///   every request to that proxy, that if the proxy is unreachable they all fail with
+///   `ERR_PROXY_CONNECTION_FAILED`, and that falling back to a direct connection takes `direct://`
+///   in the list (`net/docs/proxy.md`, "Manual proxy settings"). [`windows_browser_args`] never
+///   adds it. Microsoft doesn't document WebView2's proxy handling apart from Chromium's.
+/// - WebKitGTK documents that a custom default proxy is used for every URI that its ignore-hosts
+///   and per-scheme proxies don't cover (`webkit_network_proxy_settings_new`; PM's release build
+///   sets neither), and libsoup that it
+///   takes its proxies from a GIO proxy resolver (`SoupSession:proxy-resolver`). GIO's resolver
+///   contract says a direct connection should not be attempted unless the resolver's answer names
+///   `direct://` (`g_proxy_resolver_lookup`). That libsoup and GIO keep to it when the proxy
+///   refuses is the behaviour of their code, not a documented promise.
+///
+/// The step 0 spike's proxy answered 204 instead of refusing, and the sealed-frame job's default
+/// run measures the sinkhole, which accepts and closes. So the job's dead-port run
+/// (`PM_SEALED_FRAME_DEAD_PORT=1`, on Linux and Windows) is what measures this port: it binds no
+/// sinkhole, takes this fallback, and fails if a connection to the port isn't refused or if any
+/// load reaches its leak listener.
+///
+/// Not port 0, which no connection can be made to, so an engine might read a proxy on it as no
+/// proxy at all. Never remembered as the sinkhole's port: [`parse_remembered_port`] refuses system
+/// ports.
+///
+/// PM doesn't hold this port, so a program on this computer that listened on it would get the
+/// loads: any program may on Windows, and on Linux one allowed to bind a system port. It is the
+/// fallback for when PM can't listen on loopback at all, and the engine counts as unsealed then.
+pub const DEAD_PROXY_PORT: u16 = 1;
+
+/// The port every PM window's proxy points at: the sinkhole's, or [`DEAD_PROXY_PORT`] when it
+/// couldn't be bound, so a failed bind points the windows at a port that refuses their loads rather
+/// than leaving them a direct route (fail closed, as the engines document and the sealed-frame job's
+/// dead-port run measures; [`sinkhole_unbound`] reports the failure, which unseals the engine all
+/// the same).
+/// `None` only where the engine has no proxy (macOS: [`Platform::uses_sinkhole`]).
+pub fn proxy_port(platform: Platform, sinkhole_port: Option<u16>) -> Option<u16> {
+    platform
+        .uses_sinkhole()
+        .then_some(sinkhole_port.unwrap_or(DEAD_PROXY_PORT))
+}
+
+/// The [`SINKHOLE`] switch's report when it couldn't be bound (`e`, the last try's error): failed,
+/// so the engine is unsealed, and saying where the windows' traffic goes instead ([`proxy_port`]).
+pub fn sinkhole_unbound(e: &std::io::Error) -> SwitchOutcome {
+    SwitchOutcome::failed(
+        SINKHOLE,
+        format!(
+            "couldn't listen on loopback: {e}; the windows' traffic goes to \
+             127.0.0.1:{DEAD_PROXY_PORT} instead, a dead port, so it fails rather than going out \
+             directly"
+        ),
+    )
+}
+
+/// How long to wait between tries at binding the sinkhole: two more tries, a quarter of a second in
+/// all. Binding a fresh loopback port fails only when the system refuses loopback sockets (no
+/// loopback interface, a sandbox, no file descriptors or ports left), which rarely clears in a
+/// moment, so this is cheap insurance, not a cure: a bind that still fails leaves the windows on
+/// [`DEAD_PROXY_PORT`].
+pub const SINKHOLE_BIND_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(50), Duration::from_millis(200)];
+
+/// Bind with `attempt` (PM's is [`Sinkhole::bind_preferring`]), trying again after each
+/// [`SINKHOLE_BIND_RETRY_DELAYS`] wait (`wait` sleeps; a test passes its own). The last error is
+/// the one returned.
+pub fn bind_retrying<T>(
+    attempt: impl FnMut() -> std::io::Result<T>,
+    wait: impl FnMut(Duration),
+) -> std::io::Result<T> {
+    retrying(
+        &SINKHOLE_BIND_RETRY_DELAYS,
+        "listening on loopback for the sinkhole",
+        attempt,
+        wait,
+    )
 }
 
 /// The port a remembered-port file names: one decimal number, nothing else, and not a system port
@@ -592,20 +682,31 @@ pub const WINDOWS_RETRY_DELAYS: [Duration; 7] = [
 /// refuses a window for a previous run's sake. The last error is the one returned.
 pub fn build_retrying<T, E: std::fmt::Display>(
     platform: Platform,
-    mut attempt: impl FnMut() -> Result<T, E>,
-    mut wait: impl FnMut(Duration),
+    attempt: impl FnMut() -> Result<T, E>,
+    wait: impl FnMut(Duration),
 ) -> Result<T, E> {
     let delays: &[Duration] = match platform {
         Platform::Windows => &WINDOWS_RETRY_DELAYS,
         Platform::Linux | Platform::MacOs => &[],
     };
+    retrying(delays, "building the window", attempt, wait)
+}
+
+/// Run `attempt`, and again after each of `delays` for as long as it fails, saying on stderr what
+/// failed (`what`) and when it is tried again. The last error is the one returned.
+fn retrying<T, E: std::fmt::Display>(
+    delays: &[Duration],
+    what: &str,
+    mut attempt: impl FnMut() -> Result<T, E>,
+    mut wait: impl FnMut(Duration),
+) -> Result<T, E> {
     let mut result = attempt();
     for delay in delays {
         let Err(e) = &result else {
             break;
         };
         eprintln!(
-            "webview: building the window failed ({e}); trying again in {} ms",
+            "webview: {what} failed ({e}); trying again in {} ms",
             delay.as_millis()
         );
         wait(*delay);
@@ -656,12 +757,15 @@ pub const WRY_DEFAULT_BROWSER_ARGS: &str =
 /// refuses a second webview in the same user-data folder with different environment options, and all
 /// PM's windows share one.
 ///
+/// `proxy_port` is [`proxy_port`]'s: the sinkhole's port, or the dead one. `None` (no proxy, wry's
+/// defaults alone) only on macOS, where no WebView2 reads them.
+///
 /// `<-loopback>` removes Chromium's implicit bypass for loopback and `*.localhost`, so even a
 /// connection to 127.0.0.1 goes to the sinkhole (PM's own schemes are served before the network
 /// stack, so they are unaffected). A dev build keeps that bypass, for Vite.
-pub fn windows_browser_args(sinkhole_port: Option<u16>, is_dev: bool) -> String {
+pub fn windows_browser_args(proxy_port: Option<u16>, is_dev: bool) -> String {
     let mut args = String::from(WRY_DEFAULT_BROWSER_ARGS);
-    if let Some(port) = sinkhole_port {
+    if let Some(port) = proxy_port {
         args.push_str(" --proxy-server=");
         args.push_str(&sinkhole_proxy_uri(port));
         if !is_dev {
@@ -672,13 +776,21 @@ pub fn windows_browser_args(sinkhole_port: Option<u16>, is_dev: bool) -> String 
 }
 
 /// WebView2 can't be asked whether the args took, so the outcome is whether the main window was
-/// built with the proxy in them (a second set would have failed the build). Whether something
-/// outside PM replaces them is [`webview2_args_override`]'s question, asked by PM at startup.
+/// built with a proxy in them (a second set would have failed the build). Whether something outside
+/// PM replaces them is [`webview2_args_override`]'s question, asked by PM at startup.
+///
+/// [`DEAD_PROXY_PORT`] counts as taken. This switch is the args sending every load to a proxy
+/// instead of out directly, and those args do (why the loads should fail there, and what measures
+/// it, is [`DEAD_PROXY_PORT`]'s to say). That the sinkhole isn't there to absorb and count them is
+/// the [`SINKHOLE`] switch's to report, and it does ([`sinkhole_unbound`]), so the engine is
+/// unsealed all the same: failing here too would give one cause two reasons, and say the proxy is
+/// missing from args that carry it. [`LINUX_PROXY`] reads the same way. Only args
+/// with no proxy at all fail, which [`proxy_port`] never gives where this switch is expected.
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
-pub fn proxy_args_outcome(sinkhole_port: Option<u16>) -> SwitchOutcome {
-    match sinkhole_port {
+pub fn proxy_args_outcome(proxy_port: Option<u16>) -> SwitchOutcome {
+    match proxy_port {
         Some(_) => SwitchOutcome::took(WINDOWS_PROXY_ARGS),
-        None => SwitchOutcome::failed(WINDOWS_PROXY_ARGS, "there is no sinkhole to point it at"),
+        None => SwitchOutcome::failed(WINDOWS_PROXY_ARGS, "the args carry no proxy"),
     }
 }
 
@@ -830,15 +942,16 @@ pub fn seal_builder<'a>(
 /// Apply the engine switches to a built window, and hand `done` what took. WebKitGTK's and
 /// WKWebView's switches run on the main thread through `with_webview`, so `done` runs later, there.
 /// `Err` when the webview couldn't be reached: `done` then never runs, and a switch that never
-/// reports keeps the engine unsealed ([`verdict`]).
+/// reports keeps the engine unsealed ([`verdict`]). `proxy_port` is [`proxy_port`]'s, the dead port
+/// included.
 #[cfg(target_os = "linux")]
 pub fn apply_switches(
     window: &WebviewWindow,
-    sinkhole_port: Option<u16>,
+    proxy_port: Option<u16>,
     is_dev: bool,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
-    let proxy = sinkhole_port.map(sinkhole_proxy_uri);
+    let proxy = proxy_port.map(sinkhole_proxy_uri);
     let ignore_hosts = proxy_ignore_hosts(is_dev);
     window.with_webview(move |webview| {
         done(webkitgtk::seal(
@@ -854,7 +967,7 @@ pub fn apply_switches(
 #[cfg(target_os = "macos")]
 pub fn apply_switches(
     window: &WebviewWindow,
-    _sinkhole_port: Option<u16>,
+    _proxy_port: Option<u16>,
     is_dev: bool,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
@@ -870,11 +983,11 @@ pub fn apply_switches(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn apply_switches(
     _window: &WebviewWindow,
-    sinkhole_port: Option<u16>,
+    proxy_port: Option<u16>,
     _is_dev: bool,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
-    done(vec![proxy_args_outcome(sinkhole_port)]);
+    done(vec![proxy_args_outcome(proxy_port)]);
     Ok(())
 }
 
@@ -940,7 +1053,7 @@ pub mod webkitgtk {
         }
         // WebKitGTK has no getter for the proxy, so "took" means it was set.
         out.push(match (proxy_uri, webview.website_data_manager()) {
-            (None, _) => SwitchOutcome::failed(LINUX_PROXY, "there is no sinkhole to point it at"),
+            (None, _) => SwitchOutcome::failed(LINUX_PROXY, "there is no proxy to point it at"),
             (Some(_), None) => {
                 SwitchOutcome::failed(LINUX_PROXY, "the webview has no website data manager")
             }
@@ -1442,13 +1555,86 @@ mod tests {
     }
 
     #[test]
-    fn with_no_sinkhole_the_args_are_wrys_and_the_switch_reports_failed() {
+    fn with_no_sinkhole_the_proxy_is_the_dead_port_and_the_sinkhole_reports_failed() {
+        // Fail closed: where an engine has a proxy, a sinkhole that couldn't be bound leaves the
+        // proxy on the dead port, never on nothing (a direct route out).
+        for platform in [Platform::Linux, Platform::Windows] {
+            assert_eq!(
+                proxy_port(platform, None),
+                Some(DEAD_PROXY_PORT),
+                "{platform:?}"
+            );
+            assert_eq!(proxy_port(platform, Some(4321)), Some(4321), "{platform:?}");
+        }
+        assert_eq!(DEAD_PROXY_PORT, 1);
+        // macOS has no proxy at all, sinkhole or not.
+        assert_eq!(proxy_port(Platform::MacOs, None), None);
+        assert_eq!(proxy_port(Platform::MacOs, Some(4321)), None);
         assert_eq!(windows_browser_args(None, false), WRY_DEFAULT_BROWSER_ARGS);
         assert_eq!(
-            proxy_args_outcome(Some(1)),
+            windows_browser_args(proxy_port(Platform::Windows, None), false),
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --proxy-server=http://127.0.0.1:1 --proxy-bypass-list=<-loopback>"
+        );
+        assert_eq!(
+            windows_browser_args(proxy_port(Platform::Windows, None), true),
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --proxy-server=http://127.0.0.1:1"
+        );
+        // The args carry a proxy, the dead one included; only args without one fail.
+        assert_eq!(
+            proxy_args_outcome(Some(DEAD_PROXY_PORT)),
             SwitchOutcome::took(WINDOWS_PROXY_ARGS)
         );
         assert!(!proxy_args_outcome(None).took);
+        // The sinkhole's own switch is what fails, and says where the traffic goes instead.
+        let unbound = sinkhole_unbound(&std::io::Error::other("no loopback"));
+        assert_eq!((unbound.name, unbound.took), (SINKHOLE, false));
+        assert_eq!(
+            unbound.detail,
+            "couldn't listen on loopback: no loopback; the windows' traffic goes to 127.0.0.1:1 \
+             instead, a dead port, so it fails rather than going out directly"
+        );
+        // A system port, so never taken for a remembered sinkhole port.
+        assert_eq!(parse_remembered_port(&DEAD_PROXY_PORT.to_string()), None);
+    }
+
+    #[test]
+    fn a_sinkhole_bind_is_tried_three_times_and_only_until_it_works() {
+        // It works on the third try, after both waits.
+        let mut tries = 0;
+        let mut waited = Vec::new();
+        let r = bind_retrying(
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err(std::io::Error::other("refused"))
+                } else {
+                    Ok(tries)
+                }
+            },
+            |d| waited.push(d),
+        );
+        assert_eq!(r.unwrap(), 3);
+        assert_eq!(waited, SINKHOLE_BIND_RETRY_DELAYS);
+        // Never working: every wait, then the last error.
+        let mut tries = 0;
+        let mut waited = Vec::new();
+        let r: std::io::Result<()> = bind_retrying(
+            || {
+                tries += 1;
+                Err(std::io::Error::other(format!("no {tries}")))
+            },
+            |d| waited.push(d),
+        );
+        assert_eq!(r.unwrap_err().to_string(), "no 3");
+        assert_eq!(waited, SINKHOLE_BIND_RETRY_DELAYS);
+        let total: Duration = SINKHOLE_BIND_RETRY_DELAYS.iter().sum();
+        assert!(total <= Duration::from_millis(500), "{total:?}");
+        // A first try that works waits for nothing.
+        let mut waited = 0;
+        assert_eq!(bind_retrying(|| Ok(1), |_| waited += 1).unwrap(), 1);
+        assert_eq!(waited, 0);
     }
 
     #[test]
