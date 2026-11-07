@@ -3,13 +3,14 @@
 
 //! The sealed engine (Mods spec §1.4, "What PR-1 ships from this"): what keeps a mod's sandboxed
 //! frame off the network, and any document that isn't PM's out of a PM window's top frame. Every
-//! mitigation here but two was measured closing its leak on all three engines by the step 0 spike;
+//! mitigation here but three was measured closing its leak on all three engines by the step 0 spike;
 //! the ones that measured ineffective (macOS `proxyConfigurations`, Windows
-//! `--force-webrtc-ip-handling-policy`) are left out. The two exceptions: the dead-port fallback
+//! `--force-webrtc-ip-handling-policy`) are left out. The exceptions: the dead-port fallback
 //! ([`DEAD_PROXY_PORT`]) rests on what the engines document, and the sealed-frame job's dead-port run
-//! on Linux and Windows is what measures it; the fraudulent-website warning switch
-//! ([`MACOS_FRAUD_WARNING_OFF`]) is held only by its read-back, which is all the sealed-frame job can
-//! check, since no job sees a Safe Browsing lookup.
+//! on Linux and Windows is what measures it; and the two switches that turn off a lookup service
+//! rather than close a leak, the fraudulent-website warning ([`MACOS_FRAUD_WARNING_OFF`]) and
+//! SmartScreen ([`WINDOWS_REPUTATION_OFF`]), are held only by their read-back, which is all the
+//! sealed-frame job can check, since no job sees a Safe Browsing or SmartScreen lookup.
 //!
 //! This file names nothing in PM's crate, so the sealed-frame regression app (`tests/sealed-frame`)
 //! can include it with `#[path]` and measure exactly what ships. PM's wiring (its state, its window
@@ -24,9 +25,10 @@
 //!   than going out directly, which is what the engines document and what the sealed-frame job's
 //!   dead-port run measures.
 //! - [`windows_browser_args`]: WebView2's args pointing at that proxy, with wry's defaults kept.
-//! - [`webkitgtk::seal`] and [`wkwebview::seal`]: the engine switches, each reporting whether it took.
-//!   On macOS that includes [`content_rules_json`], a content rule list that blocks every http, https,
-//!   ws and wss load: WKWebView has no sinkhole, and this is its network wall.
+//! - [`webkitgtk::seal`], [`wkwebview::seal`] and [`webview2::reputation_checking_off`]: the engine
+//!   switches, each reporting whether it took. On macOS that includes [`content_rules_json`], a
+//!   content rule list that blocks every http, https, ws and wss load: WKWebView has no sinkhole, and
+//!   this is its network wall.
 //! - [`allow_navigation`]: the navigation guard's decision.
 //! - [`top_frame_script`] and [`WEBRTC_OFF_SCRIPT`]: the two init scripts.
 //! - [`seal_builder`] and [`apply_switches`]: the wiring that puts all of the above on a window,
@@ -119,7 +121,7 @@ impl Platform {
     pub const fn expected_switches(self) -> &'static [&'static str] {
         match self {
             Self::Linux => &[SINKHOLE, LINUX_PROXY, LINUX_WEBRTC_OFF],
-            Self::Windows => &[SINKHOLE, WINDOWS_PROXY_ARGS],
+            Self::Windows => &[SINKHOLE, WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF],
             Self::MacOs => &[
                 MACOS_PEER_CONNECTION_OFF,
                 MACOS_FRAUD_WARNING_OFF,
@@ -129,6 +131,18 @@ impl Platform {
                 MACOS_FEATURES[3],
                 MACOS_NETWORK_RULES,
             ],
+        }
+    }
+
+    /// The expected switches whose failure in any PM window unseals the engine, not only in the
+    /// main window: those whose setting the engine shares between every webview in the user-data
+    /// folder, which all PM's windows use, so that one window left at the default turns it back on
+    /// for all of them. Every other switch counts in the main window only, the one window that
+    /// holds mods (`mods::for_the_seal` in PM, where the choice is explained).
+    pub const fn folder_wide_switches(self) -> &'static [&'static str] {
+        match self {
+            Self::Windows => &[WINDOWS_REPUTATION_OFF],
+            Self::Linux | Self::MacOs => &[],
         }
     }
 }
@@ -146,6 +160,30 @@ pub const LINUX_WEBRTC_OFF: &str = "webkitgtk.enable-webrtc-off";
 /// WebView2: the browser args carry PM's proxy (as [`LINUX_PROXY`]), and nothing outside PM
 /// overrides them.
 pub const WINDOWS_PROXY_ARGS: &str = "webview2.proxy-args";
+/// WebView2: `ICoreWebView2Settings8::put_IsReputationCheckingRequired(FALSE)`, read back with
+/// `get_IsReputationCheckingRequired` ([`webview2::reputation_checking_off`]); it counts only if it
+/// reads back off ([`reputation_outcome`]). The setting is SmartScreen's, on by default, for which
+/// WebView2 checks the addresses a webview opens and the files it downloads with Microsoft's
+/// SmartScreen service. [`WRY_DEFAULT_BROWSER_ARGS`] already turn SmartScreen off with a browser
+/// flag (`msSmartScreenProtection`), but only for as long as PM's browser args hold: the
+/// [`WEBVIEW2_ARGS_ENV`] variable or a policy replaces them ([`WINDOWS_PROXY_ARGS`] then fails),
+/// and SmartScreen comes back with them. This is WebView2's own setting, which no browser args
+/// touch. PM's windows load only PM's own pages and its mods, so what a check could send is one of
+/// their addresses, or one PM refused to open.
+///
+/// WebView2 documents the setting as one for every webview in the user-data folder, which all
+/// PM's windows share: SmartScreen is on if the setting is on in any of them. So every PM window
+/// switches it off, and a failure in any of them unseals the engine, not only one in the main
+/// window ([`Platform::folder_wide_switches`]).
+///
+/// It can't cover a window's first load. The webview can be reached only once the window is
+/// built, and wry starts the first navigation (to PM's own page) while building it; WebView2
+/// documents that a new webview's first navigation applies the default (on) to every webview in
+/// the folder, and that a change takes effect at the next navigation or download. Over that gap,
+/// for each window PM opens, the browser flag is what keeps SmartScreen off. A WebView2 Runtime too
+/// old to have `ICoreWebView2Settings8` (stable since WebView2 SDK 1.0.1722.45) can't switch it at
+/// all: the switch fails there, and the flag is all there is.
+pub const WINDOWS_REPUTATION_OFF: &str = "webview2.reputation-checking-off";
 /// WKWebView: `-[WKPreferences _setPeerConnectionEnabled:NO]` (SPI).
 pub const MACOS_PEER_CONNECTION_OFF: &str = "wkwebview.peer-connection-off";
 /// WKWebView: `-[WKPreferences setFraudulentWebsiteWarningEnabled:NO]`, public API since macOS
@@ -323,6 +361,55 @@ pub fn fraud_warning_outcome(read: FraudWarningRead) -> SwitchOutcome {
              read it back",
         ),
     }
+}
+
+/// What switching WebView2's SmartScreen setting off found (see [`WINDOWS_REPUTATION_OFF`]). Each
+/// error is WebView2's, as text.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReputationRead {
+    /// The webview's settings couldn't be had (`get_CoreWebView2` or `get_Settings` failed).
+    NoSettings(String),
+    /// The settings aren't an `ICoreWebView2Settings8`: the WebView2 Runtime predates it (stable since
+    /// WebView2 SDK 1.0.1722.45).
+    NoSettings8(String),
+    /// `put_IsReputationCheckingRequired(FALSE)` failed.
+    SetFailed(String),
+    /// It was switched off, but `get_IsReputationCheckingRequired` failed.
+    ReadFailed(String),
+    /// The getter read on after it was switched off.
+    StillOn,
+    /// The getter read off.
+    Off,
+}
+
+/// The SmartScreen switch: taken only if the setting reads back off. Anything short of that, a
+/// WebView2 without the setting included, is a failure, since then nothing but the browser flag
+/// says SmartScreen is off, and something outside PM can replace that.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn reputation_outcome(read: ReputationRead) -> SwitchOutcome {
+    let failed = |why: String| SwitchOutcome::failed(WINDOWS_REPUTATION_OFF, why);
+    match read {
+        ReputationRead::Off => SwitchOutcome::took(WINDOWS_REPUTATION_OFF),
+        ReputationRead::StillOn => failed("still on after switching it off".into()),
+        ReputationRead::NoSettings(e) => failed(format!("couldn't reach the webview's settings: {e}")),
+        ReputationRead::NoSettings8(e) => failed(format!(
+            "this WebView2 Runtime is too old to have ICoreWebView2Settings8 (stable since WebView2 \
+             SDK 1.0.1722.45), so it can't switch SmartScreen off: {e}"
+        )),
+        ReputationRead::SetFailed(e) => failed(format!("WebView2 refused to switch it off: {e}")),
+        ReputationRead::ReadFailed(e) => failed(format!(
+            "switched off, but WebView2 couldn't read it back: {e}"
+        )),
+    }
+}
+
+/// A WebView2 window's report, in [`Platform::Windows`]'s expected order after the sinkhole (which
+/// [`SINKHOLE`] reports once, before any window): the browser args' outcome
+/// ([`proxy_args_outcome`]), then SmartScreen's (`reputation`).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn webview2_report(proxy_port: Option<u16>, reputation: SwitchOutcome) -> Vec<SwitchOutcome> {
+    vec![proxy_args_outcome(proxy_port), reputation]
 }
 
 /// What `+[WKPreferences _features]` gave (the macOS feature switches): an outcome for each of
@@ -798,7 +885,10 @@ pub fn proxy_ignore_hosts(is_dev: bool) -> &'static [&'static str] {
 
 /// wry's WebView2 args (`wry` `webview2/mod.rs`). Passing any args replaces them, so they are
 /// restated: they turn off Edge's mini menu, its PDF UI and SmartScreen. wry adds to them only for
-/// autoplay or its own proxy option, neither of which PM sets.
+/// autoplay or its own proxy option, neither of which PM sets. SmartScreen is also switched off
+/// through WebView2's own setting ([`WINDOWS_REPUTATION_OFF`]), which holds when something outside
+/// PM replaces these args; over each window's first load, before the setting can be reached, these
+/// args are all that keeps it off.
 pub const WRY_DEFAULT_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
 
@@ -988,11 +1078,13 @@ pub fn seal_builder<'a>(
         .initialization_script_for_all_frames(WEBRTC_OFF_SCRIPT)
 }
 
-/// Apply the engine switches to a built window, and hand `done` what took. WebKitGTK's and
-/// WKWebView's switches run on the main thread through `with_webview`, so `done` runs later, there.
-/// `Err` when the webview couldn't be reached: `done` then never runs, and a switch that never
-/// reports keeps the engine unsealed ([`verdict`]). `proxy_port` is [`proxy_port`]'s, the dead port
-/// included.
+/// Apply the engine switches to a built window, and hand `done` what took. Every engine's switches
+/// run on the main thread through `with_webview`: at once when this is called there (as `setup()`
+/// is), else when the event loop gets to it. `done` runs there, once, with every outcome, when they
+/// have all reported (on macOS, once the rule list has compiled). `Err` when the webview couldn't be
+/// reached, and if the window is gone before the event loop gets to it, `with_webview` drops the
+/// closure: either way `done` never runs, and a switch that never reports keeps the engine unsealed
+/// ([`verdict`]). `proxy_port` is [`proxy_port`]'s, the dead port included.
 #[cfg(target_os = "linux")]
 pub fn apply_switches(
     window: &WebviewWindow,
@@ -1027,17 +1119,21 @@ pub fn apply_switches(
     })
 }
 
-/// See the Linux version. WebView2 has nothing to switch once the window is built: its browser args
-/// carried the proxy or didn't, so `done` runs at once.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// See the Linux version. The browser args carried the proxy or didn't once the window is built
+/// ([`proxy_args_outcome`]), and SmartScreen's setting is switched on the webview itself, through
+/// its controller ([`webview2::reputation_checking_off`]), so `done` gets both from the main thread
+/// ([`webview2_report`]).
+#[cfg(windows)]
 pub fn apply_switches(
-    _window: &WebviewWindow,
+    window: &WebviewWindow,
     proxy_port: Option<u16>,
     _is_dev: bool,
     done: impl FnOnce(Vec<SwitchOutcome>) + Send + 'static,
 ) -> tauri::Result<()> {
-    done(vec![proxy_args_outcome(proxy_port)]);
-    Ok(())
+    window.with_webview(move |webview| {
+        let reputation = webview2::reputation_checking_off(&webview.controller());
+        done(webview2_report(proxy_port, reputation));
+    })
 }
 
 // ---- The engine switches -----------------------------------------------------------------------
@@ -1478,6 +1574,54 @@ pub mod wkwebview {
     }
 }
 
+/// WebView2. Called on the main thread, from `with_webview`. Its interfaces are webview2-com's, on
+/// windows-core 0.62, so they are cast with that crate's `Interface`: PM's own `windows` crate is
+/// 0.61, whose `Interface` is another trait and can't cast them.
+#[cfg(windows)]
+pub mod webview2 {
+    use super::{reputation_outcome, ReputationRead, SwitchOutcome};
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Controller, ICoreWebView2Settings8,
+    };
+    use windows_core::{Interface, BOOL};
+
+    /// Switch SmartScreen off in this webview's settings and read it back (see
+    /// [`super::WINDOWS_REPUTATION_OFF`]).
+    pub fn reputation_checking_off(controller: &ICoreWebView2Controller) -> SwitchOutcome {
+        reputation_outcome(switch_off(controller))
+    }
+
+    fn switch_off(controller: &ICoreWebView2Controller) -> ReputationRead {
+        // SAFETY (each call below): `controller` is the live controller of a webview wry built,
+        // handed over by `with_webview` on the main thread, the thread WebView2 takes every call on,
+        // and each call is a property access on an interface WebView2 itself returned, with an out
+        // pointer to a local that outlives it.
+        let settings =
+            unsafe { controller.CoreWebView2() }.and_then(|webview| unsafe { webview.Settings() });
+        let settings = match settings {
+            Ok(settings) => settings,
+            Err(e) => return ReputationRead::NoSettings(e.to_string()),
+        };
+        let settings = match settings.cast::<ICoreWebView2Settings8>() {
+            Ok(settings) => settings,
+            Err(e) => return ReputationRead::NoSettings8(e.to_string()),
+        };
+        if let Err(e) = unsafe { settings.SetIsReputationCheckingRequired(false) } {
+            return ReputationRead::SetFailed(e.to_string());
+        }
+        // Starts on, so a getter that succeeded without writing reads as on, never as off.
+        let mut on = BOOL(1);
+        if let Err(e) = unsafe { settings.IsReputationCheckingRequired(&mut on) } {
+            return ReputationRead::ReadFailed(e.to_string());
+        }
+        if on.as_bool() {
+            ReputationRead::StillOn
+        } else {
+            ReputationRead::Off
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1781,7 +1925,14 @@ mod tests {
         // Nothing reported at all: before the main window exists.
         let v = verdict(Platform::Windows.expected_switches(), &[]);
         assert!(!v.sealed);
-        assert_eq!(v.reasons.len(), 2);
+        assert_eq!(
+            v.reasons,
+            [
+                "sinkhole was never applied",
+                "webview2.proxy-args was never applied",
+                "webview2.reputation-checking-off was never applied",
+            ]
+        );
     }
 
     #[test]
@@ -1853,9 +2004,15 @@ mod tests {
             Platform::Linux.expected_switches(),
             [SINKHOLE, LINUX_PROXY, LINUX_WEBRTC_OFF]
         );
+        // SmartScreen, like the fraudulent-website warning, is a lookup service, not a network wall
+        // (see WINDOWS_REPUTATION_OFF).
         assert_eq!(
             Platform::Windows.expected_switches(),
-            [SINKHOLE, WINDOWS_PROXY_ARGS]
+            [
+                SINKHOLE,
+                WINDOWS_PROXY_ARGS,
+                "webview2.reputation-checking-off"
+            ]
         );
         // The fraudulent-website warning isn't a network wall the spike measured, but a lookup
         // service PM's windows have no use for (see MACOS_FRAUD_WARNING_OFF).
@@ -1886,6 +2043,110 @@ mod tests {
             let names: std::collections::HashSet<_> = expected.iter().collect();
             assert_eq!(names.len(), expected.len(), "{platform:?}: {expected:?}");
         }
+    }
+
+    #[test]
+    fn only_smartscreen_counts_in_every_window_and_only_on_windows() {
+        assert_eq!(
+            Platform::Windows.folder_wide_switches(),
+            ["webview2.reputation-checking-off"]
+        );
+        assert!(Platform::Linux.folder_wide_switches().is_empty());
+        assert!(Platform::MacOs.folder_wide_switches().is_empty());
+        // Each is a switch the seal expects, so the main window's report of it is still owed.
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            for name in platform.folder_wide_switches() {
+                assert!(
+                    platform.expected_switches().contains(name),
+                    "{platform:?}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_windows_report_names_every_expected_switch_in_order() {
+        for port in [4321, DEAD_PROXY_PORT] {
+            let mut all = vec![SwitchOutcome::took(SINKHOLE)];
+            all.extend(webview2_report(
+                Some(port),
+                reputation_outcome(ReputationRead::Off),
+            ));
+            let names: Vec<_> = all.iter().map(|o| o.name).collect();
+            assert_eq!(names, Platform::Windows.expected_switches(), "{port}");
+            assert!(verdict(Platform::Windows.expected_switches(), &all).sealed);
+        }
+        // Each outcome is its own: args with no proxy fail, SmartScreen's report is passed through.
+        let failed = reputation_outcome(ReputationRead::StillOn);
+        assert_eq!(
+            webview2_report(None, failed.clone()),
+            [
+                SwitchOutcome::failed(WINDOWS_PROXY_ARGS, "the args carry no proxy"),
+                failed
+            ]
+        );
+    }
+
+    #[test]
+    fn smartscreen_counts_only_if_it_reads_back_off() {
+        assert_eq!(
+            reputation_outcome(ReputationRead::Off),
+            SwitchOutcome::took(WINDOWS_REPUTATION_OFF)
+        );
+        let e = || "No such interface supported (0x80004002)".to_owned();
+        for (read, detail) in [
+            (
+                ReputationRead::StillOn,
+                "still on after switching it off".to_owned(),
+            ),
+            (
+                ReputationRead::NoSettings(e()),
+                format!("couldn't reach the webview's settings: {}", e()),
+            ),
+            (
+                ReputationRead::NoSettings8(e()),
+                format!(
+                    "this WebView2 Runtime is too old to have ICoreWebView2Settings8 (stable since \
+                     WebView2 SDK 1.0.1722.45), so it can't switch SmartScreen off: {}",
+                    e()
+                ),
+            ),
+            (
+                ReputationRead::SetFailed(e()),
+                format!("WebView2 refused to switch it off: {}", e()),
+            ),
+            (
+                ReputationRead::ReadFailed(e()),
+                format!("switched off, but WebView2 couldn't read it back: {}", e()),
+            ),
+        ] {
+            let outcome = reputation_outcome(read.clone());
+            assert_eq!(
+                outcome,
+                SwitchOutcome::failed(WINDOWS_REPUTATION_OFF, detail.clone()),
+                "{read:?}"
+            );
+            // Everything else took: this alone unseals the engine, and says why.
+            let mut all = all_took(Platform::Windows);
+            all.retain(|o| o.name != WINDOWS_REPUTATION_OFF);
+            all.push(outcome);
+            let v = verdict(Platform::Windows.expected_switches(), &all);
+            assert!(!v.sealed, "{read:?}");
+            assert_eq!(
+                v.reasons,
+                [format!(
+                    "webview2.reputation-checking-off didn't take: {detail}"
+                )],
+                "{read:?}"
+            );
+        }
+        // Never reported (a window whose webview was never reached): unsealed too.
+        let mut all = all_took(Platform::Windows);
+        all.retain(|o| o.name != WINDOWS_REPUTATION_OFF);
+        assert_eq!(
+            verdict(Platform::Windows.expected_switches(), &all).reasons,
+            ["webview2.reputation-checking-off was never applied"]
+        );
     }
 
     /// A macOS report as `wkwebview::seal` makes it: the peer-connection and fraudulent-website

@@ -34,3 +34,9 @@ webkit2gtk = { version = "2", features = ["v2_40"] }
 objc2 = "0.6"
 # engine.rs's content rule list completion handler, as in PM.
 block2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# engine.rs's SmartScreen switch (WebView2's ICoreWebView2Settings8), as in PM: the interfaces and the
+# windows-core 0.62 `Interface` that casts them, at the versions wry already locks.
+webview2-com = "0.39"
+windows-core = "0.62"

@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.175.2-alpha"
+version = "3.175.3-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -192,6 +192,13 @@ windows = { version = "0.61", features = [
     "Win32_System_Power",
 ] }
 windows-future = "0.2"
+# Mods (spec §1.4): WebView2's own SmartScreen setting (`ICoreWebView2Settings8`), switched off on
+# every PM window's webview through the controller Tauri hands over (src/mods/engine.rs). The
+# interfaces are webview2-com's, cast with windows-core 0.62's `Interface` (the `windows` 0.61 above
+# has another). Both at the versions wry already locks (MIT, and MIT OR Apache-2.0, already
+# allow-listed), so no new package or licence.
+webview2-com = "0.39"
+windows-core = "0.62"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.175.3-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "A privacy fix on Windows. The web engine PM's windows run on, Microsoft's WebView2, has SmartScreen, which checks the addresses a window opens with Microsoft. PM already turned it off through the options it starts WebView2 with, but something else on your computer can replace those options, and SmartScreen would come back with them. PM's windows now also turn it off through WebView2's own setting, which those options can't change. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.175.2-alpha",
     date: "2026-11-06",
     highlights: [

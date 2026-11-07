@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "pm"
-version = "3.175.2-alpha"
+version = "3.175.3-alpha"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -3115,7 +3115,9 @@ dependencies = [
  "tokio",
  "uuid",
  "webkit2gtk",
+ "webview2-com",
  "windows 0.61.3",
+ "windows-core 0.62.2",
  "windows-future 0.2.1",
  "windows-sys 0.60.2",
  "zeroize",

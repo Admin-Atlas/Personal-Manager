@@ -25,10 +25,13 @@
 //!   Tauri leaves it to `setup()`), which keeps every field it had when Tauri built it.
 //!
 //! The main window is the only one that will ever hold a mod frame, so only its switches count
-//! towards the seal. The briefing panel (tray.rs) and the pop-out Calendar (popout.rs) host no mods
-//! and get everything all the same, as defence in depth. On Windows they have to: WebView2 refuses a
-//! second webview in the same user-data folder with different browser args, and every PM window
-//! shares one (Tauri gives each the app's local data folder).
+//! towards the seal, but for one kind: a switch whose setting the engine shares between every
+//! webview in the user-data folder (WebView2's SmartScreen, `engine::WINDOWS_REPUTATION_OFF`)
+//! fails the seal from any window, since one window left at the default turns it back on in main
+//! too ([`for_the_seal`]). The briefing panel (tray.rs) and the pop-out Calendar (popout.rs) host
+//! no mods and get everything all the same, as defence in depth. On Windows they have to: WebView2
+//! refuses a second webview in the same user-data folder with different browser args, and every PM
+//! window shares one (Tauri gives each the app's local data folder).
 
 pub mod disk;
 pub mod engine;
@@ -65,6 +68,8 @@ pub const SCHEME: &str = "pmmod";
 
 /// The engine's seal, for the life of the process.
 pub struct EngineState {
+    /// The engine whose switches are expected: [`Platform::current`], but for a test's.
+    platform: Platform,
     is_dev: bool,
     /// `None` when the platform needs none (macOS), or binding loopback failed (recorded as a
     /// switch that didn't take).
@@ -119,20 +124,27 @@ impl EngineState {
     /// switch reports failed, so the engine is unsealed, and every window's proxy is the dead port
     /// instead, which is never remembered (the next run tries the remembered port again).
     pub fn start(is_dev: bool, port_file: Option<&Path>, args_overridden: Option<String>) -> Self {
-        Self::start_with(is_dev, port_file, args_overridden, |preferred| {
-            engine::bind_retrying(|| Sinkhole::bind_preferring(preferred), std::thread::sleep)
-        })
+        Self::start_with(
+            Platform::current(),
+            is_dev,
+            port_file,
+            args_overridden,
+            |preferred| {
+                engine::bind_retrying(|| Sinkhole::bind_preferring(preferred), std::thread::sleep)
+            },
+        )
     }
 
-    /// [`EngineState::start`], binding the sinkhole with `bind`, which is handed the remembered
-    /// port, so a test can make the bind fail.
+    /// [`EngineState::start`] for `platform`'s engine, binding the sinkhole with `bind`, which is
+    /// handed the remembered port, so a test can make the bind fail or judge another engine's
+    /// switches.
     fn start_with(
+        platform: Platform,
         is_dev: bool,
         port_file: Option<&Path>,
         args_overridden: Option<String>,
         bind: impl FnOnce(Option<u16>) -> std::io::Result<Sinkhole>,
     ) -> Self {
-        let platform = Platform::current();
         let mut outcomes = Vec::new();
         if let Some(why) = args_overridden {
             let failed = SwitchOutcome::failed(engine::WINDOWS_PROXY_ARGS, why);
@@ -164,6 +176,7 @@ impl EngineState {
         let proxy_port = engine::proxy_port(platform, sinkhole.as_ref().map(Sinkhole::port));
         let browser_args = engine::windows_browser_args(proxy_port, is_dev);
         Self {
+            platform,
             is_dev,
             sinkhole,
             proxy_port,
@@ -204,7 +217,32 @@ impl EngineState {
     }
 
     fn verdict(&self) -> engine::Verdict {
-        engine::verdict(Platform::current().expected_switches(), &self.outcomes())
+        engine::verdict(self.platform.expected_switches(), &self.outcomes())
+    }
+
+    /// Take a window's switch report (`label`'s, built as `role`): what [`for_the_seal`] counts goes
+    /// into the seal, and any other failure is logged. The verdict is logged once it is final, if it
+    /// is unsealed.
+    fn settle(&self, role: Role, label: &str, outcomes: Vec<SwitchOutcome>) {
+        let (counted, logged) = for_the_seal(self.platform, role, label, outcomes);
+        for o in logged.iter().filter(|o| !o.took) {
+            eprintln!(
+                "webview: the engine switch {} didn't take in the {label} window, which holds no \
+                 mods ({})",
+                o.name, o.detail
+            );
+        }
+        if counted.is_empty() {
+            return;
+        }
+        if let Some(verdict) = self.record(counted) {
+            if !verdict.sealed {
+                eprintln!(
+                    "mods: the webview engine isn't sealed: {}",
+                    verdict.reasons.join("; ")
+                );
+            }
+        }
     }
 
     /// Add `new` to the outcomes. The first time every expected switch has reported, the verdict is
@@ -218,7 +256,7 @@ impl EngineState {
         }
         let mut outcomes = self.outcomes();
         outcomes.extend(new);
-        let expected = Platform::current().expected_switches();
+        let expected = self.platform.expected_switches();
         if !engine::unreported(expected, &outcomes).is_empty()
             || self.verdict_told.swap(true, Ordering::SeqCst)
         {
@@ -506,47 +544,85 @@ pub fn mod_call(
         .map_err(|e| Error::Other(e.to_string()))
 }
 
-/// Apply the engine switches to a freshly built window and, for the main window, record whether
-/// each took. A failure to reach the webview is logged, never fatal: PM still works, and the main
-/// window's switches then never report, so the engine stays unsealed.
+/// Apply the engine switches to a freshly built window and settle what took
+/// ([`EngineState::settle`]). A failure to reach the webview is logged, never fatal: PM still works.
+/// The main window's switches then never report, so the engine stays unsealed; another window's
+/// folder-wide switches count as failed ([`unreached`]).
 fn seal_webview(app: &AppHandle, window: &WebviewWindow, state: &EngineState, role: Role) {
-    let record = role == Role::Main;
+    let label = window.label().to_owned();
     let settle_app = app.clone();
-    if let Err(e) =
+    let settle_label = label.clone();
+    let applied =
         engine::apply_switches(window, state.proxy_port(), state.is_dev, move |outcomes| {
-            settle(&settle_app, outcomes, record)
-        })
-    {
-        let consequence = if record {
+            if let Some(state) = settle_app.try_state::<EngineState>() {
+                state.settle(role, &settle_label, outcomes);
+            }
+        });
+    if let Err(e) = applied {
+        let consequence = if role == Role::Main {
             ", so the engine stays unsealed"
         } else {
             ""
         };
-        eprintln!("mods: couldn't reach the webview to seal it ({e}){consequence}");
+        eprintln!(
+            "mods: couldn't reach the {label} window's webview to seal it ({e}){consequence}"
+        );
+        state.settle(
+            role,
+            &label,
+            unreached(state.platform, role, &e.to_string()),
+        );
     }
 }
 
-/// Where a window's outcomes go: into the seal for the main window, the log otherwise. The main
-/// window's verdict is logged when it is final, if it is unsealed.
-fn settle(app: &AppHandle, outcomes: Vec<SwitchOutcome>, record: bool) {
-    if record {
-        let state = app.try_state::<EngineState>();
-        if let Some(verdict) = state.and_then(|state| state.record(outcomes)) {
-            if !verdict.sealed {
-                eprintln!(
-                    "mods: the webview engine isn't sealed: {}",
-                    verdict.reasons.join("; ")
-                );
-            }
-        }
-        return;
+/// Which of a window's switch outcomes go into the seal, and which are only logged: `(counted,
+/// logged)`. `label` names the window, and `role` says whether it is the main one.
+///
+/// The main window's all count: it is the one window that holds mods. Another window's count only
+/// where they are failures of a switch whose setting the engine shares between every webview in
+/// the user-data folder ([`Platform::folder_wide_switches`]): WebView2 turns SmartScreen on for
+/// every PM window if it is on in any of them, so a pop-out that couldn't switch it off has turned
+/// it back on in the main window too, and the seal can't stand on the main window's report alone.
+/// Such a failure says which window it was in.
+///
+/// Another window's successes never count, so a window without mods can unseal the engine but
+/// never seal it: only the main window's own report can make a switch count as taken, and while it
+/// hasn't reported, the switch is still never applied. A failure that comes after the verdict (a
+/// pop-out opened later) unseals the engine for the rest of the run, even once that window has
+/// closed: PM can't tell when WebView2 next works the setting out, and a WebView2 that refused it
+/// in one window would likely refuse it in the next.
+fn for_the_seal(
+    platform: Platform,
+    role: Role,
+    label: &str,
+    outcomes: Vec<SwitchOutcome>,
+) -> (Vec<SwitchOutcome>, Vec<SwitchOutcome>) {
+    if role == Role::Main {
+        return (outcomes, Vec::new());
     }
-    for o in outcomes.iter().filter(|o| !o.took) {
-        eprintln!(
-            "webview: the engine switch {} didn't take in a window without mods ({})",
-            o.name, o.detail
-        );
+    let folder_wide = platform.folder_wide_switches();
+    let (mut counted, logged): (Vec<_>, Vec<_>) = outcomes
+        .into_iter()
+        .partition(|o| !o.took && folder_wide.contains(&o.name));
+    for o in &mut counted {
+        o.detail = format!("in the {label} window: {}", o.detail);
     }
+    (counted, logged)
+}
+
+/// What a window whose webview couldn't be reached to apply its switches (`why`) reports. Nothing
+/// for the main window: its switches then never report, which keeps the engine unsealed. For
+/// another window, a failure of each folder-wide switch, since its webview is left at the engine's
+/// default, which turns that setting back on for every window ([`for_the_seal`]).
+fn unreached(platform: Platform, role: Role, why: &str) -> Vec<SwitchOutcome> {
+    if role == Role::Main {
+        return Vec::new();
+    }
+    platform
+        .folder_wide_switches()
+        .iter()
+        .map(|&name| SwitchOutcome::failed(name, format!("couldn't reach the webview: {why}")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -749,10 +825,11 @@ mod tests {
         for (file, remembered) in [(&fresh, None), (&kept, Some(40000))] {
             for is_dev in [false, true] {
                 let mut asked = Vec::new();
-                let state = EngineState::start_with(is_dev, Some(file), None, |preferred| {
-                    asked.push(preferred);
-                    Err(std::io::Error::other("refused by the test"))
-                });
+                let state =
+                    EngineState::start_with(platform, is_dev, Some(file), None, |preferred| {
+                        asked.push(preferred);
+                        Err(std::io::Error::other("refused by the test"))
+                    });
                 assert!(!state.engine_sealed());
                 assert_eq!(state.sinkhole_attempts(), 0);
                 if !platform.uses_sinkhole() {
@@ -808,6 +885,159 @@ mod tests {
         // Nothing remembered: no file (nor its folder) made, and the remembered port kept as it was.
         assert!(!fresh.parent().unwrap().exists());
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "40000");
+    }
+
+    /// An engine judged as `platform`'s, with a real sinkhole where it has one (so on Windows only
+    /// the two switches the main window reports are still owed).
+    fn engine_of(platform: Platform) -> EngineState {
+        EngineState::start_with(platform, false, None, None, Sinkhole::bind_preferring)
+    }
+
+    #[test]
+    fn a_window_without_mods_counts_only_where_it_failed_a_switch_webview2_shares() {
+        use engine::{WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF};
+        let took = SwitchOutcome::took;
+        let failed = SwitchOutcome::failed;
+        let report = vec![
+            took(WINDOWS_PROXY_ARGS),
+            failed(WINDOWS_REPUTATION_OFF, "refused"),
+        ];
+        // The main window's report all counts, as it is, wherever it is.
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            assert_eq!(
+                for_the_seal(platform, Role::Main, MAIN_LABEL, report.clone()),
+                (report.clone(), vec![]),
+                "{platform:?}"
+            );
+        }
+        // Another window on Windows: only SmartScreen's failure counts, and says where it was.
+        assert_eq!(
+            for_the_seal(Platform::Windows, Role::NoMods, "calendar", report),
+            (
+                vec![failed(
+                    WINDOWS_REPUTATION_OFF,
+                    "in the calendar window: refused"
+                )],
+                vec![took(WINDOWS_PROXY_ARGS)]
+            )
+        );
+        // Its successes never count, nor does a failure of a switch each window holds on its own.
+        for logged in [
+            vec![took(WINDOWS_PROXY_ARGS), took(WINDOWS_REPUTATION_OFF)],
+            vec![
+                failed(WINDOWS_PROXY_ARGS, "the args carry no proxy"),
+                took(WINDOWS_REPUTATION_OFF),
+            ],
+        ] {
+            assert_eq!(
+                for_the_seal(Platform::Windows, Role::NoMods, "briefing", logged.clone()),
+                (vec![], logged)
+            );
+        }
+        // Linux and macOS share no such setting: another window's failures are only logged.
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let all_failed: Vec<_> = [Platform::Linux, Platform::MacOs, Platform::Windows]
+                .iter()
+                .flat_map(|p| p.expected_switches().iter().copied())
+                .map(|name| failed(name, "no"))
+                .collect();
+            assert_eq!(
+                for_the_seal(platform, Role::NoMods, "calendar", all_failed.clone()),
+                (vec![], all_failed),
+                "{platform:?}"
+            );
+            assert!(unreached(platform, Role::NoMods, "gone").is_empty());
+        }
+        // A window that couldn't be reached is left at WebView2's default: SmartScreen on. The main
+        // window reports nothing then, so its switches stay never applied.
+        assert_eq!(
+            unreached(Platform::Windows, Role::NoMods, "the event loop is gone"),
+            [failed(
+                WINDOWS_REPUTATION_OFF,
+                "couldn't reach the webview: the event loop is gone"
+            )]
+        );
+        assert!(unreached(Platform::Windows, Role::Main, "gone").is_empty());
+    }
+
+    /// Through the seal itself (`EngineState::settle`, `record`, the verdict), judged as Windows.
+    #[test]
+    fn on_windows_smartscreen_failing_in_any_window_unseals_the_engine() {
+        use engine::{WINDOWS_PROXY_ARGS, WINDOWS_REPUTATION_OFF};
+        let took = SwitchOutcome::took;
+        let failed = SwitchOutcome::failed;
+        let main_report = || vec![took(WINDOWS_PROXY_ARGS), took(WINDOWS_REPUTATION_OFF)];
+
+        // Sealed by the main window's report, then unsealed by a pop-out's failure, which says where.
+        let state = engine_of(Platform::Windows);
+        state.settle(Role::Main, MAIN_LABEL, main_report());
+        assert!(state.engine_sealed(), "{:?}", state.unsealed_reasons());
+        state.settle(
+            Role::NoMods,
+            "calendar",
+            vec![
+                took(WINDOWS_PROXY_ARGS),
+                failed(WINDOWS_REPUTATION_OFF, "refused"),
+            ],
+        );
+        assert!(!state.engine_sealed());
+        assert_eq!(
+            state.unsealed_reasons(),
+            ["webview2.reputation-checking-off didn't take: in the calendar window: refused"]
+        );
+
+        // The same before the main window has reported: the verdict, once final, is unsealed.
+        let state = engine_of(Platform::Windows);
+        state.settle(
+            Role::NoMods,
+            "briefing",
+            unreached(Platform::Windows, Role::NoMods, "the event loop is gone"),
+        );
+        assert!(!state.engine_sealed());
+        let told = state
+            .record(main_report())
+            .expect("every switch has reported");
+        assert!(!told.sealed);
+        assert_eq!(
+            told.reasons,
+            [
+                "webview2.reputation-checking-off didn't take: in the briefing window: couldn't \
+                 reach the webview: the event loop is gone"
+            ]
+        );
+
+        // A pop-out's successes can't stand in for the main window's report.
+        let state = engine_of(Platform::Windows);
+        state.settle(Role::NoMods, "calendar", main_report());
+        assert_eq!(
+            state.unsealed_reasons(),
+            [
+                "webview2.proxy-args was never applied",
+                "webview2.reputation-checking-off was never applied"
+            ]
+        );
+        // Nor can a main window that couldn't be reached report anything.
+        state.settle(
+            Role::Main,
+            MAIN_LABEL,
+            unreached(Platform::Windows, Role::Main, "gone"),
+        );
+        assert_eq!(state.unsealed_reasons().len(), 2);
+
+        // On Linux the pop-out's failures are its own: the engine stays sealed.
+        let state = engine_of(Platform::Linux);
+        let rest: Vec<_> = Platform::Linux
+            .expected_switches()
+            .iter()
+            .copied()
+            .filter(|n| *n != engine::SINKHOLE)
+            .map(took)
+            .collect();
+        state.settle(Role::Main, MAIN_LABEL, rest.clone());
+        assert!(state.engine_sealed(), "{:?}", state.unsealed_reasons());
+        let all_failed = rest.iter().map(|o| failed(o.name, "no")).collect();
+        state.settle(Role::NoMods, "calendar", all_failed);
+        assert!(state.engine_sealed(), "{:?}", state.unsealed_reasons());
     }
 
     fn conf() -> serde_json::Value {
