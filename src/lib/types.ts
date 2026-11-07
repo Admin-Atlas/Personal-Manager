@@ -80,7 +80,7 @@ export interface AppLockStatus {
 /** Which classes of PM's on-machine data to remove. Browser local storage is cleared in the
  *  webview (not part of the backend command), so it isn't represented here. */
 export interface WipeSelection {
-  /** The regenerable runtime (Python engine, t-SNE/OCR, Whisper model) — re-downloads on next use. */
+  /** The regenerable runtime (Python engine, t-SNE/OCR) — re-downloads on next use. */
   regenerable: boolean;
   /** The Markdown vault + encrypted database (the real user data). Irreversible. */
   vaultAndDb: boolean;
@@ -1583,10 +1583,10 @@ export interface OcrStatus {
 }
 
 /** One on-device component in the Storage manager (the venv, the t-SNE libraries, the photo-OCR
- *  stack, the speech model, the active search model). `status` drives the action: removable now,
- *  blocked behind a dependent, required, in-use (managed elsewhere), installable (an optional
- *  component not yet downloaded — the photo-OCR stack, whose `size_bytes` is then an estimate), or
- *  stale (on disk but not working since an update: offers Install to repair it AND Remove). */
+ *  stack and the active search model). `status` drives the action: removable now, blocked behind a
+ *  dependent, required, in-use (managed elsewhere), installable (an optional component not yet
+ *  downloaded — the photo-OCR stack, whose `size_bytes` is then an estimate), or stale (on disk but
+ *  not working since an update: offers Install to repair it AND Remove). */
 export type StorageStatus =
   "required" | "in_use" | "removable" | "blocked" | "installable" | "stale";
 export interface StorageBlocker {
@@ -1612,18 +1612,10 @@ export interface StorageComponent {
   blockers: StorageBlocker[];
   manage: StorageManage | null;
   note: string | null;
-  /** A feature switch on this row and where it stands (voice input's), else null. With it,
-   *  `status` describes the engine on disk, and the switch decides Turn on vs Turn off. */
-  switch: boolean | null;
 }
 export interface StorageReport {
   total_bytes: number;
   components: StorageComponent[];
-}
-
-/** The voice switch (Mods spec D8, voice_switch.rs `VoiceSwitch`). */
-export interface VoiceSwitch {
-  on: boolean;
 }
 
 /** Global progress for the semantic-layout precompute (fires regardless of which view started it). */

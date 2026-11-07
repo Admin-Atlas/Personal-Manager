@@ -140,9 +140,6 @@ mod tasks;
 mod tray;
 mod update_delivery;
 mod vault;
-// The voice switch (D8): one stored setting enforced in `transcribe_audio`, and the speech engine as
-// an optional component it installs and removes.
-mod voice_switch;
 mod wipe;
 
 use std::ops::{Deref, DerefMut};
@@ -651,10 +648,6 @@ pub struct AppState {
     /// mustn't undo, and the single-flight lock calendar syncs take. In memory; see
     /// `commands::calendar_edit`.
     pub calendar_edit: commands::CalendarEditState,
-    /// Single-flight guard for switching voice on or off (`voice_switch::set_voice_enabled`): an off
-    /// that landed while an on was still downloading the engine would remove it and then be undone
-    /// by the on writing itself down.
-    pub voice_busy: AtomicBool,
 }
 
 /// The sentence a command gets when it needs the store but the session is closed. Pure
@@ -742,7 +735,6 @@ impl AppState {
             briefing_dirty: AtomicBool::new(false),
             local_ai: local_slot::LocalRuntime::default(),
             calendar_edit: commands::CalendarEditState::default(),
-            voice_busy: AtomicBool::new(false),
         }
     }
 
@@ -897,8 +889,8 @@ impl AppState {
     /// or a passphrase vault whose key this profile cached, neither of which passes through
     /// [`Self::open_session`]) or later through `open_session` (unlock, adopt, repair, retry, a
     /// curtain take-over). One list for both, because launch used to repeat these steps by hand and
-    /// missed the two switches when they were added: every store opened at launch then kept Local
-    /// AI reading off, and voice undecided, for the whole session.
+    /// missed the Local AI switch when it was added: every store opened at launch then kept Local
+    /// AI reading off for the whole session.
     ///
     /// Best-effort throughout, and a no-op on a closed store: a hiccup here never blocks the open.
     /// Idempotent, so a shareable vault that launch opens through `open_session` and then settles
@@ -922,29 +914,6 @@ impl AppState {
         // The Local AI switch (D7), decided on this store's first open and then read: the loops
         // park on it and the executor's gate reads it, and neither can read the store itself.
         self.learn_local_ai_switch();
-        // The voice switch (D8), decided on this store's first open from whether the Whisper model
-        // was ever downloaded here, then read. Handing it to the sidecar is what lets an older PM's
-        // speech engine be removed (voice off) or kept as the component (voice on), in the
-        // background (`voice_switch::spawn_engine_reconciler`).
-        self.learn_voice_switch();
-    }
-
-    /// Hand the open store's voice switch to the sidecar, writing D8's default down first if the
-    /// store has none yet. Best-effort like `learn_local_ai_switch`. The model folder is looked at
-    /// before the DB guard is taken, and the guard closes before the sidecar is told.
-    fn learn_voice_switch(&self) {
-        let model_present = self.sidecar.whisper_model_present();
-        let on = self.conn().ok().and_then(|conn| {
-            voice_switch::stamp_default(&conn, model_present)
-                .or_else(|e| {
-                    eprintln!("voice: couldn't record the switch's default ({e})");
-                    voice_switch::read(&conn, model_present)
-                })
-                .ok()
-        });
-        if let Some(on) = on {
-            self.sidecar.set_voice_wanted(on);
-        }
     }
 
     /// Hand the open store's Local AI switch to the runtime, writing D7's default down first if the
@@ -1671,9 +1640,17 @@ pub fn run() {
             // and feeds the latch routing reads. Its own loop, so a release waiting on the slot's
             // lane can never stall it.
             local_ai::spawn_power_watcher(handle.clone());
-            // Settles an older PM's speech engine once a store has said what voice is (D8): removed
-            // where voice is off, kept as the component where it is on. Asleep otherwise.
-            voice_switch::spawn_engine_reconciler(handle.clone());
+            // Voice input is gone, so clear away what an older PM left for it: the speech engine in
+            // the venv, the Whisper model and any recording left in runtime/tmp
+            // (`SidecarManager::retire_voice`). Every launch after that finds nothing in a quick
+            // look on disk; while something is left, each launch tries again. The work is pip, so
+            // it runs on the blocking pool, and it waits for a provision that is already running.
+            {
+                let worker = handle.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    worker.state::<AppState>().sidecar.retire_voice();
+                });
+            }
 
             // Tell the provider surfaces the moment a local call starts, not only when it ends.
             //
@@ -1773,9 +1750,6 @@ pub fn run() {
             // The Local AI switch (D7).
             local_ai_switch::get_local_ai_switch,
             local_ai_switch::set_local_ai_enabled,
-            // The voice switch (D8).
-            voice_switch::get_voice_switch,
-            voice_switch::set_voice_enabled,
             settings::get_settings,
             settings::settings_defaults,
             settings::set_indexing_speed,
@@ -1858,7 +1832,6 @@ pub fn run() {
             commands::dev_apply_change_event,
             commands::list_documents,
             commands::get_document,
-            commands::transcribe_audio,
             commands::list_projects,
             commands::retag_scope,
             commands::retag_status,
@@ -2132,18 +2105,16 @@ mod tests {
     use super::*;
 
     /// A store launch opens (a device vault) never passes through `open_session`, and is settled by
-    /// `after_store_open` alone. That hook must teach the runtime both switches and write their
-    /// defaults down, or Local AI reads off for the whole session and voice stays undecided.
+    /// `after_store_open` alone. That hook must teach the runtime the Local AI switch and write its
+    /// default down, or Local AI reads off for the whole session.
     #[test]
-    fn a_store_opened_at_launch_learns_both_switches() {
+    fn a_store_opened_at_launch_learns_the_local_ai_switch() {
         let dir = tempfile::tempdir().unwrap();
         let sidecar = SidecarManager::new(SidecarPaths {
             source_dir: dir.path().join("sidecar"),
             venv_dir: dir.path().join("runtime").join("venv"),
         });
-        // An existing Local AI user (a saved server) who dictated before voice was a switch.
-        let models = dir.path().join("runtime").join("models");
-        std::fs::create_dir_all(models.join(sidecar::WHISPER_REPO_DIR).join("snapshots")).unwrap();
+        // An existing Local AI user (a saved server).
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
             "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)",
@@ -2157,14 +2128,11 @@ mod tests {
         )
         .unwrap();
         let state = AppState::new(Some(conn), None, sidecar, None, None);
-        let voice = state.sidecar.subscribe_voice_wanted();
         assert!(!state.local_ai.local_ai_on(), "off until a store says on");
-        assert_eq!(*voice.borrow(), None);
 
         state.after_store_open();
 
         assert!(state.local_ai.local_ai_on());
-        assert_eq!(*voice.borrow(), Some(true));
         let conn = state.conn().unwrap();
         assert_eq!(
             db::get_setting(&conn, local_ai_switch::LOCAL_AI_ENABLED_KEY)
@@ -2172,13 +2140,6 @@ mod tests {
                 .as_deref(),
             Some("true"),
             "D7's default is written down"
-        );
-        assert_eq!(
-            db::get_setting(&conn, voice_switch::VOICE_ENABLED_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("true"),
-            "and D8's, so removing the speech model later can't switch voice off"
         );
     }
 

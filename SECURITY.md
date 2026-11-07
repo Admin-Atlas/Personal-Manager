@@ -104,7 +104,7 @@ What to expect:
 **In scope:**
 
 - The **PM desktop app** (Tauri/Rust backend + the web frontend).
-- The **Python sidecar** (document conversion, embeddings, on-device transcription).
+- The **Python sidecar** (document conversion, embeddings, on-device photo OCR).
 - The **build / release / signing pipeline** (CI, the signed update feed, the updater).
 
 **Out of scope:**

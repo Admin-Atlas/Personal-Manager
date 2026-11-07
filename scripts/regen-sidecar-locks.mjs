@@ -20,11 +20,12 @@
 //
 // `PM_LOCK_KEEP=1 just lock-regen` resolves with the committed locks as PREFERENCES (uv keeps a
 // version an `--output-file` already holds unless an input forces it to move), for a change that
-// moves packages between locks rather than upgrading them. Without it every regen also takes
-// whatever upstream released since the last one, which is right for a Dependabot batch and wrong
-// for a change like voice leaving the base install: that one regen would have upgraded some thirty
-// unrelated packages, majors among them, for every user. A new lock prefers what the base lock held,
-// so a package that moves out of the base keeps its version and an installed copy stays valid.
+// moves packages between locks, or drops a component, rather than upgrading them. Without it every
+// regen also takes whatever upstream released since the last one, which is right for a Dependabot
+// batch and wrong for a move: taking the old speech engine out of the base install that way would
+// have upgraded some thirty unrelated packages, majors among them, for every user. A new lock
+// prefers what the base lock held, so a package that moves out of the base keeps its version and
+// an installed copy stays valid.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -59,13 +60,11 @@ export function pythonFloor(rustSource) {
 export function optionalPins(rustSource) {
   const tsne = rustSource.match(/const OPTIONAL_TSNE_PIN:\s*&str\s*=\s*"([^"]+)"/);
   const ocr = rustSource.match(/const OPTIONAL_OCR_PINS:\s*&\[&str\]\s*=\s*&\[([^\]]+)\]/);
-  const voice = rustSource.match(/const OPTIONAL_VOICE_PINS:\s*&\[&str\]\s*=\s*&\[([^\]]+)\]/);
-  if (!tsne || !ocr || !voice) throw new Error(`could not find the optional pins in ${SIDECAR_RS}`);
+  if (!tsne || !ocr) throw new Error(`could not find the optional pins in ${SIDECAR_RS}`);
   const list = (m) => [...m[1].matchAll(/"([^"]+)"/g)].map((p) => p[1]);
   return {
     tsne: [tsne[1]],
     ocr: list(ocr),
-    voice: list(voice),
   };
 }
 
@@ -142,7 +141,7 @@ function main() {
   const pins = optionalPins(rust);
   const baseInputHash = sha256(read(BASE_INPUT));
   const overrideHash = sha256(read(BASE_OVERRIDE));
-  const optionalLocks = ["ocr", "tsne", "voice"].map((n) => `sidecar/requirements-${n}.lock`);
+  const optionalLocks = ["ocr", "tsne"].map((n) => `sidecar/requirements-${n}.lock`);
   // Read before anything is rewritten: the base lock is about to change under the optional ones.
   const keep = process.env.PM_LOCK_KEEP === "1";
   const committed = Object.fromEntries(
@@ -175,7 +174,6 @@ function main() {
   for (const [name, list] of [
     ["ocr", pins.ocr],
     ["tsne", pins.tsne],
-    ["voice", pins.voice],
   ]) {
     const out = `sidecar/requirements-${name}.lock`;
     const body = compile({

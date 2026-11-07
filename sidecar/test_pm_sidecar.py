@@ -285,7 +285,7 @@ class AnalyzeImageTest(unittest.TestCase):
         """A GPS rational with a zero denominator makes float() produce nan/inf. A non-finite float
         serializes as bare `NaN`/`Infinity` — not valid JSON — so the Rust reader skips the reply
         line and blocks on an answer that never comes, wedging the WHOLE serialized sidecar (ingest,
-        retrieval, rerank, transcribe, map) until the per-method timeout expires. One photo. No
+        retrieval, rerank, map) until the per-method timeout expires. One photo. No
         location is the honest answer."""
         self.assertIsNone(S._gps_to_decimal((float("nan"), 0, 0), "N"))
         self.assertIsNone(S._gps_to_decimal((float("inf"), 0, 0), "N"))
@@ -1768,168 +1768,6 @@ class ConvertCharsetRetryTest(unittest.TestCase):
         self.assertEqual([s.charset if s else None for s in seen], [None, "utf-8"])
 
 
-class TranscribeThreadBudgetTest(unittest.TestCase):
-    """Transcription must not silently inherit a number chosen by measuring embedding.
-
-    faster-whisper's `cpu_threads` defaults to 0, which its docstring defines as "a non zero value
-    overrides the OMP_NUM_THREADS environment variable" — zero means OMP wins. This module sets
-    OMP_NUM_THREADS for the embedding pools, so leaving `cpu_threads` unset handed transcription the
-    embedding budget: on 4 cores that was 4 threads -> 2, half speed, with nothing to connect it to.
-    """
-
-    def _budget(self, cores, env=None):
-        with mock.patch.dict(os.environ, env or {}, clear=False):
-            for k in ("PM_SIDECAR_TRANSCRIBE_THREADS",):
-                if not (env or {}).get(k):
-                    os.environ.pop(k, None)
-            with mock.patch.object(S.os, "cpu_count", lambda: cores):
-                return S._transcribe_thread_budget()
-
-    def test_no_machine_transcribes_slower_than_ctranslate2_would_alone(self):
-        # 4 is faster-whisper's own default. Below 8 cores the general budget would say 2 or 3.
-        for cores in (1, 2, 4, 6, 8):
-            self.assertEqual(self._budget(cores), 4, f"{cores} cores")
-
-    def test_it_still_scales_up_with_the_machine(self):
-        for cores, want in ((10, 5), (12, 6), (16, 8), (24, 8), (128, 8)):
-            self.assertEqual(self._budget(cores), want, f"{cores} cores")
-        self.assertEqual(self._budget(None), 4, "unknown core count takes the floor")
-
-    def test_the_two_budgets_diverge_exactly_where_the_bug_was(self):
-        # They agree from 8 cores up; the divergence below that IS the fix, so a refactor that
-        # collapsed them into one function would pass every other test in this class.
-        with mock.patch.object(S.os, "cpu_count", lambda: 4):
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("PM_SIDECAR_THREADS", None)
-                os.environ.pop("PM_SIDECAR_TRANSCRIBE_THREADS", None)
-                self.assertEqual(S._thread_budget(), 2)
-                self.assertEqual(S._transcribe_thread_budget(), 4)
-
-    def test_rust_outranks_the_local_guess_and_junk_falls_back(self):
-        self.assertEqual(self._budget(24, {"PM_SIDECAR_TRANSCRIBE_THREADS": "3"}), 3)
-        self.assertEqual(self._budget(4, {"PM_SIDECAR_TRANSCRIBE_THREADS": "banana"}), 4)
-
-    def test_the_model_is_actually_told_the_number(self):
-        # The budget existing is worth nothing if the kwarg is not passed: an unset `cpu_threads`
-        # is 0, and 0 is exactly the "let OMP_NUM_THREADS decide" case this class exists to close.
-        captured = {}
-
-        class _Model:
-            def __init__(self, name, **kw):
-                captured.update(kw)
-
-        pkg = types.ModuleType("faster_whisper")
-        pkg.WhisperModel = _Model
-        with mock.patch.dict(sys.modules, {"faster_whisper": pkg}):
-            S._whisper = None
-            try:
-                S.get_whisper(None)
-            finally:
-                S._whisper = None
-        self.assertEqual(captured.get("cpu_threads"), S._TRANSCRIBE_THREADS)
-        self.assertGreaterEqual(captured["cpu_threads"], 4)
-
-
-class VoiceEngineIsOptionalTest(unittest.TestCase):
-    """Voice input's speech engine (faster-whisper, CTranslate2, PyAV) is an optional component:
-    absent from every venv where voice is off. So nothing but the transcribe path may load it, and
-    a transcription that reaches a venv without it must say what is missing."""
-
-    ENGINE = ("faster_whisper", "ctranslate2", "av")
-
-    def test_importing_the_sidecar_never_reaches_for_the_engine(self):
-        # A finder at the FRONT of the path records every attempt, so a top-level
-        # `try: import faster_whisper` fails this as surely as a hard import would. Run in a
-        # subprocess: this test process may already have imported anything.
-        code = (
-            "import sys\n"
-            "asked = []\n"
-            "class Watch:\n"
-            "    def find_spec(self, name, path=None, target=None):\n"
-            f"        if name.split('.')[0] in {self.ENGINE!r}:\n"
-            "            asked.append(name)\n"
-            "            raise ImportError(name)\n"
-            "        return None\n"
-            "sys.meta_path.insert(0, Watch())\n"
-            "import pm_sidecar\n"
-            "print('asked=' + ','.join(asked))\n"
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "asked=", proc.stderr)
-
-    def test_a_transcription_without_the_engine_says_what_is_missing(self):
-        # `None` in sys.modules makes the import raise, as on a venv without the engine. Offline on
-        # purpose: the worker turns a failed MODEL load into ModelNotCached (which sends Rust to the
-        # network fetcher for nothing), and a missing engine must not be mistaken for one.
-        with mock.patch.dict(sys.modules, {"faster_whisper": None}):
-            with mock.patch.object(S, "_OFFLINE", True):
-                S._whisper = None
-                try:
-                    with self.assertRaises(RuntimeError) as caught:
-                        S.do_transcribe({"path": "clip.webm", "model_dir": None})
-                finally:
-                    S._whisper = None
-        self.assertNotIsInstance(caught.exception, S.ModelNotCached)
-        self.assertIn("speech engine isn't installed", str(caught.exception))
-
-    def _transcribe_with_import_failing(self, error):
-        """Transcribe offline with `import faster_whisper` raising `error`, as a venv where the
-        engine is present but broken would. Returns what the transcription raised."""
-
-        class Broken:
-            def find_spec(self, name, path=None, target=None):
-                if name.split(".")[0] == "faster_whisper":
-                    raise error
-                return None
-
-        finder = Broken()
-        with mock.patch.dict(sys.modules):
-            sys.modules.pop("faster_whisper", None)
-            sys.meta_path.insert(0, finder)
-            try:
-                with mock.patch.object(S, "_OFFLINE", True):
-                    S._whisper = None
-                    with self.assertRaises(RuntimeError) as caught:
-                        S.do_transcribe({"path": "clip.webm", "model_dir": None})
-            finally:
-                S._whisper = None
-                sys.meta_path.remove(finder)
-        return caught.exception
-
-    def test_an_engine_that_fails_to_load_keeps_its_own_words(self):
-        # A native library that won't load, on a venv where voice is on: "turn voice input on"
-        # would be wrong advice, and the loader's message is the only clue to the cause.
-        raised = self._transcribe_with_import_failing(
-            ImportError("libctranslate2.so.4: cannot open shared object file")
-        )
-        self.assertNotIsInstance(raised, S.ModelNotCached)
-        self.assertIn("libctranslate2.so.4", str(raised))
-        self.assertNotIn("isn't installed", str(raised))
-
-    def test_a_missing_package_the_engine_needs_is_named(self):
-        # Not one of the engine's own packages, so not "the engine isn't installed" either.
-        raised = self._transcribe_with_import_failing(
-            ModuleNotFoundError("No module named 'tokenizers'", name="tokenizers")
-        )
-        self.assertIn("tokenizers", str(raised))
-        self.assertNotIn("isn't installed", str(raised))
-
-    def test_each_engine_package_missing_reads_as_not_installed(self):
-        for module in S._VOICE_ENGINE_MODULES:
-            with self.subTest(module=module):
-                raised = self._transcribe_with_import_failing(
-                    ModuleNotFoundError(f"No module named '{module}'", name=module)
-                )
-                self.assertIn("speech engine isn't installed", str(raised))
-
-
 CORE_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties
     xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
@@ -2165,7 +2003,7 @@ class ResourcePostureTest(unittest.TestCase):
     def test_trimming_is_reserved_for_the_heavy_handlers(self):
         # Every handler that runs a model or holds a whole file is worth a trim; `ping` is not —
         # walking the arenas after a health check would just be latency on the hot path.
-        for method in ("embed", "rerank", "transcribe", "convert", "analyze_image"):
+        for method in ("embed", "rerank", "convert", "analyze_image"):
             self.assertIn(method, S._TRIM_AFTER)
         for method in ("ping", "count_tokens", "file_properties"):
             self.assertNotIn(method, S._TRIM_AFTER)

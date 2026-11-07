@@ -1,6 +1,6 @@
 [package]
 name = "pm"
-version = "3.173.1-alpha"
+version = "3.174.0-alpha"
 description = "PM — a local-first personal manager (Archivist + Personal Assistant)"
 authors = ["Bobby Yu"]
 edition = "2021"
@@ -62,7 +62,7 @@ sha2 = "0.11"
 # Best-effort wipe of raw key material (the DB key) from memory after use. The OS
 # keychain stays the real secret boundary; this just shrinks the in-memory window.
 zeroize = "1"
-# Random-named, RAII-deleted temp files (the voice clip; the export DB snapshot).
+# Random-named, RAII-deleted temp files (the export DB snapshot).
 tempfile = "3"
 # Bundle the data folder (store snapshot + Markdown vault) into one .zip for the
 # "Export all data" button. default-features off keeps it to deflate (no bzip2/zstd/aes).

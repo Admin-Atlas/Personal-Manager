@@ -149,7 +149,7 @@ deny:
 # fastembed 0.9.1) is a lock pip's resolver refuses. Like the install it replaces, it reads the lines whose markers
 # match the auditing interpreter (3.12 in CI).
 pip-audit:
-    pip-audit --disable-pip -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock -r sidecar/requirements-voice.lock
+    pip-audit --disable-pip -r sidecar/requirements.lock -r sidecar/requirements-ocr.lock -r sidecar/requirements-tsne.lock
 
 # JS dependency CVE audit against the npm lockfile. `moderate` (not `high`) so a moderate-rated
 # sanitizer / proto-pollution advisory in the render path can't pass green (L-7).

@@ -88,7 +88,7 @@ const PBS_TAG = "20260610";
 // on `_tkinter`'s `libtcl9.0.so` dependency (it resolves through the module's
 // $ORIGIN rpath, which linuxdeploy doesn't follow), killing the AppImage
 // bundle; (2) lean — the sidecar is headless (markitdown / fastembed /
-// faster-whisper), nothing imports tkinter, and the family is ~25 MB of dead
+// rapidocr), nothing imports tkinter, and the family is ~25 MB of dead
 // weight. `pruneRev` is folded into the stamp so editing the prune list forces
 // a re-extract on machines holding an older tree.
 const PLATFORMS = {

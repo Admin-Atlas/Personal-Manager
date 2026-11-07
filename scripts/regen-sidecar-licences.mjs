@@ -7,8 +7,8 @@
 // `just sidecar-licences` is the offline gate that fails if you forget.
 //
 // IT DOES NOT DECIDE THE LICENCE. That is the whole design. PyPI's licence metadata is not
-// trustworthy enough to normalise automatically, and this is not a hypothetical — across the 80
-// packages in the three locks:
+// trustworthy enough to normalise automatically, and this is not a hypothetical — across the
+// seventy-odd packages in the locks:
 //
 //   • pi-heif declares `BSD-3-Clause` and simultaneously classifies itself LGPLv3 (pillow-heif,
 //     which it replaced, did the same with GPLv2)

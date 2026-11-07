@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.174.0-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "Voice input is gone for now: the microphone in chat, the voice switch in Settings → Storage and the speech engine behind them. A better design for speaking to PM, and for PM speaking back, is planned and will replace it. If the speech engine is on your computer, whether voice was on or switched off with the engine kept, PM removes it, and its speech model if it was downloaded, by itself the first time it starts after this update, which frees up to about 400 MB. Nothing you typed or saved is affected: PM never kept recordings or transcripts.",
+    ],
+  },
+  {
     version: "3.173.1-alpha",
     date: "2026-11-06",
     highlights: [

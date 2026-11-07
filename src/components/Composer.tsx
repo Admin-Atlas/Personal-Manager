@@ -10,18 +10,11 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useRecorder, type RecorderState } from "../lib/useRecorder";
 import { listTags } from "../lib/ipc";
 import { completeMention, matchTags, mentionAtCaret } from "../lib/mentions";
 import type { TagSummary } from "../lib/types";
-import { useVoiceSwitch, voiceShown } from "../lib/voiceSwitch";
 import { MentionSuggest } from "./MentionSuggest";
 import { Button, Textarea } from "./ui";
-
-// The mic·input·send cluster is capped to exactly the conversation column width (ChatView's
-// max-w-3xl = 48rem) and centered by the 1fr gutters, so it sits directly under the message
-// column; the Context/Explain tools live in those gutters, hugging the cluster from outside.
-const COMPOSER_GRID = "grid grid-cols-[1fr_minmax(0,48rem)_1fr] gap-2";
 
 interface Props {
   disabled: boolean;
@@ -36,7 +29,7 @@ interface Props {
   busy?: boolean;
   onSend: (text: string) => void;
   /** Compact chat tool anchored at the FAR LEFT of the row (the context meter) — it and the
-   *  matching {@link rightTools} bracket the mic·input·send cluster so the input stays visually
+   *  matching {@link rightTools} bracket the input·send cluster so the input stays visually
    *  centered. Renders its own popover; absent tools simply render nothing. */
   leftTools?: ReactNode;
   /** Compact chat tool anchored at the FAR RIGHT of the row (retrieval-explain). See {@link leftTools}. */
@@ -124,17 +117,6 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
     });
   }
 
-  // Voice input (spec §4 P1): a dictated clip is transcribed on-device and
-  // appended to the box for the user to review/edit — never auto-sent. It is a
-  // switch (Mods spec D8): while it is off, or not known yet, there is no mic and
-  // no recorder at all, and the backend refuses a transcription anyway.
-  const voiceOn = voiceShown(useVoiceSwitch());
-  const [voice, setVoice] = useState<VoiceStatus>(VOICE_IDLE);
-  const onTranscript = useCallback((spoken: string) => {
-    setText((current) => (current.trim() ? `${current.trim()} ${spoken}` : spoken));
-    textareaRef.current?.focus();
-  }, []);
-
   // Grow the textarea to fit its content, capped at `cap`px; past that it scrolls inside. Reset to
   // auto first so it can also shrink as the draft gets shorter (and back to one row on send).
   const autosize = useCallback((cap: number) => {
@@ -175,19 +157,21 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
     setMentionQuery(null);
   }
 
-  const recording = voiceOn && voice.state === "recording";
-  const transcribing = voiceOn && voice.state === "transcribing";
-  const voiceError = voiceOn ? voice.error : null;
-
   return (
     <div ref={rootRef} className="border-t border-border p-4">
-      <div className={`${COMPOSER_GRID} items-end`} data-help="chat-composer">
+      {/* The input·send cluster is capped to exactly the conversation column width (ChatView's
+          max-w-3xl = 48rem) and centered by the 1fr gutters, so it sits directly under the message
+          column; the Context/Explain tools live in those gutters, hugging the cluster from outside. */}
+      <div
+        className="grid grid-cols-[1fr_minmax(0,48rem)_1fr] items-end gap-2"
+        data-help="chat-composer"
+      >
         {/* Left gutter — Context meter hangs just outside the conversation width, hugging the cluster.
             min-w-0 lets both gutters take an equal fr share (a tool overflows outward rather than
             flooring its track wider than the empty side), so the cluster stays centered under the column. */}
         <div className="flex min-w-0 items-center justify-end">{leftTools}</div>
 
-        {/* Center — mic·input·send, exactly the conversation column width and centered under it.
+        {/* Center — input·send, exactly the conversation column width and centered under it.
             `relative` anchors the `@` suggestion panel to this cluster. */}
         <div className="relative flex items-end gap-2">
           <MentionSuggest
@@ -198,8 +182,6 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
             onPick={pick}
             onHover={setActive}
           />
-          {voiceOn && <VoiceMic onTranscript={onTranscript} onStatus={setVoice} />}
-
           <Textarea
             ref={textareaRef}
             value={text}
@@ -273,127 +255,6 @@ export function Composer({ disabled, busy, onSend, leftTools, rightTools }: Prop
         {/* Right gutter — Explain tool, hugging the cluster's right edge (see left gutter re min-w-0). */}
         <div className="flex min-w-0 items-center justify-start">{rightTools}</div>
       </div>
-
-      {(recording || transcribing || voiceError) && (
-        <div className={`mt-2 ${COMPOSER_GRID}`}>
-          <div />
-          <div role="status" aria-live="polite">
-            {recording && (
-              <p className="text-xs" style={{ color: "var(--st-due)" }}>
-                Recording… click the mic to stop.
-              </p>
-            )}
-            {transcribing && (
-              <p className="text-xs text-ink4">
-                Transcribing on your device… the first time also downloads the voice model.
-              </p>
-            )}
-            {voiceError && (
-              <p className="text-xs" style={{ color: "var(--st-due)" }}>
-                {voiceError}
-              </p>
-            )}
-          </div>
-          <div />
-        </div>
-      )}
     </div>
-  );
-}
-
-/** What the composer's status line shows about the mic. */
-interface VoiceStatus {
-  state: RecorderState;
-  error: string | null;
-}
-
-const VOICE_IDLE: VoiceStatus = { state: "idle", error: null };
-
-/**
- * The mic button. Its own component so the recorder exists only while voice is on: switching voice
- * off unmounts it, which stops a recording and releases the microphone (`useRecorder`'s cleanup),
- * and its status goes back to idle so no stale line is left under the box.
- */
-function VoiceMic({
-  onTranscript,
-  onStatus,
-}: {
-  onTranscript: (text: string) => void;
-  onStatus: (status: VoiceStatus) => void;
-}) {
-  const recorder = useRecorder(onTranscript);
-  const { state, error } = recorder;
-  useEffect(() => {
-    onStatus({ state, error });
-  }, [state, error, onStatus]);
-  useEffect(() => () => onStatus(VOICE_IDLE), [onStatus]);
-
-  function toggleMic() {
-    if (recorder.state === "recording") recorder.stop();
-    else if (recorder.state === "idle") void recorder.start();
-  }
-
-  const recording = state === "recording";
-  const transcribing = state === "transcribing";
-  const micTitle = recording
-    ? "Stop and transcribe"
-    : transcribing
-      ? "Transcribing…"
-      : "Record voice (transcribed on your device)";
-
-  return (
-    <button
-      type="button"
-      onClick={toggleMic}
-      disabled={transcribing}
-      title={micTitle}
-      aria-label={micTitle}
-      data-help="composer-mic"
-      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[var(--radius-sm)] border text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-        recording ? "animate-pulse" : "border-border2 text-ink3 hover:text-ink2"
-      }`}
-      style={
-        recording
-          ? {
-              color: "var(--st-due)",
-              background: "color-mix(in oklab, var(--st-due) 15%, transparent)",
-            }
-          : undefined
-      }
-    >
-      {transcribing ? <SpinnerIcon /> : recording ? <StopIcon /> : <MicIcon />}
-    </button>
-  );
-}
-
-function MicIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2}>
-      <rect x="9" y="3" width="6" height="11" rx="3" />
-      <path d="M5 11a7 7 0 0 0 14 0" strokeLinecap="round" />
-      <line x1="12" y1="18" x2="12" y2="21" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function StopIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor">
-      <rect x="6" y="6" width="12" height="12" rx="2" />
-    </svg>
-  );
-}
-
-function SpinnerIcon() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      className="h-5 w-5 animate-spin"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-    >
-      <path d="M12 3a9 9 0 1 0 9 9" strokeLinecap="round" />
-    </svg>
   );
 }

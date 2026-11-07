@@ -216,7 +216,7 @@ const MAX_SKIP_LINES: usize = 1024;
 /// `MAX_LINE_CHARS` (64 MiB, mirrored in `pm_sidecar.py`). The child *silently drops* a line
 /// over that cap — no reply — which would leave [`SidecarManager::request`] blocked forever on
 /// a reply that never comes, wedging the whole (serialized) sidecar: ingest, chat retrieval,
-/// rerank, transcribe and the map all queue behind the dead call until restart (F-06 / B3-1).
+/// rerank and the map all queue behind the dead call until restart (F-06 / B3-1).
 /// Refusing to *send* an oversized line turns that permanent wedge into a clean per-call error.
 /// Byte length here is conservative against the child's *character* cap (UTF-8 bytes ≥ chars),
 /// and the 16 MiB headroom to 64 MiB absorbs JSON quoting/escaping of the payload. The gateway
@@ -249,55 +249,306 @@ const OPTIONAL_TSNE_PIN: &str = "openTSNE==1.0.4";
 /// wheel a third of the size.
 const OPTIONAL_OCR_PINS: &[&str] = &["rapidocr==3.10.0", "pi-heif==1.4.0"];
 
-/// The OPTIONAL voice-input engine (Mods spec D8), pinned. **Not** in `requirements.txt` since voice
-/// became a switch: it sat in the base venv for every user, about 240 MB of CTranslate2 and FFmpeg
-/// that nobody who never dictates needs. Switching voice on installs it
-/// ([`SidecarManager::install_optional_voice`]); switching it off offers to remove it. faster-whisper
-/// runs Whisper on CTranslate2 and decodes audio with the FFmpeg inside the PyAV wheel, so no system
-/// ffmpeg is needed, and it shares onnxruntime, tokenizers, huggingface-hub and numpy with fastembed
-/// (the lock is resolved against the base lock, so those stay on the base venv's versions).
+/// The speech engine voice input used to install, as pip names its packages, in the order the
+/// clean-up asks pip to remove them. Voice input is gone, and pip never removes a package because a
+/// lock stopped listing it, so every venv that ever had the engine (about 240 MB, nearly all of it
+/// CTranslate2 and the FFmpeg inside PyAV) keeps it until [`SidecarManager::retire_voice`] removes
+/// it. None of the four is in the base lock or another component's lock
+/// (`no_lock_installs_a_package_the_voice_clean_up_removes` reads them all), so removing them
+/// can't take anything the document engine or an optional component runs on.
 ///
-/// **`av` is pinned too, exactly.** It was the `av<19` tripwire in requirements.txt: faster-whisper
-/// 1.2.1 calls `av.open(..., metadata_errors="ignore")`, PyAV 19 removed that parameter, and
-/// faster-whisper itself asks only for `av>=11`, so without a bound the next `just lock-regen`
-/// resolves PyAV 19 and every transcription raises TypeError with nothing offline to notice. An
-/// optional component's pins are exact (`just requirements-lock` reads them as `name==version`), so
-/// the bound became the version the lock already held. Revisit it once a faster-whisper release
-/// includes SYSTRAN/faster-whisper#1495 (merged, unreleased at 1.2.1).
-const OPTIONAL_VOICE_PINS: &[&str] = &["faster-whisper==1.2.1", "av==18.1.0"];
-
-/// The Whisper model's own folder under `runtime/models`. The worker loads
-/// `WhisperModel(WHISPER_MODEL, download_root=<runtime/models>)` (`pm_sidecar.py`, `get_whisper`), and
-/// faster-whisper hands that root to huggingface_hub as its `cache_dir`, which lays the repo out as
-/// `models--<org>--<name>`. The same root also holds the embedder and reranker (`fastembed/`), the hf
-/// and xet caches (`hf/`) and the photo-OCR weights (`rapidocr/`), so nothing that means "the speech
-/// model" may measure or remove more than this folder (and its lock folder, [`whisper_paths`]).
+/// setuptools is here because CTranslate2 depends on it, but finding it proves nothing: a venv
+/// built on Python 3.11 has its own setuptools from `venv`, voice or not. So it is uninstalled only
+/// beside an engine pip can remove, one of the other three with a dist-info and its RECORD in the
+/// site-packages of the venv's own interpreter ([`pip_can_uninstall_voice_engine`]), and it is
+/// never removed by hand ([`VOICE_ENGINE_DIRS`]).
 ///
-/// It is also D8's evidence that someone used voice before it became a switch: the folder appears
-/// only after a first transcription. `runtime/models` being non-empty proves nothing, because the
-/// embedder lives there too.
-pub(crate) const WHISPER_REPO_DIR: &str = "models--Systran--faster-whisper-base.en";
+/// pip is asked for one package at a time: one `pip uninstall` naming several gives up on all of
+/// them at the first it can't remove (a dist-info with no RECORD, or a native library something
+/// still holds open on Windows). faster-whisper goes last, after the two heavy libraries it runs
+/// on, so a clean-up cut short (PM closed mid-way) never leaves them behind the package that is
+/// the plainest sign of an engine.
+const VOICE_ENGINE_PACKAGES: &[&str] = &["av", "ctranslate2", "setuptools", "faster-whisper"];
 
-/// Every path the Whisper download leaves under `models`: the repo folder and huggingface_hub's lock
-/// folder for it.
-pub(crate) fn whisper_paths(models: &Path) -> [PathBuf; 2] {
-    [
-        models.join(WHISPER_REPO_DIR),
-        models.join(".locks").join(WHISPER_REPO_DIR),
-    ]
+/// The engine's own three packages by their import names, which also name their other entries in
+/// site-packages ([`is_voice_engine_entry`]). setuptools is deliberately not one of them (see
+/// [`VOICE_ENGINE_PACKAGES`]), so it neither counts as an engine nor is ever removed by hand.
+const VOICE_ENGINE_DIRS: &[&str] = &["faster_whisper", "ctranslate2", "av"];
+
+/// Whether a site-packages entry belongs to one of the engine's own packages: exactly `<name>` (the
+/// import dir), `<name>.libs` (the native libraries a Linux or Windows wheel bundles beside it) or
+/// `<name>-<version>.dist-info`, for a name in [`VOICE_ENGINE_DIRS`]. Exact, so PyAV's `av-` never
+/// matches `avro-1.12.0.dist-info`. The look on disk and the removal by hand both ask this, so the
+/// clean-up can never find something it would not then remove.
+fn is_voice_engine_entry(name: &str) -> bool {
+    is_voice_engine_dist_info(name)
+        || VOICE_ENGINE_DIRS.iter().any(|d| {
+            name.strip_prefix(d)
+                .is_some_and(|rest| rest.is_empty() || rest == ".libs")
+        })
 }
 
-/// Remove the Whisper model's folders and nothing else under `models`.
-pub(crate) fn remove_whisper(models: &Path) -> std::io::Result<()> {
-    for p in whisper_paths(models) {
-        if p.exists() {
-            std::fs::remove_dir_all(&p)?;
+/// Whether a site-packages entry is the `<name>-<version>.dist-info` of one of the engine's own
+/// packages: the record pip finds an installed package by, and uninstalls it from.
+fn is_voice_engine_dist_info(name: &str) -> bool {
+    VOICE_ENGINE_DIRS.iter().any(|d| {
+        name.strip_prefix(d)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|rest| rest.ends_with(".dist-info"))
+    })
+}
+
+/// The characters pip puts after the `~` that starts a stash's name, in the order it tries them
+/// (`AdjacentTempDirectory.LEADING_CHARS` in pip's `utils/temp_dir.py`).
+const PIP_STASH_CHARS: &[u8] = b"-~.=%0123456789";
+
+/// Whether `run` is one pip draws from [`PIP_STASH_CHARS`]: any number of them, repeats allowed,
+/// never one after another that comes later in that order (`itertools.combinations_with_replacement`).
+fn is_pip_stash_run(run: &[u8]) -> bool {
+    let mut last = 0;
+    run.iter()
+        .all(|c| match PIP_STASH_CHARS.iter().position(|s| s == c) {
+            Some(at) if at >= last => {
+                last = at;
+                true
+            }
+            _ => false,
+        })
+}
+
+/// Whether pip could have named its stash of the folder `name` as `stash`. pip removes a package
+/// by first moving each of its folders aside, to the first of these names not already taken
+/// (`AdjacentTempDirectory._generate_names`), and deletes those once the removal is done: `~` and a
+/// run of i - 1 stash characters in place of the name's first i characters, for i from 1 to one
+/// short of the whole name (so `av` becomes `~v`, and `ctranslate2` `~translate2`, then
+/// `~-ranslate2`), then `~` and a run of at most 14 before the whole name (`~av`, `~-av`).
+fn is_pip_stash_name(stash: &str, name: &str) -> bool {
+    let Some(rest) = stash.as_bytes().strip_prefix(b"~") else {
+        return false;
+    };
+    let name = name.as_bytes();
+    let before_whole = rest
+        .strip_suffix(name)
+        .is_some_and(|run| run.len() < PIP_STASH_CHARS.len() && is_pip_stash_run(run));
+    let in_place = rest.len() + 1 == name.len()
+        && (1..name.len()).any(|i| rest[i - 1..] == name[i..] && is_pip_stash_run(&rest[..i - 1]));
+    before_whole || in_place
+}
+
+/// Whether a site-packages entry is pip's stash ([`is_pip_stash_name`]) of one of the engine's
+/// entries: an import dir, a `.libs`, or a dist-info. A removal cut short, or a delete Windows
+/// refused, leaves stashes behind. A dist-info's version can be anything, so for one only the
+/// names that keep its `-<version>.dist-info` count; past the hyphen it could be any package's.
+/// A stash is no installed package, so it never has pip run (and another package's can share the
+/// name), but it is a leftover the quick look counts, so one stranded after the engine's last live
+/// entry still goes by hand.
+fn is_voice_engine_stash(name: &str) -> bool {
+    VOICE_ENGINE_DIRS.iter().any(|d| {
+        is_pip_stash_name(name, d)
+            || is_pip_stash_name(name, &format!("{d}.libs"))
+            || name
+                .strip_suffix(".dist-info")
+                .and_then(|stem| stem.rsplit_once('-'))
+                .is_some_and(|(head, version)| {
+                    !version.is_empty() && is_pip_stash_name(&format!("{head}-"), &format!("{d}-"))
+                })
+    })
+}
+
+/// Whether a site-packages entry is anything of the engine's the clean-up removes by hand: one of
+/// its entries, or pip's stash of one. The quick look and the removal both ask this, so the
+/// clean-up can never find something it would not then remove.
+fn is_voice_engine_leftover(name: &str) -> bool {
+    is_voice_engine_entry(name) || is_voice_engine_stash(name)
+}
+
+/// Whether `path` is a real folder: not a file, and not a link or a Windows junction, which could
+/// lead out of PM's data dir. `symlink_metadata` looks at the entry itself, never at its target.
+fn real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Every site-packages folder in the venv: `Lib/site-packages` on Windows, and every
+/// `lib/python3.X/site-packages` elsewhere, not only the first. A venv rebuilt in place on another
+/// Python minor keeps its old `lib/python3.X` beside the new one, with whatever was installed into
+/// it, and pip on the new interpreter never looks there. Real folders only, all the way down, so
+/// nothing the clean-up removes is ever reached through a link.
+fn venv_site_dirs(venv: &Path) -> Vec<PathBuf> {
+    if !real_dir(venv) {
+        return Vec::new();
+    }
+    if cfg!(windows) {
+        let lib = venv.join("Lib");
+        let site = lib.join("site-packages");
+        return if real_dir(&lib) && real_dir(&site) {
+            vec![site]
+        } else {
+            Vec::new()
+        };
+    }
+    let lib = venv.join("lib");
+    if !real_dir(&lib) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&lib) else {
+        return Vec::new();
+    };
+    let mut sites: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("python"))
+        // `file_type` is the entry's own type, so a `python3.X` that is a link is passed over.
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path().join("site-packages"))
+        .filter(|site| real_dir(site))
+        .collect();
+    sites.sort();
+    sites
+}
+
+/// Whether the speech engine, or any part of it, is in the venv: an entry of one of its own three
+/// packages ([`is_voice_engine_entry`]) in any of its site-packages. Any one is enough: a removal
+/// that failed part-way can leave CTranslate2 or PyAV (nearly all of the ~240 MB) without
+/// faster-whisper.
+fn voice_engine_on_disk(venv: &Path) -> bool {
+    venv_site_has(venv, is_voice_engine_entry)
+}
+
+/// Whether any of the venv's site-packages ([`venv_site_dirs`]) holds an entry `wanted` names.
+fn venv_site_has(venv: &Path, wanted: impl Fn(&str) -> bool) -> bool {
+    venv_site_dirs(venv).iter().any(|site| {
+        std::fs::read_dir(site).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| wanted(&e.file_name().to_string_lossy()))
+        })
+    })
+}
+
+/// Whether pip can remove any of the engine from `site`: one of its three packages has a dist-info
+/// there with a RECORD, which is what pip uninstalls a package by. Without one, pip only reports
+/// each package not installed, or refuses it, and a leftover nothing can delete would cost a worker
+/// stop and four interpreter starts on every launch it outlives.
+fn pip_can_uninstall_voice_engine(site: &Path) -> bool {
+    std::fs::read_dir(site).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            is_voice_engine_dist_info(&e.file_name().to_string_lossy())
+                && e.file_type().is_ok_and(|t| t.is_dir())
+                && std::fs::symlink_metadata(e.path().join("RECORD")).is_ok_and(|m| m.is_file())
+        })
+    })
+}
+
+/// Remove by hand, in every site-packages, what pip left of the engine's own three packages, or was
+/// never asked to remove: their entries and pip's stashes of them ([`is_voice_engine_leftover`]).
+/// That is what pip can't take: an import dir with no dist-info (pip calls it not installed), a
+/// dist-info with no RECORD (pip refuses it), anything in a site-packages other than its own
+/// interpreter's, and a stash Windows wouldn't let pip delete. It leaves the few small launcher
+/// scripts pip would also have taken from the venv's `bin/` (nothing runs them), and setuptools
+/// always.
+fn remove_voice_engine_by_hand(venv: &Path) {
+    for site in venv_site_dirs(venv) {
+        let Ok(entries) = std::fs::read_dir(&site) else {
+            continue;
+        };
+        // Collected first, so nothing is removed from the folder while it is being read.
+        let leftovers: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| is_voice_engine_leftover(&e.file_name().to_string_lossy()))
+            .map(|e| e.path())
+            .collect();
+        for path in leftovers {
+            remove_voice_leftover(&path);
         }
     }
-    Ok(())
 }
 
-/// One on-demand pip component (t-SNE / photo-OCR / voice). The per-component ready/install/uninstall
+/// The Whisper model's own folder under `runtime/models`, where voice input downloaded it: the
+/// worker loaded `WhisperModel("base.en", download_root=<runtime/models>)`, and faster-whisper
+/// handed that root to huggingface_hub as its `cache_dir`, which lays the repo out as
+/// `models--<org>--<name>`. The same root also holds the embedder and reranker (`fastembed/`), the
+/// hf and xet caches (`hf/`) and the photo-OCR weights (`rapidocr/`), so the clean-up removes this
+/// folder and its lock folder ([`whisper_paths`]) and nothing else.
+const WHISPER_REPO_DIR: &str = "models--Systran--faster-whisper-base.en";
+
+/// Every path the Whisper download left under `models`: the repo folder and huggingface_hub's lock
+/// folder for it. Each only inside a real folder ([`real_dir`]): a `models` or `.locks` that is a
+/// link or a junction leads somewhere PM doesn't own, so nothing is looked for or removed there.
+fn whisper_paths(models: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if real_dir(models) {
+        paths.push(models.join(WHISPER_REPO_DIR));
+        let locks = models.join(".locks");
+        if real_dir(&locks) {
+            paths.push(locks.join(WHISPER_REPO_DIR));
+        }
+    }
+    paths
+}
+
+/// The recordings voice input left in `runtime/tmp`, named `voice-<random>.webm`. Each was deleted
+/// as soon as it was transcribed, so only a crash or a kill mid-transcription left one behind.
+/// None when `tmp` is not a real folder ([`real_dir`]).
+fn voice_clips(tmp: &Path) -> Vec<PathBuf> {
+    if !real_dir(tmp) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("voice-") && name.ends_with(".webm")
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Whether `path` is a real folder ([`real_dir`]) with nothing in it. An empty folder a link points
+/// to does not count: the clean-up never removes a link it finds there, so counting it would have
+/// every launch find it again.
+fn is_empty_dir(path: &Path) -> bool {
+    real_dir(path) && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// Whether an entry is a link to a folder that only `remove_dir` takes away: on Windows a directory
+/// symlink or a junction, which `remove_file` refuses. `remove_dir` removes the link itself and
+/// leaves its target alone. On other systems a link to a folder is removed like a file.
+#[cfg(windows)]
+fn is_dir_link(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    meta.file_type().is_symlink_dir()
+}
+
+#[cfg(not(windows))]
+fn is_dir_link(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Remove a file or a folder (a link itself, never what it points at) if it is there, and log a
+/// failure rather than return it: every step of the voice clean-up is best-effort, and whatever is
+/// left is tried again at the next launch.
+fn remove_voice_leftover(path: &Path) {
+    let removed = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => Err(e),
+        // A real folder: `remove_dir_all` deletes what is in it without following a link inside.
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(meta) if is_dir_link(&meta) => std::fs::remove_dir(path),
+        // A file, or a link (to a file, or on Linux and macOS to a folder): the entry alone goes.
+        Ok(_) => std::fs::remove_file(path),
+    };
+    if let Err(e) = removed {
+        eprintln!(
+            "sidecar: couldn't remove {} that voice input left ({e}); the next launch tries again",
+            path.display()
+        );
+    }
+}
+
+/// One on-demand pip component (t-SNE / photo-OCR). The per-component ready/install/uninstall
 /// operations differ only in these fields, so they share one implementation each
 /// (`optional_ready` / `install_optional` / `uninstall_optional` on [`SidecarManager`]); the
 /// public per-component methods are one-line delegates.
@@ -319,8 +570,7 @@ struct OptionalComponent {
     /// The packages `pip uninstall` removes, and never one anything else needs. For t-SNE and OCR
     /// that means the top-level ones only: their heavier transitive deps are LEFT in place so a
     /// removal can never break the base venv by pulling a package something else relies on (see the
-    /// public delegates' docs for each component's cascade). Voice removes every package only its own
-    /// lock brings, which a test checks against all four locks.
+    /// public delegates' docs for each component's cascade).
     uninstall: &'static [&'static str],
     /// Packages an older lock of this component installed that the current lock replaces with a
     /// differently-named distribution of the SAME files, uninstalled before the lock is installed.
@@ -355,33 +605,11 @@ const OPTIONAL_OCR_COMPONENT: OptionalComponent = OptionalComponent {
     superseded: &["opencv-python"],
 };
 
-const OPTIONAL_VOICE_COMPONENT: OptionalComponent = OptionalComponent {
-    marker: SidecarPaths::voice_marker,
-    lock: "requirements-voice.lock",
-    pins: OPTIONAL_VOICE_PINS,
-    // The whole tree only voice brings, not just the two pins, unlike the components above: none of
-    // these is in the base lock or another component's (`voice_removes_exactly_what_only_voice_needs`
-    // reads all four locks), so removing them can't take anything else's, and leaving CTranslate2 and
-    // PyAV behind would strand the ~240 MB that switching voice off promised to free. setuptools
-    // arrives only as CTranslate2's dependency.
-    //
-    // faster-whisper goes LAST. pip removes the packages one at a time and stops at the first that
-    // fails (a native library something else still holds open, on Windows), and faster-whisper's
-    // import dir is the plainest sign that an engine is here. Removed first, a failure on
-    // CTranslate2 would leave the two heavy libraries behind an engine that looked gone.
-    // `components::voice_engine_on_disk` looks for all three import dirs as well.
-    uninstall: &["av", "ctranslate2", "setuptools", "faster-whisper"],
-    superseded: &[],
-};
-
 /// Every optional component, so a caller that must treat them all alike can't miss one. `provision`
 /// is the reason this exists: a venv rebuild removes their markers along with the venv, and each new
 /// component would otherwise need remembering there too.
-const ALL_OPTIONAL_COMPONENTS: &[&OptionalComponent] = &[
-    &OPTIONAL_TSNE_COMPONENT,
-    &OPTIONAL_OCR_COMPONENT,
-    &OPTIONAL_VOICE_COMPONENT,
-];
+const ALL_OPTIONAL_COMPONENTS: &[&OptionalComponent] =
+    &[&OPTIONAL_TSNE_COMPONENT, &OPTIONAL_OCR_COMPONENT];
 
 /// Where the sidecar script and its requirements live, and where the venv goes.
 pub struct SidecarPaths {
@@ -451,25 +679,27 @@ impl SidecarPaths {
         self.venv_dir.join(".pm-ocr")
     }
 
-    /// Marker that the OPTIONAL voice engine is installed in this venv (separate from `.pm-ready`
-    /// like the two above). A venv that has faster-whisper but not this marker predates voice
-    /// becoming a switch: an older PM installed it with the base lock (see `legacy_voice_action`).
-    fn voice_marker(&self) -> PathBuf {
-        self.venv_dir.join(".pm-voice")
+    /// The two markers voice input kept in the venv: `.pm-voice` (its engine installed as an optional
+    /// component) and `.pm-voice-kept` (an engine an older PM installed, kept when voice was switched
+    /// off). Nothing reads them any more; [`SidecarManager::retire_voice`] removes them.
+    fn voice_markers(&self) -> [PathBuf; 2] {
+        [
+            self.venv_dir.join(".pm-voice"),
+            self.venv_dir.join(".pm-voice-kept"),
+        ]
     }
 
-    /// Set when someone switched voice off and chose to keep such an older engine (no `.pm-voice`).
-    /// The one-off clean-up then leaves it: "keep" was an answer, and the stored switch alone reads
-    /// the same as the upgrade's default off. Dropped whenever the engine is installed as the
-    /// component or removed, so it never speaks for an engine it wasn't about.
-    fn voice_kept_marker(&self) -> PathBuf {
-        self.venv_dir.join(".pm-voice-kept")
-    }
-
-    /// Where the speech model's weights are cached — a sibling of the venv under
-    /// `runtime/`, so they live inside PM's data dir and uninstall with it.
+    /// Where the downloaded models are cached (the embedder, the reranker, the photo-OCR weights and
+    /// the hf and xet caches) — a sibling of the venv under `runtime/`, so they live inside PM's data
+    /// dir and uninstall with it.
     fn models_dir(&self) -> Option<PathBuf> {
         self.venv_dir.parent().map(|p| p.join("models"))
+    }
+
+    /// `runtime/tmp`, where voice input wrote each recording while it was transcribed. Nothing else
+    /// used it, so the clean-up removes the folder once it is empty.
+    fn voice_tmp_dir(&self) -> Option<PathBuf> {
+        self.venv_dir.parent().map(|p| p.join("tmp"))
     }
 
     /// Where a standalone interpreter that must live OUTSIDE the install lands — a
@@ -751,7 +981,7 @@ impl std::fmt::Display for SbxError {
 
 /// Whether the untrusted-file worker is OS-confined, for the Developer-mode readout (issue #286). The
 /// worker spawns lazily, so this reflects the LAST spawn this session — `NotSpawned` until the first
-/// convert/embed/transcribe. Sandboxing fails OPEN by design, so `Unconfined` is a normal state, not an
+/// convert/embed. Sandboxing fails OPEN by design, so `Unconfined` is a normal state, not an
 /// error: it names (with a code) why setup fell back so a hardened-machine surprise is visible without
 /// the log. `Degraded` is the middle ground — some axes enforced, some not (e.g. Linux with no Landlock:
 /// network blocked but filesystem open) — surfaced honestly rather than mislabeled `Confined`.
@@ -943,11 +1173,6 @@ pub struct SidecarManager {
         )
     ))]
     sandbox_report: Mutex<SandboxReport>,
-    /// What the open store's voice switch says (Mods spec D8), for the one-off upgrade of a venv an
-    /// older PM built with the speech engine in its base install (`legacy_voice_action`). `None`
-    /// until a store has been opened: neither keeping nor removing that engine can be decided
-    /// before then. A watch channel because the engine reconciler (`voice_switch`) wakes on it.
-    voice_wanted: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 impl SidecarManager {
@@ -958,7 +1183,6 @@ impl SidecarManager {
             status: Mutex::new(SidecarStatus::NotInstalled),
             install: Mutex::new(()),
             req_seq: AtomicU64::new(0),
-            voice_wanted: tokio::sync::watch::Sender::new(None),
             #[cfg(any(
                 windows,
                 target_os = "macos",
@@ -1059,10 +1283,9 @@ impl SidecarManager {
     /// out of the mutex drops it, and its `Drop` kills the child, releasing every file it holds
     /// open. Waits for a request in flight, since each holds `proc` for its whole run.
     ///
-    /// Before pip removes packages too, not only before `runtime/` goes: a worker that has
-    /// transcribed or read a photo has CTranslate2's, PyAV's or OpenCV's native libraries loaded,
-    /// and Windows refuses to delete a DLL a running process has mapped, which would leave the
-    /// package half removed.
+    /// Before pip removes packages too, not only before `runtime/` goes: a worker that has read a
+    /// photo has OpenCV's native libraries loaded, and Windows refuses to delete a DLL a running
+    /// process has mapped, which would leave the package half removed.
     fn stop_worker(&self) {
         if let Ok(mut proc) = self.proc.lock() {
             proc.take(); // drop → Process::drop kills the child, freeing the interpreter's locks
@@ -1185,7 +1408,7 @@ impl SidecarManager {
             self.paths.ready_marker().exists(),
             detected,
         );
-        let mut reinstall: Vec<&OptionalComponent> = ALL_OPTIONAL_COMPONENTS
+        let reinstall: Vec<&OptionalComponent> = ALL_OPTIONAL_COMPONENTS
             .iter()
             .copied()
             .filter(|c| {
@@ -1193,23 +1416,9 @@ impl SidecarManager {
                     rebuild,
                     (c.marker)(&self.paths).exists(),
                     self.optional_ready(c),
-                    // An engine kept when voice was switched off is not fetched again for it.
-                    c.lock == OPTIONAL_VOICE_COMPONENT.lock && self.voice_wanted() == Some(false),
                 )
             })
             .collect();
-        // A speech engine an older PM installed with its base lock (D8) has no marker, so the rule
-        // above can't see it. Decided here, before a teardown can take it: kept as a component if
-        // the open store has voice on (it becomes one by installing its lock, which in place
-        // downloads only what the lock moved, and is what a rebuilt venv needs anyway), removed after
-        // the base install if voice is off and nobody chose to keep it. Undecided until a store has
-        // said, and then the reconciler does it.
-        //
-        // The base install below makes the venv current before either action runs.
-        let legacy_voice = self.legacy_voice(true);
-        if legacy_voice == LegacyVoice::Adopt {
-            reinstall.push(&OPTIONAL_VOICE_COMPONENT);
-        }
         if rebuild {
             // Drop any live child first: on Windows it would hold a lock on the
             // venv's python.exe and block removal.
@@ -1293,16 +1502,11 @@ impl SidecarManager {
                 );
             }
         }
-        // Retired after the base install, not before: a failure part-way leaves the venv as usable
-        // as it was. A rebuilt venv never had it. Best-effort for the same reason as above.
-        if legacy_voice == LegacyVoice::Retire && !rebuild {
-            if let Err(e) = self.uninstall_optional_locked(&OPTIONAL_VOICE_COMPONENT) {
-                eprintln!(
-                    "sidecar: couldn't remove the speech engine an earlier PM installed ({e}); \
-                     the next launch tries again"
-                );
-            }
-        }
+        // What voice input left (see `retire_voice`), after the base install, not before: a failure
+        // part-way leaves the venv as usable as it was. Best-effort like the reinstalls above, and
+        // under the install lock this already holds. A rebuilt venv took the engine with it; the
+        // Whisper model and the rest outside the venv go here all the same.
+        self.retire_voice_locked();
 
         // Stamp the marker with the lock's hash so we can skip next time.
         let hash = self.lock_hash().map_err(unknown)?;
@@ -1504,18 +1708,6 @@ impl SidecarManager {
         }
     }
 
-    /// The on-device model-cache dir for the Whisper weights (a sibling of the venv under
-    /// `runtime/models`), created if missing, so they live inside PM's data dir and uninstall
-    /// with it. The embedder's weights, the huggingface cache and the xet chunk cache all land in
-    /// the same subtree via `PM_MODELS_DIR` (issue #286) — an older note here said the embedder
-    /// still used fastembed's own default and called that hygiene deferred, which stopped being
-    /// true and sent a later reader hunting for a cache that isn't there.
-    fn model_dir_param(&self) -> Option<String> {
-        let dir = self.paths.models_dir()?;
-        let _ = std::fs::create_dir_all(&dir);
-        Some(dir.to_string_lossy().into_owned())
-    }
-
     /// Embed a batch of strings into the given embedder's vectors. The first call for a model
     /// downloads its weights and is slow; later calls are fast and fully local. Any retrieval
     /// prefix has already been applied by the gateway, so the text is embedded as-is. For a custom
@@ -1636,22 +1828,6 @@ impl SidecarManager {
             ));
         }
         Ok(scores)
-    }
-
-    /// Transcribe an audio clip to text with the local Whisper model. The first
-    /// call downloads the model (~145 MB) and is slow; later calls are fast and
-    /// fully local. `path` is a temp file the caller writes (and then deletes). The
-    /// engine is an optional component, so the caller installs it first
-    /// ([`Self::install_optional_voice`]).
-    pub fn transcribe(&self, path: &Path) -> Result<String> {
-        let result = self.request(
-            "transcribe",
-            json!({
-                "path": path.to_string_lossy(),
-                "model_dir": self.model_dir_param(),
-            }),
-        )?;
-        Ok(result["text"].as_str().unwrap_or_default().to_string())
     }
 
     /// Analyse one image for photo ingestion: EXIF capture metadata (always) + OCR text (only when
@@ -1789,142 +1965,142 @@ impl SidecarManager {
         self.uninstall_optional(&OPTIONAL_OCR_COMPONENT)
     }
 
-    /// Whether the OPTIONAL voice engine is installed in this venv at the pinned versions. Cheap (a
-    /// marker read and a hash of the small voice lock), for the Storage row.
-    pub fn optional_voice_ready(&self) -> bool {
-        self.optional_ready(&OPTIONAL_VOICE_COMPONENT)
-    }
-
-    /// Install the OPTIONAL voice engine (faster-whisper with CTranslate2 and PyAV) — the shared
-    /// [`Self::install_optional`] flow. Switching voice on calls it, before the switch is written.
-    pub fn install_optional_voice(&self, on_progress: impl FnMut(f32)) -> Result<()> {
-        self.install_optional(&OPTIONAL_VOICE_COMPONENT, on_progress)
-    }
-
-    /// The same install, for a transcription that finds the engine gone (its marker absent or
-    /// stale). Refused once voice has been switched off, checked under the install lock: a switch-off
-    /// that removed the engine while this waited for the lock must win, not be undone by a ~240 MB
-    /// download for a recording that may no longer be transcribed.
-    pub fn install_optional_voice_for_recording(&self, on_progress: impl FnMut(f32)) -> Result<()> {
-        self.install_optional_checked(
-            &OPTIONAL_VOICE_COMPONENT,
-            || match self.voice_wanted() {
-                Some(false) => Err(Error::Other(crate::voice_switch::OFF_REFUSAL.into())),
-                _ => Ok(()),
-            },
-            on_progress,
-        )
-    }
-
-    /// Record that voice was switched off with its engine kept, before the off is published to the
-    /// reconciler (see [`SidecarPaths::voice_kept_marker`]). Only an engine an older PM installed
-    /// needs it: one with the component's marker is never touched by the clean-up. No venv or no
-    /// engine, nothing to record.
-    pub fn keep_voice_engine(&self) -> Result<()> {
-        if crate::components::voice_engine_on_disk(&self.paths.venv_dir)
-            && !(OPTIONAL_VOICE_COMPONENT.marker)(&self.paths).exists()
-        {
-            std::fs::write(self.paths.voice_kept_marker(), b"")?;
-        }
-        Ok(())
-    }
-
-    /// Remove the OPTIONAL voice engine — the shared [`Self::uninstall_optional`] flow, which for
-    /// voice takes the whole tree only voice brings (see its `uninstall`). The speech model's
-    /// weights are a separate download with their own removal ([`Self::remove_whisper_model`]).
-    pub fn uninstall_optional_voice(&self) -> Result<()> {
-        self.uninstall_optional(&OPTIONAL_VOICE_COMPONENT)
-    }
-
-    /// Whether the Whisper model has been downloaded (its own folder, [`WHISPER_REPO_DIR`]): D8's
-    /// evidence that this machine's user dictated before voice became a switch.
-    pub fn whisper_model_present(&self) -> bool {
-        self.paths.models_dir().is_some_and(|models| {
-            std::fs::read_dir(models.join(WHISPER_REPO_DIR))
-                .map(|mut rd| rd.next().is_some())
-                .unwrap_or(false)
-        })
-    }
-
-    /// Delete the Whisper model's weights, and nothing else under `runtime/models`.
-    pub fn remove_whisper_model(&self) -> Result<()> {
-        if let Some(models) = self.paths.models_dir() {
-            remove_whisper(&models)?;
-        }
-        Ok(())
-    }
-
-    /// Tell the manager what the open store's voice switch says. Every store open and every switch
-    /// does, so the upgrade rule below and in `provision` always acts on the current answer.
-    pub fn set_voice_wanted(&self, on: bool) {
-        self.voice_wanted.send_replace(Some(on));
-    }
-
-    fn voice_wanted(&self) -> Option<bool> {
-        *self.voice_wanted.borrow()
-    }
-
-    /// For the engine reconciler, which wakes on each answer.
-    pub fn subscribe_voice_wanted(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
-        self.voice_wanted.subscribe()
-    }
-
-    /// The one-off upgrade of a venv an older PM built with the speech engine in its base install
-    /// (D8): pip never removes a package because a lock stopped listing it, so without this every
-    /// existing user keeps ~240 MB of CTranslate2 and PyAV whether or not voice is on. With voice
-    /// off it is removed (safe on any venv: nothing else needs those packages), unless someone
-    /// switched voice off and chose to keep it; with voice on it is adopted as the component by
-    /// installing its lock, once the base venv is current, because that lock is resolved against
-    /// the current base and installing it into an older one would half-upgrade the packages the two
-    /// share. `provision` makes the same call when it runs, so an outdated venv is settled there
-    /// instead.
+    /// Clear away what voice input left on this computer, now that PM has none: the speech engine in
+    /// the venv ([`VOICE_ENGINE_PACKAGES`]), its two markers, the Whisper model's folders
+    /// ([`WHISPER_REPO_DIR`]) and any recording a crash left in `runtime/tmp`. It acts on every
+    /// computer alike: there is no voice switch left to ask, and nothing here is any use without
+    /// voice input.
     ///
-    /// Acts on the answer [`Self::set_voice_wanted`] last gave, and does nothing before one.
-    /// Blocking (pip); run it off the async runtime. Idempotent: a venv that has the marker, or no
-    /// engine, is left alone, so running it on every store open costs a directory read. A removal
-    /// that fails part-way leaves an engine the next pass still sees, and tries again.
-    pub fn reconcile_voice_engine(&self) {
-        // Cheap first look, so the common case never waits on the install lock behind a download.
-        if self.voice_wanted().is_none()
-            || !self.paths.venv_python().exists()
-            || !crate::components::voice_engine_on_disk(&self.paths.venv_dir)
-            || (OPTIONAL_VOICE_COMPONENT.marker)(&self.paths).exists()
-        {
+    /// Run once per launch, on a background thread (it can run pip), and by `provision` after the
+    /// base install. A quick look on disk comes first, so once everything is gone a launch costs a
+    /// few directory reads and never waits on the install lock. With something to remove, it waits
+    /// for the lock, so pip never runs beside a provision or an optional install. Every step is
+    /// best-effort and logged, and nothing is recorded as done: what a failure leaves is still on
+    /// disk, so the next launch's look finds it and tries again. A leftover PM may not delete at
+    /// all (a folder without write permission) is tried again on every launch, at the cost of a
+    /// few directory reads, and of pip's four runs only while it still has a RECORD pip could
+    /// remove it by.
+    pub fn retire_voice(&self) {
+        if !self.voice_leftovers_on_disk() {
             return;
         }
         let _install = self.install.lock().unwrap();
-        // The answer can have moved while this waited for the lock; act on the latest.
-        let action = self.legacy_voice(self.is_ready_marker_current().unwrap_or(false));
-        match action {
-            LegacyVoice::Leave => {}
-            LegacyVoice::Retire => {
-                if let Err(e) = self.uninstall_optional_locked(&OPTIONAL_VOICE_COMPONENT) {
-                    eprintln!(
-                        "sidecar: couldn't remove the speech engine an earlier PM installed ({e}); \
-                         the next store open tries again"
-                    );
-                }
+        self.retire_voice_locked();
+    }
+
+    /// Whether anything [`Self::retire_voice`] removes is still here.
+    fn voice_leftovers_on_disk(&self) -> bool {
+        // A dangling link counts: `symlink_metadata` looks at the link, not at what it points to.
+        let there = |p: &PathBuf| std::fs::symlink_metadata(p).is_ok();
+        let venv = &self.paths.venv_dir;
+        venv_site_has(venv, is_voice_engine_leftover)
+            // The markers only in a real venv: through a link they are somewhere PM doesn't own.
+            || (real_dir(venv) && self.paths.voice_markers().iter().any(there))
+            || self
+                .paths
+                .models_dir()
+                .is_some_and(|models| whisper_paths(&models).iter().any(there))
+            || self
+                .paths
+                .voice_tmp_dir()
+                .is_some_and(|tmp| !voice_clips(&tmp).is_empty() || is_empty_dir(&tmp))
+    }
+
+    /// The clean-up itself, for a caller that already holds `self.install` (`provision`, and
+    /// [`Self::retire_voice`] once it has taken it).
+    fn retire_voice_locked(&self) {
+        let venv = &self.paths.venv_dir;
+        // pip only where it can help: an engine piece is in the venv (looked for first, as asking
+        // the interpreter its version starts it), and one of the three has a dist-info with its
+        // RECORD in the site-packages of the venv's own interpreter. setuptools alone is no sign
+        // of an engine (a Python 3.11 venv has its own), and neither is an engine left in a stale
+        // `lib/python3.X` beside the one in use, so neither ever has pip take the venv's copy.
+        let pip_helps = voice_engine_on_disk(venv)
+            && self
+                .pip_site_dir()
+                .is_some_and(|site| pip_can_uninstall_voice_engine(&site));
+        if pip_helps {
+            // Stopped first, as before every removal (see `stop_worker`). This version's worker
+            // never imports the engine, so it is only a guard, and a cheap one: it happens once,
+            // and the next request respawns the worker.
+            self.stop_worker();
+            self.uninstall_voice_engine();
+        }
+        // Then by hand, whether pip ran or not: whatever is left of the three packages and pip's
+        // stashes of them, in every site-packages, so the quick look finds nothing next time. With
+        // nothing left it is one directory read.
+        remove_voice_engine_by_hand(venv);
+        // The markers only in a real venv: through a link they are somewhere PM doesn't own.
+        if real_dir(venv) {
+            for marker in self.paths.voice_markers() {
+                remove_voice_leftover(&marker);
             }
-            LegacyVoice::Adopt => {
-                if let Err(e) = self.install_optional_locked(&OPTIONAL_VOICE_COMPONENT, |_| {}) {
-                    eprintln!(
-                        "sidecar: couldn't adopt the speech engine an earlier PM installed ({e}); \
-                         the next recording installs it"
-                    );
+        }
+        if let Some(models) = self.paths.models_dir() {
+            for path in whisper_paths(&models) {
+                remove_voice_leftover(&path);
+            }
+        }
+        if let Some(tmp) = self.paths.voice_tmp_dir() {
+            // Only a real folder: a link here leads out of PM's data dir, and on Windows
+            // `remove_dir` would take the link itself.
+            if real_dir(&tmp) {
+                for clip in voice_clips(&tmp) {
+                    remove_voice_leftover(&clip);
                 }
+                // The folder too, once nothing is left in it. `remove_dir` refuses one that isn't
+                // empty, which leaves anything else someone put there alone.
+                let _ = std::fs::remove_dir(&tmp);
             }
         }
     }
 
-    /// [`legacy_voice_action`] on this venv as it is now, for `provision` and the reconciler.
-    fn legacy_voice(&self, base_current: bool) -> LegacyVoice {
-        legacy_voice_action(
-            crate::components::voice_engine_on_disk(&self.paths.venv_dir),
-            (OPTIONAL_VOICE_COMPONENT.marker)(&self.paths).exists(),
-            self.paths.voice_kept_marker().exists(),
-            self.voice_wanted(),
-            base_current,
-        )
+    /// The site-packages the venv's own interpreter, and so its pip, installs into and uninstalls
+    /// from: `Lib/site-packages` on Windows, and elsewhere `lib/python3.<minor>/site-packages` for
+    /// the minor the interpreter reports. None without an interpreter, or when that folder is not
+    /// one of the venv's real ones ([`venv_site_dirs`]).
+    fn pip_site_dir(&self) -> Option<PathBuf> {
+        let venv = &self.paths.venv_dir;
+        let py = self.paths.venv_python();
+        if !py.exists() {
+            return None;
+        }
+        let own = if cfg!(windows) {
+            venv.join("Lib").join("site-packages")
+        } else {
+            let (major, minor) = detect_python_version(&py)?;
+            venv.join("lib")
+                .join(format!("python{major}.{minor}"))
+                .join("site-packages")
+        };
+        venv_site_dirs(venv).contains(&own).then_some(own)
+    }
+
+    /// `pip uninstall` the speech engine one package at a time ([`VOICE_ENGINE_PACKAGES`]), logging a
+    /// failure and going on to the next. pip skips a package it doesn't find installed and refuses
+    /// one whose dist-info has no RECORD; whatever it leaves, the by-hand pass after this takes.
+    fn uninstall_voice_engine(&self) {
+        let py = self.paths.venv_python();
+        if !py.exists() {
+            // No interpreter, so no pip: the by-hand pass after this does it all.
+            return;
+        }
+        for package in VOICE_ENGINE_PACKAGES {
+            let mut pip = Command::new(&py);
+            pip.args([
+                "-m",
+                "pip",
+                "uninstall",
+                "-y",
+                "--disable-pip-version-check",
+                package,
+            ]);
+            clean_python_env(&mut pip);
+            no_window(&mut pip);
+            if let Err(e) = run_command(&mut pip, &format!("pip uninstall {package}")) {
+                eprintln!("sidecar: couldn't uninstall {package}, which voice input left ({e})");
+            }
+        }
     }
 
     /// Shared readiness check for an [`OptionalComponent`]: the venv exists and the component's
@@ -1971,18 +2147,6 @@ impl SidecarManager {
     fn install_optional(
         &self,
         component: &OptionalComponent,
-        on_progress: impl FnMut(f32),
-    ) -> Result<()> {
-        self.install_optional_checked(component, || Ok(()), on_progress)
-    }
-
-    /// [`Self::install_optional`] with a last word: `check` runs once the install lock is held,
-    /// before anything is downloaded, and its error stops the install. For a condition that can
-    /// change while the caller waited for the lock behind another install or a removal.
-    fn install_optional_checked(
-        &self,
-        component: &OptionalComponent,
-        check: impl FnOnce() -> Result<()>,
         mut on_progress: impl FnMut(f32),
     ) -> Result<()> {
         on_progress(0.03);
@@ -1991,7 +2155,6 @@ impl SidecarManager {
         on_progress(0.10);
 
         let _install = self.install.lock().unwrap();
-        check()?;
         if self.optional_ready(component) {
             on_progress(1.0);
             return Ok(());
@@ -2073,10 +2236,6 @@ impl SidecarManager {
             (component.marker)(&self.paths),
             self.optional_stamp(component)?,
         )?;
-        if component.lock == OPTIONAL_VOICE_COMPONENT.lock {
-            // The component now, with its marker: the "kept" note was about the older engine.
-            let _ = std::fs::remove_file(self.paths.voice_kept_marker());
-        }
         on_progress(1.0);
         Ok(())
     }
@@ -2084,25 +2243,15 @@ impl SidecarManager {
     /// Shared removal flow for an [`OptionalComponent`]. Drops the marker first — that alone
     /// disables the feature (`optional_ready` then reports false) — then `pip uninstall`s the
     /// component's packages (its `uninstall` list) to reclaim space. Idempotent.
-    fn uninstall_optional(&self, component: &OptionalComponent) -> Result<()> {
-        let _install = self.install.lock().unwrap();
-        self.uninstall_optional_locked(component)
-    }
-
-    /// The removal itself, for a caller that already holds `self.install` (`provision` and the
-    /// voice reconciler retire an older PM's speech engine under it).
     ///
     /// The marker goes first, so the feature is off whatever pip then does. pip's own failure is
     /// returned, not swallowed: pip stops at the first package it can't remove (a native library
     /// something else holds open, on Windows), and the person who asked for the space back has to
     /// be told some of it is still taken. What is left stays on disk, measured on its Storage row
     /// with its own Remove.
-    fn uninstall_optional_locked(&self, component: &OptionalComponent) -> Result<()> {
+    fn uninstall_optional(&self, component: &OptionalComponent) -> Result<()> {
+        let _install = self.install.lock().unwrap();
         let _ = std::fs::remove_file((component.marker)(&self.paths));
-        if component.lock == OPTIONAL_VOICE_COMPONENT.lock {
-            // A removal is an answer too: what is left after a failed one is for the next pass.
-            let _ = std::fs::remove_file(self.paths.voice_kept_marker());
-        }
         let py = self.paths.venv_python();
         if !py.exists() {
             return Ok(());
@@ -2243,7 +2392,7 @@ impl SidecarManager {
                     // exactly as long.
                     if !fetched && is_model_not_cached(&value) {
                         fetched = true;
-                        self.fetch_model(method, fetch_params(method, &req["params"]))?;
+                        self.fetch_model(method, &fetch_params(method, &req["params"]))?;
                         continue;
                     }
                     let msg = value["error"].as_str().unwrap_or("unknown sidecar error");
@@ -2355,16 +2504,6 @@ impl SidecarManager {
                 "PM_SIDECAR_THREADS".to_string(),
                 sidecar_thread_budget(std::thread::available_parallelism().map(|n| n.get()).ok())
                     .to_string(),
-            ),
-            // Separate from the general budget on purpose: transcription is the one workload whose
-            // library picks its own default when we say nothing, so it needs its own floor rather
-            // than a number chosen by measuring embedding.
-            (
-                "PM_SIDECAR_TRANSCRIBE_THREADS".to_string(),
-                sidecar_transcribe_thread_budget(
-                    std::thread::available_parallelism().map(|n| n.get()).ok(),
-                )
-                .to_string(),
             ),
         ];
         // Debug builds only: unlock the worker's dev-only `net_selftest` handler (the Developer-mode
@@ -2746,9 +2885,9 @@ impl SidecarManager {
     /// `--fetch` helper (issue #286). The offline worker reports a cold-cache model as
     /// `model_not_cached`; this turns that miss into a real download WITHOUT ever giving the worker —
     /// the process that parses untrusted files — a socket. It reuses the worker's own loaders, so the
-    /// cache it fills is exactly the one the worker then reads (same OS user, same fastembed/whisper
-    /// defaults; whisper's `model_dir` rides along in `params`). Blocks — a first download can take
-    /// minutes — bounded by a generous deadline so a stalled download can't wedge the caller forever.
+    /// cache it fills is exactly the one the worker then reads (same OS user, same fastembed
+    /// defaults, the same `PM_MODELS_DIR`). Blocks — a first download can take minutes — bounded by
+    /// a generous deadline so a stalled download can't wedge the caller forever.
     fn fetch_model(&self, method: &str, params: &Value) -> Result<()> {
         let py = self.paths.venv_python();
         let request = serde_json::to_string(&json!({ "method": method, "params": params }))
@@ -2941,7 +3080,7 @@ fn read_reply_with_timeout(
 /// would break local ML — far worse than waiting. Values are intentionally round; tune on the
 /// live rig if a legitimate operation is ever cut short.
 /// Deadline for the `--fetch` helper (issue #286). A first model download is slow; this matches the
-/// worker's own download-bearing grace (`request_timeout` for embed/rerank/transcribe) so the fetch
+/// worker's own download-bearing grace (`request_timeout` for embed/rerank/analyze_image) so the fetch
 /// path is no more likely to time out than the inline first-use download it replaces.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -2958,18 +3097,28 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 ))]
 const SELFTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// What the network-allowed `--fetch` helper is given for `method`.
+/// What the network-allowed `--fetch` helper is given for `method`: what names the model to
+/// download, and nothing else.
 ///
-/// The fetcher is the ONE child that keeps a socket, so it must never receive anything derived from
-/// the file being parsed. For every model-bearing method the params ARE the model id (plus the
-/// speech model's `model_dir`), so they pass straight through — and by reference, since an embed
-/// batch can be large. `analyze_image` is the exception: its params carry the path of the image
-/// mid-ingest, while all the fetcher does with it is build the OCR engine. It gets `null`, which the
-/// helper reads as no params at all (`params or {}`).
-fn fetch_params<'a>(method: &str, params: &'a Value) -> &'a Value {
+/// The fetcher is the ONE child that keeps a socket, so it must never receive the user's content.
+/// An embed, count_tokens or rerank request carries it beside the model (the texts, the query, the
+/// passages), and the helper reads only `model` and, for a custom model, its `custom` spec, so it
+/// gets those two, each only when the request has it. `analyze_image` names no model (all the
+/// fetcher does for it is build the OCR engine) and its params carry the path of the image
+/// mid-ingest, so it gets `null`, which the helper reads as no params at all (`params or {}`). So
+/// does any other method: the helper has nothing to fetch for one.
+fn fetch_params(method: &str, params: &Value) -> Value {
     match method {
-        "analyze_image" => &Value::Null,
-        _ => params,
+        "embed" | "count_tokens" | "rerank" => {
+            let mut model = serde_json::Map::new();
+            for key in ["model", "custom"] {
+                if let Some(value) = params.get(key) {
+                    model.insert(key.to_string(), value.clone());
+                }
+            }
+            Value::Object(model)
+        }
+        _ => Value::Null,
     }
 }
 
@@ -2984,7 +3133,7 @@ fn request_timeout(method: &str) -> std::time::Duration {
     use std::time::Duration;
     match method {
         // First use of any of these can download a model; keep the grace long.
-        "embed" | "rerank" | "transcribe" | "analyze_image" => Duration::from_secs(30 * 60),
+        "embed" | "rerank" | "analyze_image" => Duration::from_secs(30 * 60),
         // CPU-bound conversion / parse / projection of a possibly-large or pathological input.
         "convert" | "analyze_spreadsheet" | "reduce" => Duration::from_secs(10 * 60),
         // Pure tokeniser pass — fast once the tokeniser is loaded.
@@ -3048,55 +3197,9 @@ fn should_rebuild_venv(
 /// Whether provisioning must put an optional component back: the user installed it (its marker is
 /// present, current or not; removing a component deletes the marker first) and the venv being
 /// provisioned no longer satisfies it — rebuilt from scratch, or updated in place to locks that
-/// moved its stamp. Never for a component whose feature is `switched_off` (voice input, kept on
-/// disk when voice was turned off): a download for something switched off is the opposite of what
-/// the switch is for, and turning it back on installs it.
-fn should_reinstall_optional(
-    rebuild: bool,
-    marker_present: bool,
-    ready: bool,
-    switched_off: bool,
-) -> bool {
-    marker_present && !switched_off && (rebuild || !ready)
-}
-
-/// What to do with a speech engine an older PM installed as part of its base lock (D8).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum LegacyVoice {
-    /// Nothing to do, or nothing that can be decided yet.
-    Leave,
-    /// Voice is on: install the voice lock over it, which stamps the marker and makes it the
-    /// component (in place it downloads nothing the base lock already put there).
-    Adopt,
-    /// Voice is off: uninstall it, as switching voice off with "remove" would.
-    Retire,
-}
-
-/// The one-off upgrade rule for that engine. Pure, so the table is tested. It is "legacy" only when
-/// it is on disk without the component's marker; an engine installed by the switch always has the
-/// marker (removal drops the marker first, and a stale one is `should_reinstall_optional`'s case).
-/// Nothing is decided before a store has said what voice is (`wanted` is `None`). Adoption waits
-/// for a current base venv (`base_current`), because the voice lock is resolved against the
-/// current base and installing it into an older one would move packages the base still owns;
-/// removal never has to wait, since nothing else needs the voice packages. An off that came with
-/// "keep the engine" (`kept`) is not the upgrade's default and is never overridden by it.
-fn legacy_voice_action(
-    engine_on_disk: bool,
-    marker_present: bool,
-    kept: bool,
-    wanted: Option<bool>,
-    base_current: bool,
-) -> LegacyVoice {
-    if !engine_on_disk || marker_present {
-        return LegacyVoice::Leave;
-    }
-    match wanted {
-        None => LegacyVoice::Leave,
-        Some(false) if kept => LegacyVoice::Leave,
-        Some(false) => LegacyVoice::Retire,
-        Some(true) if base_current => LegacyVoice::Adopt,
-        Some(true) => LegacyVoice::Leave,
-    }
+/// moved its stamp.
+fn should_reinstall_optional(rebuild: bool, marker_present: bool, ready: bool) -> bool {
+    marker_present && (rebuild || !ready)
 }
 
 /// Parse a `python --version`-style string into `(major, minor)`. Tolerates the
@@ -3314,29 +3417,12 @@ const PYTHON_ENV_REMOVES: &[&str] = &["PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP
 /// from an unbounded pool to 8 cost ~14% embedding throughput and handed back 16 cores. The floor of
 /// 2 keeps a single-core VM from serializing. The sidecar derives the same number itself when the
 /// variable is absent (a raw dev run), so the two paths agree — keep them in step.
+///
+/// Fed from `available_parallelism` rather than `hardware::scan()`: that reports PHYSICAL cores via
+/// sysinfo and runs a GPU probe to do it, while this figure wants the LOGICAL, cgroup-aware count —
+/// a container with a CPU quota must size its pools to the quota, not to the host.
 fn sidecar_thread_budget(cores: Option<usize>) -> usize {
     (cores.unwrap_or(4) / 2).clamp(2, 8)
-}
-
-/// The same shape for transcription, with a HIGHER FLOOR — and the floor is the whole point.
-///
-/// faster-whisper takes `cpu_threads = 0` by default, which its own docstring defines as "a non
-/// zero value overrides the OMP_NUM_THREADS environment variable" — i.e. zero means OMP wins. Once
-/// #769 started setting `OMP_NUM_THREADS`, transcription silently inherited a figure derived by
-/// measuring EMBEDDING, and a 4-core laptop went from ctranslate2's flat 4 threads to 2: half speed,
-/// with nothing in the release notes to connect it to a memory fix.
-///
-/// 4 is that library default, so no machine transcribes slower than it did before this existed;
-/// above 8 cores the budget scales up exactly as the general one does. The ceiling is inherited
-/// rather than measured — ctranslate2's own scaling past 8 intra-op threads has not been benchmarked
-/// here, so 8 is a deliberate carry-over, not a finding.
-///
-/// Uses `available_parallelism` like its sibling rather than `hardware::scan()`: that reports
-/// PHYSICAL cores via sysinfo and runs a GPU probe to do it, while this figure wants the LOGICAL,
-/// cgroup-aware count — a container with a CPU quota must size its pools to the quota, not to the
-/// host.
-fn sidecar_transcribe_thread_budget(cores: Option<usize>) -> usize {
-    (cores.unwrap_or(8) / 2).clamp(4, 8)
 }
 
 fn clean_python_env(command: &mut Command) {
@@ -4124,19 +4210,14 @@ mod tests {
     fn an_installed_component_survives_a_base_lock_update() {
         // The in-place update after a base lock moves: the marker is there but stale. Before, this
         // left photo OCR off with Storage still showing it installed.
-        assert!(should_reinstall_optional(false, true, false, false));
+        assert!(should_reinstall_optional(false, true, false));
         // Rebuilt venv: whatever the user had goes back, current marker or not.
-        assert!(should_reinstall_optional(true, true, true, false));
-        assert!(should_reinstall_optional(true, true, false, false));
+        assert!(should_reinstall_optional(true, true, true));
+        assert!(should_reinstall_optional(true, true, false));
         // Already satisfied, or never installed / removed by the user: leave it alone.
-        assert!(!should_reinstall_optional(false, true, true, false));
-        assert!(!should_reinstall_optional(true, false, false, false));
-        assert!(!should_reinstall_optional(false, false, false, false));
-        // Kept on disk when its switch went off (voice): never downloaded again for it, whether the
-        // venv was rebuilt or its lock moved. Turning voice on is what installs it.
-        assert!(!should_reinstall_optional(false, true, false, true));
-        assert!(!should_reinstall_optional(true, true, true, true));
-        assert!(!should_reinstall_optional(true, true, false, true));
+        assert!(!should_reinstall_optional(false, true, true));
+        assert!(!should_reinstall_optional(true, false, false));
+        assert!(!should_reinstall_optional(false, false, false));
     }
 
     /// A superseded package is uninstalled before its component's lock installs, so it must never be
@@ -4169,8 +4250,8 @@ mod tests {
     }
 
     /// L-6: the audit-only `sidecar/requirements-optional.txt` (which `just pip-audit` scans) must list
-    /// exactly the optional pins whose source of truth is `OPTIONAL_TSNE_PIN` + `OPTIONAL_OCR_PINS` +
-    /// `OPTIONAL_VOICE_PINS`, so a bumped/added optional pin can't silently escape CVE scanning.
+    /// exactly the optional pins whose source of truth is `OPTIONAL_TSNE_PIN` + `OPTIONAL_OCR_PINS`,
+    /// so a bumped/added optional pin can't silently escape CVE scanning.
     #[test]
     fn optional_requirements_file_matches_the_pins() {
         let path = concat!(
@@ -4187,7 +4268,6 @@ mod tests {
             .collect();
         let mut expected = vec![OPTIONAL_TSNE_PIN.to_string()];
         expected.extend(OPTIONAL_OCR_PINS.iter().map(|s| s.to_string()));
-        expected.extend(OPTIONAL_VOICE_PINS.iter().map(|s| s.to_string()));
         assert_eq!(
             listed, expected,
             "requirements-optional.txt must list exactly the optional pins, in order"
@@ -4211,192 +4291,891 @@ mod tests {
         name.trim().to_ascii_lowercase().replace(['_', '.'], "-")
     }
 
-    /// The voice component as D8 describes it: its own lock and marker, the pins its lock was
-    /// resolved from, and one of the components `provision` treats alike (so a rebuilt venv puts it
-    /// back). Its pins are gone from the base lock — that is the whole change — and present in its
-    /// own.
+    /// The voice clean-up uninstalls its four packages from every venv that has an engine piece,
+    /// so none of them may be a package the base venv or an optional component installs: removing
+    /// it would break that. Reads every lock in `sidecar/`, so a lock added later is covered
+    /// without remembering this test, and a regeneration that brings one of the four in fails here
+    /// before it ships.
     #[test]
-    fn the_voice_engine_is_an_optional_component_with_its_own_lock() {
-        let c = &OPTIONAL_VOICE_COMPONENT;
-        assert_eq!(c.lock, "requirements-voice.lock");
-        assert_eq!(c.pins, OPTIONAL_VOICE_PINS);
-        assert!(c.superseded.is_empty());
-        let paths = SidecarPaths {
-            source_dir: PathBuf::from("/pm/sidecar"),
-            venv_dir: PathBuf::from("/pm/runtime/venv"),
-        };
-        assert_eq!(
-            (c.marker)(&paths),
-            PathBuf::from("/pm/runtime/venv/.pm-voice")
-        );
-        // By lock name: a `&CONST` is not one address, so pointer equality would prove nothing.
-        assert!(ALL_OPTIONAL_COMPONENTS.iter().any(|x| x.lock == c.lock));
-
-        let base = locked_names("requirements.lock");
-        let voice = locked_names(c.lock);
-        for pin in OPTIONAL_VOICE_PINS {
-            let name = normalised(pin.split_once("==").unwrap().0);
-            assert!(voice.contains(&name), "{name} is missing from {}", c.lock);
-            assert!(
-                !base.contains(&name),
-                "{name} is still in the base lock, so every user would get it"
-            );
-        }
-    }
-
-    /// Removing voice takes exactly the packages only the voice lock brings: nothing the base venv or
-    /// another component runs on (so removal can't break them), and nothing left behind (so the space
-    /// switching voice off promised really comes back). A lock regeneration that changes the set
-    /// fails here, so the list is updated on purpose rather than drifting.
-    #[test]
-    fn voice_removes_exactly_what_only_voice_needs() {
-        let mut others = locked_names("requirements.lock");
-        for c in ALL_OPTIONAL_COMPONENTS {
-            if c.lock != OPTIONAL_VOICE_COMPONENT.lock {
-                others.extend(locked_names(c.lock));
-            }
-        }
-        let only_voice: std::collections::BTreeSet<String> =
-            locked_names(OPTIONAL_VOICE_COMPONENT.lock)
-                .difference(&others)
-                .cloned()
-                .collect();
-        let removed: std::collections::BTreeSet<String> = OPTIONAL_VOICE_COMPONENT
-            .uninstall
-            .iter()
-            .copied()
-            .map(normalised)
+    fn no_lock_installs_a_package_the_voice_clean_up_removes() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../sidecar");
+        let mut locks: Vec<String> = std::fs::read_dir(dir)
+            .expect("the sidecar folder is checked in")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".lock"))
             .collect();
-        assert_eq!(removed, only_voice);
-        assert!(removed.contains("faster-whisper") && removed.contains("ctranslate2"));
-    }
-
-    /// D8's upgrade rule for an engine an older PM put in the base venv.
-    #[test]
-    fn an_older_pms_speech_engine_is_kept_where_voice_is_on_and_removed_where_off() {
-        use LegacyVoice::*;
-        // Voice off: removed, whether or not the base venv is current (nothing else needs it).
-        assert_eq!(
-            legacy_voice_action(true, false, false, Some(false), false),
-            Retire
-        );
-        assert_eq!(
-            legacy_voice_action(true, false, false, Some(false), true),
-            Retire
-        );
-        // Unless it was switched off with "keep the engine": that answer stands.
-        for base in [false, true] {
-            assert_eq!(
-                legacy_voice_action(true, false, true, Some(false), base),
-                Leave
-            );
+        locks.sort();
+        // The base lock and every component's are among them, so the walk can't miss one.
+        assert!(locks.iter().any(|l| l == "requirements.lock"));
+        for c in ALL_OPTIONAL_COMPONENTS {
+            assert!(locks.iter().any(|l| l == c.lock), "{} is missing", c.lock);
         }
-        // Voice on: adopted as the component, but only into a current base venv, kept or not.
-        for kept in [false, true] {
-            assert_eq!(
-                legacy_voice_action(true, false, kept, Some(true), true),
-                Adopt
+        for lock in &locks {
+            let names = locked_names(lock);
+            assert!(
+                !names.is_empty(),
+                "{lock} pins nothing, so this proves nothing"
             );
-            assert_eq!(
-                legacy_voice_action(true, false, kept, Some(true), false),
-                Leave
-            );
-            // No store has said yet: nothing is decided.
-            assert_eq!(legacy_voice_action(true, false, kept, None, true), Leave);
-        }
-        // Not legacy: installed by the switch (it has the marker), or not there at all.
-        for wanted in [None, Some(false), Some(true)] {
-            for base in [false, true] {
-                for kept in [false, true] {
-                    assert_eq!(legacy_voice_action(true, true, kept, wanted, base), Leave);
-                    assert_eq!(legacy_voice_action(false, false, kept, wanted, base), Leave);
-                    assert_eq!(legacy_voice_action(false, true, kept, wanted, base), Leave);
-                }
+            for package in VOICE_ENGINE_PACKAGES {
+                assert!(
+                    !names.contains(&normalised(package)),
+                    "{package} is in {lock}, so the voice clean-up would remove it from every \
+                     venv that had the speech engine"
+                );
             }
         }
     }
 
-    /// A `runtime/models` laid out the way a real install fills it: the embedder and reranker, the hf
-    /// and xet caches, the photo-OCR weights, and the Whisper repo with its lock folder.
-    fn seeded_models(models: &Path) {
-        let put = |rel: &str, bytes: usize| {
-            let p = models.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, vec![0u8; bytes]).unwrap();
-        };
-        put(
-            "fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx",
-            1000,
-        );
-        put("hf/xet/chunk", 100);
-        put("rapidocr/det.onnx", 300);
-        put(&format!("{WHISPER_REPO_DIR}/snapshots/abc/model.bin"), 50);
-        put(&format!(".locks/{WHISPER_REPO_DIR}/x.lock"), 7);
-    }
-
-    /// D8's evidence is the Whisper folder itself, never a non-empty `runtime/models` (the embedder
-    /// lives there too), and switching voice off with "remove" takes that folder and nothing else.
+    /// The engine's own packages are the three import dirs it looks for, and faster-whisper is
+    /// removed last (see `VOICE_ENGINE_PACKAGES`).
     #[test]
-    fn the_speech_model_is_found_and_removed_by_its_own_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = SidecarManager::new(SidecarPaths {
-            source_dir: dir.path().join("sidecar"),
-            venv_dir: dir.path().join("runtime").join("venv"),
-        });
-        let models = dir.path().join("runtime").join("models");
-        assert!(!mgr.whisper_model_present(), "nothing downloaded yet");
-
-        seeded_models(&models);
-        assert!(mgr.whisper_model_present());
-        mgr.remove_whisper_model().unwrap();
-        assert!(!mgr.whisper_model_present());
-        assert!(!models.join(WHISPER_REPO_DIR).exists());
-        assert!(!models.join(".locks").join(WHISPER_REPO_DIR).exists());
-        assert!(models
-            .join("fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx")
-            .is_file());
-        assert!(models.join("hf/xet/chunk").is_file());
-        assert!(models.join("rapidocr/det.onnx").is_file());
-        // Only the search models left: still no evidence of voice. Removing again is not an error.
-        assert!(!mgr.whisper_model_present());
-        mgr.remove_whisper_model().unwrap();
+    fn the_voice_engine_lists_agree() {
+        for dir in VOICE_ENGINE_DIRS {
+            assert!(
+                VOICE_ENGINE_PACKAGES
+                    .iter()
+                    .any(|p| normalised(p) == normalised(dir)),
+                "{dir} is not uninstalled"
+            );
+        }
+        assert_eq!(VOICE_ENGINE_PACKAGES.last(), Some(&"faster-whisper"));
+        assert!(!VOICE_ENGINE_DIRS.contains(&"setuptools"));
     }
 
     #[test]
-    fn whisper_folder_name_matches_the_sidecar_model() {
-        // `WHISPER_REPO_DIR` is derived from the sidecar's model name; if that changes, D8's default
-        // and the removal would silently stop finding the download.
-        let sidecar = include_str!("../../sidecar/pm_sidecar.py");
-        assert!(sidecar.contains("WHISPER_MODEL = \"base.en\""));
+    fn whisper_folder_name_matches_the_model_voice_input_used() {
+        // faster-whisper's `base.en` lived in Systran's repo, laid out by huggingface_hub as
+        // `models--<org>--<name>`; a typo here would leave ~145 MB on every computer that used it.
         assert_eq!(WHISPER_REPO_DIR, "models--Systran--faster-whisper-base.en");
     }
 
-    /// The reconciler's answer is held until a store gives one, and each answer replaces the last.
-    #[test]
-    fn the_voice_answer_starts_unknown_and_follows_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = SidecarManager::new(SidecarPaths {
-            source_dir: dir.path().join("sidecar"),
-            venv_dir: dir.path().join("venv"),
-        });
-        assert_eq!(mgr.voice_wanted(), None);
-        let mut rx = mgr.subscribe_voice_wanted();
-        mgr.set_voice_wanted(false);
-        assert!(rx.has_changed().unwrap());
-        assert_eq!(*rx.borrow_and_update(), Some(false));
-        mgr.set_voice_wanted(true);
-        assert_eq!(mgr.voice_wanted(), Some(true));
-        // No venv: the reconciler has nothing to settle and returns without touching pip.
-        mgr.reconcile_voice_engine();
+    /// A stand-in for the venv's interpreter, as a shell script. `--version` answers 3.`minor`;
+    /// every other call is logged, a line each, to `log`; and `-m pip uninstall` does what real pip
+    /// does in the venv's own `lib/python3.<minor>/site-packages`, the only one pip there looks in:
+    /// a package with no dist-info there is skipped as not installed (exit 0), one whose dist-info
+    /// has no RECORD stops the whole command (exit 1, pip's UninstallMissingRecord), and otherwise
+    /// the package's import dir, its `.libs` and its dist-info go. Anything else (an install) only
+    /// logs.
+    #[cfg(unix)]
+    fn fake_python(venv: &Path, log: &Path, minor: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let py = venv.join("bin").join("python");
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        let site = venv
+            .join("lib")
+            .join(format!("python3.{minor}"))
+            .join("site-packages");
+        std::fs::write(
+            &py,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'Python 3.{minor}.0'; exit 0; fi
+echo "$@" >> '{log}'
+[ "$1 $2 $3" = "-m pip uninstall" ] || exit 0
+shift 3
+site='{site}'
+for package; do
+    case "$package" in -*) continue ;; esac
+    name=$(printf '%s' "$package" | sed 's/-/_/g')
+    found=
+    for d in "$site/$name"-*.dist-info; do
+        if [ -d "$d" ]; then found=$d; fi
+    done
+    if [ -z "$found" ]; then
+        echo "WARNING: Skipping $package as it is not installed." >&2
+        continue
+    fi
+    if [ ! -f "$found/RECORD" ]; then
+        echo "ERROR: Cannot uninstall $package, RECORD file not found." >&2
+        exit 1
+    fi
+    rm -rf "$site/$name" "$site/$name.libs" "$found"
+done
+"#,
+                log = log.display(),
+                site = site.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// A venv whose interpreter only records what pip is asked, with an older PM's speech engine in
-    /// it (faster-whisper on disk, no `.pm-voice`) and neutral fixture locks. Returns the manager,
-    /// the pip log, site-packages and the sidecar source dir.
+    /// A file of `bytes` zeros at `path`, with its folders.
+    #[cfg(unix)]
+    fn put(path: PathBuf, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; bytes]).unwrap();
+    }
+
+    /// A venv on [`fake_python`] laid out the way an older PM left it for someone who used voice:
+    /// the engine in site-packages beside the document engine's own packages, both voice markers,
+    /// the Whisper model beside the search and OCR models, and a recording a crash left in
+    /// `runtime/tmp`. Returns the manager, the pip log, site-packages and `runtime/`.
     #[cfg(unix)]
     fn fake_voice_venv(dir: &Path) -> (SidecarManager, PathBuf, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let source_dir = dir.join("sidecar");
+        let runtime = dir.join("runtime");
+        let venv = runtime.join("venv");
+        let log = dir.join("pip.log");
+        fake_python(&venv, &log, 12);
+
+        let site = venv.join("lib").join("python3.12").join("site-packages");
+        for engine in [
+            "faster_whisper/__init__.py",
+            "faster_whisper-1.2.1.dist-info/RECORD",
+            "ctranslate2/__init__.py",
+            "ctranslate2-4.8.1.dist-info/RECORD",
+            "ctranslate2.libs/libct2.so",
+            "av/__init__.py",
+            "av-18.1.0.dist-info/RECORD",
+            "av.libs/libavcodec.so",
+            "setuptools/__init__.py",
+            "setuptools-80.9.0.dist-info/RECORD",
+        ] {
+            put(site.join(engine), 3);
+        }
+        for base in [
+            "fastembed/__init__.py",
+            "fastembed-0.9.1.dist-info/RECORD",
+            "onnxruntime/__init__.py",
+            "pip/__init__.py",
+        ] {
+            put(site.join(base), 5);
+        }
+        put(venv.join(".pm-ready"), 1);
+        put(venv.join(".pm-voice"), 1);
+        put(venv.join(".pm-voice-kept"), 1);
+        let models = runtime.join("models");
+        put(
+            models.join("fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx"),
+            10,
+        );
+        put(models.join("hf/xet/chunk"), 10);
+        put(models.join("rapidocr/det.onnx"), 10);
+        put(
+            models
+                .join(WHISPER_REPO_DIR)
+                .join("snapshots/abc/model.bin"),
+            50,
+        );
+        put(
+            models.join(".locks").join(WHISPER_REPO_DIR).join("x.lock"),
+            1,
+        );
+        put(runtime.join("tmp").join("voice-a1b2c3.webm"), 20);
+
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.join("sidecar"),
+            venv_dir: venv,
+        });
+        (mgr, log, site, runtime)
+    }
+
+    /// Every file and folder under `root`, relative to it, for comparing a tree before and after.
+    /// A link is listed but never followed.
+    #[cfg(unix)]
+    fn tree(root: &Path) -> std::collections::BTreeSet<PathBuf> {
+        fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeSet<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = e.path();
+                out.insert(path.strip_prefix(root).unwrap().to_path_buf());
+                if e.file_type().unwrap().is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// Take the engine and setuptools out of `site`, as a finished removal leaves it, so a test can
+    /// put back only the piece it is about.
+    #[cfg(unix)]
+    fn clear_engine(site: &Path) {
+        for e in std::fs::read_dir(site).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if is_voice_engine_entry(&name) || name.starts_with("setuptools") {
+                std::fs::remove_dir_all(e.path()).unwrap();
+            }
+        }
+    }
+
+    /// What pip is asked wherever an engine piece is found: each package on its own, so a failure
+    /// on one never stops the rest, and faster-whisper last.
+    #[cfg(unix)]
+    const VOICE_REMOVAL: &str = "\
+-m pip uninstall -y --disable-pip-version-check av
+-m pip uninstall -y --disable-pip-version-check ctranslate2
+-m pip uninstall -y --disable-pip-version-check setuptools
+-m pip uninstall -y --disable-pip-version-check faster-whisper
+";
+
+    /// After one clean-up, nothing is left for the quick look to find, so the next launch makes no
+    /// pip call and changes not a file.
+    #[cfg(unix)]
+    fn assert_gone_for_good(mgr: &SidecarManager, dir: &Path, log: &Path) {
+        assert!(!mgr.voice_leftovers_on_disk(), "something is still found");
+        let _ = std::fs::remove_file(log);
+        let before = tree(dir);
+        mgr.retire_voice();
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap_or_default(),
+            "",
+            "no pip call at the next launch"
+        );
+        assert_eq!(tree(dir), before, "and nothing else changes");
+    }
+
+    /// The upgrade end to end, on [`fake_voice_venv`]: pip is asked for the engine's four packages
+    /// one at a time, and the markers, the Whisper folders and the recording go with them, while
+    /// the document engine, the other models and the base marker stay. The next launch finds
+    /// nothing: no pip call, and not a file changes.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_pms_voice_leftovers_are_removed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, runtime) = fake_voice_venv(dir.path());
+
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), VOICE_REMOVAL);
+        for gone in [
+            "faster_whisper",
+            "ctranslate2",
+            "ctranslate2.libs",
+            "av",
+            "av.libs",
+            "setuptools",
+        ] {
+            assert!(!site.join(gone).exists(), "{gone} is left");
+        }
+        let venv = runtime.join("venv");
+        assert!(!venv.join(".pm-voice").exists());
+        assert!(!venv.join(".pm-voice-kept").exists());
+        let models = runtime.join("models");
+        assert!(!models.join(WHISPER_REPO_DIR).exists());
+        assert!(!models.join(".locks").join(WHISPER_REPO_DIR).exists());
+        assert!(
+            !runtime.join("tmp").exists(),
+            "the recording, and its folder once empty"
+        );
+        assert!(venv.join(".pm-ready").is_file());
+        for kept in [
+            "fastembed/models--Qdrant--bge-small-en-v1.5/model.onnx",
+            "hf/xet/chunk",
+            "rapidocr/det.onnx",
+        ] {
+            assert!(models.join(kept).is_file(), "{kept} is not voice's");
+        }
+        for kept in [
+            "fastembed",
+            "fastembed-0.9.1.dist-info",
+            "onnxruntime",
+            "pip",
+        ] {
+            assert!(site.join(kept).is_dir(), "{kept} is not voice's");
+        }
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// Import dirs with no dist-info, as a removal cut short leaves them: pip has nothing to
+    /// uninstall them by (it would call each package not installed), so it is never run, they go by
+    /// hand, and the next launch finds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn an_import_dir_pip_cannot_see_is_removed_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, _runtime) = fake_voice_venv(dir.path());
+        clear_engine(&site);
+        put(site.join("ctranslate2").join("__init__.py"), 3);
+        put(site.join("ctranslate2.libs").join("libct2.so"), 3);
+        put(site.join("av").join("__init__.py"), 3);
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        for gone in ["ctranslate2", "ctranslate2.libs", "av"] {
+            assert!(!site.join(gone).exists(), "{gone} is left");
+        }
+        assert!(site.join("fastembed").is_dir());
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// A dist-info with no RECORD, which pip refuses to uninstall. It is the first package asked
+    /// for, and the rest are still asked for, one each; what pip refused goes by hand. setuptools
+    /// went through pip, beside an engine.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_pip_refuses_never_stops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, _runtime) = fake_voice_venv(dir.path());
+        let av_info = site.join("av-18.1.0.dist-info");
+        std::fs::remove_file(av_info.join("RECORD")).unwrap();
+        put(av_info.join("METADATA"), 3);
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), VOICE_REMOVAL);
+        for gone in [
+            "av",
+            "av.libs",
+            "av-18.1.0.dist-info",
+            "ctranslate2",
+            "ctranslate2-4.8.1.dist-info",
+            "faster_whisper",
+            "setuptools",
+            "setuptools-80.9.0.dist-info",
+        ] {
+            assert!(!site.join(gone).exists(), "{gone} is left");
+        }
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// A venv rebuilt in place on a newer Python keeps its old `lib/python3.11`, and pip on 3.12
+    /// never looks there, so it is never run. The engine in it goes by hand, and so does what pip
+    /// couldn't see in the current one (both are searched, not just the first); the old
+    /// site-packages' own setuptools, and everything else in it, stay.
+    #[cfg(unix)]
+    #[test]
+    fn an_engine_in_an_older_pythons_site_packages_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, runtime) = fake_voice_venv(dir.path());
+        clear_engine(&site);
+        put(site.join("av").join("__init__.py"), 3);
+        let old = runtime.join("venv/lib/python3.11/site-packages");
+        for piece in [
+            "ctranslate2/__init__.py",
+            "ctranslate2-4.8.1.dist-info/RECORD",
+            "ctranslate2.libs/libct2.so",
+            "av/__init__.py",
+            "av-18.1.0.dist-info/RECORD",
+            "setuptools/__init__.py",
+            "setuptools-65.5.0.dist-info/RECORD",
+            "fastembed/__init__.py",
+        ] {
+            put(old.join(piece), 3);
+        }
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        for gone in [
+            "ctranslate2",
+            "ctranslate2-4.8.1.dist-info",
+            "ctranslate2.libs",
+            "av",
+            "av-18.1.0.dist-info",
+        ] {
+            assert!(!old.join(gone).exists(), "{gone} is left");
+        }
+        assert!(!site.join("av").exists(), "av is left in 3.12");
+        for kept in ["setuptools", "setuptools-65.5.0.dist-info", "fastembed"] {
+            assert!(old.join(kept).is_dir(), "{kept} is not removed by hand");
+        }
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// The folders pip had moved aside when a removal of the engine was cut short go with it, and
+    /// only those: another package's stash and a package whose name merely starts like one stay.
+    #[cfg(unix)]
+    #[test]
+    fn pips_stashes_of_the_engine_go_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, _runtime) = fake_voice_venv(dir.path());
+        for piece in [
+            "~v/__init__.py",
+            "~v.libs/libavcodec.so",
+            "~translate2-4.8.1.dist-info/RECORD",
+            "~aster_whisper/__init__.py",
+            // The names pip falls back on when the first is taken.
+            "~av/__init__.py",
+            "~-.libs/libavcodec.so",
+            "~--18.1.0.dist-info/RECORD",
+            "~-ranslate2/__init__.py",
+            "~ip/__init__.py",
+            "~vro/__init__.py",
+            "~-v/__init__.py",
+            "~.-av/__init__.py",
+            // pip could make these of the engine's dist-infos, but only by replacing past the
+            // hyphen, where any package's dist-info could have given them.
+            "~---8.1.0.dist-info/RECORD",
+            "~000000000000.8.1.dist-info/RECORD",
+            "avro/__init__.py",
+            "avro-1.12.0.dist-info/RECORD",
+        ] {
+            put(site.join(piece), 3);
+        }
+        mgr.retire_voice();
+        for gone in [
+            "~v",
+            "~v.libs",
+            "~translate2-4.8.1.dist-info",
+            "~aster_whisper",
+            "~av",
+            "~-.libs",
+            "~--18.1.0.dist-info",
+            "~-ranslate2",
+        ] {
+            assert!(!site.join(gone).exists(), "{gone} is left");
+        }
+        for kept in [
+            "~ip",
+            "~vro",
+            "~-v",
+            "~.-av",
+            "~---8.1.0.dist-info",
+            "~000000000000.8.1.dist-info",
+            "avro",
+            "avro-1.12.0.dist-info",
+        ] {
+            assert!(site.join(kept).is_dir(), "{kept} is not the engine's");
+        }
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    #[test]
+    fn the_engines_entries_are_named_exactly() {
+        for name in [
+            "av",
+            "av.libs",
+            "av-18.1.0.dist-info",
+            "ctranslate2",
+            "ctranslate2.libs",
+            "ctranslate2-4.8.1.dist-info",
+            "faster_whisper",
+            "faster_whisper-1.2.1.dist-info",
+        ] {
+            assert!(is_voice_engine_entry(name), "{name}");
+            assert!(!is_voice_engine_stash(name), "{name}");
+            let stash = format!("~{}", &name[1..]);
+            assert!(is_voice_engine_stash(&stash), "{stash}");
+            assert!(!is_voice_engine_entry(&stash), "{stash}");
+        }
+        for name in [
+            "avro",
+            "avro-1.12.0.dist-info",
+            "av_utils",
+            "av-18.1.0.dist-info.bak",
+            "ctranslate2_extra",
+            "faster_whisper_server-0.1.dist-info",
+            "setuptools",
+            "setuptools-80.9.0.dist-info",
+            "_distutils_hack",
+            "~vro",
+            "~ip",
+            "~etuptools",
+        ] {
+            assert!(!is_voice_engine_entry(name), "{name}");
+            assert!(!is_voice_engine_stash(name), "{name}");
+        }
+
+        // pip's other names, tried in turn when one is taken: the first characters swapped for `~`
+        // and a run of its stash characters, or a run of up to 14 before the whole name.
+        let fourteen = format!("~{}av", "9".repeat(14));
+        for stash in [
+            "~av",
+            "~-av",
+            "~%%av",
+            fourteen.as_str(),
+            "~-.libs",
+            "~--libs",
+            "~--18.1.0.dist-info",
+            "~av-18.1.0.dist-info",
+            "~-ranslate2",
+            "~09anslate2",
+            "~~ctranslate2.libs",
+            "~=ster_whisper-1.2.1.dist-info",
+        ] {
+            assert!(is_voice_engine_stash(stash), "{stash}");
+        }
+        // And what pip never makes of these names: a run out of its order, one too long, a name
+        // of the wrong length, or one past a dist-info's hyphen with no version.
+        let fifteen = format!("~{}av", "9".repeat(15));
+        for name in [
+            "~-v",
+            "~.-av",
+            fifteen.as_str(),
+            "~-v.libs",
+            "~=aster_whisper-1.2.1.dist-info",
+            "~v-.dist-info",
+            "~x",
+        ] {
+            assert!(!is_voice_engine_stash(name), "{name}");
+        }
+        // Past a dist-info's hyphen: pip does make these of `av-18.1.0.dist-info` (its first four
+        // characters replaced) and `ctranslate2-4.8.1.dist-info` (thirteen), but what is left
+        // names no package, so they are never taken for the engine's.
+        for (stash, of) in [
+            ("~---8.1.0.dist-info", "av-18.1.0.dist-info"),
+            ("~000000000000.8.1.dist-info", "ctranslate2-4.8.1.dist-info"),
+        ] {
+            assert!(is_pip_stash_name(stash, of), "pip makes {stash} of {of}");
+            assert!(!is_voice_engine_stash(stash), "{stash}");
+        }
+    }
+
+    /// setuptools alone is no engine: a venv built on Python 3.11 has its own from `venv`. With no
+    /// engine piece in site-packages pip is never called, so that copy stays, while what voice left
+    /// outside site-packages (here the Whisper model) still goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_venvs_own_setuptools_is_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, runtime) = fake_voice_venv(dir.path());
+        clear_engine(&site);
+        put(site.join("setuptools").join("__init__.py"), 3);
+        put(site.join("setuptools-65.5.0.dist-info").join("RECORD"), 3);
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        assert!(site.join("setuptools").is_dir());
+        assert!(site.join("setuptools-65.5.0.dist-info").is_dir());
+        assert!(!runtime.join("models").join(WHISPER_REPO_DIR).exists());
+        assert!(!runtime.join("venv").join(".pm-voice").exists());
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// An engine someone chose to keep when they switched voice off (`.pm-voice-kept`) goes too:
+    /// that choice was about a switch that no longer exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_engine_is_removed_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, _site, runtime) = fake_voice_venv(dir.path());
+        std::fs::remove_file(runtime.join("venv").join(".pm-voice")).unwrap();
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), VOICE_REMOVAL);
+        assert!(!runtime.join("venv").join(".pm-voice-kept").exists());
+    }
+
+    /// A `runtime/tmp` or `runtime/models` (or its `.locks`) that is a link leads out of PM's data
+    /// dir, so nothing is looked for or removed through one, even while the clean-up runs in full
+    /// for the real leftovers beside it; and with only links left, the quick look finds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_clean_up_never_follows_a_link_out_of_the_data_dir() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, _site, runtime) = fake_voice_venv(dir.path());
+        let outside = dir.path().join("outside");
+        let clip = outside.join("tmp").join("voice-x.webm");
+        let model = outside
+            .join("models")
+            .join(WHISPER_REPO_DIR)
+            .join("model.bin");
+        put(clip.clone(), 3);
+        put(model.clone(), 3);
+        std::fs::remove_dir_all(runtime.join("tmp")).unwrap();
+        std::fs::remove_dir_all(runtime.join("models")).unwrap();
+        symlink(outside.join("tmp"), runtime.join("tmp")).unwrap();
+        symlink(outside.join("models"), runtime.join("models")).unwrap();
+
+        mgr.retire_voice();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            VOICE_REMOVAL,
+            "the real engine still goes"
+        );
+        assert!(!runtime.join("venv").join(".pm-voice").exists());
+        assert!(clip.is_file(), "a recording through a link stays");
+        assert!(model.is_file(), "a model through a link stays");
+        assert!(runtime.join("tmp").is_symlink() && runtime.join("models").is_symlink());
+        assert_gone_for_good(&mgr, dir.path(), &log);
+
+        // A real `models` whose `.locks` is a link, and a `tmp` that links to an empty folder:
+        // neither is voice's to clear, so there is nothing to find.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let outside = dir.path().join("outside");
+        let lock = outside.join("locks").join(WHISPER_REPO_DIR).join("x.lock");
+        put(lock.clone(), 1);
+        std::fs::create_dir_all(outside.join("empty")).unwrap();
+        std::fs::create_dir_all(runtime.join("models")).unwrap();
+        symlink(outside.join("locks"), runtime.join("models").join(".locks")).unwrap();
+        symlink(outside.join("empty"), runtime.join("tmp")).unwrap();
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: runtime.join("venv"),
+        });
+        assert!(!mgr.voice_leftovers_on_disk());
+        let before = tree(dir.path());
+        mgr.retire_voice();
+        assert_eq!(tree(dir.path()), before);
+        assert!(lock.is_file() && outside.join("empty").is_dir());
+    }
+
+    /// Take away everything voice left outside site-packages (the markers, the Whisper folders and
+    /// the recording), so a test's only leftover is the one it puts in site-packages.
+    #[cfg(unix)]
+    fn clear_outside_site(runtime: &Path) {
+        for path in [
+            runtime.join("venv/.pm-voice"),
+            runtime.join("venv/.pm-voice-kept"),
+            runtime.join("models").join(WHISPER_REPO_DIR),
+            runtime.join("models/.locks").join(WHISPER_REPO_DIR),
+            runtime.join("tmp"),
+        ] {
+            remove_voice_leftover(&path);
+        }
+    }
+
+    /// The venv, or any folder on the way down to its site-packages, that is a link leads out of
+    /// PM's data dir: nothing through it is counted, pip is never run on it, and nothing in the
+    /// folder it points to is touched, the voice marker beside a linked venv's engine included.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_venv_or_site_packages_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        for (linked, minor) in [
+            ("venv", 12),
+            ("venv/lib", 12),
+            ("venv/lib/python3.11", 11),
+            ("venv/lib/python3.12/site-packages", 12),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let runtime = dir.path().join("runtime");
+            let log = dir.path().join("pip.log");
+            // A whole venv outside, with the engine where its interpreter's site-packages is.
+            let outside = dir.path().join("outside");
+            fake_python(&outside.join("venv"), &log, minor);
+            let site = outside
+                .join("venv/lib")
+                .join(format!("python3.{minor}"))
+                .join("site-packages");
+            put(site.join("av").join("__init__.py"), 3);
+            put(site.join("ctranslate2-4.8.1.dist-info").join("RECORD"), 3);
+            put(outside.join("venv/.pm-voice"), 1);
+            // PM's own folders down to the link, its interpreter among them.
+            if linked != "venv" {
+                fake_python(&runtime.join("venv"), &log, minor);
+            }
+            let link = runtime.join(linked);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(outside.join(linked), &link).unwrap();
+
+            let mgr = SidecarManager::new(SidecarPaths {
+                source_dir: dir.path().join("sidecar"),
+                venv_dir: runtime.join("venv"),
+            });
+            let before = tree(&outside);
+            assert!(!mgr.voice_leftovers_on_disk(), "{linked}: found through it");
+            mgr.retire_voice();
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                "",
+                "{linked}: pip ran"
+            );
+            assert_eq!(
+                tree(&outside),
+                before,
+                "{linked}: changed what it points to"
+            );
+
+            // With a real leftover beside it the whole clean-up runs, and still reaches nothing
+            // through the link.
+            let whisper = runtime.join("models").join(WHISPER_REPO_DIR);
+            put(whisper.join("model.bin"), 3);
+            mgr.retire_voice();
+            assert!(!whisper.exists(), "{linked}: the real leftover stays");
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                "",
+                "{linked}: pip ran in the full clean-up"
+            );
+            assert_eq!(
+                tree(&outside),
+                before,
+                "{linked}: the full clean-up changed what it points to"
+            );
+        }
+    }
+
+    /// The interpreter's own `lib/python3.11` is a link to a folder outside holding an engine pip
+    /// could remove: pip is never run through it, and that folder is left as it was, while the
+    /// real engine beside it in `lib/python3.12` still goes by hand.
+    #[cfg(unix)]
+    #[test]
+    fn pip_never_runs_on_a_linked_site_packages_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let venv = runtime.join("venv");
+        let log = dir.path().join("pip.log");
+        fake_python(&venv, &log, 11);
+        let outside = dir.path().join("outside");
+        put(outside.join("site-packages/av/__init__.py"), 3);
+        put(outside.join("site-packages/av-18.1.0.dist-info/RECORD"), 3);
+        std::fs::create_dir_all(venv.join("lib")).unwrap();
+        std::os::unix::fs::symlink(&outside, venv.join("lib/python3.11")).unwrap();
+        let real = venv.join("lib/python3.12/site-packages/av");
+        put(real.join("__init__.py"), 3);
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: venv,
+        });
+
+        let before = tree(&outside);
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        assert_eq!(tree(&outside), before, "the linked folder changed");
+        assert!(!real.exists(), "the real engine is left");
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// A real removal leaves what else is in `runtime/tmp` and in huggingface_hub's lock folder:
+    /// only voice's recording and the Whisper model's lock go, and a `tmp` that still holds
+    /// something stays.
+    #[cfg(unix)]
+    #[test]
+    fn what_else_is_in_tmp_and_the_locks_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, _site, runtime) = fake_voice_venv(dir.path());
+        let other = runtime.join("tmp").join("other.bin");
+        let lock = runtime.join("models/.locks/models--Qdrant--bge-small-en-v1.5/x.lock");
+        put(other.clone(), 1);
+        put(lock.clone(), 1);
+        mgr.retire_voice();
+        assert!(!runtime.join("tmp").join("voice-a1b2c3.webm").exists());
+        assert!(!runtime
+            .join("models/.locks")
+            .join(WHISPER_REPO_DIR)
+            .exists());
+        assert!(other.is_file(), "tmp keeps what isn't voice's");
+        assert!(lock.is_file(), "the locks keep the search model's");
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// A venv on Python 3.11 with the engine only in a stale `lib/python3.12` beside its own
+    /// folder: pip on 3.11 has nothing of the engine's to remove, so it is never run and never
+    /// takes the venv's own setuptools. The stale engine goes by hand, its setuptools with it never.
+    #[cfg(unix)]
+    #[test]
+    fn an_engine_beside_the_interpreters_own_folder_never_has_pip_take_its_setuptools() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let venv = runtime.join("venv");
+        let log = dir.path().join("pip.log");
+        fake_python(&venv, &log, 11);
+        let own = venv.join("lib/python3.11/site-packages");
+        let stale = venv.join("lib/python3.12/site-packages");
+        for piece in [
+            "setuptools/__init__.py",
+            "setuptools-65.5.0.dist-info/RECORD",
+            "fastembed/__init__.py",
+        ] {
+            put(own.join(piece), 3);
+        }
+        for piece in [
+            "av/__init__.py",
+            "av-18.1.0.dist-info/RECORD",
+            "ctranslate2/__init__.py",
+            "ctranslate2-4.8.1.dist-info/RECORD",
+            "faster_whisper/__init__.py",
+            "faster_whisper-1.2.1.dist-info/RECORD",
+            "setuptools/__init__.py",
+            "setuptools-80.9.0.dist-info/RECORD",
+        ] {
+            put(stale.join(piece), 3);
+        }
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: venv,
+        });
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        for kept in ["setuptools", "setuptools-65.5.0.dist-info", "fastembed"] {
+            assert!(own.join(kept).is_dir(), "{kept} is the venv's own");
+        }
+        for gone in [
+            "av",
+            "av-18.1.0.dist-info",
+            "ctranslate2",
+            "ctranslate2-4.8.1.dist-info",
+            "faster_whisper",
+            "faster_whisper-1.2.1.dist-info",
+        ] {
+            assert!(!stale.join(gone).exists(), "{gone} is left");
+        }
+        assert!(stale.join("setuptools").is_dir(), "never removed by hand");
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// The engine's only dist-info in the interpreter's own site-packages has no RECORD, so pip
+    /// would refuse it: pip is never run (setuptools stays), and the package goes by hand.
+    #[cfg(unix)]
+    #[test]
+    fn a_dist_info_pip_would_refuse_is_removed_without_pip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, _runtime) = fake_voice_venv(dir.path());
+        clear_engine(&site);
+        put(site.join("av").join("__init__.py"), 3);
+        put(site.join("av-18.1.0.dist-info").join("METADATA"), 3);
+        put(site.join("setuptools").join("__init__.py"), 3);
+        put(site.join("setuptools-80.9.0.dist-info").join("RECORD"), 3);
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        assert!(!site.join("av").exists());
+        assert!(!site.join("av-18.1.0.dist-info").exists());
+        assert!(site.join("setuptools").is_dir(), "pip never ran");
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// A stash pip left after the engine's last live entry was gone is a leftover on its own: the
+    /// quick look finds it and it goes by hand, with no pip call. Another package's stash stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_stash_alone_is_removed_without_pip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, runtime) = fake_voice_venv(dir.path());
+        clear_engine(&site);
+        clear_outside_site(&runtime);
+        put(site.join("~v").join("__init__.py"), 3);
+        put(site.join("~-.libs").join("libavcodec.so"), 3);
+        put(
+            site.join("~=ster_whisper-1.2.1.dist-info").join("RECORD"),
+            3,
+        );
+        put(site.join("~-v").join("__init__.py"), 3);
+        assert!(mgr.voice_leftovers_on_disk(), "a stash is found");
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        for gone in ["~v", "~-.libs", "~=ster_whisper-1.2.1.dist-info"] {
+            assert!(!site.join(gone).exists(), "{gone} is left");
+        }
+        assert!(
+            site.join("~-v").is_dir(),
+            "pip never makes `~-v` of the engine"
+        );
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// The engine in a venv whose interpreter is gone: no pip to run, so it all goes by hand, and
+    /// setuptools stays.
+    #[cfg(unix)]
+    #[test]
+    fn without_an_interpreter_the_engine_still_goes_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mgr, log, site, runtime) = fake_voice_venv(dir.path());
+        std::fs::remove_file(runtime.join("venv/bin/python")).unwrap();
+        mgr.retire_voice();
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        for gone in [
+            "faster_whisper",
+            "faster_whisper-1.2.1.dist-info",
+            "ctranslate2",
+            "ctranslate2.libs",
+            "av",
+            "av.libs",
+            "av-18.1.0.dist-info",
+        ] {
+            assert!(!site.join(gone).exists(), "{gone} is left");
+        }
+        assert!(site.join("setuptools").is_dir(), "never removed by hand");
+        assert_gone_for_good(&mgr, dir.path(), &log);
+    }
+
+    /// The shared optional-component flow end to end, on photo OCR and [`fake_python`]. An install
+    /// over a current base venv first removes what the component's lock superseded, then installs
+    /// the lock with the flags every lock install takes, and stamps the marker; a second install
+    /// finds it current and runs nothing; a removal drops the marker and uninstalls exactly the
+    /// component's own packages.
+    #[cfg(unix)]
+    #[test]
+    fn an_optional_component_installs_once_and_removes_its_own_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("sidecar");
         std::fs::create_dir_all(&source_dir).unwrap();
         // Only their existence and hashes matter here.
         std::fs::write(
@@ -4404,142 +5183,84 @@ mod tests {
             b"base==0 \\\n    --hash=sha256:aaa\n",
         )
         .unwrap();
-        std::fs::write(
-            source_dir.join(OPTIONAL_VOICE_COMPONENT.lock),
-            b"voice==0 \\\n    --hash=sha256:bbb\n",
-        )
-        .unwrap();
-        let venv = dir.join("runtime").join("venv");
-        let log = dir.join("pip.log");
-        let py = venv.join("bin").join("python");
-        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
-        std::fs::write(
-            &py,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Python 3.12.0'; exit 0; fi\n\
-                 echo \"$@\" >> '{}'\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let site = venv.join("lib").join("python3.12").join("site-packages");
-        std::fs::create_dir_all(site.join("faster_whisper")).unwrap();
+        let ocr_lock = source_dir.join(OPTIONAL_OCR_COMPONENT.lock);
+        std::fs::write(&ocr_lock, b"rapidocr==0 \\\n    --hash=sha256:bbb\n").unwrap();
+        let venv = dir.path().join("runtime").join("venv");
+        let log = dir.path().join("pip.log");
+        fake_python(&venv, &log, 12);
+        // The base venv as provision leaves it: its marker holds the base lock's hash.
+        let base = crate::ingest::hex_digest(
+            &std::fs::read(source_dir.join("requirements.lock")).unwrap(),
+        );
+        std::fs::write(venv.join(".pm-ready"), base).unwrap();
         let mgr = SidecarManager::new(SidecarPaths {
-            source_dir: source_dir.clone(),
-            venv_dir: venv,
+            source_dir,
+            venv_dir: venv.clone(),
         });
-        (mgr, log, site, source_dir)
-    }
-
-    /// The reconciler end to end, on [`fake_voice_venv`]: an older PM's engine is left until a store
-    /// says, removed whole where voice is off (and again if a removal left part of it), left alone
-    /// where voice was switched off with "keep", left for `provision` while the base venv is
-    /// outdated, and adopted (the voice lock installed, the marker stamped) once it is current. As
-    /// the component it is never touched again.
-    #[cfg(unix)]
-    #[test]
-    fn the_reconciler_removes_or_adopts_an_older_pms_speech_engine() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mgr, log, site, source_dir) = fake_voice_venv(dir.path());
-        let venv = dir.path().join("runtime").join("venv");
         let logged = || std::fs::read_to_string(&log).unwrap_or_default();
-        let forget = || {
-            let _ = std::fs::remove_file(&log);
-        };
-        let removal =
-            "-m pip uninstall -y --disable-pip-version-check av ctranslate2 setuptools faster-whisper";
 
-        mgr.reconcile_voice_engine();
-        assert_eq!(logged(), "", "nothing is decided before a store says");
-
-        mgr.set_voice_wanted(false);
-        mgr.reconcile_voice_engine();
-        assert_eq!(logged().trim(), removal);
-
-        // A removal pip stopped part-way: faster-whisper is gone and CTranslate2 is not. Still an
-        // engine on disk, so the next pass tries again.
-        forget();
-        std::fs::remove_dir_all(site.join("faster_whisper")).unwrap();
-        std::fs::create_dir_all(site.join("ctranslate2")).unwrap();
-        mgr.set_voice_wanted(false);
-        mgr.reconcile_voice_engine();
-        assert_eq!(logged().trim(), removal);
-        std::fs::remove_dir_all(site.join("ctranslate2")).unwrap();
-        std::fs::create_dir_all(site.join("faster_whisper")).unwrap();
-
-        // Switched off with "keep the engine": what `set_voice_enabled(false, false)` does, in its
-        // order. The upgrade's clean-up leaves it.
-        forget();
-        mgr.keep_voice_engine().unwrap();
-        mgr.set_voice_wanted(false);
-        mgr.reconcile_voice_engine();
-        assert_eq!(logged(), "", "an engine someone chose to keep stays");
-
-        // The fake pip removed nothing, so the engine is still there for the next two cases.
-        forget();
-        mgr.set_voice_wanted(true);
-        mgr.reconcile_voice_engine();
+        assert!(!mgr.optional_ocr_ready());
+        mgr.install_optional_ocr(|_| {}).unwrap();
+        let lock_arg = ocr_lock.to_string_lossy().into_owned();
+        let mut install = vec!["-m", "pip", "install"];
+        install.extend(LOCK_INSTALL_FLAGS);
+        install.extend(["--progress-bar", "off", "-r", &lock_arg]);
         assert_eq!(
             logged(),
-            "",
-            "an outdated base venv is provision's to settle"
+            format!(
+                "-m pip uninstall -y --disable-pip-version-check opencv-python\n{}\n",
+                install.join(" ")
+            ),
+            "the superseded package first, then the lock"
         );
+        assert!(mgr.optional_ocr_ready());
 
-        let base = crate::ingest::hex_digest(
-            &std::fs::read(source_dir.join("requirements.lock")).unwrap(),
-        );
-        std::fs::write(venv.join(".pm-ready"), base).unwrap();
-        mgr.reconcile_voice_engine();
-        let adopted = logged();
-        assert!(
-            adopted.starts_with("-m pip install")
-                && adopted.contains(OPTIONAL_VOICE_COMPONENT.lock),
-            "the voice lock is installed: {adopted}"
-        );
-        assert!(mgr.optional_voice_ready(), "and the marker stamped");
-        assert!(
-            !venv.join(".pm-voice-kept").exists(),
-            "the note about the older engine goes with it"
-        );
+        std::fs::remove_file(&log).unwrap();
+        mgr.install_optional_ocr(|_| {}).unwrap();
+        assert_eq!(logged(), "", "a current component installs nothing");
 
-        forget();
-        mgr.set_voice_wanted(false);
-        mgr.reconcile_voice_engine();
+        mgr.uninstall_optional_ocr().unwrap();
+        assert!(!venv.join(".pm-ocr").exists());
+        assert!(!mgr.optional_ocr_ready());
         assert_eq!(
             logged(),
-            "",
-            "the component is the switch's to remove, not the upgrade's"
+            format!(
+                "-m pip uninstall -y --disable-pip-version-check {}\n",
+                OPTIONAL_OCR_COMPONENT.uninstall.join(" ")
+            )
         );
     }
 
-    /// A recording that finds the engine gone installs it, unless voice was switched off while it
-    /// waited: checked under the install lock, and nothing is downloaded.
-    #[cfg(unix)]
+    /// A computer that never had voice, or a fresh install with no venv yet: nothing is there, so
+    /// the launch returns at once, without pip and without creating or removing anything.
     #[test]
-    fn a_recording_never_reinstalls_the_engine_once_voice_is_off() {
+    fn nothing_to_retire_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let (mgr, log, _site, source_dir) = fake_voice_venv(dir.path());
-        let venv = dir.path().join("runtime").join("venv");
-        let base = crate::ingest::hex_digest(
-            &std::fs::read(source_dir.join("requirements.lock")).unwrap(),
-        );
-        std::fs::write(venv.join(".pm-ready"), base).unwrap();
+        let runtime = dir.path().join("runtime");
+        let mgr = SidecarManager::new(SidecarPaths {
+            source_dir: dir.path().join("sidecar"),
+            venv_dir: runtime.join("venv"),
+        });
+        assert!(!mgr.voice_leftovers_on_disk());
+        mgr.retire_voice();
+        assert!(!runtime.exists());
 
-        mgr.set_voice_wanted(false);
-        let refused = mgr
-            .install_optional_voice_for_recording(|_| {})
-            .unwrap_err()
-            .to_string();
-        assert!(refused.contains("Voice input is off"), "{refused}");
-        assert!(!std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .contains("install"));
-        assert!(!mgr.optional_voice_ready());
-
-        mgr.set_voice_wanted(true);
-        mgr.install_optional_voice_for_recording(|_| {}).unwrap();
-        assert!(mgr.optional_voice_ready());
+        // A real venv and models without any of voice's, and a `runtime/tmp` holding something
+        // else: still nothing to do, and that file is left alone.
+        let site = if cfg!(windows) {
+            runtime.join("venv").join("Lib").join("site-packages")
+        } else {
+            runtime.join("venv/lib/python3.12/site-packages")
+        };
+        std::fs::create_dir_all(site.join("fastembed")).unwrap();
+        std::fs::create_dir_all(site.join("avro")).unwrap();
+        std::fs::create_dir_all(site.join("avro-1.12.0.dist-info")).unwrap();
+        std::fs::create_dir_all(runtime.join("models/fastembed")).unwrap();
+        std::fs::create_dir_all(runtime.join("tmp")).unwrap();
+        std::fs::write(runtime.join("tmp/other.bin"), b"x").unwrap();
+        assert!(!mgr.voice_leftovers_on_disk(), "avro is not av");
+        mgr.retire_voice();
+        assert!(runtime.join("tmp/other.bin").is_file());
     }
 
     /// Every sidecar file the app READS at runtime must be bundled, in BOTH manifests. The resource
@@ -4692,7 +5413,7 @@ mod tests {
         // unknown method still gets a safe non-zero default.
         let secs = |m| request_timeout(m).as_secs();
         assert_eq!(secs("embed"), 30 * 60);
-        assert_eq!(secs("transcribe"), 30 * 60);
+        assert_eq!(secs("analyze_image"), 30 * 60);
         assert!(secs("count_tokens") < secs("embed"));
         assert!(secs("count_tokens") > 0);
         assert!(
@@ -4786,19 +5507,52 @@ mod tests {
     }
 
     #[test]
-    fn the_fetcher_is_never_handed_anything_from_the_file_being_parsed() {
-        // The `--fetch` helper is the ONE child that keeps a socket (issue #286). Every other
-        // method's params ARE the model id, so they pass through untouched — and by reference, so
-        // a large embed batch is not cloned to make the point.
-        let embed = json!({ "model": "bge-small", "texts": ["a", "b"] });
-        assert_eq!(fetch_params("embed", &embed), &embed);
-        let whisper = json!({ "model_dir": "/pm/runtime/models" });
-        assert_eq!(fetch_params("transcribe", &whisper), &whisper);
+    fn the_fetcher_is_handed_the_model_and_nothing_of_the_users() {
+        // The `--fetch` helper is the ONE child that keeps a socket (issue #286). Of an embed,
+        // count_tokens or rerank request it gets the model id and a custom model's spec, which is
+        // all it reads; the texts, the query and the passages stay behind.
+        let spec = json!({ "hf": "someone/custom-embedder", "dim": 384 });
+        let embed = json!({
+            "model": "custom:abc", "custom": spec, "texts": ["a", "b"], "batch_size": 8
+        });
+        assert_eq!(
+            fetch_params("embed", &embed),
+            json!({ "model": "custom:abc", "custom": spec })
+        );
+        let count = json!({ "model": "bge-small", "texts": ["a private note"] });
+        assert_eq!(
+            fetch_params("count_tokens", &count),
+            json!({ "model": "bge-small" })
+        );
+        let rerank = json!({ "model": "bge-reranker", "query": "q", "passages": ["p"] });
+        assert_eq!(
+            fetch_params("rerank", &rerank),
+            json!({ "model": "bge-reranker" })
+        );
+        // Neither key is invented when the request lacks it: the helper's own default stands.
+        assert_eq!(fetch_params("embed", &json!({ "texts": ["a"] })), json!({}));
 
-        // analyze_image is the exception: its params carry the path of the image mid-ingest, while
-        // all the fetcher does is build the OCR engine.
+        // analyze_image names no model, and its params carry the path of the image mid-ingest:
+        // all the fetcher does is build the OCR engine. A method with nothing to fetch gets
+        // nothing either.
         let image = json!({ "path": "/tmp/sandbox-in/receipt.png", "run_ocr": true });
-        assert_eq!(fetch_params("analyze_image", &image), &Value::Null);
+        assert_eq!(fetch_params("analyze_image", &image), Value::Null);
+        assert_eq!(
+            fetch_params("convert", &json!({ "path": "/tmp/sandbox-in/a.pdf" })),
+            Value::Null
+        );
+
+        for (method, params) in [
+            ("embed", &embed),
+            ("count_tokens", &count),
+            ("rerank", &rerank),
+            ("analyze_image", &image),
+        ] {
+            let handed = fetch_params(method, params);
+            for key in ["texts", "query", "passages", "path"] {
+                assert!(handed.get(key).is_none(), "{method} hands over {key}");
+            }
+        }
     }
 
     fn paths_with_source(source_dir: PathBuf) -> SidecarPaths {
@@ -5187,45 +5941,5 @@ mod tests {
             (2..=8).contains(&budget),
             "thread budget {budget} escaped the clamp on this machine"
         );
-    }
-
-    #[test]
-    fn transcription_never_drops_below_the_library_default_it_replaced() {
-        // The regression this exists to prevent: OMP_NUM_THREADS started governing ctranslate2 the
-        // moment #769 set it, so every machine under 8 cores lost threads it used to have. 4 is
-        // faster-whisper's own default, so the floor means no machine is slower than before.
-        for cores in [1usize, 2, 4, 6, 8] {
-            assert_eq!(
-                sidecar_transcribe_thread_budget(Some(cores)),
-                4,
-                "{cores} cores must keep ctranslate2's own default of 4"
-            );
-        }
-    }
-
-    #[test]
-    fn transcription_scales_up_with_the_machine_inside_the_same_ceiling() {
-        for (cores, want) in [(10usize, 5usize), (12, 6), (16, 8), (24, 8), (128, 8)] {
-            assert_eq!(
-                sidecar_transcribe_thread_budget(Some(cores)),
-                want,
-                "{cores} cores"
-            );
-        }
-        assert_eq!(
-            sidecar_transcribe_thread_budget(None),
-            4,
-            "unknown core count takes the floor, not the ceiling"
-        );
-    }
-
-    #[test]
-    fn transcription_is_never_handed_the_embedding_budget_by_accident() {
-        // Both are half-the-cores inside a clamp, and they agree from 8 cores up — the divergence
-        // below that is the entire fix, so a refactor that collapsed them into one call would pass
-        // every other test here.
-        let cores = Some(4);
-        assert_eq!(sidecar_thread_budget(cores), 2);
-        assert_eq!(sidecar_transcribe_thread_budget(cores), 4);
     }
 }

@@ -123,7 +123,7 @@ pub struct ChunkSpan {
 
 /// A decrypted image handed to the webview as base64 + mime (for a `data:` URL). The asset protocol is
 /// off and an opt-in saved original follows the vault cipher (possibly ciphertext), so image bytes come
-/// back through a command rather than a file URL — the same base64 hop `transcribe_audio` uses.
+/// back through a command rather than a file URL, base64 in the reply.
 #[derive(Serialize)]
 pub struct ImageData {
     pub base64: String,

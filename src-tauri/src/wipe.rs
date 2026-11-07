@@ -5,10 +5,10 @@
 //! Windows uninstaller, which only removes the app + the regenerable `runtime/`). It erases, à la
 //! carte, the four classes of data PM leaves on a machine:
 //!
-//!   1. **Regenerable components** — the whole `runtime/` (Python venv incl. t-SNE/OCR, the Whisper
-//!      model, the bundled interpreter). Exactly what Settings → Storage frees; re-downloaded on
-//!      next use. The shared embedder model cache lives OUTSIDE the data dir and is deliberately
-//!      left (matching the Storage tab, which marks it read-only).
+//!   1. **Regenerable components** — the whole `runtime/` (Python venv incl. t-SNE/OCR, the
+//!      downloaded models, the bundled interpreter), re-downloaded on next use. The models have
+//!      lived in `runtime/models` since #286, so the search model, the reranker and the photo-OCR
+//!      weights go too: more than Settings → Storage frees, which never removes the search model.
 //!   2. **Vault & database** — the real user data: the encrypted `pm.sqlite`, the `vault-meta.json`,
 //!      the Markdown vault, and the ancillary vault artifacts (entity rules, index-only manifest,
 //!      lock batons, the relocation pointer). Irreversible.
@@ -62,7 +62,7 @@ pub const RESTORE_STAGING_DIR: &str = "restored-vaults";
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WipeSelection {
-    /// The regenerable `runtime/` (venv + t-SNE/OCR + Whisper + bundled interpreter).
+    /// The regenerable `runtime/` (venv + t-SNE/OCR + downloaded models + bundled interpreter).
     pub regenerable: bool,
     /// The vault, encrypted store, and vault artifacts. Irreversible.
     pub vault_and_db: bool,
@@ -808,13 +808,15 @@ fn report_third_party_stores(app: &AppHandle, report: &mut WipeReport) {
             );
         }
     }
-    // macOS keeps the microphone grant in a system database no application may edit.
+    // macOS keeps the microphone grant in a system database no application may edit. PM no longer
+    // asks for the microphone (voice input was removed), but a grant an earlier version was given
+    // stays there until someone clears it.
     #[cfg(target_os = "macos")]
     report.leave_behind(
         "Microphone permission (System Settings > Privacy & Security)",
-        "macOS remembers that you allowed PM to use the microphone, and no app can revoke that for \
-         itself. Remove PM from the Microphone list there, or run: tccutil reset Microphone \
-         org.itsatlas.pm",
+        "if you used voice input in an earlier version of PM, macOS still remembers that you \
+         allowed PM to use the microphone, and no app can revoke that for itself. Remove PM from \
+         the Microphone list there, or run: tccutil reset Microphone org.itsatlas.pm",
     );
 }
 

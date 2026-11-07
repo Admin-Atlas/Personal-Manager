@@ -6,16 +6,15 @@
 A long-lived helper process that does the jobs the Rust backend cannot do
 natively: convert arbitrary files to Markdown (MarkItDown), embed text locally
 with an on-device ONNX model (fastembed), re-rank passages with a local
-cross-encoder (fastembed), transcribe voice clips locally (faster-whisper — an
-OPTIONAL component that switching voice input on installs), and read text +
-capture metadata out of photos (rapidocr OCR + Pillow EXIF — an OPTIONAL
-component the user installs on demand, like the t-SNE reducer).
+cross-encoder (fastembed), and read text + capture metadata out of photos
+(rapidocr OCR + Pillow EXIF — an OPTIONAL component the user installs on
+demand, like the t-SNE reducer).
 It is the only part of PM that runs Python, and it is deliberately dumb: it
-converts, embeds, scores, transcribes, and analyses images, nothing else.
+converts, embeds, scores, and analyses images, nothing else.
 Chunking, hashing, prefixes, the vault, and the database all live in Rust.
 
 Protocol: newline-delimited JSON over stdio. One request per line, where method is one of
-ping, convert, embed, count_tokens, rerank, transcribe, reduce, analyze_image, analyze_spreadsheet:
+ping, convert, embed, count_tokens, rerank, reduce, analyze_image, analyze_spreadsheet:
 
     {"id": <int>, "method": <name>, "params": {...}}
 
@@ -25,16 +24,16 @@ One response per line:
     {"id": <int>, "ok": false, "error": "message"}
 
 Heavy objects (the MarkItDown instance, the embedding/reranking models, the
-Whisper model) are created lazily on first use so `ping` stays instant and
+OCR engine) are created lazily on first use so `ping` stays instant and
 startup is cheap. The long-lived worker runs OFFLINE (PM_SIDECAR_OFFLINE=1): a
 model missing from the local cache raises `ModelNotCached`, which the Rust side
 turns into a run of this same script with `--fetch` (network allowed) to download
 it, then a retry. So the worker that parses untrusted files never needs a socket;
 only the short-lived fetcher does (issue #286).
 
-Security: ingested content — including transcribed audio and passages scored by
-the reranker — is untrusted data, never instructions. This process only
-converts/embeds/scores/transcribes bytes; it never executes file contents.
+Security: ingested content — including passages scored by the reranker — is
+untrusted data, never instructions. This process only converts/embeds/scores
+bytes; it never executes file contents.
 """
 
 import ctypes
@@ -49,8 +48,8 @@ import traceback
 # file bytes and must run with no outbound sockets; downloading a model is instead the job
 # of the short-lived `--fetch` helper, which Rust runs with the network allowed. Rust sets
 # PM_SIDECAR_OFFLINE=1 on the worker only. Translate it to Hugging Face's offline flags HERE,
-# at import time, before any loader pulls in huggingface_hub (fastembed and faster-whisper
-# both fetch through it) — so a cold-cache load fails fast with a catchable error the worker
+# at import time, before any loader pulls in huggingface_hub (fastembed fetches through
+# it) — so a cold-cache load fails fast with a catchable error the worker
 # can turn into "please fetch this", instead of silently reaching out to the network.
 _OFFLINE = os.environ.get("PM_SIDECAR_OFFLINE") == "1"
 if _OFFLINE:
@@ -58,7 +57,7 @@ if _OFFLINE:
     # inherited falsy value like HF_HUB_OFFLINE=0 must NOT win. huggingface_hub reads "0" as online
     # and fastembed keys its offline gate off this var, so a stale "0" would let a cold-cache
     # embed/rerank download from inside the untrusted-file worker (the exact socket #286 forbids),
-    # with _OFFLINE still True so nothing notices. faster-whisper and (below) fastembed also pass
+    # with _OFFLINE still True so nothing notices. fastembed (below) also passes
     # local_files_only=_OFFLINE as belt-and-suspenders, but this env var must be authoritative too.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -117,32 +116,6 @@ def _thread_budget():
 
 
 _THREADS = _thread_budget()
-
-
-def _transcribe_thread_budget():
-    """Threads for transcription specifically. Half the cores, clamped to 4..8.
-
-    A separate number from `_thread_budget` because of one line in faster-whisper's own docstring:
-    "cpu_threads: Number of threads to use when running on CPU (4 by default). A non zero value
-    overrides the OMP_NUM_THREADS environment variable." Zero — the default we were taking by not
-    passing the argument — means OMP wins. So the moment this module started setting
-    `OMP_NUM_THREADS`, transcription silently began using a figure derived from measuring
-    EMBEDDING, and every machine below 8 cores lost threads: a 4-core laptop went 4 -> 2.
-
-    The floor of 4 is ctranslate2's own default, so no machine transcribes slower than it did
-    before any of this existed. The ceiling of 8 is carried over from the general budget rather
-    than measured — ctranslate2's scaling past 8 intra-op threads is not benchmarked here.
-    """
-    override = os.environ.get("PM_SIDECAR_TRANSCRIBE_THREADS")
-    if override:
-        try:
-            return max(1, int(override))
-        except ValueError:
-            pass
-    return max(4, min(8, (os.cpu_count() or 8) // 2))
-
-
-_TRANSCRIBE_THREADS = _transcribe_thread_budget()
 
 # The env-var half of the budget: numpy's OpenBLAS, any OpenMP runtime under onnxruntime, and
 # tokenizers' rayon pool. setdefault, not hard assignment — an operator who deliberately exported
@@ -208,7 +181,7 @@ def _release_free_memory():
 # Handlers heavy enough to be worth a trim once they return — the ones that run a model or hold a
 # whole file in memory. Everything else returns promptly to a small steady state on its own.
 _TRIM_AFTER = frozenset(
-    {"embed", "rerank", "transcribe", "convert", "analyze_image", "analyze_spreadsheet", "reduce"}
+    {"embed", "rerank", "convert", "analyze_image", "analyze_spreadsheet", "reduce"}
 )
 
 
@@ -334,11 +307,6 @@ except Exception:
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
 
-# The speech-to-text model for voice input. Fixed for v1, like EMBED_MODEL.
-# English-only, ~145 MB, run int8 on CPU — the speed/accuracy sweet spot for
-# dictation. Weights download once on first `transcribe`, then it is fully local.
-WHISPER_MODEL = "base.en"
-
 _markitdown = None
 # Per-model caches, keyed by model id, so one process can serve several models
 # (e.g. the English embedder plus a multilingual one). `_registered` tracks the
@@ -349,7 +317,6 @@ _embedders = {}
 _tokenizers = {}
 _rerankers = {}
 _registered = set()
-_whisper = None
 _ocr_engine = None
 _heif_registered = False
 
@@ -376,15 +343,15 @@ class Unconvertible(Exception):
 def _load_model(build):
     """Construct a model, converting ANY failure in OFFLINE mode into ModelNotCached so Rust runs
     the network-allowed `--fetch` helper and retries. Treating every offline construction failure as
-    "not downloaded yet" is deliberate: the exception differs by library and version. faster-whisper
-    surfaces huggingface_hub's `LocalEntryNotFoundError`, but fastembed swallows the offline error
-    and raises a bare `ValueError("Could not load model ... from any source")` (verified against the
-    0.8.0 venv; unchanged in 0.8.1's and 0.9.0's source), so matching specific types/messages would
-    silently break first-use ingest on a wording change. In offline mode the only recovery for ANY
-    load failure is for the fetcher (with the network) to obtain the model and retry, which also
-    self-heals a corrupt cache; if it still fails, `request()` fetches once then surfaces the real
-    error. In the FETCHER itself (`_OFFLINE` False) this is a passthrough: a genuine download error
-    must surface as-is."""
+    "not downloaded yet" is deliberate: the exception differs by library and version. A plain
+    huggingface_hub load surfaces `LocalEntryNotFoundError`, but fastembed swallows the offline
+    error and raises a bare `ValueError("Could not load model ... from any source")` (verified
+    against the 0.8.0 venv; unchanged in 0.8.1's and 0.9.0's source), so matching specific
+    types/messages would silently break first-use ingest on a wording change. In offline mode the
+    only recovery for ANY load failure is for the fetcher (with the network) to obtain the model and
+    retry, which also self-heals a corrupt cache; if it still fails, `request()` fetches once then
+    surfaces the real error. In the FETCHER itself (`_OFFLINE` False) this is a passthrough: a
+    genuine download error must surface as-is."""
     if not _OFFLINE:
         return build()
     try:
@@ -575,52 +542,6 @@ def get_reranker(model, spec=None):
             )
         )
     return _rerankers[name]
-
-
-# The speech engine's own packages (the voice component's import dirs).
-_VOICE_ENGINE_MODULES = ("faster_whisper", "ctranslate2", "av")
-
-
-def get_whisper(model_dir):
-    global _whisper
-    if _whisper is None:
-        # Imported here and nowhere else: the speech engine is an optional component, absent from
-        # every venv where voice input is off, so nothing outside the transcribe path may need it.
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            # Rust installs the engine before it asks (`install_optional_voice_for_recording`), so
-            # one of its packages missing means it was removed under a request. Say that, rather
-            # than a bare module name. Anything else (a native library that won't load, a package
-            # the engine needs gone) keeps its own words: the friendly line would send someone
-            # whose voice is already on to turn it on, and the cause would never reach Rust.
-            missing = (getattr(exc, "name", None) or "").split(".")[0]
-            if isinstance(exc, ModuleNotFoundError) and missing in _VOICE_ENGINE_MODULES:
-                raise RuntimeError(
-                    "voice input's speech engine isn't installed; turn voice input on in "
-                    "Settings → Storage"
-                ) from exc
-            raise RuntimeError(f"voice input's speech engine couldn't be loaded: {exc}") from exc
-
-        # `model_dir` (passed by Rust) keeps the weights inside PM's data dir so
-        # they uninstall cleanly with it; None falls back to the default cache.
-        # `local_files_only` mirrors the worker's offline posture: the OFFLINE worker
-        # loads from cache only (a miss raises → ModelNotCached), while the `--fetch`
-        # helper runs with it False so it can download (issue #286).
-        _whisper = _load_model(
-            lambda: WhisperModel(
-                WHISPER_MODEL,
-                device="cpu",
-                compute_type="int8",
-                # Stated, never inferred. Left unset it is 0, which faster-whisper documents as
-                # "OMP_NUM_THREADS wins" — and this module sets OMP_NUM_THREADS for the embedding
-                # pools, so silence here means transcription quietly takes embedding's budget.
-                cpu_threads=_TRANSCRIBE_THREADS,
-                download_root=model_dir or None,
-                local_files_only=_OFFLINE,
-            )
-        )
-    return _whisper
 
 
 def clean_text(value):
@@ -1010,7 +931,7 @@ def do_convert(params):
     engine = get_markitdown()
     # Imported HERE, not at module scope: markitdown is a deliberately lazy import (see
     # `get_markitdown`), and naming its exceptions at module level would load the whole package
-    # on every sidecar start — including for `embed`, `rerank` and `transcribe`, which never
+    # on every sidecar start — including for `embed` and `rerank`, which never
     # convert anything. Safe at this point: the engine has already imported successfully.
     from markitdown import MarkItDownException, MissingDependencyException, StreamInfo
 
@@ -1127,22 +1048,6 @@ def do_rerank(params):
     return {"scores": [float(s) for s in scores]}
 
 
-def do_transcribe(params):
-    """Transcribe one audio clip to text with the local Whisper model.
-
-    The Rust side records the clip in the webview, writes the bytes to a temp
-    file, and passes its path here; faster-whisper decodes the audio itself via
-    the bundled PyAV (no system ffmpeg needed). The text is the user's own speech
-    bound for the chat box — still untrusted data, so it is `clean_text`-ed like
-    every other string we return.
-    """
-    path = params["path"]
-    model = get_whisper(params.get("model_dir"))
-    segments, _info = model.transcribe(path)
-    text = " ".join(segment.text.strip() for segment in segments).strip()
-    return {"text": clean_text(text)}
-
-
 def _forbid_rapidocr_downloads():
     """Make the OFFLINE posture authoritative for rapidocr, which has no offline flag of its own.
 
@@ -1154,8 +1059,8 @@ def _forbid_rapidocr_downloads():
 
     So we replace the downloader's single entry point with one that refuses to fetch. A cold cache
     then surfaces as a clean `ModelNotCached`, `request()` runs the network-allowed `--fetch`
-    helper, and the retry finds the models on disk — which is how the embedder, reranker and speech
-    model already work.
+    helper, and the retry finds the models on disk — which is how the embedder and reranker already
+    work.
 
     It has to keep the "already downloaded" case working, and that is not free: rapidocr's engine
     calls the downloader UNCONDITIONALLY and lets the downloader decide whether the file is already
@@ -1315,7 +1220,7 @@ def _gps_to_decimal(value, ref):
     # A GPS rational with a zero denominator makes float() produce nan/inf, and a non-finite float
     # serializes as bare `NaN`/`Infinity` -- which is not valid JSON, so the Rust reader skips the
     # reply line and blocks on an answer that never comes. One corrupt-EXIF photo would wedge the
-    # whole serialized sidecar (ingest, retrieval, rerank, transcribe, map) until the per-method
+    # whole serialized sidecar (ingest, retrieval, rerank, map) until the per-method
     # timeout expired. A photo with no readable location is the honest answer here.
     if not math.isfinite(dec):
         return None
@@ -2011,7 +1916,6 @@ HANDLERS = {
     "embed": do_embed,
     "count_tokens": do_count_tokens,
     "rerank": do_rerank,
-    "transcribe": do_transcribe,
     "reduce": do_reduce,
     "analyze_image": do_analyze_image,
     "analyze_spreadsheet": do_analyze_spreadsheet,
@@ -2041,7 +1945,7 @@ def _quiet_stdout():
     the Rust reader cannot parse the reply, skips the line, and then blocks on an answer that has
     already been sent — wedging the serialized sidecar for the whole per-method timeout. This used
     to be guarded only around the two rapidocr calls, which is the one library we happened to
-    catch doing it; MarkItDown, openpyxl, fastembed and faster-whisper all pull in dependency trees
+    catch doing it; MarkItDown, openpyxl and fastembed all pull in dependency trees
     nobody has audited for prints. Guarding the DISPATCH covers every handler, present and future,
     for the same three lines. `main()` and `fetch_main()` hold the real stdout from before this
     runs, so the reply itself is unaffected."""
@@ -2116,8 +2020,7 @@ def main():
         # `allow_nan=False` is the load-bearing half. Python's json emits bare `NaN` / `Infinity`
         # for non-finite floats, which are NOT valid JSON: the Rust reader can't parse the line, so
         # it skips it and then blocks forever on a reply that has already been sent. That wedges the
-        # whole serialized sidecar -- ingest, chat retrieval, rerank, transcribe, map -- for
-        # the full
+        # whole serialized sidecar -- ingest, chat retrieval, rerank, map -- for the full
         # per-method timeout (30 minutes for analyze_image/embed) before the child is killed. One
         # photo with a zero-denominator GPS rational was enough to do it.
         #
@@ -2147,9 +2050,8 @@ def main():
 def _ensure_model(method, params):
     """Load — and thus download, with the network allowed — the model `method` needs, so a later
     OFFLINE worker call finds it in the shared cache. Reuses the worker's own lazy loaders; the
-    cache location is identical (same OS user, same fastembed/whisper defaults, and whisper's
-    `model_dir` rides along in `params`), so what this process fetches is exactly what the worker
-    then reads."""
+    cache location is identical (same OS user, same fastembed defaults, and the same
+    PM_MODELS_DIR), so what this process fetches is exactly what the worker then reads."""
     model = params.get("model") or EMBED_MODEL
     custom = params.get("custom")
     if method in ("embed", "count_tokens"):
@@ -2159,13 +2061,12 @@ def _ensure_model(method, params):
     elif method == "rerank":
         _adopt_fastembed_cache("rerank", params.get("model"), custom)
         get_reranker(params.get("model"), custom)
-    elif method == "transcribe":
-        get_whisper(params.get("model_dir"))
     elif method == "analyze_image":
         # Photo OCR. rapidocr fetches its own models from its own host rather than through
         # huggingface_hub, but that is the fetcher's problem, not the worker's — the contract is
         # identical to every other model's, so it rides the same path. Nothing here touches the
-        # image: `params` carries no path (Rust strips it) and this only builds the engine.
+        # image: Rust hands this helper no params for it, so no path, and this only builds the
+        # engine.
         get_ocr_engine()
     else:
         raise ValueError(f"nothing to fetch for method {method!r}")
@@ -2174,10 +2075,12 @@ def _ensure_model(method, params):
 def fetch_main():
     """The network-allowed model DOWNLOADER (issue #286). Rust spawns this SHORT-LIVED process —
     deliberately WITHOUT PM_SIDECAR_OFFLINE — when the offline worker reports a model isn't cached.
-    It reads one request line ({"method","params"}, the shape the worker gets), downloads that
-    method's model into the shared cache, writes one reply line, and exits. It never parses
-    untrusted file bytes: its only input is a trusted model id from Rust, so it is the one component
-    that legitimately keeps network access once the worker is sandboxed."""
+    It reads one request line ({"method","params"}), downloads that method's model into the shared
+    cache, writes one reply line, and exits. Rust cuts the params down to what names the model (its
+    id and a custom model's spec, or nothing for photo OCR), so the texts, query, passages or image
+    path the worker's request carried never reach it. It never parses untrusted file bytes: its only
+    input is a model named by Rust, so it is the one component that legitimately keeps network
+    access once the worker is sandboxed."""
     # The real reply channel, held before `_quiet_stdout` swaps `sys.stdout` — a downloader that
     # prints its progress (rapidocr's does) would otherwise land on the one line Rust parses.
     out = sys.stdout

@@ -39,16 +39,6 @@
         "classifiers": []
       }
     },
-    "av": {
-      "versions": ["18.1.0"],
-      "licence": "BSD-3-Clause",
-      "stamp": "6cc25597aa56ec8396d93ec4161b64f5",
-      "evidence": {
-        "expression": "BSD-3-Clause",
-        "license": null,
-        "classifiers": []
-      }
-    },
     "beautifulsoup4": {
       "versions": ["4.15.0"],
       "licence": "MIT",
@@ -141,16 +131,6 @@
         "classifiers": []
       }
     },
-    "ctranslate2": {
-      "versions": ["4.8.1"],
-      "licence": "MIT",
-      "stamp": "3a129a66b528ce195cea25ca67904ce2",
-      "evidence": {
-        "expression": null,
-        "license": "MIT",
-        "classifiers": []
-      }
-    },
     "defusedxml": {
       "versions": ["0.7.1"],
       "licence": "PSF-2.0",
@@ -180,16 +160,6 @@
         "expression": "Apache-2.0",
         "license": null,
         "classifiers": []
-      }
-    },
-    "faster-whisper": {
-      "versions": ["1.2.1"],
-      "licence": "MIT",
-      "stamp": "6d5a11a0b5ee0e5a5d647136e10dbe05",
-      "evidence": {
-        "expression": null,
-        "license": "MIT",
-        "classifiers": ["License :: OSI Approved :: MIT License"]
       }
     },
     "filelock": {
@@ -659,16 +629,6 @@
         }
       },
       "note": "`license` is the entire licence text pasted into the one-line field; it is the three-clause text."
-    },
-    "setuptools": {
-      "versions": ["84.2.1"],
-      "licence": "MIT",
-      "stamp": "c8b738d8329822d796948cbf7c4457ed",
-      "evidence": {
-        "expression": "MIT",
-        "license": null,
-        "classifiers": []
-      }
     },
     "shapely": {
       "versions": ["2.1.2"],
