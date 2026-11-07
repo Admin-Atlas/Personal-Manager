@@ -24,6 +24,13 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "3.175.2-alpha",
+    date: "2026-11-06",
+    highlights: [
+      "A privacy fix on a Mac. The web engine PM's windows run on has a fraudulent-website warning, on by default, which checks addresses with Apple's Safe Browsing service, and that can send information about them to Google, or to Tencent in some regions. PM's pages never visit websites, but a window might still have checked a web address it refused to open, so PM now turns the warning off in its windows. Nothing changes in how you use PM.",
+    ],
+  },
+  {
     version: "3.175.1-alpha",
     date: "2026-11-06",
     highlights: [
