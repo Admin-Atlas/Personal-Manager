@@ -44,7 +44,16 @@ convenience trade-off, and one worth stating plainly: that single grant is *coar
 per-secret grant, so any code running as PM, once you allow it, can read every secret rather than
 just the one it asked for. On **Windows and Linux** each secret is its own keychain item, because
 Windows Credential Manager caps one credential at 2560 bytes and PM's secrets together exceed it;
-neither platform prompts per item, so nothing is lost by keeping them separate. Wherever they are
+neither platform prompts per item, so nothing is lost by keeping them separate. On Windows, a
+secret PM saves for the first time (an API key added where none was saved, an account connected for
+the first time, the database key of a new install) is kept in Credential Manager for **this computer only** (`CRED_PERSIST_LOCAL_MACHINE`), so
+it doesn't follow you to other PCs with a work or school roaming profile. A secret saved before
+keeps the setting it had, and PM keeps that setting when it updates it, so no other computer that
+shares it loses it and nothing needs reconnecting. Two limits follow: a secret that already roams
+keeps roaming, even when PM replaces its value, until it is removed and saved again (by
+disconnecting and reconnecting an account, or, for the OpenRouter keys and the database key, only
+through Remove PM data), and on a roaming profile shared with a PC running an older PM, that PC may
+still save roaming copies. Wherever they are
 stored, the secrets themselves never leave the Rust backend. Your **documents live in a plaintext Markdown vault**,
 so their at-rest protection relies on your own OS full-disk encryption (BitLocker /
 FileVault) — a deliberate choice to keep your notes openable by any tool, not a gap
