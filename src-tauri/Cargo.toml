@@ -203,7 +203,7 @@ windows-future = "0.2"
 # (the `windows` 0.61 above has another). Both at the versions wry already locks (MIT, and MIT OR
 # Apache-2.0, already allow-listed), so no new package or licence.
 webview2-com = "0.39"
-windows-core = "0.62"
+windows-core = "0.100"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
