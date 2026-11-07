@@ -2147,6 +2147,7 @@ dependencies = [
  "tauri-build",
  "webkit2gtk",
  "webview2-com",
+ "windows",
  "windows-core",
 ]
 

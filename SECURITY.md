@@ -21,11 +21,17 @@ Drive, Google Sheets, OneDrive), and encrypted backups to your own cloud. PM its
 telemetry, analytics, or crash reporting, and switches off the usage reporting of the libraries in
 its document engine (onnxruntime, huggingface_hub, hf-xet) and the system profile pip would send
 PyPI. Two components do reporting of their own: on Windows, Microsoft's Edge WebView2 Runtime
-sends Microsoft its required diagnostic data (no app can turn that off), optional data when Windows
-allows it, and crash reports; and the Proton Drive CLI reports to Proton if the Proton account's
+sends Microsoft its required diagnostic data (no app can turn that off) and optional data when
+Windows allows it, while PM starts it with custom crash reporting on
+(`IsCustomCrashReportingEnabled`), so its crash dumps stay on the computer, in WebView2's own crash
+folder. Three runs are exceptions, where crash reports follow Windows' settings: one where PM had to
+fall back to WebView2's default environment, and one on a WebView2 Runtime too old to have the
+option (both leave its webview engine unsealed), and possibly the first launch after the update
+that brings this, if the previous version's WebView2 browser process was still running, which may
+not show as unsealed; and the Proton Drive CLI reports to Proton if the Proton account's
 "Collect usage diagnostics" was on when the CLI last signed in (it reads the setting only then), and
-can send a crash report if it fails while starting up, before it has read the setting. PM can't
-change either. **Calendar editing raises the stakes of a stolen token:** a Google
+can send a crash report if it fails while starting up, before it has read the setting. Beyond
+WebView2's crash dumps, PM can't change either. **Calendar editing raises the stakes of a stolen token:** a Google
 account with editing on holds a token that can create, change and delete events on every
 calendar that account can edit, put them on another of its calendars, add video calls, and send
 invitations, and replies to invitations, in its name.

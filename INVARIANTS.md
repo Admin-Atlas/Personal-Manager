@@ -450,22 +450,30 @@ then on.
 
 ### I-26 · Every PM window is built through `mods::build_window` — **Held**
 
-The main window (`tauri.conf.json` says `"create": false`, and `setup()` builds it), the briefing
-panel (`tray.rs`) and the pop-out Calendar (`popout.rs`) are each built by `mods::build_window`
+The main window (`tauri.conf.json` says `"create": false`, and `setup()` builds it through
+`mods::build_main_window`), the briefing panel (`tray.rs`) and the pop-out Calendar (`popout.rs`) are
+each built by `mods::build_window`, or for the main window by the `build_window_with` it wraps
 (`src-tauri/src/mods/mod.rs`). It adds the navigation guard, the download refusal, the top-frame and
 WebRTC init scripts, WebView2's browser args (which point at PM's sinkhole proxy, or at a dead port
-when the sinkhole couldn't be bound), and the engine switches (Mods spec §1.4). A test in that file
-fails if the config entry is created by Tauri again.
+when the sinkhole couldn't be bound), on Windows PM's one WebView2 environment (which carries those
+args and keeps WebView2's crash reports on the computer, `engine::WINDOWS_CRASH_UPLOAD_OFF`; the main
+window creates it, in the data folder Tauri gives every window), and the engine switches (Mods spec
+§1.4). A test in that file fails if the config entry is created by Tauri again.
 
-**Why.** WebView2 refuses a second webview in the same user-data folder with different browser args,
-and every PM window shares one. So on Windows a window built with a bare `WebviewWindowBuilder::build`
-fails to open beside a sealed one. Everywhere else, it opens without the guard, which is the wall that
-keeps a mod's page from becoming a top document holding Tauri's invoke key.
+**Why.** WebView2 refuses a second webview in the same user-data folder with different environment
+options, browser args included, and every PM window shares one. So on Windows a window built with a
+bare `WebviewWindowBuilder::build` fails to open beside a sealed one, and one built with an
+environment of its own differs from PM's in the crash option, which WebView2 may refuse, or may let
+it share the browser process with, leaving which option is in force unknown. Everywhere else, it
+opens without the guard, which is the wall that keeps a mod's page from becoming a top document
+holding Tauri's invoke key.
 
 **Co-signers.** A new window goes through `build_window` with `Role::NoMods`. Only the main window is
 `Role::Main`, the one that may load a mod frame and whose switches decide whether the engine is sealed.
-The exception is a switch whose setting WebView2 shares between every window (SmartScreen's,
-`Platform::folder_wide_switches`): its failure in a `Role::NoMods` window unseals the engine too.
+The exception is a switch whose setting WebView2 shares between every window (SmartScreen's and crash
+reporting's, `Platform::folder_wide_switches`): its failure in a `Role::NoMods` window unseals the
+engine too. Nothing else creates a WebView2 environment: when the main window couldn't be built with
+PM's, every window is built without it (`engine::build_main_retrying`), and the engine is unsealed.
 
 ### I-27 · A mod reaches the webview only as verified bytes, and its id only as a `ModId` — **Held**
 

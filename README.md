@@ -303,8 +303,14 @@ chosen cloud (Proton Drive or Google Drive). Nothing else leaves the machine fro
 has no telemetry, analytics, or crash reporting, and it switches off the usage reporting of the
 libraries in its document engine. Two pieces PM relies on do reporting of their own. On Windows,
 PM's windows are drawn by Microsoft's Edge WebView2 Runtime, part of Windows, which sends Microsoft
-its required diagnostic data whatever Windows' settings say (no app can turn that off), more when
-Windows' optional diagnostic data is on, and a crash report if one of its processes crashes. And Proton Drive's command-line tool, once installed, reports to Proton if your
+its required diagnostic data whatever Windows' settings say (no app can turn that off), and more
+when Windows' optional diagnostic data is on. PM tells it to keep its crash reports on your
+computer: if one of its processes crashes, the crash dump stays in WebView2's own crash folder, and
+nothing sends it to Microsoft. In a rare run where PM can't confirm that, crash reports follow
+Windows' settings for that run: when PM couldn't start WebView2 that way and fell back to its
+defaults rather than not opening, when the WebView2 Runtime is too old to have the option, or
+possibly the first launch after the update that brings this, if the previous version's WebView2
+was still running. And Proton Drive's command-line tool, once installed, reports to Proton if your
 Proton account's "Collect usage diagnostics" was on when the tool last signed in, and can send a
 crash report if it fails while starting up, before it has read that setting. Settings → Backup
 says where to turn the setting off; then disconnect and reconnect Proton Drive there, since the tool
